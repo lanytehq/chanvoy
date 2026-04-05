@@ -939,7 +939,7 @@ fn message_mentions_username(message: &str, username: &str) -> bool {
         let boundary_ok = message
             .as_bytes()
             .get(boundary_index)
-            .map(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+            .map(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte != b'-')
             .unwrap_or(true);
         if boundary_ok {
             return true;
