@@ -1,0 +1,5 @@
+/target
+/sbom
+**/*.rs.bk
+.DS_Store
+AGENTS.local.md

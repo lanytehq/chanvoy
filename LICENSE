@@ -1,0 +1,16 @@
+# License Summary
+
+This repository uses a split licensing model:
+
+- **Code** (software, scripts, tooling) is dual-licensed under **MIT OR Apache-2.0** at your option.
+  - See `LICENSE-MIT` and `LICENSE-APACHE`.
+- **Creative works and data** (documentation, specifications, schemas, registries, and other non-code assets) are dedicated to the public domain under **CC0 1.0**.
+
+## Trademark Notice
+
+"3 Leaps" is a registered trademark of 3 Leaps, LLC. "Lanyte" and "LanyteHQ" are project names and trademarks of 3 Leaps, LLC, claimed through use in commerce.
+
+While code and documentation are open under the licenses above, use of these marks in derivative works does not imply endorsement by 3 Leaps, LLC. As a courtesy, rename derivative projects to avoid using "lanyte" or "lanytehq" in repository, package, or product names.
+
+For additional governance details and contributor obligations, see:
+https://github.com/3leaps/oss-policies
