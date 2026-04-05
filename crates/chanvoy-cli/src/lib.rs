@@ -4,8 +4,8 @@ use std::process::Stdio;
 
 use chanvoy_core::{
     list_profiles, load_active_profile, store_active_profile, store_profile, CapabilityClass,
-    Channel, CredentialMode, Identity, Message, Notification, PostReceipt, Profile, ProfileStatus,
-    Provider, WaitResult,
+    Channel, CredentialMode, DaemonStatus, Identity, Message, Notification, PostReceipt, Profile,
+    ProfileStatus, Provider, WaitResult,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{Local, TimeZone};
@@ -314,7 +314,7 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
                         &health,
                         &format!(
                             "daemon listening for profile {} at {}",
-                            health.profile,
+                            health.profile_name,
                             health.socket_path.display()
                         ),
                     );
@@ -350,12 +350,8 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
             Ok(())
         }
         DaemonCommand::Status => {
-            let socket = status(profile)?;
-            print_json_or_text(
-                json,
-                &serde_json::json!({"profile": profile, "socket_path": socket}),
-                &format!("profile: {profile}\nsocket: {}", socket.display()),
-            )
+            let daemon_status = status(profile).await?;
+            print_value(json, &daemon_status)
         }
     }
 }
@@ -578,6 +574,18 @@ impl HumanReadable for ProfileStatus {
             self.bot_username,
             self.server_url,
             self.socket_path.display()
+        )
+    }
+}
+
+impl HumanReadable for DaemonStatus {
+    fn to_human_string(&self) -> String {
+        format!(
+            "profile: {}\nsocket: {}\nmattermost_username: {}\nmattermost_ok: {}",
+            self.profile_name,
+            self.socket_path.display(),
+            self.mattermost_username,
+            self.mattermost_ok
         )
     }
 }

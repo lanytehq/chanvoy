@@ -7,10 +7,10 @@ use std::{fs, io};
 use chanvoy_core::{
     load_profile, load_token, pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile,
     AddMemberParams, ArchiveChannelParams, CapabilityClass, Channel, CoreError,
-    CreateChannelParams, DaemonHealth, DirectMessageParams, JsonRpcRequest, JsonRpcResponse,
-    MattermostClient, NotificationsParams, NotifyParams, PostMessageParams, Profile, ProfileStatus,
-    Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult, WaitChannelParams,
-    WaitResult, WAIT_POLL_SECONDS,
+    CreateChannelParams, DaemonHealth, DaemonStatus, DirectMessageParams, JsonRpcRequest,
+    JsonRpcResponse, MattermostClient, NotificationsParams, NotifyParams, PostMessageParams,
+    Profile, ProfileStatus, Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult,
+    WaitChannelParams, WaitResult, WAIT_POLL_SECONDS,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -117,14 +117,8 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     })
 }
 
-pub async fn ping(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
-    daemon_client(profile_name)
-        .profile_status()
-        .await
-        .map(|status| DaemonHealth {
-            profile: status.profile_name,
-            socket_path: status.socket_path,
-        })
+pub async fn ping(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
+    daemon_client(profile_name).daemon_status().await
 }
 
 pub async fn stop(profile_name: &str) -> Result<(), DaemonError> {
@@ -132,13 +126,8 @@ pub async fn stop(profile_name: &str) -> Result<(), DaemonError> {
     Ok(())
 }
 
-pub fn status(profile_name: &str) -> Result<PathBuf, DaemonError> {
-    let socket_path = socket_path_for_profile(profile_name);
-    if socket_path.exists() {
-        Ok(socket_path)
-    } else {
-        Err(DaemonError::NotRunning(profile_name.to_string()))
-    }
+pub async fn status(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
+    daemon_client(profile_name).daemon_status().await
 }
 
 async fn handle_client(
@@ -287,6 +276,19 @@ async fn dispatch_request(
             server_url: state.profile.server_url.clone(),
             socket_path: state.socket_path.clone(),
         })),
+        "daemon_status" => state
+            .client
+            .whoami()
+            .await
+            .map(|identity| {
+                to_value(DaemonStatus {
+                    profile_name: state.profile.name.clone(),
+                    socket_path: state.socket_path.clone(),
+                    mattermost_username: identity.username,
+                    mattermost_ok: true,
+                })
+            })
+            .map_err(DaemonError::from),
         "shutdown" => {
             if let Some(sender) = shutdown_tx.lock().await.take() {
                 let _ = sender.send(());
@@ -324,6 +326,7 @@ fn error_code(error: &DaemonError) -> i64 {
         DaemonError::Rpc { code, .. } => *code,
         DaemonError::NotRunning(_) => -32004,
         DaemonError::AlreadyRunning(_) => -32003,
+        DaemonError::Core(CoreError::WaitTimeout(_)) => -32005,
         DaemonError::Core(CoreError::RequiresElevatedCapability) => -32006,
         _ => -32000,
     }
@@ -361,10 +364,9 @@ async fn wait_for_messages(
             sleep(Duration::from_secs(WAIT_POLL_SECONDS)).await;
         }
     };
-    timeout(limit, future).await.map_err(|_| CoreError::Api {
-        status: reqwest::StatusCode::REQUEST_TIMEOUT,
-        message: format!("timeout waiting for channel {channel}"),
-    })?
+    timeout(limit, future)
+        .await
+        .map_err(|_| CoreError::WaitTimeout(channel.to_string()))?
 }
 
 async fn initialize_wait_cursor(
@@ -618,6 +620,10 @@ impl DaemonClient {
 
     pub async fn profile_status(&self) -> Result<ProfileStatus, DaemonError> {
         self.call("profile_status", serde_json::json!({})).await
+    }
+
+    pub async fn daemon_status(&self) -> Result<DaemonStatus, DaemonError> {
+        self.call("daemon_status", serde_json::json!({})).await
     }
 
     pub async fn shutdown(&self) -> Result<ShutdownResult, DaemonError> {

@@ -208,6 +208,14 @@ pub struct DaemonHealth {
     pub socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonStatus {
+    pub profile_name: String,
+    pub socket_path: PathBuf,
+    pub mattermost_username: String,
+    pub mattermost_ok: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ConfigFile {
     pub mattermost: Option<MattermostConfig>,
@@ -228,6 +236,8 @@ pub enum CoreError {
     MissingEnvFile,
     #[error("operation requires elevated capability")]
     RequiresElevatedCapability,
+    #[error("timeout waiting for channel {0}")]
+    WaitTimeout(String),
     #[error("profile {0} not found")]
     ProfileNotFound(String),
     #[error("unknown provider in profile")]
@@ -579,12 +589,13 @@ impl MattermostClient {
     }
 
     pub async fn notifications(&self, since_minutes: u64) -> Result<Vec<Notification>, CoreError> {
+        let my_username = self.whoami().await?.username;
         let messages = self
             .read_channel(DEFAULT_NOTIFICATIONS_CHANNEL, since_minutes)
             .await?;
         let notifications = messages
             .into_iter()
-            .filter(|message| message.message.contains('@'))
+            .filter(|message| message_mentions_username(&message.message, &my_username))
             .map(|message| Notification {
                 from_channel: DEFAULT_NOTIFICATIONS_CHANNEL.to_string(),
                 message,
@@ -919,6 +930,25 @@ fn default_capability_class() -> CapabilityClass {
     CapabilityClass::Standard
 }
 
+fn message_mentions_username(message: &str, username: &str) -> bool {
+    let needle = format!("@{username}");
+    let mut search_start = 0;
+    while let Some(index) = message[search_start..].find(&needle) {
+        let absolute = search_start + index;
+        let boundary_index = absolute + needle.len();
+        let boundary_ok = message
+            .as_bytes()
+            .get(boundary_index)
+            .map(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+            .unwrap_or(true);
+        if boundary_ok {
+            return true;
+        }
+        search_start = boundary_index;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,5 +998,21 @@ credential_mode = "env_name"
         .unwrap();
         assert_eq!(profile.env_name, "LANYTE_MM_TOKEN");
         assert_eq!(profile.credential_mode, CredentialMode::EnvName);
+    }
+
+    #[test]
+    fn matches_only_targeted_notifications() {
+        assert!(message_mentions_username(
+            "@agent-bravo-devlead please review",
+            "agent-bravo-devlead"
+        ));
+        assert!(!message_mentions_username(
+            "@agent-bravo-devrev please review",
+            "agent-bravo-devlead"
+        ));
+        assert!(!message_mentions_username(
+            "@agent-bravo-devlead-extra please review",
+            "agent-bravo-devlead"
+        ));
     }
 }
