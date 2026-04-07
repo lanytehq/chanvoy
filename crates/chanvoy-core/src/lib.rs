@@ -3,12 +3,19 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::{SinkExt, StreamExt};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::{broadcast, Mutex};
+use tokio::time::{sleep, MissedTickBehavior};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub const DEFAULT_TEAM: &str = "org-lanytehq";
@@ -54,6 +61,8 @@ pub struct Profile {
     pub credential_mode: CredentialMode,
     #[serde(default = "default_capability_class")]
     pub capability_class: CapabilityClass,
+    #[serde(default)]
+    pub monitored_channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +125,116 @@ pub struct Notification {
 pub struct ErrorDetail {
     pub code: i64,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WsConnectionState {
+    Disconnected,
+    Connecting,
+    Healthy,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonEventKind {
+    InboundMessage,
+    InboundMention,
+    ConnectionStateChanged,
+    Gap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InboundEventPayload {
+    pub profile: String,
+    pub provider: Provider,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub post_id: String,
+    pub sender_id: String,
+    pub sender_username: String,
+    pub message: String,
+    pub create_at: i64,
+    pub received_at: i64,
+    pub mentioned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionStateChangedPayload {
+    pub profile: String,
+    pub provider: Provider,
+    pub state: WsConnectionState,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GapPayload {
+    pub subscription_id: String,
+    pub missed_from_seq: u64,
+    pub missed_to_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonEvent {
+    pub seq: u64,
+    pub kind: DaemonEventKind,
+    #[serde(flatten)]
+    pub payload: DaemonEventPayloadInner,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DaemonEventPayloadInner {
+    Inbound(InboundEventPayload),
+    ConnectionStateChanged(ConnectionStateChangedPayload),
+    Gap(GapPayload),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionFilter {
+    AllMonitored,
+    ChannelByName(String),
+    MentionsOnly,
+    ConnectionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscribeParams {
+    pub filter: SubscriptionFilter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsubscribeParams {
+    pub subscription_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionAck {
+    pub subscription_id: String,
+    pub start_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: Value,
+}
+
+pub fn daemon_event_to_notification(event: &DaemonEvent) -> JsonRpcNotification {
+    let method = match event.kind {
+        DaemonEventKind::InboundMessage => "push.inbound_message",
+        DaemonEventKind::InboundMention => "push.inbound_mention",
+        DaemonEventKind::ConnectionStateChanged => "push.connection_state_changed",
+        DaemonEventKind::Gap => "push.gap",
+    };
+    JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: method.to_string(),
+        params: serde_json::to_value(event).unwrap_or_default(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -214,6 +333,14 @@ pub struct DaemonStatus {
     pub socket_path: PathBuf,
     pub mattermost_username: String,
     pub mattermost_ok: bool,
+    #[serde(default)]
+    pub ws_connection_state: Option<WsConnectionState>,
+    #[serde(default)]
+    pub ws_last_event_at: Option<i64>,
+    #[serde(default)]
+    pub ws_last_error: Option<String>,
+    #[serde(default)]
+    pub ws_reconnect_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -492,6 +619,7 @@ impl MattermostClient {
         #[derive(Deserialize)]
         struct RawPost {
             id: String,
+            user_id: String,
             message: String,
             create_at: i64,
             username: Option<String>,
@@ -512,7 +640,7 @@ impl MattermostClient {
             .into_values()
             .map(|post| Message {
                 id: post.id,
-                user_id: String::new(),
+                user_id: post.user_id,
                 username: post.username.unwrap_or_else(|| "unknown".to_string()),
                 message: post.message,
                 create_at: post.create_at,
@@ -693,9 +821,18 @@ impl MattermostClient {
         since_minutes: u64,
     ) -> Result<Vec<Message>, CoreError> {
         let since = minutes_ago_millis(since_minutes);
+        self.read_channel_by_id_since_millis(channel_id, since).await
+    }
+
+    pub async fn read_channel_by_id_since_millis(
+        &self,
+        channel_id: &str,
+        since_millis: i64,
+    ) -> Result<Vec<Message>, CoreError> {
         #[derive(Deserialize)]
         struct RawPost {
             id: String,
+            user_id: String,
             message: String,
             create_at: i64,
             username: Option<String>,
@@ -707,7 +844,7 @@ impl MattermostClient {
         let response: PostsResponse = self
             .request(
                 "GET",
-                &format!("/channels/{channel_id}/posts?since={since}&per_page=30"),
+                &format!("/channels/{channel_id}/posts?since={since_millis}&per_page=30"),
                 None::<Value>,
             )
             .await?;
@@ -716,7 +853,7 @@ impl MattermostClient {
             .into_values()
             .map(|post| Message {
                 id: post.id,
-                user_id: String::new(),
+                user_id: post.user_id,
                 username: post.username.unwrap_or_else(|| "unknown".to_string()),
                 message: post.message,
                 create_at: post.create_at,
@@ -858,6 +995,19 @@ impl MattermostClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize,
     {
+        self.request_raw(method, endpoint, body).await
+    }
+
+    pub async fn request_raw<T, B>(
+        &self,
+        method: &str,
+        endpoint: &str,
+        body: Option<B>,
+    ) -> Result<T, CoreError>
+    where
+        T: for<'de> Deserialize<'de>,
+        B: Serialize,
+    {
         let url = format!("{}/api/v4{endpoint}", self.base_url);
         let request = match method {
             "GET" => self.client.get(&url),
@@ -886,6 +1036,576 @@ impl MattermostClient {
 #[derive(Debug, Clone, Deserialize)]
 struct ChannelIdResponse {
     id: String,
+}
+
+pub struct EventBus {
+    sender: broadcast::Sender<Arc<DaemonEvent>>,
+    seq_counter: AtomicU64,
+}
+
+impl EventBus {
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            seq_counter: AtomicU64::new(0),
+        }
+    }
+
+    pub fn sender(&self) -> broadcast::Sender<Arc<DaemonEvent>> {
+        self.sender.clone()
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<DaemonEvent>> {
+        self.sender.subscribe()
+    }
+
+    pub fn current_seq(&self) -> u64 {
+        self.seq_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn emit(&self, mut event: DaemonEvent) -> u64 {
+        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        event.seq = seq;
+        let _ = self.sender.send(Arc::new(event));
+        seq
+    }
+}
+
+pub struct WsState {
+    pub connection_state: Arc<Mutex<WsConnectionState>>,
+    pub last_event_at: Arc<AtomicI64>,
+    pub last_error: Arc<Mutex<Option<String>>>,
+    pub reconnect_count: Arc<AtomicU64>,
+    pub last_disconnect_at: Arc<AtomicI64>,
+    pub last_disconnect_seq: AtomicU64,
+}
+
+impl Default for WsState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WsState {
+    pub fn new() -> Self {
+        Self {
+            connection_state: Arc::new(Mutex::new(WsConnectionState::Disconnected)),
+            last_event_at: Arc::new(AtomicI64::new(0)),
+            last_error: Arc::new(Mutex::new(None)),
+            reconnect_count: Arc::new(AtomicU64::new(0)),
+            last_disconnect_at: Arc::new(AtomicI64::new(0)),
+            last_disconnect_seq: AtomicU64::new(0),
+        }
+    }
+
+    pub async fn set_state(&self, state: WsConnectionState) {
+        if matches!(state, WsConnectionState::Disconnected) {
+            self.last_disconnect_at.store(now_unix_millis(), Ordering::Relaxed);
+        }
+        *self.connection_state.lock().await = state;
+    }
+
+    pub fn record_disconnect_seq(&self, seq: u64) {
+        self.last_disconnect_seq.store(seq, Ordering::Relaxed);
+    }
+
+    pub async fn set_error(&self, msg: impl Into<String>) {
+        *self.last_error.lock().await = Some(msg.into());
+    }
+
+    pub fn touch_event(&self) {
+        self.last_event_at.store(now_unix_millis(), Ordering::Relaxed);
+    }
+
+    pub fn bump_reconnect(&self) {
+        self.reconnect_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub struct MattermostWs {
+    ws_url: String,
+    token: String,
+    event_bus: Arc<EventBus>,
+    ws_state: Arc<WsState>,
+    profile_name: String,
+    client: MattermostClient,
+    monitored_channels: Vec<String>,
+    bot_username: String,
+    my_user_id: String,
+    seen_posts: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl MattermostWs {
+    pub fn new(
+        profile: &Profile,
+        token: String,
+        client: MattermostClient,
+        event_bus: Arc<EventBus>,
+        my_user_id: String,
+    ) -> Self {
+        let ws_url = profile
+            .server_url
+            .trim_end_matches('/')
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+        let ws_url = format!("{ws_url}/api/v4/websocket");
+        Self {
+            ws_url,
+            token,
+            event_bus,
+            ws_state: Arc::new(WsState::new()),
+            profile_name: profile.name.clone(),
+            client,
+            monitored_channels: profile.monitored_channels.clone(),
+            bot_username: profile.bot_username.clone(),
+            my_user_id,
+            seen_posts: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    pub fn ws_state(&self) -> Arc<WsState> {
+        Arc::clone(&self.ws_state)
+    }
+
+    pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let mut attempt: u64 = 0;
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            attempt += 1;
+            self.ws_state
+                .set_state(WsConnectionState::Connecting)
+                .await;
+            self.event_bus.emit(DaemonEvent {
+                seq: 0,
+                kind: DaemonEventKind::ConnectionStateChanged,
+                payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                    ConnectionStateChangedPayload {
+                        profile: self.profile_name.clone(),
+                        provider: Provider::Mattermost,
+                        state: WsConnectionState::Connecting,
+                        message: format!("attempt {attempt}"),
+                    },
+                ),
+            });
+
+            match self.connect_and_listen().await {
+                Ok(()) => {
+                    info!("websocket session ended cleanly");
+                }
+                Err(e) => {
+                    warn!(%e, "websocket session error");
+                    self.ws_state.set_error(e.to_string()).await;
+                }
+            }
+
+            if *shutdown.borrow() {
+                break;
+            }
+
+            self.ws_state
+                .set_state(WsConnectionState::Disconnected)
+                .await;
+            self.ws_state.record_disconnect_seq(self.event_bus.current_seq());
+            self.ws_state.bump_reconnect();
+
+            self.event_bus.emit(DaemonEvent {
+                seq: 0,
+                kind: DaemonEventKind::ConnectionStateChanged,
+                payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                    ConnectionStateChangedPayload {
+                        profile: self.profile_name.clone(),
+                        provider: Provider::Mattermost,
+                        state: WsConnectionState::Disconnected,
+                        message: format!("disconnected, will reconnect (attempt {attempt})"),
+                    },
+                ),
+            });
+
+            let delay = if attempt <= 3 {
+                Duration::from_secs(1 << attempt.min(3))
+            } else {
+                self.ws_state
+                    .set_state(WsConnectionState::Degraded)
+                    .await;
+                self.event_bus.emit(DaemonEvent {
+                    seq: 0,
+                    kind: DaemonEventKind::ConnectionStateChanged,
+                    payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                        ConnectionStateChangedPayload {
+                            profile: self.profile_name.clone(),
+                            provider: Provider::Mattermost,
+                            state: WsConnectionState::Degraded,
+                            message: format!("degraded after {attempt} attempts"),
+                        },
+                    ),
+                });
+                Duration::from_secs(30)
+            };
+
+            tokio::select! {
+                _ = sleep(delay) => {}
+                _ = shutdown.changed() => {
+                    break;
+                }
+            }
+        }
+
+        self.ws_state
+            .set_state(WsConnectionState::Disconnected)
+            .await;
+    }
+
+    async fn connect_and_listen(&self) -> Result<(), CoreError> {
+        let (ws_stream, _) = connect_async(&self.ws_url)
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string())))?;
+
+        let (mut write, mut read) = ws_stream.split();
+
+        let auth = serde_json::json!({
+            "seq": 1,
+            "action": "authentication_challenge",
+            "data": { "token": self.token }
+        });
+        write
+            .send(WsMessage::Text(auth.to_string().into()))
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())))?;
+
+        let mut authenticated = false;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        loop {
+            let remaining = if !authenticated {
+                auth_deadline.saturating_duration_since(tokio::time::Instant::now())
+            } else {
+                Duration::from_secs(3600)
+            };
+
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            if !authenticated {
+                                if is_auth_success(&text) {
+                                    authenticated = true;
+                                    self.ws_state
+                                        .set_state(WsConnectionState::Healthy)
+                                        .await;
+                                    info!("websocket authenticated and healthy");
+                                    self.event_bus.emit(DaemonEvent {
+                                        seq: 0,
+                                        kind: DaemonEventKind::ConnectionStateChanged,
+                                        payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                                            ConnectionStateChangedPayload {
+                                                profile: self.profile_name.clone(),
+                                                provider: Provider::Mattermost,
+                                                state: WsConnectionState::Healthy,
+                                                message: "connected and authenticated".to_string(),
+                                            },
+                                        ),
+                                    });
+                                    self.reconnect_catchup().await;
+                                } else if is_auth_error(&text) {
+                                    return Err(CoreError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        format!("websocket auth rejected: {}", text),
+                                    )));
+                                }
+                            } else {
+                                self.handle_ws_message(&text).await;
+                            }
+                        }
+                        Some(Ok(WsMessage::Ping(data))) => {
+                            let _ = write.send(WsMessage::Pong(data)).await;
+                        }
+                        Some(Ok(WsMessage::Close(_))) | None => {
+                            return Ok(());
+                        }
+                        Some(Err(e)) => {
+                            return Err(CoreError::Io(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                e.to_string(),
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if authenticated {
+                        let ping = serde_json::json!({
+                            "seq": 0,
+                            "action": "user_activity"
+                        });
+                        if write.send(WsMessage::Text(ping.to_string().into())).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    if !authenticated {
+                        return Err(CoreError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "websocket auth timed out waiting for server ack",
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_ws_message(&self, text: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+
+        let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let data = value.get("data").cloned().unwrap_or(Value::Null);
+
+        match event {
+            "posted" | "post_edited" => {
+                self.handle_post_event(&data).await;
+            }
+            "status_change" | "hello" => {
+                self.ws_state.touch_event();
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_post_event(&self, data: &Value) {
+        self.ws_state.touch_event();
+
+        let Some(post_str) = data.get("post").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let Ok(post): Result<Value, _> = serde_json::from_str(post_str) else {
+            return;
+        };
+
+        let post_id = post
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let channel_id = post
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let sender_id = post
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let message = post
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let create_at = post
+            .get("create_at")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        if sender_id == self.my_user_id {
+            return;
+        }
+
+        if post_id.is_empty() || channel_id.is_empty() {
+            return;
+        }
+
+        {
+            let mut seen = self.seen_posts.lock().await;
+            if !seen.insert(post_id.clone()) {
+                return;
+            }
+            if seen.len() > 10000 {
+                let to_remove: Vec<String> = seen.iter().take(5000).cloned().collect();
+                for id in to_remove {
+                    seen.remove(&id);
+                }
+            }
+        }
+
+        let channel_name = self.resolve_channel_name(&channel_id).await;
+        let sender_username = self.resolve_username(&sender_id).await;
+        let mentioned = message_mentions_username(&message, &self.bot_username);
+
+        let is_monitored = self.monitored_channels.iter().any(|m| {
+            m.eq_ignore_ascii_case(&channel_name)
+        });
+
+        if is_monitored {
+            let event = DaemonEvent {
+                seq: 0,
+                kind: DaemonEventKind::InboundMessage,
+                payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                    profile: self.profile_name.clone(),
+                    provider: Provider::Mattermost,
+                    channel_id,
+                    channel_name,
+                    post_id,
+                    sender_id,
+                    sender_username,
+                    message,
+                    create_at,
+                    received_at: now_unix_millis(),
+                    mentioned,
+                }),
+            };
+            self.event_bus.emit(event);
+        } else if mentioned {
+            let event = DaemonEvent {
+                seq: 0,
+                kind: DaemonEventKind::InboundMention,
+                payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                    profile: self.profile_name.clone(),
+                    provider: Provider::Mattermost,
+                    channel_id,
+                    channel_name,
+                    post_id,
+                    sender_id,
+                    sender_username,
+                    message,
+                    create_at,
+                    received_at: now_unix_millis(),
+                    mentioned: true,
+                }),
+            };
+            self.event_bus.emit(event);
+        }
+    }
+
+    async fn reconnect_catchup(&self) {
+        let five_min_ago = now_unix_millis() - (5 * 60 * 1000);
+        let disconnect_at = self.ws_state.last_disconnect_at.load(Ordering::Relaxed);
+        let outage_exceeded_window = disconnect_at > 0 && disconnect_at < five_min_ago;
+
+        for channel_name in &self.monitored_channels {
+            let Ok(channel_id) = self.client.channel_id_for_name(channel_name).await else {
+                continue;
+            };
+            let Ok(messages) = self.client.read_channel_by_id_since_millis(&channel_id, five_min_ago).await else {
+                continue;
+            };
+
+            let mut seen = self.seen_posts.lock().await;
+
+            let new_messages: Vec<_> = messages
+                .into_iter()
+                .filter(|m| {
+                    m.user_id != self.my_user_id && seen.insert(m.id.clone())
+                })
+                .collect();
+
+            for msg in new_messages {
+                let mentioned = message_mentions_username(&msg.message, &self.bot_username);
+                let event = DaemonEvent {
+                    seq: 0,
+                    kind: DaemonEventKind::InboundMessage,
+                    payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                        profile: self.profile_name.clone(),
+                        provider: Provider::Mattermost,
+                        channel_id: channel_id.clone(),
+                        channel_name: channel_name.clone(),
+                        post_id: msg.id,
+                        sender_id: msg.user_id,
+                        sender_username: msg.username,
+                        message: msg.message,
+                        create_at: msg.create_at,
+                        received_at: now_unix_millis(),
+                        mentioned,
+                    }),
+                };
+                self.event_bus.emit(event);
+            }
+
+            if seen.len() > 10000 {
+                let to_remove: Vec<String> = seen.iter().take(5000).cloned().collect();
+                for id in to_remove {
+                    seen.remove(&id);
+                }
+            }
+        }
+
+        if outage_exceeded_window {
+            let missed_from = self.ws_state.last_disconnect_seq.load(Ordering::Relaxed);
+            let missed_to = self.event_bus.current_seq();
+            self.event_bus.emit(DaemonEvent {
+                seq: 0,
+                kind: DaemonEventKind::Gap,
+                payload: DaemonEventPayloadInner::Gap(GapPayload {
+                    subscription_id: format!("__reconnect__{}", self.profile_name),
+                    missed_from_seq: missed_from,
+                    missed_to_seq: missed_to,
+                }),
+            });
+        }
+    }
+
+    async fn resolve_channel_name(&self, channel_id: &str) -> String {
+        let channels = self.client.list_channels().await.unwrap_or_default();
+        channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| channel_id.to_string())
+    }
+
+    async fn resolve_username(&self, user_id: &str) -> String {
+        #[derive(Deserialize)]
+        struct UserResp {
+            username: String,
+        }
+        let result: Result<UserResp, _> = self
+            .client
+            .request_raw("GET", &format!("/users/{user_id}"), None::<Value>)
+            .await;
+        result.map(|u| u.username).unwrap_or_else(|_| "unknown".to_string())
+    }
+}
+
+fn is_auth_success(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    if event == "hello" {
+        let status = value
+            .get("data")
+            .and_then(|d| d.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        return status == "OK";
+    }
+    false
+}
+
+fn is_auth_error(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let has_error = value.get("error").is_some();
+    if seq == 0 && has_error {
+        return true;
+    }
+    let status = value
+        .get("data")
+        .and_then(|d| d.get("status"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    if status == "FAIL" || status == "INVALID_TOKEN" {
+        return true;
+    }
+    false
 }
 
 pub fn rpc_request(method: impl Into<String>, params: Value) -> JsonRpcRequest {
@@ -1014,5 +1734,211 @@ credential_mode = "env_name"
             "@agent-bravo-devlead-extra please review",
             "agent-bravo-devlead"
         ));
+    }
+
+    #[test]
+    fn parses_monitored_channels_from_profile() {
+        let profile: Profile = toml::from_str(
+            r#"
+name = "bravo-devlead"
+role = "devlead"
+scope = "bravo"
+provider = "mattermost"
+bot_username = "agent-bravo-devlead"
+server_url = "https://mm.example.com"
+env_name = "LANYTE_MM_TOKEN"
+monitored_channels = ["per-003", "per-004"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(profile.monitored_channels, vec!["per-003", "per-004"]);
+    }
+
+    #[test]
+    fn daemon_event_serializes_as_notification() {
+        let event = DaemonEvent {
+            seq: 42,
+            kind: DaemonEventKind::InboundMessage,
+            payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                profile: "bravo-devlead".to_string(),
+                provider: Provider::Mattermost,
+                channel_id: "ch123".to_string(),
+                channel_name: "per-004".to_string(),
+                post_id: "post456".to_string(),
+                sender_id: "user789".to_string(),
+                sender_username: "agent-dispatch".to_string(),
+                message: "hello".to_string(),
+                create_at: 1000,
+                received_at: 1001,
+                mentioned: false,
+            }),
+        };
+        let notification = daemon_event_to_notification(&event);
+        assert_eq!(notification.jsonrpc, "2.0");
+        assert_eq!(notification.method, "push.inbound_message");
+        let params = &notification.params;
+        assert_eq!(params["seq"], 42);
+        assert_eq!(params["kind"], "inbound_message");
+        assert_eq!(params["channel_name"], "per-004");
+    }
+
+    #[tokio::test]
+    async fn event_bus_seq_monotonic() {
+        let bus = Arc::new(EventBus::new(16));
+        let mut rx = bus.subscribe();
+
+        bus.emit(DaemonEvent {
+            seq: 0,
+            kind: DaemonEventKind::ConnectionStateChanged,
+            payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                ConnectionStateChangedPayload {
+                    profile: "test".to_string(),
+                    provider: Provider::Mattermost,
+                    state: WsConnectionState::Healthy,
+                    message: "ok".to_string(),
+                },
+            ),
+        });
+        bus.emit(DaemonEvent {
+            seq: 0,
+            kind: DaemonEventKind::ConnectionStateChanged,
+            payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                ConnectionStateChangedPayload {
+                    profile: "test".to_string(),
+                    provider: Provider::Mattermost,
+                    state: WsConnectionState::Disconnected,
+                    message: "gone".to_string(),
+                },
+            ),
+        });
+
+        let e1 = rx.recv().await.unwrap();
+        let e2 = rx.recv().await.unwrap();
+        assert_eq!(e1.seq, 1);
+        assert_eq!(e2.seq, 2);
+        assert!(e2.seq > e1.seq);
+    }
+
+    #[tokio::test]
+    async fn event_bus_gap_detection() {
+        let bus = Arc::new(EventBus::new(2));
+        let mut rx = bus.subscribe();
+
+        for i in 0..5 {
+            bus.emit(DaemonEvent {
+                seq: 0,
+                kind: DaemonEventKind::ConnectionStateChanged,
+                payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                    ConnectionStateChangedPayload {
+                        profile: "test".to_string(),
+                        provider: Provider::Mattermost,
+                        state: WsConnectionState::Healthy,
+                        message: format!("event {i}"),
+                    },
+                ),
+            });
+        }
+
+        let result = rx.try_recv();
+        match result {
+            Ok(event) => {
+                assert!(event.seq >= 1);
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                assert!(n > 0, "should report lagged count");
+            }
+            _ => {}
+        }
+
+        assert_eq!(bus.current_seq(), 5);
+    }
+
+    #[tokio::test]
+    async fn event_bus_multi_subscriber_isolation() {
+        let bus = Arc::new(EventBus::new(16));
+        let mut rx1 = bus.subscribe();
+        let mut rx2 = bus.subscribe();
+
+        bus.emit(DaemonEvent {
+            seq: 0,
+            kind: DaemonEventKind::InboundMessage,
+            payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                profile: "test".to_string(),
+                provider: Provider::Mattermost,
+                channel_id: "ch1".to_string(),
+                channel_name: "per-004".to_string(),
+                post_id: "p1".to_string(),
+                sender_id: "u1".to_string(),
+                sender_username: "alice".to_string(),
+                message: "hello".to_string(),
+                create_at: 1000,
+                received_at: 1001,
+                mentioned: false,
+            }),
+        });
+
+        let e1 = rx1.recv().await.unwrap();
+        let e2 = rx2.recv().await.unwrap();
+        assert_eq!(e1.seq, e2.seq);
+        assert_eq!(e1.kind, DaemonEventKind::InboundMessage);
+
+        drop(rx1);
+
+        bus.emit(DaemonEvent {
+            seq: 0,
+            kind: DaemonEventKind::InboundMention,
+            payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                profile: "test".to_string(),
+                provider: Provider::Mattermost,
+                channel_id: "ch2".to_string(),
+                channel_name: "bravo-team".to_string(),
+                post_id: "p2".to_string(),
+                sender_id: "u2".to_string(),
+                sender_username: "bob".to_string(),
+                message: "@agent-bravo-devlead review".to_string(),
+                create_at: 2000,
+                received_at: 2001,
+                mentioned: true,
+            }),
+        });
+
+        let e3 = rx2.recv().await.unwrap();
+        assert_eq!(e3.kind, DaemonEventKind::InboundMention);
+    }
+
+    #[test]
+    fn is_auth_success_accepts_hello_ok() {
+        let frame = r#"{"event":"hello","data":{"status":"OK","server_version":"10.5.0"}}"#;
+        assert!(is_auth_success(frame));
+    }
+
+    #[test]
+    fn is_auth_success_rejects_non_hello() {
+        let frame = r#"{"event":"posted","data":{"post":"{}"}}"#;
+        assert!(!is_auth_success(frame));
+    }
+
+    #[test]
+    fn is_auth_success_rejects_hello_fail() {
+        let frame = r#"{"event":"hello","data":{"status":"FAIL"}}"#;
+        assert!(!is_auth_success(frame));
+    }
+
+    #[test]
+    fn is_auth_error_detects_fail_status() {
+        let frame = r#"{"data":{"status":"FAIL"}}"#;
+        assert!(is_auth_error(frame));
+    }
+
+    #[test]
+    fn is_auth_error_detects_invalid_token() {
+        let frame = r#"{"data":{"status":"INVALID_TOKEN"}}"#;
+        assert!(is_auth_error(frame));
+    }
+
+    #[test]
+    fn is_auth_error_rejects_normal_event() {
+        let frame = r#"{"event":"posted","data":{"post":"{}"}}"#;
+        assert!(!is_auth_error(frame));
     }
 }
