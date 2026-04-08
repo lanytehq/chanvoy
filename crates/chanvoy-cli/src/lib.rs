@@ -396,6 +396,7 @@ async fn handle_profile(
                     CliCapabilityClass::Elevated => CapabilityClass::Elevated,
                 },
                 monitored_channels: Vec::new(),
+                ipc: None,
             };
             validate_profile_create_args(&profile)?;
             let path = store_profile(&profile)?;

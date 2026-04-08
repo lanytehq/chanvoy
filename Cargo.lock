@@ -190,6 +190,7 @@ name = "chanvoy-daemon"
 version = "0.1.0"
 dependencies = [
  "chanvoy-core",
+ "chanvoy-ipc",
  "dirs",
  "reqwest",
  "serde",
@@ -199,6 +200,23 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "chanvoy-ipc"
+version = "0.1.0"
+dependencies = [
+ "chanvoy-core",
+ "chrono",
+ "ipcprims",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -740,6 +758,57 @@ dependencies = [
  "hashbrown 0.16.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "ipcprims"
+version = "0.2.1"
+dependencies = [
+ "ipcprims-frame",
+ "ipcprims-peer",
+ "ipcprims-transport",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "ipcprims-frame"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "ipcprims-transport",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "ipcprims-peer"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "ipcprims-frame",
+ "ipcprims-transport",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "ipcprims-transport"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "libc",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

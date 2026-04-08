@@ -63,6 +63,16 @@ pub struct Profile {
     pub capability_class: CapabilityClass,
     #[serde(default)]
     pub monitored_channels: Vec<String>,
+    #[serde(default)]
+    pub ipc: Option<IpcConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gateway_socket: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +351,12 @@ pub struct DaemonStatus {
     pub ws_last_error: Option<String>,
     #[serde(default)]
     pub ws_reconnect_count: Option<u64>,
+    #[serde(default)]
+    pub ipc_connected: Option<bool>,
+    #[serde(default)]
+    pub ipc_peer_id: Option<String>,
+    #[serde(default)]
+    pub ipc_reconnect_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -863,7 +879,7 @@ impl MattermostClient {
         Ok(posts)
     }
 
-    async fn post_message_by_id(
+    pub async fn post_message_by_id(
         &self,
         channel_id: &str,
         message: &str,
