@@ -763,7 +763,7 @@ impl IpcPeer {
                             subscription_id: sub_id.clone(),
                             expected_seq: resume_seq,
                             next_seq: start_seq,
-                            reason: "resume_gap".to_string(),
+                            reason: "history_unavailable".to_string(),
                             message: Some(format!(
                                 "missed {} events between seq {} and {}",
                                 start_seq.saturating_sub(resume_seq),
@@ -1154,12 +1154,12 @@ mod tests {
             subscription_id: "ipc-sub-1".to_string(),
             expected_seq: 5,
             next_seq: 10,
-            reason: "resume_gap".to_string(),
+            reason: "history_unavailable".to_string(),
             message: Some("missed 5 events between seq 5 and 10".to_string()),
         };
         let json = serde_json::to_string(&gap).unwrap();
         assert!(json.contains("ipc-sub-1"));
-        assert!(json.contains("resume_gap"));
+        assert!(json.contains("history_unavailable"));
         let parsed: ChatFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(gap, parsed);
     }
