@@ -303,17 +303,14 @@ pub fn daemon_event_to_chat_notification(
             mentions_bot: None,
             actor: None,
         }),
-        DaemonEventPayloadInner::Gap(g) => Some(ChatFrame::SubscriptionGap {
-            subscription_id: g.subscription_id.clone(),
-            expected_seq: g.missed_from_seq,
-            next_seq: g.missed_to_seq,
-            reason: "overflow".to_string(),
-            message: Some(format!("missed {} events", g.missed_to_seq.saturating_sub(g.missed_from_seq))),
-        }),
+        DaemonEventPayloadInner::Gap(_) => None,
     }
 }
 
 fn event_matches_ipc_filter(event: &DaemonEvent, filter: &IpcSubscriptionFilter) -> bool {
+    if let DaemonEventPayloadInner::Gap(_) = &event.payload {
+        return true;
+    }
     if let Some(kinds) = &filter.event_kinds {
         let kind_str = match event.kind {
             DaemonEventKind::InboundMessage => "message_posted",
@@ -326,9 +323,10 @@ fn event_matches_ipc_filter(event: &DaemonEvent, filter: &IpcSubscriptionFilter)
         }
     }
     if filter.mentions_only == Some(true) {
-        match &event.payload {
-            DaemonEventPayloadInner::Inbound(p) if !p.mentioned => return false,
-            _ => {}
+        if let DaemonEventPayloadInner::Inbound(p) = &event.payload {
+            if !p.mentioned {
+                return false;
+            }
         }
     }
     if let Some(channel_ids) = &filter.channel_ids {
@@ -510,7 +508,22 @@ impl IpcPeer {
                                 let subs = subscriptions.lock().await;
                                 for (sub_id, entry) in subs.iter() {
                                     if event_matches_ipc_filter(&event, &entry.filter) {
-                                        if let Some(notification) = daemon_event_to_chat_notification(&event, sub_id) {
+                                        if let DaemonEventPayloadInner::Gap(g) = &event.payload {
+                                            let gap = ChatFrame::SubscriptionGap {
+                                                subscription_id: sub_id.clone(),
+                                                expected_seq: g.missed_from_seq,
+                                                next_seq: g.missed_to_seq,
+                                                reason: "overflow".to_string(),
+                                                message: Some(format!(
+                                                    "missed {} events",
+                                                    g.missed_to_seq.saturating_sub(g.missed_from_seq)
+                                                )),
+                                            };
+                                            let payload = serde_json::to_vec(&gap).unwrap_or_default();
+                                            if tx_clone.send(CHANNEL_260, &payload).await.is_err() {
+                                                return;
+                                            }
+                                        } else if let Some(notification) = daemon_event_to_chat_notification(&event, sub_id) {
                                             let payload = serde_json::to_vec(&notification).unwrap_or_default();
                                             if tx_clone.send(CHANNEL_260, &payload).await.is_err() {
                                                 return;
@@ -746,29 +759,19 @@ impl IpcPeer {
 
                 if let Some(resume_seq) = resume_after_seq {
                     if resume_seq < start_seq {
-                        let replay_rx = self.event_bus.subscribe();
-                        let tx_clone = tx.clone();
-                        let sub_id_clone = sub_id.clone();
-                        let filter_clone = ipc_filter.clone();
-                        tokio::spawn(async move {
-                            let mut rx = replay_rx;
-                            while let Ok(event) = rx.recv().await {
-                                if event.seq <= resume_seq {
-                                    continue;
-                                }
-                                if event.seq > start_seq {
-                                    break;
-                                }
-                                if event_matches_ipc_filter(&event, &filter_clone) {
-                                    if let Some(notification) = daemon_event_to_chat_notification(&event, &sub_id_clone) {
-                                        let payload = serde_json::to_vec(&notification).unwrap_or_default();
-                                        if tx_clone.send(CHANNEL_260, &payload).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        });
+                        let gap = ChatFrame::SubscriptionGap {
+                            subscription_id: sub_id.clone(),
+                            expected_seq: resume_seq,
+                            next_seq: start_seq,
+                            reason: "resume_gap".to_string(),
+                            message: Some(format!(
+                                "missed {} events between seq {} and {}",
+                                start_seq.saturating_sub(resume_seq),
+                                resume_seq,
+                                start_seq
+                            )),
+                        };
+                        let _ = self.send_response(tx, &gap).await;
                     }
                 }
 
@@ -1124,5 +1127,40 @@ mod tests {
         assert!(json.contains("\"audit_event\""));
         let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, parsed);
+    }
+
+    #[test]
+    fn gap_events_pass_ipc_filter() {
+        let event = DaemonEvent {
+            seq: 10,
+            kind: DaemonEventKind::Gap,
+            payload: DaemonEventPayloadInner::Gap(chanvoy_core::GapPayload {
+                subscription_id: "m2-sub".to_string(),
+                missed_from_seq: 5,
+                missed_to_seq: 10,
+            }),
+        };
+        let filter = IpcSubscriptionFilter {
+            channel_ids: None,
+            event_kinds: Some(vec!["message_posted".to_string()]),
+            mentions_only: None,
+        };
+        assert!(event_matches_ipc_filter(&event, &filter));
+    }
+
+    #[test]
+    fn subscription_gap_frame_uses_ipc_sub_id() {
+        let gap = ChatFrame::SubscriptionGap {
+            subscription_id: "ipc-sub-1".to_string(),
+            expected_seq: 5,
+            next_seq: 10,
+            reason: "resume_gap".to_string(),
+            message: Some("missed 5 events between seq 5 and 10".to_string()),
+        };
+        let json = serde_json::to_string(&gap).unwrap();
+        assert!(json.contains("ipc-sub-1"));
+        assert!(json.contains("resume_gap"));
+        let parsed: ChatFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(gap, parsed);
     }
 }
