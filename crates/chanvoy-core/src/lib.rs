@@ -63,6 +63,16 @@ pub struct Profile {
     pub capability_class: CapabilityClass,
     #[serde(default)]
     pub monitored_channels: Vec<String>,
+    #[serde(default)]
+    pub ipc: Option<IpcConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub gateway_socket: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +351,12 @@ pub struct DaemonStatus {
     pub ws_last_error: Option<String>,
     #[serde(default)]
     pub ws_reconnect_count: Option<u64>,
+    #[serde(default)]
+    pub ipc_connected: Option<bool>,
+    #[serde(default)]
+    pub ipc_peer_id: Option<String>,
+    #[serde(default)]
+    pub ipc_reconnect_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -863,7 +879,7 @@ impl MattermostClient {
         Ok(posts)
     }
 
-    async fn post_message_by_id(
+    pub async fn post_message_by_id(
         &self,
         channel_id: &str,
         message: &str,
@@ -888,6 +904,76 @@ impl MattermostClient {
             )
             .await?;
         Ok(PostReceipt { id: receipt.id })
+    }
+
+    pub async fn post_threaded_reply(
+        &self,
+        channel_id: &str,
+        root_id: &str,
+        message: &str,
+    ) -> Result<PostReceipt, CoreError> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            channel_id: &'a str,
+            root_id: &'a str,
+            message: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct RawPostReceipt {
+            id: String,
+        }
+        let receipt: RawPostReceipt = self
+            .request(
+                "POST",
+                "/posts",
+                Some(Payload {
+                    channel_id,
+                    root_id,
+                    message,
+                }),
+            )
+            .await?;
+        Ok(PostReceipt { id: receipt.id })
+    }
+
+    pub async fn read_thread(
+        &self,
+        root_post_id: &str,
+    ) -> Result<Vec<Message>, CoreError> {
+        #[derive(Deserialize)]
+        struct RawPost {
+            id: String,
+            user_id: String,
+            message: String,
+            create_at: i64,
+            username: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct ThreadResponse {
+            posts: BTreeMap<String, RawPost>,
+        }
+        let response: ThreadResponse = self
+            .request(
+                "GET",
+                &format!("/posts/{root_post_id}/thread"),
+                None::<Value>,
+            )
+            .await?;
+        let mut posts: Vec<Message> = response
+            .posts
+            .into_values()
+            .filter_map(|p| {
+                p.username.map(|username| Message {
+                    id: p.id,
+                    user_id: p.user_id,
+                    username,
+                    message: p.message,
+                    create_at: p.create_at,
+                })
+            })
+            .collect();
+        posts.sort_by_key(|m| m.create_at);
+        Ok(posts)
     }
 
     async fn team_id(&self) -> Result<String, CoreError> {

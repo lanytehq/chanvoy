@@ -8,13 +8,14 @@ use chanvoy_core::{
     load_profile, load_token, pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile,
     AddMemberParams, ArchiveChannelParams, CapabilityClass, Channel, CoreError,
     CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, DaemonHealth,
-    DaemonStatus, DirectMessageParams, EventBus, JsonRpcNotification,
+    DaemonStatus, DirectMessageParams, EventBus, IpcConfig, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
     NotifyParams, PostMessageParams, Profile, ProfileStatus, Provider, ReadChannelParams,
     ReadDirectMessageParams, ShutdownResult, SubscriptionAck, SubscriptionFilter, SubscribeParams,
     UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
     daemon_event_to_notification,
 };
+use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -48,6 +49,7 @@ struct AppState {
     event_bus: Arc<EventBus>,
     subscriptions: Arc<Mutex<HashMap<String, SubscriptionFilter>>>,
     ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>>,
+    ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>>,
 }
 
 pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
@@ -76,14 +78,38 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
 
     let ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>> = Arc::new(Mutex::new(None));
+    let event_bus: Arc<EventBus> = Arc::new(EventBus::new(256));
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>> = match &profile.ipc {
+        Some(IpcConfig { enabled: true, gateway_socket }) if !gateway_socket.is_empty() => {
+            let token_for_ipc = load_token(&profile)?;
+            let client_for_ipc = MattermostClient::new(&profile, token_for_ipc)?;
+            let ipc_peer = Arc::new(IpcPeer::new(
+                &profile,
+                client_for_ipc,
+                Arc::clone(&event_bus),
+                gateway_socket.clone(),
+            ));
+            let state = ipc_peer.state();
+            let cancel = cancel_token.clone();
+            tokio::spawn(async move {
+                ipc_peer.run(cancel).await;
+            });
+            Some(state)
+        }
+        _ => None,
+    };
+
     let state = Arc::new(AppState {
         profile: profile.clone(),
         client,
         socket_path: socket_path.clone(),
         my_user_id,
-        event_bus: Arc::new(EventBus::new(256)),
+        event_bus: Arc::clone(&event_bus),
         subscriptions: Arc::new(Mutex::new(HashMap::new())),
         ws_state_holder: ws_state_holder.clone(),
+        ipc_state,
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -92,7 +118,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     {
         let token_for_ws = load_token(&profile)?;
         let client_for_ws = MattermostClient::new(&profile, token_for_ws.clone())?;
-        let event_bus = Arc::clone(&state.event_bus);
+        let event_bus = Arc::clone(&event_bus);
         let ws = Arc::new(MattermostWs::new(
             &profile,
             token_for_ws,
@@ -127,6 +153,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                 });
             }
             _ = &mut shutdown_rx => {
+                cancel_token.cancel();
                 let _ = ws_shutdown_tx.send(true);
                 break;
             }
@@ -465,6 +492,18 @@ async fn dispatch_request(
                         ws_last_event_at: last_event,
                         ws_last_error: last_error,
                         ws_reconnect_count: reconnect_count,
+                        ipc_connected: match &state.ipc_state {
+                            Some(s) => Some(s.lock().await.connected),
+                            None => None,
+                        },
+                        ipc_peer_id: match &state.ipc_state {
+                            Some(s) => s.lock().await.peer_id.clone(),
+                            None => None,
+                        },
+                        ipc_reconnect_count: match &state.ipc_state {
+                            Some(s) => Some(s.lock().await.reconnect_count),
+                            None => None,
+                        },
                     }))
                 }
                 Err(e) => Err(DaemonError::from(e)),

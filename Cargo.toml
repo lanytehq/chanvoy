@@ -13,6 +13,7 @@ members = [
   "crates/chanvoy-daemon",
   "crates/chanvoy-cli",
   "crates/chanvoy-mcp",
+  "crates/chanvoy-ipc",
 ]
 resolver = "2"
 
