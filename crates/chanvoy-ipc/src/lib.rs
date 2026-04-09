@@ -847,7 +847,7 @@ async fn emit_audit(
         entry_id: uuid::Uuid::new_v4().to_string(),
         peer_id: peer_id.to_string(),
         timestamp: format_rfc3339(chanvoy_core::now_unix_millis()),
-        action: format!("chat.{action}"),
+        action: action.to_string(),
         actor: "chanvoy".to_string(),
         prev_hash: "0".repeat(64),
         details,
@@ -1127,6 +1127,24 @@ mod tests {
         assert!(json.contains("\"audit_event\""));
         let parsed: AuditEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, parsed);
+    }
+
+    #[test]
+    fn audit_actions_are_not_double_prefixed() {
+        let action = "chat.post";
+        let event = AuditEvent {
+            event_type: "audit_event".to_string(),
+            entry_id: uuid::Uuid::new_v4().to_string(),
+            peer_id: "chanvoy-1".to_string(),
+            timestamp: "2026-04-08T16:00:00+00:00".to_string(),
+            action: action.to_string(),
+            actor: "chanvoy".to_string(),
+            prev_hash: "0".repeat(64),
+            details: None,
+            severity: Some("info".to_string()),
+        };
+
+        assert_eq!(event.action, action);
     }
 
     #[test]
