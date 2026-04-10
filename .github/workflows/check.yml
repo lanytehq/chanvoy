@@ -9,6 +9,7 @@ name: check
 
 env:
   MSRV: "1.85.0"
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
@@ -19,9 +20,7 @@ jobs:
         with:
           toolchain: "1.85.0"
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
+      - run: make check
 
   msrv:
     runs-on: ubuntu-latest
@@ -30,4 +29,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85.0"
-      - run: cargo +${{ env.MSRV }} check --workspace --all-targets --locked
+      - run: make msrv
