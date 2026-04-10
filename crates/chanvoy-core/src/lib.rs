@@ -837,7 +837,8 @@ impl MattermostClient {
         since_minutes: u64,
     ) -> Result<Vec<Message>, CoreError> {
         let since = minutes_ago_millis(since_minutes);
-        self.read_channel_by_id_since_millis(channel_id, since).await
+        self.read_channel_by_id_since_millis(channel_id, since)
+            .await
     }
 
     pub async fn read_channel_by_id_since_millis(
@@ -936,10 +937,7 @@ impl MattermostClient {
         Ok(PostReceipt { id: receipt.id })
     }
 
-    pub async fn read_thread(
-        &self,
-        root_post_id: &str,
-    ) -> Result<Vec<Message>, CoreError> {
+    pub async fn read_thread(&self, root_post_id: &str) -> Result<Vec<Message>, CoreError> {
         #[derive(Deserialize)]
         struct RawPost {
             id: String,
@@ -1187,7 +1185,8 @@ impl WsState {
 
     pub async fn set_state(&self, state: WsConnectionState) {
         if matches!(state, WsConnectionState::Disconnected) {
-            self.last_disconnect_at.store(now_unix_millis(), Ordering::Relaxed);
+            self.last_disconnect_at
+                .store(now_unix_millis(), Ordering::Relaxed);
         }
         *self.connection_state.lock().await = state;
     }
@@ -1201,7 +1200,8 @@ impl WsState {
     }
 
     pub fn touch_event(&self) {
-        self.last_event_at.store(now_unix_millis(), Ordering::Relaxed);
+        self.last_event_at
+            .store(now_unix_millis(), Ordering::Relaxed);
     }
 
     pub fn bump_reconnect(&self) {
@@ -1261,9 +1261,7 @@ impl MattermostWs {
                 break;
             }
             attempt += 1;
-            self.ws_state
-                .set_state(WsConnectionState::Connecting)
-                .await;
+            self.ws_state.set_state(WsConnectionState::Connecting).await;
             self.event_bus.emit(DaemonEvent {
                 seq: 0,
                 kind: DaemonEventKind::ConnectionStateChanged,
@@ -1294,7 +1292,8 @@ impl MattermostWs {
             self.ws_state
                 .set_state(WsConnectionState::Disconnected)
                 .await;
-            self.ws_state.record_disconnect_seq(self.event_bus.current_seq());
+            self.ws_state
+                .record_disconnect_seq(self.event_bus.current_seq());
             self.ws_state.bump_reconnect();
 
             self.event_bus.emit(DaemonEvent {
@@ -1313,9 +1312,7 @@ impl MattermostWs {
             let delay = if attempt <= 3 {
                 Duration::from_secs(1 << attempt.min(3))
             } else {
-                self.ws_state
-                    .set_state(WsConnectionState::Degraded)
-                    .await;
+                self.ws_state.set_state(WsConnectionState::Degraded).await;
                 self.event_bus.emit(DaemonEvent {
                     seq: 0,
                     kind: DaemonEventKind::ConnectionStateChanged,
@@ -1345,9 +1342,12 @@ impl MattermostWs {
     }
 
     async fn connect_and_listen(&self) -> Result<(), CoreError> {
-        let (ws_stream, _) = connect_async(&self.ws_url)
-            .await
-            .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string())))?;
+        let (ws_stream, _) = connect_async(&self.ws_url).await.map_err(|e| {
+            CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                e.to_string(),
+            ))
+        })?;
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -1359,7 +1359,12 @@ impl MattermostWs {
         write
             .send(WsMessage::Text(auth.to_string().into()))
             .await
-            .map_err(|e| CoreError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())))?;
+            .map_err(|e| {
+                CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    e.to_string(),
+                ))
+            })?;
 
         let mut authenticated = false;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -1494,10 +1499,7 @@ impl MattermostWs {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let create_at = post
-            .get("create_at")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let create_at = post.get("create_at").and_then(|v| v.as_i64()).unwrap_or(0);
 
         if sender_id == self.my_user_id {
             return;
@@ -1524,9 +1526,10 @@ impl MattermostWs {
         let sender_username = self.resolve_username(&sender_id).await;
         let mentioned = message_mentions_username(&message, &self.bot_username);
 
-        let is_monitored = self.monitored_channels.iter().any(|m| {
-            m.eq_ignore_ascii_case(&channel_name)
-        });
+        let is_monitored = self
+            .monitored_channels
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(&channel_name));
 
         if is_monitored {
             let event = DaemonEvent {
@@ -1578,7 +1581,11 @@ impl MattermostWs {
             let Ok(channel_id) = self.client.channel_id_for_name(channel_name).await else {
                 continue;
             };
-            let Ok(messages) = self.client.read_channel_by_id_since_millis(&channel_id, five_min_ago).await else {
+            let Ok(messages) = self
+                .client
+                .read_channel_by_id_since_millis(&channel_id, five_min_ago)
+                .await
+            else {
                 continue;
             };
 
@@ -1586,9 +1593,7 @@ impl MattermostWs {
 
             let new_messages: Vec<_> = messages
                 .into_iter()
-                .filter(|m| {
-                    m.user_id != self.my_user_id && seen.insert(m.id.clone())
-                })
+                .filter(|m| m.user_id != self.my_user_id && seen.insert(m.id.clone()))
                 .collect();
 
             for msg in new_messages {
@@ -1654,7 +1659,9 @@ impl MattermostWs {
             .client
             .request_raw("GET", &format!("/users/{user_id}"), None::<Value>)
             .await;
-        result.map(|u| u.username).unwrap_or_else(|_| "unknown".to_string())
+        result
+            .map(|u| u.username)
+            .unwrap_or_else(|_| "unknown".to_string())
     }
 }
 

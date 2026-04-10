@@ -7,7 +7,7 @@ rust-version = "1.85.0"
 [dependencies]
 chanvoy-core = { path = "../chanvoy-core" }
 chrono = { workspace = true }
-ipcprims = { path = "../../../../3leaps/ipcprims/crates/ipcprims", features = ["peer", "async"] }
+ipcprims = { git = "https://github.com/3leaps/ipcprims.git", tag = "v0.2.0", features = ["peer", "async"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

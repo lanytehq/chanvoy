@@ -5,10 +5,8 @@ use chanvoy_core::{
     Channel, CoreError, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, EventBus,
     MattermostClient, Message, Profile, SubscriptionFilter,
 };
-use ipcprims::peer::{
-    async_connect_with_config, AsyncPeerTx, HandshakeConfig, PeerConfig,
-};
 use ipcprims::frame::Frame;
+use ipcprims::peer::{async_connect_with_config, AsyncPeerTx, HandshakeConfig, PeerConfig};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -116,10 +114,7 @@ pub enum ChatFrame {
         subscription_id: String,
     },
     #[serde(rename = "chat_unsubscribe_response")]
-    UnsubscribeResponse {
-        request_id: String,
-        success: bool,
-    },
+    UnsubscribeResponse { request_id: String, success: bool },
     #[serde(rename = "chat_event_notification")]
     EventNotification {
         subscription_id: String,
@@ -231,10 +226,7 @@ pub fn translate_m2_filter_to_260(filter: &SubscriptionFilter) -> IpcSubscriptio
     match filter {
         SubscriptionFilter::AllMonitored => IpcSubscriptionFilter {
             channel_ids: None,
-            event_kinds: Some(vec![
-                "message_posted".to_string(),
-                "mention".to_string(),
-            ]),
+            event_kinds: Some(vec!["message_posted".to_string(), "mention".to_string()]),
             mentions_only: None,
         },
         SubscriptionFilter::ChannelByName(name) => IpcSubscriptionFilter {
@@ -590,7 +582,9 @@ impl IpcPeer {
                     Ok(channels) => {
                         let channels: Vec<ChannelSummary> = channels
                             .iter()
-                            .filter(|c| include_archived.unwrap_or(false) || !c.name.starts_with("__"))
+                            .filter(|c| {
+                                include_archived.unwrap_or(false) || !c.name.starts_with("__")
+                            })
                             .map(channel_to_summary)
                             .collect();
                         ChatFrame::ChannelListResponse {
@@ -682,7 +676,9 @@ impl IpcPeer {
                     return;
                 }
                 let result = if let Some(root_id) = &thread_root_id {
-                    self.client.post_threaded_reply(&channel_id, root_id, &message).await
+                    self.client
+                        .post_threaded_reply(&channel_id, root_id, &message)
+                        .await
                 } else {
                     self.client.post_message_by_id(&channel_id, &message).await
                 };
@@ -691,14 +687,19 @@ impl IpcPeer {
                         emit_audit(
                             tx,
                             peer_id,
-                            if thread_root_id.is_some() { "chat.thread_reply" } else { "chat.post" },
+                            if thread_root_id.is_some() {
+                                "chat.thread_reply"
+                            } else {
+                                "chat.post"
+                            },
                             Some(serde_json::json!({
                                 "channel_id": &channel_id,
                                 "post_id": &receipt.id,
                                 "has_thread_root": thread_root_id.is_some(),
                             })),
                             "notice",
-                        ).await;
+                        )
+                        .await;
                         ChatFrame::PostResponse {
                             request_id,
                             post: PostSummary {
@@ -786,7 +787,8 @@ impl IpcPeer {
                     "chat.subscribe",
                     Some(serde_json::json!({ "subscription_id": &sub_id })),
                     "info",
-                ).await;
+                )
+                .await;
 
                 let response = ChatFrame::SubscribeResponse {
                     request_id,
@@ -812,7 +814,8 @@ impl IpcPeer {
                         "chat.unsubscribe",
                         Some(serde_json::json!({ "subscription_id": &subscription_id })),
                         "info",
-                    ).await;
+                    )
+                    .await;
                 }
                 let response = ChatFrame::UnsubscribeResponse {
                     request_id,
@@ -879,7 +882,11 @@ mod tests {
         let err = CoreError::WaitTimeout("ch".to_string());
         let frame = core_error_to_chat(err, "test-2");
         match frame {
-            ChatFrame::Error { error_code, retryable, .. } => {
+            ChatFrame::Error {
+                error_code,
+                retryable,
+                ..
+            } => {
                 assert_eq!(error_code, ChatErrorCode::NotFound);
                 assert_eq!(retryable, Some(false));
             }
@@ -910,7 +917,11 @@ mod tests {
         };
         let frame = core_error_to_chat(err, "test-4");
         match frame {
-            ChatFrame::Error { error_code, retryable, .. } => {
+            ChatFrame::Error {
+                error_code,
+                retryable,
+                ..
+            } => {
                 assert_eq!(error_code, ChatErrorCode::RateLimited);
                 assert_eq!(retryable, Some(true));
             }
@@ -939,7 +950,8 @@ mod tests {
 
     #[test]
     fn translate_m2_channel_by_name() {
-        let f = translate_m2_filter_to_260(&SubscriptionFilter::ChannelByName("per-005".to_string()));
+        let f =
+            translate_m2_filter_to_260(&SubscriptionFilter::ChannelByName("per-005".to_string()));
         assert_eq!(f.channel_ids, Some(vec!["per-005".to_string()]));
     }
 

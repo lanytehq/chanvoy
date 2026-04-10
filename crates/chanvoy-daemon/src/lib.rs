@@ -5,15 +5,14 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use chanvoy_core::{
-    load_profile, load_token, pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile,
-    AddMemberParams, ArchiveChannelParams, CapabilityClass, Channel, CoreError,
-    CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, DaemonHealth,
-    DaemonStatus, DirectMessageParams, EventBus, IpcConfig, JsonRpcNotification,
+    daemon_event_to_notification, load_profile, load_token, pid_path_for_profile, rpc_error,
+    rpc_result, socket_path_for_profile, AddMemberParams, ArchiveChannelParams, CapabilityClass,
+    Channel, CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
+    DaemonHealth, DaemonStatus, DirectMessageParams, EventBus, IpcConfig, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
     NotifyParams, PostMessageParams, Profile, ProfileStatus, Provider, ReadChannelParams,
-    ReadDirectMessageParams, ShutdownResult, SubscriptionAck, SubscriptionFilter, SubscribeParams,
+    ReadDirectMessageParams, ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter,
     UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
-    daemon_event_to_notification,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -82,7 +81,10 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
     let ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>> = match &profile.ipc {
-        Some(IpcConfig { enabled: true, gateway_socket }) if !gateway_socket.is_empty() => {
+        Some(IpcConfig {
+            enabled: true,
+            gateway_socket,
+        }) if !gateway_socket.is_empty() => {
             let token_for_ipc = load_token(&profile)?;
             let client_for_ipc = MattermostClient::new(&profile, token_for_ipc)?;
             let ipc_peer = Arc::new(IpcPeer::new(
@@ -295,9 +297,7 @@ fn event_matches_filter(event: &DaemonEvent, filter: &SubscriptionFilter) -> boo
         ),
         SubscriptionFilter::ChannelByName(name) => {
             let channel_matches = match &event.payload {
-                DaemonEventPayloadInner::Inbound(p) => {
-                    p.channel_name.eq_ignore_ascii_case(name)
-                }
+                DaemonEventPayloadInner::Inbound(p) => p.channel_name.eq_ignore_ascii_case(name),
                 _ => true,
             };
             channel_matches
@@ -435,31 +435,27 @@ async fn dispatch_request(
         })
         .await
         .map(to_value),
-        "subscribe" => {
-            parse_and_call(&request.params, |params: SubscribeParams| async move {
-                let sub_id = uuid::Uuid::new_v4().to_string();
-                let start_seq = state.event_bus.current_seq();
-                state
-                    .subscriptions
-                    .lock()
-                    .await
-                    .insert(sub_id.clone(), params.filter);
-                Ok(SubscriptionAck {
-                    subscription_id: sub_id,
-                    start_sequence: start_seq,
-                })
+        "subscribe" => parse_and_call(&request.params, |params: SubscribeParams| async move {
+            let sub_id = uuid::Uuid::new_v4().to_string();
+            let start_seq = state.event_bus.current_seq();
+            state
+                .subscriptions
+                .lock()
+                .await
+                .insert(sub_id.clone(), params.filter);
+            Ok(SubscriptionAck {
+                subscription_id: sub_id,
+                start_sequence: start_seq,
             })
-            .await
-            .map(to_value)
-        }
-        "unsubscribe" => {
-            parse_and_call(&request.params, |params: UnsubscribeParams| async move {
-                let mut subs = state.subscriptions.lock().await;
-                Ok(subs.remove(&params.subscription_id).is_some())
-            })
-            .await
-            .map(to_value)
-        }
+        })
+        .await
+        .map(to_value),
+        "unsubscribe" => parse_and_call(&request.params, |params: UnsubscribeParams| async move {
+            let mut subs = state.subscriptions.lock().await;
+            Ok(subs.remove(&params.subscription_id).is_some())
+        })
+        .await
+        .map(to_value),
         "profile_status" => Ok(to_value(ProfileStatus {
             profile_name: state.profile.name.clone(),
             role: state.profile.role.clone(),
@@ -469,46 +465,52 @@ async fn dispatch_request(
             server_url: state.profile.server_url.clone(),
             socket_path: state.socket_path.clone(),
         })),
-        "daemon_status" => {
-            match state.client.whoami().await {
-                Ok(identity) => {
-                    let ws_guard = state.ws_state_holder.lock().await;
-                    let (conn_state, last_event, last_error, reconnect_count) = match ws_guard.as_ref() {
-                        Some(ws) => {
-                            let conn = *ws.connection_state.lock().await;
-                            let last = ws.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
-                            let err = ws.last_error.lock().await.clone();
-                            let rc = ws.reconnect_count.load(std::sync::atomic::Ordering::Relaxed);
-                            (Some(conn), if last > 0 { Some(last) } else { None }, err, Some(rc))
-                        }
-                        None => (None, None, None, None),
-                    };
-                    Ok(to_value(DaemonStatus {
-                        profile_name: state.profile.name.clone(),
-                        socket_path: state.socket_path.clone(),
-                        mattermost_username: identity.username,
-                        mattermost_ok: true,
-                        ws_connection_state: conn_state,
-                        ws_last_event_at: last_event,
-                        ws_last_error: last_error,
-                        ws_reconnect_count: reconnect_count,
-                        ipc_connected: match &state.ipc_state {
-                            Some(s) => Some(s.lock().await.connected),
-                            None => None,
-                        },
-                        ipc_peer_id: match &state.ipc_state {
-                            Some(s) => s.lock().await.peer_id.clone(),
-                            None => None,
-                        },
-                        ipc_reconnect_count: match &state.ipc_state {
-                            Some(s) => Some(s.lock().await.reconnect_count),
-                            None => None,
-                        },
-                    }))
-                }
-                Err(e) => Err(DaemonError::from(e)),
+        "daemon_status" => match state.client.whoami().await {
+            Ok(identity) => {
+                let ws_guard = state.ws_state_holder.lock().await;
+                let (conn_state, last_event, last_error, reconnect_count) = match ws_guard.as_ref()
+                {
+                    Some(ws) => {
+                        let conn = *ws.connection_state.lock().await;
+                        let last = ws.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+                        let err = ws.last_error.lock().await.clone();
+                        let rc = ws
+                            .reconnect_count
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        (
+                            Some(conn),
+                            if last > 0 { Some(last) } else { None },
+                            err,
+                            Some(rc),
+                        )
+                    }
+                    None => (None, None, None, None),
+                };
+                Ok(to_value(DaemonStatus {
+                    profile_name: state.profile.name.clone(),
+                    socket_path: state.socket_path.clone(),
+                    mattermost_username: identity.username,
+                    mattermost_ok: true,
+                    ws_connection_state: conn_state,
+                    ws_last_event_at: last_event,
+                    ws_last_error: last_error,
+                    ws_reconnect_count: reconnect_count,
+                    ipc_connected: match &state.ipc_state {
+                        Some(s) => Some(s.lock().await.connected),
+                        None => None,
+                    },
+                    ipc_peer_id: match &state.ipc_state {
+                        Some(s) => s.lock().await.peer_id.clone(),
+                        None => None,
+                    },
+                    ipc_reconnect_count: match &state.ipc_state {
+                        Some(s) => Some(s.lock().await.reconnect_count),
+                        None => None,
+                    },
+                }))
             }
-        }
+            Err(e) => Err(DaemonError::from(e)),
+        },
         "shutdown" => {
             if let Some(sender) = shutdown_tx.lock().await.take() {
                 let _ = sender.send(());
@@ -575,16 +577,34 @@ async fn wait_for_messages(
     let cursor_id = initial.last().map(|m| m.id.clone()).unwrap_or_default();
     let cursor_create_at = initial.last().map(|m| m.create_at).unwrap_or(0);
 
-    let is_monitored = state.profile.monitored_channels.iter().any(|m| {
-        m.eq_ignore_ascii_case(channel)
-    });
+    let is_monitored = state
+        .profile
+        .monitored_channels
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(channel));
 
     let limit = Duration::from_secs(timeout_minutes * 60);
 
     if is_monitored {
-        wait_push_backed(state, channel, &channel_id, &cursor_id, cursor_create_at, limit).await
+        wait_push_backed(
+            state,
+            channel,
+            &channel_id,
+            &cursor_id,
+            cursor_create_at,
+            limit,
+        )
+        .await
     } else {
-        wait_rest_poll(state, channel, &channel_id, &cursor_id, cursor_create_at, limit).await
+        wait_rest_poll(
+            state,
+            channel,
+            &channel_id,
+            &cursor_id,
+            cursor_create_at,
+            limit,
+        )
+        .await
     }
 }
 
@@ -663,7 +683,9 @@ async fn wait_rest_poll(
 ) -> Result<WaitResult, CoreError> {
     let my_user_id = state.my_user_id.clone();
     let channel_name = channel.to_string();
-    let future: std::pin::Pin<Box<dyn std::future::Future<Output = Result<WaitResult, CoreError>> + Send + '_>> = Box::pin(async {
+    let future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<WaitResult, CoreError>> + Send + '_>,
+    > = Box::pin(async {
         loop {
             let messages = state
                 .client
@@ -672,9 +694,7 @@ async fn wait_rest_poll(
             let fresh: Vec<_> = messages
                 .into_iter()
                 .filter(|m| {
-                    m.user_id != my_user_id
-                        && m.id != cursor_id
-                        && m.create_at > cursor_create_at
+                    m.user_id != my_user_id && m.id != cursor_id && m.create_at > cursor_create_at
                 })
                 .collect();
             if !fresh.is_empty() {
@@ -960,13 +980,19 @@ mod tests {
     #[test]
     fn filter_all_monitored_matches_inbound_message() {
         let event = inbound_event("per-004", false);
-        assert!(event_matches_filter(&event, &SubscriptionFilter::AllMonitored));
+        assert!(event_matches_filter(
+            &event,
+            &SubscriptionFilter::AllMonitored
+        ));
     }
 
     #[test]
     fn filter_all_monitored_matches_mention() {
         let event = inbound_event("per-004", true);
-        assert!(event_matches_filter(&event, &SubscriptionFilter::AllMonitored));
+        assert!(event_matches_filter(
+            &event,
+            &SubscriptionFilter::AllMonitored
+        ));
     }
 
     #[test]
@@ -983,7 +1009,10 @@ mod tests {
                 },
             ),
         };
-        assert!(event_matches_filter(&event, &SubscriptionFilter::AllMonitored));
+        assert!(event_matches_filter(
+            &event,
+            &SubscriptionFilter::AllMonitored
+        ));
     }
 
     #[test]
@@ -1003,19 +1032,28 @@ mod tests {
     #[test]
     fn filter_mentions_only_rejects_plain_message() {
         let event = inbound_event("per-004", false);
-        assert!(!event_matches_filter(&event, &SubscriptionFilter::MentionsOnly));
+        assert!(!event_matches_filter(
+            &event,
+            &SubscriptionFilter::MentionsOnly
+        ));
     }
 
     #[test]
     fn filter_mentions_only_accepts_mention() {
         let event = inbound_event("per-004", true);
-        assert!(event_matches_filter(&event, &SubscriptionFilter::MentionsOnly));
+        assert!(event_matches_filter(
+            &event,
+            &SubscriptionFilter::MentionsOnly
+        ));
     }
 
     #[test]
     fn filter_connection_state_rejects_inbound() {
         let event = inbound_event("per-004", false);
-        assert!(!event_matches_filter(&event, &SubscriptionFilter::ConnectionState));
+        assert!(!event_matches_filter(
+            &event,
+            &SubscriptionFilter::ConnectionState
+        ));
     }
 
     #[tokio::test]
@@ -1026,7 +1064,10 @@ mod tests {
         let sub_b_id = "sub-b".to_string();
 
         let mut subs: HashMap<String, SubscriptionFilter> = HashMap::new();
-        subs.insert(sub_a_id.clone(), SubscriptionFilter::ChannelByName("per-004".to_string()));
+        subs.insert(
+            sub_a_id.clone(),
+            SubscriptionFilter::ChannelByName("per-004".to_string()),
+        );
         subs.insert(sub_b_id.clone(), SubscriptionFilter::MentionsOnly);
 
         let mut rx = bus.subscribe();
@@ -1058,7 +1099,10 @@ mod tests {
         let mut subs: HashMap<String, SubscriptionFilter> = HashMap::new();
 
         let sub_id = "sub-test".to_string();
-        subs.insert(sub_id.clone(), SubscriptionFilter::ChannelByName("per-004".to_string()));
+        subs.insert(
+            sub_id.clone(),
+            SubscriptionFilter::ChannelByName("per-004".to_string()),
+        );
 
         let mut rx = bus.subscribe();
 
