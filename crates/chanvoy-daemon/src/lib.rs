@@ -8,11 +8,11 @@ use chanvoy_core::{
     daemon_event_to_notification, load_profile, load_token, pid_path_for_profile, rpc_error,
     rpc_result, socket_path_for_profile, AddMemberParams, ArchiveChannelParams, CapabilityClass,
     Channel, CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
-    DaemonHealth, DaemonStatus, DirectMessageParams, EventBus, IpcConfig, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
-    NotifyParams, PostMessageParams, Profile, ProfileStatus, Provider, ReadChannelParams,
-    ReadDirectMessageParams, ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter,
-    UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
+    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs,
+    NotificationsParams, NotifyParams, PostMessageParams, Profile, ProfileStatus, Provider,
+    ReadChannelParams, ReadDirectMessageParams, ShutdownResult, SubscribeParams, SubscriptionAck,
+    SubscriptionFilter, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -70,7 +70,15 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     }
     let token = load_token(&profile)?;
     let client = MattermostClient::new(&profile, token)?;
-    let my_user_id = client.whoami().await?.id;
+    let identity = client.whoami().await?;
+    if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
+        return Err(CoreError::ProfileIdentityMismatch {
+            expected: profile.bot_username.clone(),
+            actual: identity.username,
+        }
+        .into());
+    }
+    let my_user_id = identity.id;
     let listener = UnixListener::bind(&socket_path)?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     fs::write(&pid_path, std::process::id().to_string())?;
@@ -333,6 +341,12 @@ async fn dispatch_request(
         "list_channels" => state
             .client
             .list_channels()
+            .await
+            .map(to_value)
+            .map_err(DaemonError::from),
+        "list_dms" => state
+            .client
+            .list_dms()
             .await
             .map(to_value)
             .map_err(DaemonError::from),
@@ -739,6 +753,10 @@ impl DaemonClient {
 
     pub async fn list_channels(&self) -> Result<Vec<Channel>, DaemonError> {
         self.call("list_channels", serde_json::json!({})).await
+    }
+
+    pub async fn list_dms(&self) -> Result<Vec<DmConversation>, DaemonError> {
+        self.call("list_dms", serde_json::json!({})).await
     }
 
     pub async fn read_channel(

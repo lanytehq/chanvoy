@@ -91,6 +91,8 @@ pub struct Identity {
     pub id: String,
     pub username: String,
     #[serde(default)]
+    pub is_bot: bool,
+    #[serde(default)]
     pub nickname: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
@@ -129,6 +131,13 @@ pub struct WaitResult {
 pub struct Notification {
     pub from_channel: String,
     pub message: Message,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DmConversation {
+    pub id: String,
+    pub name: String,
+    pub last_post_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,6 +386,8 @@ pub enum CoreError {
     MissingCredential(String),
     #[error("credential mode env_file requires --env-file in the profile")]
     MissingEnvFile,
+    #[error("profile bot username mismatch: expected {expected}, got {actual}")]
+    ProfileIdentityMismatch { expected: String, actual: String },
     #[error("operation requires elevated capability")]
     RequiresElevatedCapability,
     #[error("timeout waiting for channel {0}")]
@@ -585,6 +596,8 @@ impl MattermostClient {
         struct RawUser {
             id: String,
             username: String,
+            #[serde(default)]
+            is_bot: bool,
             nickname: Option<String>,
             email: Option<String>,
         }
@@ -592,6 +605,7 @@ impl MattermostClient {
         Ok(Identity {
             id: user.id,
             username: user.username,
+            is_bot: user.is_bot,
             nickname: user.nickname,
             email: user.email,
         })
@@ -727,7 +741,7 @@ impl MattermostClient {
     ) -> Result<PostReceipt, CoreError> {
         self.post_message(
             DEFAULT_NOTIFICATIONS_CHANNEL,
-            &format!("@{bot_username} {message}"),
+            &format!("@{bot_username} **[notify]** {message}"),
         )
         .await
     }
@@ -746,6 +760,46 @@ impl MattermostClient {
             })
             .collect();
         Ok(notifications)
+    }
+
+    pub async fn validate_team_access(&self) -> Result<(), CoreError> {
+        let _ = self.team_id().await?;
+        Ok(())
+    }
+
+    pub async fn list_dms(&self) -> Result<Vec<DmConversation>, CoreError> {
+        let my_id = self.whoami().await?.id;
+
+        #[derive(Deserialize)]
+        struct RawDmChannel {
+            id: String,
+            name: String,
+            #[serde(rename = "type")]
+            channel_type: String,
+            last_post_at: i64,
+        }
+
+        let raw_channels: Vec<RawDmChannel> = self
+            .request(
+                "GET",
+                &format!("/users/{my_id}/channels?per_page=100"),
+                None::<Value>,
+            )
+            .await?;
+
+        let mut channels: Vec<DmConversation> = raw_channels
+            .into_iter()
+            .filter(|channel: &RawDmChannel| channel.channel_type == "D")
+            .map(|channel| DmConversation {
+                id: channel.id,
+                name: channel.name,
+                last_post_at: channel.last_post_at,
+            })
+            .collect();
+
+        channels.sort_by(|left, right| right.last_post_at.cmp(&left.last_post_at));
+        channels.truncate(20);
+        Ok(channels)
     }
 
     pub async fn create_channel(
