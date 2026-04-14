@@ -3,6 +3,7 @@
 set -euo pipefail
 
 CHANNEL="${1:-per-007}"
+EXPECTED_USERNAME="${EXPECTED_MM_USERNAME:-agent-bravo-devlead}"
 PROFILE_ARG=()
 if [[ -n "${CHANVOY_PROFILE:-}" ]]; then
 	PROFILE_ARG=(--profile "$CHANVOY_PROFILE")
@@ -74,6 +75,7 @@ printf '%s\n' "$daemon_status_output"
 assert_contains "$daemon_status_output" 'profile: '
 assert_contains "$daemon_status_output" 'socket: '
 assert_contains "$daemon_status_output" 'mattermost_username: '
+assert_contains "$daemon_status_output" "mattermost_username: $EXPECTED_USERNAME"
 assert_contains "$daemon_status_output" 'mattermost_ok: true'
 
 printf '\n== bootstrap bad team ==\n'
@@ -158,6 +160,7 @@ assert_contains "$daemon_restart_output" 'daemon listening for profile '
 
 daemon_status_after_restart="$(assert_command_success daemon status)"
 printf '%s\n' "$daemon_status_after_restart"
+assert_contains "$daemon_status_after_restart" "mattermost_username: $EXPECTED_USERNAME"
 assert_contains "$daemon_status_after_restart" 'mattermost_ok: true'
 
 printf '\nsmoke probe complete: %s\n' "$probe_id"

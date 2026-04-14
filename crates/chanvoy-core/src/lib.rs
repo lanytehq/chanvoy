@@ -386,6 +386,8 @@ pub enum CoreError {
     MissingCredential(String),
     #[error("credential mode env_file requires --env-file in the profile")]
     MissingEnvFile,
+    #[error("profile bot username mismatch: expected {expected}, got {actual}")]
+    ProfileIdentityMismatch { expected: String, actual: String },
     #[error("operation requires elevated capability")]
     RequiresElevatedCapability,
     #[error("timeout waiting for channel {0}")]
