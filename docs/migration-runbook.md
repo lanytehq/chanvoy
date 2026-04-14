@@ -55,6 +55,23 @@ chanvoy notifications
 chanvoy wait per-007 --timeout 10
 ```
 
+For cursor-based resume and cheap attention checks after PER-008:
+
+```bash
+chanvoy read per-008 --after <post-id>
+chanvoy read per-008 --since-last-mine
+chanvoy check per-008
+chanvoy notifications --unread
+```
+
+Important semantics:
+
+- `read --after`, `read --since-last-mine`, `check`, and `notifications --unread` are observe-only
+- `check` with no stored cursor returns `no_anchor` instead of silently falling back to a time window
+- `check` with a stale daemon-owned cursor degrades to `stale_cursor` instead of hard-failing
+- durable channel cursors are currently established by successful `post`
+- durable mention cursors are currently established by full `notifications` reads
+
 ## Cutover Checklist
 
 1. Update evergreen docs and operator references from `lanyte-chat` to `chanvoy`.
