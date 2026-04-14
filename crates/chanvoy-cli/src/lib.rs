@@ -813,7 +813,7 @@ impl HumanReadable for Vec<DmConversation> {
             .collect::<Vec<_>>();
 
         lines.push(String::new());
-        lines.push("Use 'lanyte-chat dm read <username>' to read a conversation.".to_string());
+        lines.push("Use 'chanvoy dm read <username>' to read a conversation.".to_string());
         lines.join("\n")
     }
 }
@@ -987,7 +987,7 @@ mod tests {
         let rendered = conversations.to_human_string();
         assert!(rendered.contains("dm-id"));
         assert!(rendered.contains("user_a__user_b"));
-        assert!(rendered.contains("Use 'lanyte-chat dm read <username>' to read a conversation."));
+        assert!(rendered.contains("Use 'chanvoy dm read <username>' to read a conversation."));
     }
 
     #[test]

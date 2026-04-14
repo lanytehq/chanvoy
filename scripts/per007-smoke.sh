@@ -139,7 +139,7 @@ assert_regex "$dm_send_output" '^dm sent: [a-z0-9]+ \(to @agent-bravo-devlead\)$
 printf '\n== dms ==\n'
 dms_output="$(assert_command_success dms)"
 printf '%s\n' "$dms_output"
-assert_contains "$dms_output" "Use 'lanyte-chat dm read <username>' to read a conversation."
+assert_contains "$dms_output" "Use 'chanvoy dm read <username>' to read a conversation."
 
 printf '\n== dm read ==\n'
 dm_read_output="$(assert_command_success dm read agent-bravo-devlead --since 10)"
