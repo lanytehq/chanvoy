@@ -55,12 +55,25 @@ Common commands:
 target/debug/chanvoy whoami
 target/debug/chanvoy channels
 target/debug/chanvoy read <channel> --since 60
+target/debug/chanvoy read <channel> --after <post-id>
+target/debug/chanvoy read <channel> --since-last-mine
+target/debug/chanvoy check <channel>
 target/debug/chanvoy post <channel> "message"
 target/debug/chanvoy dms
 target/debug/chanvoy dm <username> "message"
 target/debug/chanvoy notifications
+target/debug/chanvoy notifications --unread
 target/debug/chanvoy daemon status
 ```
+
+## Cursor Notes
+
+- `read --after` and `read --since-last-mine` are observe-only
+- `check` is observe-only and returns exit `0` when new messages exist, exit `1` otherwise
+- `notifications --unread` is observe-only and returns a count only
+- if `check <channel>` has no stored cursor yet, it returns `new: 0 anchor=none source=no_anchor`
+- if a daemon-owned stored cursor no longer resolves, `check <channel>` degrades to `new: 0 anchor=none source=stale_cursor` instead of hard-failing
+- current durable cursor establishment comes from successful `post` in a channel and full `notifications` reads
 
 ## Docs
 

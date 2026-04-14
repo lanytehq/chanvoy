@@ -48,6 +48,36 @@ Recommended shell setup:
 4. Start the daemon with `chanvoy daemon start`.
 5. Use plain `chanvoy ...` commands after that.
 
+## Resume And Attention
+
+PER-008 adds cursor-based local-mode workflow primitives:
+
+- `chanvoy read <channel> --after <post-id>`
+- `chanvoy read <channel> --since-last-mine`
+- `chanvoy check <channel> [--after <post-id>]`
+- `chanvoy notifications --unread`
+
+Current semantics:
+
+- `read --after` is a pure read and does not advance stored channel state
+- `read --since-last-mine` is a pure read and does not advance stored channel state
+- `check` is a pure probe and does not advance stored channel state
+- `notifications --unread` is a pure probe and does not advance mention state
+- `check <channel>` without `--after` uses the stored daemon cursor when available
+- if no stored cursor exists yet, `check` returns `new: 0 anchor=none source=no_anchor` with exit code `1`
+- if a stored daemon cursor becomes stale or unreadable, `check` degrades to `new: 0 anchor=none source=stale_cursor` with exit code `1` rather than erroring
+
+Current durable cursor behavior:
+
+- successful `post` stores the latest post id for that profile+channel
+- full `notifications` reads store the latest mention cursor
+- probes do not clear attention
+
+Current inspectability gap worth tracking:
+
+- there is not yet a first-class `doctor` or `status` surface for showing the current stored attention state file and cursor values
+- operators can inspect the per-profile JSON state file directly under the config root for now
+
 Profile resolution precedence is:
 
 1. `--profile`

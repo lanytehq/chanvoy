@@ -134,6 +134,12 @@ pub struct Notification {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MentionSummary {
+    pub post_id: String,
+    pub create_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DmConversation {
     pub id: String,
     pub name: String,
@@ -278,7 +284,11 @@ pub struct JsonRpcResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadChannelParams {
     pub channel: String,
-    pub since_minutes: u64,
+    pub since_minutes: Option<u64>,
+    #[serde(default)]
+    pub after_post_id: Option<String>,
+    #[serde(default)]
+    pub since_last_mine: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -301,7 +311,57 @@ pub struct ReadDirectMessageParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotificationsParams {
-    pub since_minutes: u64,
+    pub since_minutes: Option<u64>,
+    #[serde(default)]
+    pub unread_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckChannelParams {
+    pub channel: String,
+    #[serde(default)]
+    pub after_post_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckResult {
+    pub channel: String,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    pub anchor_source: String,
+    pub has_new_messages: bool,
+    pub count: usize,
+    #[serde(default)]
+    pub newest_post_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnreadNotifications {
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AttentionState {
+    #[serde(default)]
+    pub channels: BTreeMap<String, ChannelCursorState>,
+    #[serde(default)]
+    pub mentions: MentionCursorState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ChannelCursorState {
+    #[serde(default)]
+    pub last_seen_post_id: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MentionCursorState {
+    #[serde(default)]
+    pub last_seen_post_id: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -388,6 +448,14 @@ pub enum CoreError {
     MissingEnvFile,
     #[error("profile bot username mismatch: expected {expected}, got {actual}")]
     ProfileIdentityMismatch { expected: String, actual: String },
+    #[error("anchor post {0} not found")]
+    AnchorNotFound(String),
+    #[error("anchor post {post_id} is not in channel {channel}")]
+    AnchorChannelMismatch { post_id: String, channel: String },
+    #[error("no prior authored post found in channel {channel} for {username}")]
+    NoPriorAuthoredPost { channel: String, username: String },
+    #[error("no stored cursor exists for channel {channel}")]
+    NoStoredCursor { channel: String },
     #[error("operation requires elevated capability")]
     RequiresElevatedCapability,
     #[error("timeout waiting for channel {0}")]
@@ -438,6 +506,10 @@ pub fn pid_path_for_profile(profile: &str) -> PathBuf {
 
 pub fn active_profile_path() -> PathBuf {
     default_chanvoy_config_dir().join("active_profile")
+}
+
+pub fn attention_state_path(profile_name: &str) -> PathBuf {
+    default_chanvoy_config_dir().join(format!("state-{profile_name}.json"))
 }
 
 pub fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>, CoreError> {
@@ -535,6 +607,30 @@ pub fn store_profile(profile: &Profile) -> Result<PathBuf, CoreError> {
     let path = dir.join(format!("{}.toml", profile.name));
     fs::write(&path, toml::to_string_pretty(profile)?)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(path)
+}
+
+pub fn load_attention_state(profile_name: &str) -> Result<AttentionState, CoreError> {
+    let path = attention_state_path(profile_name);
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(serde_json::from_str(&contents)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AttentionState::default()),
+        Err(err) => Err(CoreError::Io(err)),
+    }
+}
+
+pub fn store_attention_state(
+    profile_name: &str,
+    state: &AttentionState,
+) -> Result<PathBuf, CoreError> {
+    let dir = default_chanvoy_config_dir();
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let path = attention_state_path(profile_name);
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp_path, &path)?;
     Ok(path)
 }
 
@@ -680,6 +776,95 @@ impl MattermostClient {
         Ok(posts)
     }
 
+    pub async fn read_channel_after(
+        &self,
+        channel_name: &str,
+        after_post_id: &str,
+    ) -> Result<Vec<Message>, CoreError> {
+        let channel_id = self.channel_id(channel_name).await?;
+        self.assert_post_in_channel(&channel_id, channel_name, after_post_id)
+            .await?;
+
+        #[derive(Deserialize)]
+        struct RawPost {
+            id: String,
+            user_id: String,
+            message: String,
+            create_at: i64,
+            username: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct PostsResponse {
+            posts: BTreeMap<String, RawPost>,
+        }
+
+        let mut page = 0;
+        let mut messages = Vec::new();
+
+        loop {
+            let response: PostsResponse = self
+                .request(
+                    "GET",
+                    &format!(
+                        "/channels/{channel_id}/posts?after={after_post_id}&page={page}&per_page=200"
+                    ),
+                    None::<Value>,
+                )
+                .await?;
+
+            let mut page_messages: Vec<Message> = response
+                .posts
+                .into_values()
+                .map(|post| Message {
+                    id: post.id,
+                    user_id: post.user_id,
+                    username: post.username.unwrap_or_else(|| "unknown".to_string()),
+                    message: post.message,
+                    create_at: post.create_at,
+                })
+                .collect();
+
+            if page_messages.is_empty() {
+                break;
+            }
+
+            page_messages.sort_by_key(|message| message.create_at);
+            let page_len = page_messages.len();
+            messages.extend(page_messages);
+
+            if page_len < 200 {
+                break;
+            }
+
+            page += 1;
+        }
+
+        messages.sort_by(|left, right| {
+            left.create_at
+                .cmp(&right.create_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        Ok(messages)
+    }
+
+    pub async fn read_channel_since_last_mine(
+        &self,
+        channel_name: &str,
+    ) -> Result<Vec<Message>, CoreError> {
+        let my_username = self.whoami().await?.username;
+        let after_post_id = self
+            .latest_authored_post_id(channel_name, &my_username)
+            .await?
+            .ok_or_else(|| CoreError::NoPriorAuthoredPost {
+                channel: channel_name.to_string(),
+                username: my_username.clone(),
+            })?;
+
+        self.read_channel_after(channel_name, &after_post_id).await
+    }
+
     pub async fn post_message(
         &self,
         channel_name: &str,
@@ -760,6 +945,32 @@ impl MattermostClient {
             })
             .collect();
         Ok(notifications)
+    }
+
+    pub async fn unread_notification_mentions_since(
+        &self,
+        after_post_id: Option<&str>,
+    ) -> Result<Vec<MentionSummary>, CoreError> {
+        let my_username = self.whoami().await?.username;
+        let messages = match after_post_id {
+            Some(post_id) => {
+                self.read_channel_after(DEFAULT_NOTIFICATIONS_CHANNEL, post_id)
+                    .await?
+            }
+            None => {
+                self.latest_channel_messages(DEFAULT_NOTIFICATIONS_CHANNEL, 200)
+                    .await?
+            }
+        };
+
+        Ok(messages
+            .into_iter()
+            .filter(|message| message_mentions_username(&message.message, &my_username))
+            .map(|message| MentionSummary {
+                post_id: message.id,
+                create_at: message.create_at,
+            })
+            .collect())
     }
 
     pub async fn validate_team_access(&self) -> Result<(), CoreError> {
@@ -1096,6 +1307,52 @@ impl MattermostClient {
         Ok(posts)
     }
 
+    async fn latest_authored_post_id(
+        &self,
+        channel_name: &str,
+        username: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let team_id = self.team_id().await?;
+
+        #[derive(Serialize)]
+        struct SearchPayload {
+            terms: String,
+            is_or_search: bool,
+            page: u64,
+            per_page: u64,
+        }
+
+        #[derive(Deserialize)]
+        struct RawPost {
+            id: String,
+            create_at: i64,
+        }
+
+        #[derive(Deserialize)]
+        struct SearchResponse {
+            posts: BTreeMap<String, RawPost>,
+        }
+
+        let response: SearchResponse = self
+            .request(
+                "POST",
+                &format!("/teams/{team_id}/posts/search"),
+                Some(SearchPayload {
+                    terms: format!("from:{username} in:{channel_name}"),
+                    is_or_search: false,
+                    page: 0,
+                    per_page: 1,
+                }),
+            )
+            .await?;
+
+        Ok(response
+            .posts
+            .into_values()
+            .max_by_key(|post| post.create_at)
+            .map(|post| post.id))
+    }
+
     async fn channel_id(&self, channel_name: &str) -> Result<String, CoreError> {
         let team_id = self.team_id().await?;
         #[derive(Deserialize)]
@@ -1121,6 +1378,39 @@ impl MattermostClient {
             .request("GET", &format!("/users/username/{username}"), None::<Value>)
             .await?;
         Ok(user.id)
+    }
+
+    async fn assert_post_in_channel(
+        &self,
+        expected_channel_id: &str,
+        channel_name: &str,
+        post_id: &str,
+    ) -> Result<(), CoreError> {
+        #[derive(Deserialize)]
+        struct PostResponse {
+            channel_id: String,
+        }
+
+        let post: PostResponse = match self
+            .request("GET", &format!("/posts/{post_id}"), None::<Value>)
+            .await
+        {
+            Ok(post) => post,
+            Err(CoreError::Api {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }) => return Err(CoreError::AnchorNotFound(post_id.to_string())),
+            Err(error) => return Err(error),
+        };
+
+        if post.channel_id != expected_channel_id {
+            return Err(CoreError::AnchorChannelMismatch {
+                post_id: post_id.to_string(),
+                channel: channel_name.to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     async fn request<T, B>(
@@ -1819,6 +2109,9 @@ fn message_mentions_username(message: &str, username: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_env_file_lines() {
@@ -1832,6 +2125,35 @@ mod tests {
         let values = parse_env_file(&path).unwrap();
         assert_eq!(values.get("LANYTE_MM_TOKEN"), Some(&"secret".to_string()));
         assert_eq!(values.get("OTHER"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn stores_and_loads_attention_state() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { env::set_var("XDG_CONFIG_HOME", dir.path()) };
+
+        let state = AttentionState {
+            channels: BTreeMap::from([(
+                "per-008".to_string(),
+                ChannelCursorState {
+                    last_seen_post_id: Some("post-123".to_string()),
+                    updated_at: Some(1_776_000_000_000),
+                },
+            )]),
+            mentions: MentionCursorState {
+                last_seen_post_id: Some("mention-456".to_string()),
+                updated_at: Some(1_776_000_000_001),
+            },
+        };
+
+        let path = store_attention_state("bravo-devlead", &state).unwrap();
+        let loaded = load_attention_state("bravo-devlead").unwrap();
+
+        assert_eq!(loaded, state);
+        assert!(path.ends_with("lanytehq/chanvoy/state-bravo-devlead.json"));
+
+        unsafe { env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[test]

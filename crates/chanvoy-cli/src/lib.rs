@@ -5,9 +5,9 @@ use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
     list_profiles, load_active_profile, load_token, store_active_profile, store_profile,
-    CapabilityClass, Channel, CredentialMode, DaemonStatus, DmConversation, Identity,
+    CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus, DmConversation, Identity,
     MattermostClient, Message, Notification, PostReceipt, Profile, ProfileStatus, Provider,
-    WaitResult, DEFAULT_TEAM,
+    UnreadNotifications, WaitResult, DEFAULT_TEAM,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -54,6 +54,7 @@ enum CommandSet {
     Channels,
     Dms,
     Read(ReadArgs),
+    Check(CheckArgs),
     Post(PostArgs),
     #[command(subcommand)]
     Dm(DmCommand),
@@ -99,14 +100,27 @@ enum ChannelCommand {
 #[derive(Debug, Args)]
 struct ReadArgs {
     channel: String,
-    #[arg(long, default_value_t = 60)]
-    since: u64,
+    #[arg(long, conflicts_with_all = ["after", "since_last_mine"])]
+    since: Option<u64>,
+    #[arg(long, conflicts_with_all = ["since", "since_last_mine"])]
+    after: Option<String>,
+    #[arg(long, conflicts_with_all = ["since", "after"])]
+    since_last_mine: bool,
 }
 
 #[derive(Debug, Args)]
 struct ReadWindowArgs {
     #[arg(long, default_value_t = 1440)]
     since: u64,
+    #[arg(long)]
+    unread: bool,
+}
+
+#[derive(Debug, Args)]
+struct CheckArgs {
+    channel: String,
+    #[arg(long)]
+    after: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -237,9 +251,24 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
         CommandSet::Read(args) => print_value(
             cli.json,
             &daemon_client(&profile)
-                .read_channel(&args.channel, args.since)
+                .read_channel(
+                    &args.channel,
+                    args.since,
+                    args.after.clone(),
+                    args.since_last_mine,
+                )
                 .await?,
         ),
+        CommandSet::Check(args) => match daemon_client(&profile)
+            .check_channel(&args.channel, args.after.clone())
+            .await?
+        {
+            result if result.has_new_messages => print_value(cli.json, &result),
+            result => {
+                print_value(cli.json, &result)?;
+                process::exit(1);
+            }
+        },
         CommandSet::Post(args) => print_receipt(
             cli.json,
             "posted",
@@ -270,7 +299,22 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
         ),
         CommandSet::Notifications(args) => print_value(
             cli.json,
-            &daemon_client(&profile).notifications(args.since).await?,
+            &if args.unread {
+                serde_json::from_value::<UnreadNotifications>(
+                    daemon_client(&profile)
+                        .notifications(args.since, true)
+                        .await?,
+                )?
+            } else {
+                return print_value(
+                    cli.json,
+                    &serde_json::from_value::<Vec<Notification>>(
+                        daemon_client(&profile)
+                            .notifications(args.since, false)
+                            .await?,
+                    )?,
+                );
+            },
         ),
         CommandSet::Wait(args) => {
             if !cli.json {
@@ -839,6 +883,32 @@ impl HumanReadable for Vec<Notification> {
     }
 }
 
+impl HumanReadable for CheckResult {
+    fn to_human_string(&self) -> String {
+        if self.has_new_messages {
+            format!(
+                "new: {} newest={} anchor={} source={}",
+                self.count,
+                self.newest_post_id.clone().unwrap_or_default(),
+                self.anchor.clone().unwrap_or_else(|| "none".to_string()),
+                self.anchor_source,
+            )
+        } else {
+            format!(
+                "new: 0 anchor={} source={}",
+                self.anchor.clone().unwrap_or_else(|| "none".to_string()),
+                self.anchor_source,
+            )
+        }
+    }
+}
+
+impl HumanReadable for UnreadNotifications {
+    fn to_human_string(&self) -> String {
+        format!("unread: {}", self.count)
+    }
+}
+
 impl HumanReadable for WaitResult {
     fn to_human_string(&self) -> String {
         self.messages
@@ -1056,5 +1126,28 @@ mod tests {
         unsafe { env::set_var(OsStr::new("LANYTE_MM_TEAM"), OsStr::new("custom-team")) };
         assert_eq!(derive_team_name("lanytehq"), "custom-team");
         unsafe { env::remove_var(OsStr::new("LANYTE_MM_TEAM")) };
+    }
+
+    #[test]
+    fn check_result_renders_compact_probe_output() {
+        let result = CheckResult {
+            channel: "per-008".to_string(),
+            anchor: Some("anchor-1".to_string()),
+            anchor_source: "daemon_cursor".to_string(),
+            has_new_messages: true,
+            count: 3,
+            newest_post_id: Some("post-3".to_string()),
+        };
+
+        assert_eq!(
+            result.to_human_string(),
+            "new: 3 newest=post-3 anchor=anchor-1 source=daemon_cursor"
+        );
+    }
+
+    #[test]
+    fn unread_notifications_render_as_count_only() {
+        let unread = UnreadNotifications { count: 4 };
+        assert_eq!(unread.to_human_string(), "unread: 4");
     }
 }

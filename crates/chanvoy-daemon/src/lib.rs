@@ -5,14 +5,16 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use chanvoy_core::{
-    daemon_event_to_notification, load_profile, load_token, pid_path_for_profile, rpc_error,
-    rpc_result, socket_path_for_profile, AddMemberParams, ArchiveChannelParams, CapabilityClass,
-    Channel, CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
-    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig,
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs,
-    NotificationsParams, NotifyParams, PostMessageParams, Profile, ProfileStatus, Provider,
-    ReadChannelParams, ReadDirectMessageParams, ShutdownResult, SubscribeParams, SubscriptionAck,
-    SubscriptionFilter, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
+    daemon_event_to_notification, load_attention_state, load_profile, load_token,
+    pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile, store_attention_state,
+    AddMemberParams, ArchiveChannelParams, AttentionState, CapabilityClass, Channel,
+    CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind,
+    DaemonEventPayloadInner, DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation,
+    EventBus, IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient,
+    MattermostWs, NotificationsParams, NotifyParams, PostMessageParams, Profile, ProfileStatus,
+    Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult, SubscribeParams,
+    SubscriptionAck, SubscriptionFilter, UnreadNotifications, UnsubscribeParams, WaitChannelParams,
+    WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -49,6 +51,14 @@ struct AppState {
     subscriptions: Arc<Mutex<HashMap<String, SubscriptionFilter>>>,
     ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>>,
     ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>>,
+    attention_state: Arc<Mutex<AttentionState>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum NotificationsResponse {
+    Messages(Vec<chanvoy_core::Notification>),
+    Unread(UnreadNotifications),
 }
 
 pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
@@ -120,6 +130,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         subscriptions: Arc::new(Mutex::new(HashMap::new())),
         ws_state_holder: ws_state_holder.clone(),
         ipc_state,
+        attention_state: Arc::new(Mutex::new(load_attention_state(&profile.name)?)),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -351,18 +362,39 @@ async fn dispatch_request(
             .map(to_value)
             .map_err(DaemonError::from),
         "read_channel" => parse_and_call(&request.params, |params: ReadChannelParams| async move {
-            state
-                .client
-                .read_channel(&params.channel, params.since_minutes)
-                .await
+            if let Some(after_post_id) = params.after_post_id {
+                state
+                    .client
+                    .read_channel_after(&params.channel, &after_post_id)
+                    .await
+            } else if params.since_last_mine {
+                state
+                    .client
+                    .read_channel_since_last_mine(&params.channel)
+                    .await
+            } else {
+                state
+                    .client
+                    .read_channel(&params.channel, params.since_minutes.unwrap_or(60))
+                    .await
+            }
         })
         .await
         .map(to_value),
+        "check_channel" => {
+            parse_and_call(&request.params, |params: CheckChannelParams| async move {
+                check_channel(state, &params.channel, params.after_post_id.as_deref()).await
+            })
+            .await
+            .map(to_value)
+        }
         "post_message" => parse_and_call(&request.params, |params: PostMessageParams| async move {
-            state
+            let receipt = state
                 .client
                 .post_message(&params.channel, &params.message)
-                .await
+                .await?;
+            record_channel_cursor(state, &params.channel, &receipt.id).await?;
+            Ok(receipt)
         })
         .await
         .map(to_value),
@@ -389,7 +421,18 @@ async fn dispatch_request(
         .map(to_value),
         "notifications" => {
             parse_and_call(&request.params, |params: NotificationsParams| async move {
-                state.client.notifications(params.since_minutes).await
+                if params.unread_only {
+                    unread_notifications(state)
+                        .await
+                        .map(NotificationsResponse::Unread)
+                } else {
+                    let notifications = state
+                        .client
+                        .notifications(params.since_minutes.unwrap_or(1440))
+                        .await?;
+                    record_notifications_cursor(state, &notifications).await?;
+                    Ok(NotificationsResponse::Messages(notifications))
+                }
             })
             .await
             .map(to_value)
@@ -725,6 +768,134 @@ async fn wait_rest_poll(
         .map_err(|_| CoreError::WaitTimeout(channel.to_string()))?
 }
 
+async fn check_channel(
+    state: &AppState,
+    channel: &str,
+    explicit_after: Option<&str>,
+) -> Result<CheckResult, CoreError> {
+    let (anchor, anchor_source) = if let Some(after) = explicit_after {
+        (Some(after.to_string()), "explicit_after".to_string())
+    } else {
+        let attention = state.attention_state.lock().await;
+        let Some(cursor) = attention.channels.get(channel) else {
+            return Ok(CheckResult {
+                channel: channel.to_string(),
+                anchor: None,
+                anchor_source: "no_anchor".to_string(),
+                has_new_messages: false,
+                count: 0,
+                newest_post_id: None,
+            });
+        };
+        (
+            cursor.last_seen_post_id.clone(),
+            if cursor.last_seen_post_id.is_some() {
+                "daemon_cursor".to_string()
+            } else {
+                "no_anchor".to_string()
+            },
+        )
+    };
+
+    let Some(anchor_post_id) = anchor.clone() else {
+        return Ok(CheckResult {
+            channel: channel.to_string(),
+            anchor,
+            anchor_source,
+            has_new_messages: false,
+            count: 0,
+            newest_post_id: None,
+        });
+    };
+
+    let messages = match state
+        .client
+        .read_channel_after(channel, &anchor_post_id)
+        .await
+    {
+        Ok(messages) => messages,
+        Err(CoreError::AnchorNotFound(_)) | Err(CoreError::AnchorChannelMismatch { .. })
+            if anchor_source == "daemon_cursor" =>
+        {
+            return Ok(stale_cursor_check_result(channel));
+        }
+        Err(error) => return Err(error),
+    };
+    let fresh: Vec<_> = messages
+        .into_iter()
+        .filter(|message| message.user_id != state.my_user_id)
+        .collect();
+    let newest_post_id = fresh.last().map(|message| message.id.clone());
+    Ok(CheckResult {
+        channel: channel.to_string(),
+        anchor,
+        anchor_source,
+        has_new_messages: !fresh.is_empty(),
+        count: fresh.len(),
+        newest_post_id,
+    })
+}
+
+async fn record_channel_cursor(
+    state: &AppState,
+    channel: &str,
+    post_id: &str,
+) -> Result<(), CoreError> {
+    let mut attention = state.attention_state.lock().await;
+    attention.channels.insert(
+        channel.to_string(),
+        chanvoy_core::ChannelCursorState {
+            last_seen_post_id: Some(post_id.to_string()),
+            updated_at: Some(chanvoy_core::now_unix_millis()),
+        },
+    );
+    store_attention_state(&state.profile.name, &attention)?;
+    Ok(())
+}
+
+async fn record_notifications_cursor(
+    state: &AppState,
+    notifications: &[chanvoy_core::Notification],
+) -> Result<(), CoreError> {
+    let Some(last) = notifications.last() else {
+        return Ok(());
+    };
+
+    let mut attention = state.attention_state.lock().await;
+    attention.mentions = chanvoy_core::MentionCursorState {
+        last_seen_post_id: Some(last.message.id.clone()),
+        updated_at: Some(chanvoy_core::now_unix_millis()),
+    };
+    store_attention_state(&state.profile.name, &attention)?;
+    Ok(())
+}
+
+async fn unread_notifications(state: &AppState) -> Result<UnreadNotifications, CoreError> {
+    let anchor = {
+        let attention = state.attention_state.lock().await;
+        attention.mentions.last_seen_post_id.clone()
+    };
+
+    let mentions = state
+        .client
+        .unread_notification_mentions_since(anchor.as_deref())
+        .await?;
+    Ok(UnreadNotifications {
+        count: mentions.len(),
+    })
+}
+
+fn stale_cursor_check_result(channel: &str) -> CheckResult {
+    CheckResult {
+        channel: channel.to_string(),
+        anchor: None,
+        anchor_source: "stale_cursor".to_string(),
+        has_new_messages: false,
+        count: 0,
+        newest_post_id: None,
+    }
+}
+
 fn cleanup_runtime_files(socket_path: &Path, pid_path: &Path) -> Result<(), io::Error> {
     if socket_path.exists() {
         fs::remove_file(socket_path)?;
@@ -762,13 +933,32 @@ impl DaemonClient {
     pub async fn read_channel(
         &self,
         channel: &str,
-        since_minutes: u64,
+        since_minutes: Option<u64>,
+        after_post_id: Option<String>,
+        since_last_mine: bool,
     ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
         self.call(
             "read_channel",
             serde_json::to_value(ReadChannelParams {
                 channel: channel.to_string(),
                 since_minutes,
+                after_post_id,
+                since_last_mine,
+            })?,
+        )
+        .await
+    }
+
+    pub async fn check_channel(
+        &self,
+        channel: &str,
+        after_post_id: Option<String>,
+    ) -> Result<CheckResult, DaemonError> {
+        self.call(
+            "check_channel",
+            serde_json::to_value(CheckChannelParams {
+                channel: channel.to_string(),
+                after_post_id,
             })?,
         )
         .await
@@ -837,10 +1027,14 @@ impl DaemonClient {
     pub async fn notifications(
         &self,
         since_minutes: u64,
-    ) -> Result<Vec<chanvoy_core::Notification>, DaemonError> {
+        unread_only: bool,
+    ) -> Result<serde_json::Value, DaemonError> {
         self.call(
             "notifications",
-            serde_json::to_value(NotificationsParams { since_minutes })?,
+            serde_json::to_value(NotificationsParams {
+                since_minutes: Some(since_minutes),
+                unread_only,
+            })?,
         )
         .await
     }
@@ -961,6 +1155,17 @@ pub fn daemon_client(profile_name: &str) -> DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_daemon_cursor_degrades_to_nonfatal_probe() {
+        let result = stale_cursor_check_result("per-008");
+        assert_eq!(result.channel, "per-008");
+        assert_eq!(result.anchor_source, "stale_cursor");
+        assert_eq!(result.anchor, None);
+        assert!(!result.has_new_messages);
+        assert_eq!(result.count, 0);
+        assert_eq!(result.newest_post_id, None);
+    }
     use chanvoy_core::{
         DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, EventBus, InboundEventPayload,
         Provider, SubscriptionFilter,
