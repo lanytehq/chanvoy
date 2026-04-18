@@ -63,6 +63,15 @@ enum CommandSet {
     Wait(WaitArgs),
     #[command(subcommand)]
     Channel(ChannelCommand),
+    /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
+    AutoSetup(AutoSetupArgs),
+}
+
+#[derive(Debug, Args)]
+struct AutoSetupArgs {
+    /// Do not set the resulting profile as active (default: activate if no active profile).
+    #[arg(long)]
+    no_activate: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -243,6 +252,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
         CommandSet::Profile(command) => handle_profile(&profile, cli.json, command).await,
+        CommandSet::AutoSetup(args) => handle_auto_setup(cli.json, args).await,
         CommandSet::Whoami => print_identity(cli.json, &daemon_client(&profile).whoami().await?),
         CommandSet::Channels => {
             print_value(cli.json, &daemon_client(&profile).list_channels().await?)
@@ -540,6 +550,246 @@ async fn handle_profile(
             store_profile_and_maybe_activate(json, &profile, args.activate)
         }
     }
+}
+
+async fn handle_auto_setup(json: bool, args: AutoSetupArgs) -> Result<(), CliError> {
+    let desired = build_desired_profile_from_env()?;
+    let existing = match chanvoy_core::load_profile(&desired.name) {
+        Ok(existing) => Some(existing),
+        Err(chanvoy_core::CoreError::ProfileNotFound(_)) => None,
+        Err(err) => return Err(err.into()),
+    };
+
+    let action = decide_profile_action(&desired, existing.as_ref());
+    let (profile_state, persisted_profile, refresh_diff) = match action {
+        ProfileAction::Create => {
+            let validated = validate_and_finalize_profile(desired).await?;
+            store_profile(&validated)?;
+            (ProfileState::Created, validated, Vec::new())
+        }
+        ProfileAction::Refresh(diff) => {
+            let validated = validate_and_finalize_profile(desired).await?;
+            store_profile(&validated)?;
+            (ProfileState::Refreshed, validated, diff)
+        }
+        ProfileAction::Reuse => {
+            let existing = existing.expect("Reuse implies existing profile");
+            (ProfileState::Reused, existing, Vec::new())
+        }
+    };
+
+    let activate_requested = !args.no_activate;
+    let active_before = load_active_profile()?;
+    let is_active_now = match active_before.as_deref() {
+        Some(name) if name == persisted_profile.name => true,
+        _ if activate_requested => {
+            store_active_profile(&persisted_profile.name)?;
+            true
+        }
+        _ => false,
+    };
+
+    let daemon_state = ensure_daemon_running(&persisted_profile.name).await?;
+
+    // TODO(PER-009 cursor-seed): once entarch/secrev land on option (a)/(b)/(c),
+    // wire cursor seeding here on fresh profiles and diff-and-seed on re-invocation.
+    // Report.cursor_seed remains None until that decision resolves.
+
+    let report = AutoSetupReport {
+        profile_name: persisted_profile.name.clone(),
+        bot_username: persisted_profile.bot_username.clone(),
+        profile_state,
+        daemon_state,
+        is_active: is_active_now,
+        refresh_diff,
+    };
+
+    print_auto_setup_report(json, &report)
+}
+
+fn build_desired_profile_from_env() -> Result<Profile, CliError> {
+    let role = required_env("LANYTE_AGENT_ROLE")?;
+    let scope = required_env("LANYTE_AGENT_SCOPE")?;
+    let server_url = required_env("LANYTE_MM_URL")?;
+    let name = env_var_nonempty("CHANVOY_PROFILE").unwrap_or_else(|| role.clone());
+    let team_name = derive_team_name(&scope);
+
+    let profile = Profile {
+        name,
+        role,
+        scope,
+        provider: Provider::Mattermost,
+        bot_username: String::new(),
+        team_name,
+        server_url,
+        env_name: env_var_nonempty("CHANVOY_TOKEN_ENV_NAME")
+            .unwrap_or_else(|| "LANYTE_MM_TOKEN".to_string()),
+        env_file: None,
+        credential_mode: CredentialMode::EnvName,
+        capability_class: CapabilityClass::Standard,
+        monitored_channels: Vec::new(),
+        ipc: None,
+    };
+    validate_profile_create_args(&profile)?;
+    Ok(profile)
+}
+
+async fn validate_and_finalize_profile(mut profile: Profile) -> Result<Profile, CliError> {
+    let token = load_token(&profile)?;
+    let client = MattermostClient::new(&profile, token)?;
+    let identity = client.whoami().await?;
+    client.validate_team_access().await?;
+    profile.bot_username = identity.username;
+    Ok(profile)
+}
+
+async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
+    if ping(profile).await.is_ok() {
+        return Ok(DaemonState::AlreadyRunning);
+    }
+    let exe = std::env::current_exe()?;
+    Command::new(exe)
+        .arg("--profile")
+        .arg(profile)
+        .arg("daemon")
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    for _ in 0..20 {
+        if ping(profile).await.is_ok() {
+            return Ok(DaemonState::Started);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err(DaemonError::NotRunning(profile.to_string()).into())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProfileAction {
+    Create,
+    Refresh(Vec<ProfileFieldDiff>),
+    Reuse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ProfileFieldDiff {
+    field: String,
+    from: String,
+    to: String,
+}
+
+fn decide_profile_action(desired: &Profile, existing: Option<&Profile>) -> ProfileAction {
+    let Some(existing) = existing else {
+        return ProfileAction::Create;
+    };
+    let diff = material_profile_diff(existing, desired);
+    if diff.is_empty() {
+        ProfileAction::Reuse
+    } else {
+        ProfileAction::Refresh(diff)
+    }
+}
+
+fn material_profile_diff(from: &Profile, to: &Profile) -> Vec<ProfileFieldDiff> {
+    let mut diff = Vec::new();
+    fn push(diff: &mut Vec<ProfileFieldDiff>, field: &str, from: String, to: String) {
+        if from != to {
+            diff.push(ProfileFieldDiff {
+                field: field.to_string(),
+                from,
+                to,
+            });
+        }
+    }
+    push(&mut diff, "role", from.role.clone(), to.role.clone());
+    push(&mut diff, "scope", from.scope.clone(), to.scope.clone());
+    push(
+        &mut diff,
+        "server_url",
+        from.server_url.clone(),
+        to.server_url.clone(),
+    );
+    push(
+        &mut diff,
+        "team_name",
+        from.team_name.clone(),
+        to.team_name.clone(),
+    );
+    push(
+        &mut diff,
+        "env_name",
+        from.env_name.clone(),
+        to.env_name.clone(),
+    );
+    push(
+        &mut diff,
+        "credential_mode",
+        format!("{:?}", from.credential_mode),
+        format!("{:?}", to.credential_mode),
+    );
+    push(
+        &mut diff,
+        "capability_class",
+        format!("{:?}", from.capability_class),
+        format!("{:?}", to.capability_class),
+    );
+    // Excluded from material diff: `name` (used as key), `bot_username` (derived from token
+    // via whoami), `monitored_channels`, `ipc`, `env_file`, `provider`.
+    diff
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileState {
+    Created,
+    Refreshed,
+    Reused,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonState {
+    AlreadyRunning,
+    Started,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AutoSetupReport {
+    profile_name: String,
+    bot_username: String,
+    profile_state: ProfileState,
+    daemon_state: DaemonState,
+    is_active: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refresh_diff: Vec<ProfileFieldDiff>,
+}
+
+fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    let profile_line = match report.profile_state {
+        ProfileState::Created => format!("profile {} created", report.profile_name),
+        ProfileState::Refreshed => format!("profile {} refreshed", report.profile_name),
+        ProfileState::Reused => format!("profile {} reused", report.profile_name),
+    };
+    let daemon_line = match report.daemon_state {
+        DaemonState::AlreadyRunning => "daemon already running".to_string(),
+        DaemonState::Started => "daemon started".to_string(),
+    };
+    println!("{profile_line}");
+    println!("{daemon_line}");
+    println!("bot_username: {}", report.bot_username);
+    if report.is_active {
+        println!("active: {}", report.profile_name);
+    }
+    for field in &report.refresh_diff {
+        println!("  ~ {}: {} -> {}", field.field, field.from, field.to);
+    }
+    Ok(())
 }
 
 fn resolve_profile_name(profile: Option<&str>) -> Result<String, CliError> {
@@ -1149,5 +1399,70 @@ mod tests {
     fn unread_notifications_render_as_count_only() {
         let unread = UnreadNotifications { count: 4 };
         assert_eq!(unread.to_human_string(), "unread: 4");
+    }
+
+    fn sample_profile() -> Profile {
+        Profile {
+            name: "bravo-devlead".to_string(),
+            role: "bravo-devlead".to_string(),
+            scope: "lanytehq".to_string(),
+            provider: Provider::Mattermost,
+            bot_username: "agent-bravo-devlead".to_string(),
+            team_name: "org-lanytehq".to_string(),
+            server_url: "https://mm.example.com".to_string(),
+            env_name: "LANYTE_MM_TOKEN".to_string(),
+            env_file: None,
+            credential_mode: CredentialMode::EnvName,
+            capability_class: CapabilityClass::Standard,
+            monitored_channels: Vec::new(),
+            ipc: None,
+        }
+    }
+
+    #[test]
+    fn decide_profile_action_creates_when_absent() {
+        let desired = sample_profile();
+        assert_eq!(decide_profile_action(&desired, None), ProfileAction::Create);
+    }
+
+    #[test]
+    fn decide_profile_action_reuses_when_material_fields_match() {
+        let desired = sample_profile();
+        let mut existing = sample_profile();
+        // bot_username is not material — diverging here must still Reuse.
+        existing.bot_username = "stale-username".to_string();
+        assert_eq!(
+            decide_profile_action(&desired, Some(&existing)),
+            ProfileAction::Reuse
+        );
+    }
+
+    #[test]
+    fn decide_profile_action_refreshes_on_material_diff() {
+        let desired = sample_profile();
+        let mut existing = sample_profile();
+        existing.server_url = "https://old.example.com".to_string();
+        existing.team_name = "old-team".to_string();
+        let action = decide_profile_action(&desired, Some(&existing));
+        match action {
+            ProfileAction::Refresh(diff) => {
+                let fields: Vec<&str> = diff.iter().map(|d| d.field.as_str()).collect();
+                assert!(fields.contains(&"server_url"));
+                assert!(fields.contains(&"team_name"));
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn material_diff_excludes_name_and_bot_username() {
+        let mut a = sample_profile();
+        let mut b = sample_profile();
+        a.name = "a-name".to_string();
+        b.name = "b-name".to_string();
+        a.bot_username = "bot-a".to_string();
+        b.bot_username = "bot-b".to_string();
+        assert!(material_profile_diff(&a, &b).is_empty());
     }
 }
