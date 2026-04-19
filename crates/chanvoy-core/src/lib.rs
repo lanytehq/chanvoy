@@ -335,6 +335,20 @@ pub struct CheckResult {
     pub newest_post_id: Option<String>,
 }
 
+/// Per-channel outcome of a seed-cursors pass. See PER-009 / #per-009 for the contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SeededChannelOutcome {
+    Seeded { channel: String, post_id: String },
+    UnseededEmptyChannel { channel: String },
+    Failed { channel: String, reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SeedCursorsResult {
+    pub outcomes: Vec<SeededChannelOutcome>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnreadNotifications {
     pub count: usize,

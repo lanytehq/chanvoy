@@ -7,7 +7,7 @@ use chanvoy_core::{
     list_profiles, load_active_profile, load_token, store_active_profile, store_profile,
     CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus, DmConversation, Identity,
     MattermostClient, Message, Notification, PostReceipt, Profile, ProfileStatus, Provider,
-    UnreadNotifications, WaitResult, DEFAULT_TEAM,
+    SeedCursorsResult, SeededChannelOutcome, UnreadNotifications, WaitResult, DEFAULT_TEAM,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -617,10 +617,19 @@ async fn handle_auto_setup(json: bool, args: AutoSetupArgs) -> Result<(), CliErr
         }
     };
 
-    // TODO(PER-009 cursor-seed Phase 2): wire daemon RPC call to seed cursors for
-    // channels missing from attention state. Report carries seed_outcomes; any
-    // non-empty `seed_failed` flips overall exit to EXIT_SOFT_DEGRADED.
-    let seed_outcomes: Vec<SeedOutcome> = Vec::new();
+    let seed_outcomes: Vec<SeedOutcome> = match daemon_client(&persisted_profile.name)
+        .seed_cursors()
+        .await
+    {
+        Ok(SeedCursorsResult { outcomes }) => outcomes.into_iter().map(SeedOutcome::from).collect(),
+        Err(err) => {
+            // Membership enumeration or daemon RPC itself failed — surface explicitly.
+            vec![SeedOutcome::Failed {
+                channel: "<membership-enumeration>".to_string(),
+                reason: err.to_string(),
+            }]
+        }
+    };
     let degraded = seed_outcomes
         .iter()
         .any(|outcome| matches!(outcome, SeedOutcome::Failed { .. }));
@@ -868,8 +877,6 @@ enum DaemonState {
     Started,
 }
 
-// Variant fields consumed only after Phase 2 wires the daemon seed-cursors RPC.
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SeedOutcome {
@@ -880,6 +887,22 @@ enum SeedOutcome {
     /// Seed attempt failed (membership enumeration error or per-channel HEAD fetch error).
     /// Flips overall report to degraded.
     Failed { channel: String, reason: String },
+}
+
+impl From<SeededChannelOutcome> for SeedOutcome {
+    fn from(outcome: SeededChannelOutcome) -> Self {
+        match outcome {
+            SeededChannelOutcome::Seeded { channel, post_id } => {
+                SeedOutcome::Seeded { channel, post_id }
+            }
+            SeededChannelOutcome::UnseededEmptyChannel { channel } => {
+                SeedOutcome::UnseededEmptyChannel { channel }
+            }
+            SeededChannelOutcome::Failed { channel, reason } => {
+                SeedOutcome::Failed { channel, reason }
+            }
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
