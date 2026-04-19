@@ -615,7 +615,41 @@ async fn handle_auto_setup(
         }
         ProfileAction::Reuse => {
             let existing = existing.expect("Reuse implies existing profile");
-            (ProfileState::Reused, existing, Vec::new())
+            // AC #3 (amended brief): team/token validation must happen against
+            // the *current* env credential before reporting success, on every
+            // path including Reuse. Without this, a token rotated in place
+            // under the same env var name would be unobserved and the report
+            // would claim success based purely on token-source presence from
+            // `check_token_available`, never proving the token actually works
+            // for the configured team.
+            let validated = match validate_and_finalize_profile(existing.clone()).await {
+                Ok(profile) => profile,
+                Err(err) => return exit_on_preflight(json, err),
+            };
+            // If the env credential now authenticates as a different bot than
+            // the persisted profile, the running daemon (if any) is holding a
+            // token for a different identity. Promote to a refresh-style
+            // reload so the daemon uses the env-current credential and the
+            // stored profile reflects reality. bot_username drift on a Reuse
+            // is not classified as EXIT_IDENTITY_DRIFT because the brief lists
+            // bot_username as "derived / ignored for drift" at the
+            // decide_profile_action phase; treating a post-whoami change as a
+            // surfaced refresh is consistent with that rule.
+            if validated.bot_username != existing.bot_username {
+                store_profile(&validated)?;
+                if let Err(err) = stop_daemon_if_present(&validated.name).await {
+                    print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
+                    process::exit(EXIT_DAEMON_FAILED);
+                }
+                let diff = vec![ProfileFieldDiff {
+                    field: "bot_username".to_string(),
+                    from: existing.bot_username.clone(),
+                    to: validated.bot_username.clone(),
+                }];
+                (ProfileState::Refreshed, validated, diff)
+            } else {
+                (ProfileState::Reused, validated, Vec::new())
+            }
         }
         ProfileAction::IdentityDrift(diff) => {
             print_identity_drift_error(json, &diff)?;
