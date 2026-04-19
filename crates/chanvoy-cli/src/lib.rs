@@ -69,7 +69,8 @@ enum CommandSet {
 
 #[derive(Debug, Args)]
 struct AutoSetupArgs {
-    /// Do not set the resulting profile as active (default: activate if no active profile).
+    /// Do not set the resulting profile as active. Use when bootstrapping or repairing a
+    /// secondary profile without stealing active-profile resolution (multi-profile operators).
     #[arg(long)]
     no_activate: bool,
 }
@@ -553,7 +554,14 @@ async fn handle_profile(
 }
 
 async fn handle_auto_setup(json: bool, args: AutoSetupArgs) -> Result<(), CliError> {
-    let desired = build_desired_profile_from_env()?;
+    let desired = match build_desired_profile_from_env() {
+        Ok(profile) => profile,
+        Err(err) => {
+            print_auto_setup_error(json, "env_input", &err.to_string())?;
+            process::exit(EXIT_ENV_INPUT);
+        }
+    };
+
     let existing = match chanvoy_core::load_profile(&desired.name) {
         Ok(existing) => Some(existing),
         Err(chanvoy_core::CoreError::ProfileNotFound(_)) => None,
@@ -563,18 +571,30 @@ async fn handle_auto_setup(json: bool, args: AutoSetupArgs) -> Result<(), CliErr
     let action = decide_profile_action(&desired, existing.as_ref());
     let (profile_state, persisted_profile, refresh_diff) = match action {
         ProfileAction::Create => {
-            let validated = validate_and_finalize_profile(desired).await?;
+            let validated = match validate_and_finalize_profile(desired).await {
+                Ok(profile) => profile,
+                Err(err) => return exit_on_preflight(json, err),
+            };
             store_profile(&validated)?;
             (ProfileState::Created, validated, Vec::new())
         }
         ProfileAction::Refresh(diff) => {
-            let validated = validate_and_finalize_profile(desired).await?;
+            let existing = existing.clone().expect("Refresh implies existing profile");
+            let merged = merge_forward_for_refresh(desired, &existing);
+            let validated = match validate_and_finalize_profile(merged).await {
+                Ok(profile) => profile,
+                Err(err) => return exit_on_preflight(json, err),
+            };
             store_profile(&validated)?;
             (ProfileState::Refreshed, validated, diff)
         }
         ProfileAction::Reuse => {
             let existing = existing.expect("Reuse implies existing profile");
             (ProfileState::Reused, existing, Vec::new())
+        }
+        ProfileAction::IdentityDrift(diff) => {
+            print_identity_drift_error(json, &diff)?;
+            process::exit(EXIT_IDENTITY_DRIFT);
         }
     };
 
@@ -589,11 +609,21 @@ async fn handle_auto_setup(json: bool, args: AutoSetupArgs) -> Result<(), CliErr
         _ => false,
     };
 
-    let daemon_state = ensure_daemon_running(&persisted_profile.name).await?;
+    let daemon_state = match ensure_daemon_running(&persisted_profile.name).await {
+        Ok(state) => state,
+        Err(err) => {
+            print_auto_setup_error(json, "daemon_start", &err.to_string())?;
+            process::exit(EXIT_DAEMON_FAILED);
+        }
+    };
 
-    // TODO(PER-009 cursor-seed): once entarch/secrev land on option (a)/(b)/(c),
-    // wire cursor seeding here on fresh profiles and diff-and-seed on re-invocation.
-    // Report.cursor_seed remains None until that decision resolves.
+    // TODO(PER-009 cursor-seed Phase 2): wire daemon RPC call to seed cursors for
+    // channels missing from attention state. Report carries seed_outcomes; any
+    // non-empty `seed_failed` flips overall exit to EXIT_SOFT_DEGRADED.
+    let seed_outcomes: Vec<SeedOutcome> = Vec::new();
+    let degraded = seed_outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, SeedOutcome::Failed { .. }));
 
     let report = AutoSetupReport {
         profile_name: persisted_profile.name.clone(),
@@ -602,9 +632,92 @@ async fn handle_auto_setup(json: bool, args: AutoSetupArgs) -> Result<(), CliErr
         daemon_state,
         is_active: is_active_now,
         refresh_diff,
+        seed_outcomes,
+        degraded,
     };
 
-    print_auto_setup_report(json, &report)
+    print_auto_setup_report(json, &report)?;
+    if degraded {
+        process::exit(EXIT_SOFT_DEGRADED);
+    }
+    Ok(())
+}
+
+const EXIT_SOFT_DEGRADED: i32 = 1;
+const EXIT_ENV_INPUT: i32 = 2;
+const EXIT_PREFLIGHT_FAILED: i32 = 3;
+const EXIT_DAEMON_FAILED: i32 = 4;
+const EXIT_IDENTITY_DRIFT: i32 = 5;
+
+fn exit_on_preflight(json: bool, err: CliError) -> Result<(), CliError> {
+    let (code, message) = classify_preflight_error(&err);
+    print_auto_setup_error(json, code, &message)?;
+    process::exit(EXIT_PREFLIGHT_FAILED);
+}
+
+fn classify_preflight_error(err: &CliError) -> (&'static str, String) {
+    if let CliError::Core(chanvoy_core::CoreError::Api { status, message }) = err {
+        let code = match status.as_u16() {
+            401 => "token_invalid",
+            403 => "bot_not_in_team",
+            404 => "team_missing",
+            _ => "preflight_failed",
+        };
+        return (code, format!("{status}: {message}"));
+    }
+    ("preflight_failed", err.to_string())
+}
+
+fn merge_forward_for_refresh(mut desired: Profile, existing: &Profile) -> Profile {
+    // Non-env-owned fields survive refresh to avoid wiping operator-configured state
+    // (monitored_channels, IPC config, env_file). Env-owned fields come from `desired`.
+    desired.monitored_channels = existing.monitored_channels.clone();
+    desired.ipc = existing.ipc.clone();
+    if desired.env_file.is_none() && existing.env_file.is_some() {
+        desired.env_file = existing.env_file.clone();
+    }
+    desired
+}
+
+fn print_auto_setup_error(json: bool, code: &str, message: &str) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error_code": code,
+                "message": message,
+            }))?
+        );
+    } else {
+        eprintln!("{code}: {message}");
+    }
+    Ok(())
+}
+
+fn print_identity_drift_error(json: bool, diff: &[ProfileFieldDiff]) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error_code": "identity_drift",
+                "message": "persisted profile identity does not match env-derived identity; refusing silent refresh",
+                "drift": diff,
+                "recovery": "resolve the mismatch (correct the env, or rename/remove the persisted profile), then re-run auto-setup",
+            }))?
+        );
+    } else {
+        eprintln!("identity_drift: persisted profile identity does not match env-derived identity");
+        for field in diff {
+            eprintln!(
+                "  * {}: persisted={} env={}",
+                field.field, field.from, field.to
+            );
+        }
+        eprintln!(
+            "recovery: resolve the mismatch (correct the env, or rename/remove the persisted profile), then re-run auto-setup"
+        );
+    }
+    Ok(())
 }
 
 fn build_desired_profile_from_env() -> Result<Profile, CliError> {
@@ -671,6 +784,7 @@ enum ProfileAction {
     Create,
     Refresh(Vec<ProfileFieldDiff>),
     Reuse,
+    IdentityDrift(Vec<ProfileFieldDiff>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -684,60 +798,59 @@ fn decide_profile_action(desired: &Profile, existing: Option<&Profile>) -> Profi
     let Some(existing) = existing else {
         return ProfileAction::Create;
     };
-    let diff = material_profile_diff(existing, desired);
-    if diff.is_empty() {
+    let identity_diff = identity_surface_diff(existing, desired);
+    if !identity_diff.is_empty() {
+        return ProfileAction::IdentityDrift(identity_diff);
+    }
+    let refreshable_diff = refreshable_profile_diff(existing, desired);
+    if refreshable_diff.is_empty() {
         ProfileAction::Reuse
     } else {
-        ProfileAction::Refresh(diff)
+        ProfileAction::Refresh(refreshable_diff)
     }
 }
 
-fn material_profile_diff(from: &Profile, to: &Profile) -> Vec<ProfileFieldDiff> {
+/// Fields that define WHO this profile is talking as and WHERE. Any change here must
+/// hard-error (exit 5) — silent refresh would let one persisted attention state slide
+/// across identities.
+fn identity_surface_diff(from: &Profile, to: &Profile) -> Vec<ProfileFieldDiff> {
     let mut diff = Vec::new();
-    fn push(diff: &mut Vec<ProfileFieldDiff>, field: &str, from: String, to: String) {
-        if from != to {
-            diff.push(ProfileFieldDiff {
-                field: field.to_string(),
-                from,
-                to,
-            });
-        }
-    }
-    push(&mut diff, "role", from.role.clone(), to.role.clone());
-    push(&mut diff, "scope", from.scope.clone(), to.scope.clone());
-    push(
-        &mut diff,
-        "server_url",
-        from.server_url.clone(),
-        to.server_url.clone(),
-    );
-    push(
-        &mut diff,
-        "team_name",
-        from.team_name.clone(),
-        to.team_name.clone(),
-    );
-    push(
-        &mut diff,
-        "env_name",
-        from.env_name.clone(),
-        to.env_name.clone(),
-    );
-    push(
+    push_if_diff(&mut diff, "role", &from.role, &to.role);
+    push_if_diff(&mut diff, "scope", &from.scope, &to.scope);
+    push_if_diff(&mut diff, "server_url", &from.server_url, &to.server_url);
+    push_if_diff(&mut diff, "team_name", &from.team_name, &to.team_name);
+    diff
+}
+
+/// Fields that are safely refreshable on env change.
+fn refreshable_profile_diff(from: &Profile, to: &Profile) -> Vec<ProfileFieldDiff> {
+    let mut diff = Vec::new();
+    push_if_diff(&mut diff, "env_name", &from.env_name, &to.env_name);
+    push_if_diff(
         &mut diff,
         "credential_mode",
-        format!("{:?}", from.credential_mode),
-        format!("{:?}", to.credential_mode),
+        &format!("{:?}", from.credential_mode),
+        &format!("{:?}", to.credential_mode),
     );
-    push(
+    push_if_diff(
         &mut diff,
         "capability_class",
-        format!("{:?}", from.capability_class),
-        format!("{:?}", to.capability_class),
+        &format!("{:?}", from.capability_class),
+        &format!("{:?}", to.capability_class),
     );
-    // Excluded from material diff: `name` (used as key), `bot_username` (derived from token
-    // via whoami), `monitored_channels`, `ipc`, `env_file`, `provider`.
+    // Excluded from all diffs: `name` (key), `bot_username` (derived from token),
+    // `monitored_channels`, `ipc`, `env_file`, `provider` (pass through via merge-forward).
     diff
+}
+
+fn push_if_diff(diff: &mut Vec<ProfileFieldDiff>, field: &str, from: &str, to: &str) {
+    if from != to {
+        diff.push(ProfileFieldDiff {
+            field: field.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -755,6 +868,20 @@ enum DaemonState {
     Started,
 }
 
+// Variant fields consumed only after Phase 2 wires the daemon seed-cursors RPC.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SeedOutcome {
+    /// Cursor seeded to HEAD for a channel that had no stored anchor.
+    Seeded { channel: String, post_id: String },
+    /// Joined channel has no posts yet — explicitly left unseeded. Not a failure.
+    UnseededEmptyChannel { channel: String },
+    /// Seed attempt failed (membership enumeration error or per-channel HEAD fetch error).
+    /// Flips overall report to degraded.
+    Failed { channel: String, reason: String },
+}
+
 #[derive(Debug, serde::Serialize)]
 struct AutoSetupReport {
     profile_name: String,
@@ -762,8 +889,11 @@ struct AutoSetupReport {
     profile_state: ProfileState,
     daemon_state: DaemonState,
     is_active: bool,
+    degraded: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     refresh_diff: Vec<ProfileFieldDiff>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    seed_outcomes: Vec<SeedOutcome>,
 }
 
 fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), CliError> {
@@ -771,6 +901,7 @@ fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), C
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
     }
+    // Short status lines first (narrow-terminal friendly per A5 / entarch #7).
     let profile_line = match report.profile_state {
         ProfileState::Created => format!("profile {} created", report.profile_name),
         ProfileState::Refreshed => format!("profile {} refreshed", report.profile_name),
@@ -786,8 +917,25 @@ fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), C
     if report.is_active {
         println!("active: {}", report.profile_name);
     }
+    if report.degraded {
+        println!("status: degraded (see seed outcomes below)");
+    }
+    // Detail sections follow.
     for field in &report.refresh_diff {
-        println!("  ~ {}: {} -> {}", field.field, field.from, field.to);
+        println!("  refresh {}: {} -> {}", field.field, field.from, field.to);
+    }
+    for outcome in &report.seed_outcomes {
+        match outcome {
+            SeedOutcome::Seeded { channel, post_id } => {
+                println!("  seeded: {channel} -> {post_id}")
+            }
+            SeedOutcome::UnseededEmptyChannel { channel } => {
+                println!("  unseeded: {channel} (empty channel)")
+            }
+            SeedOutcome::Failed { channel, reason } => {
+                println!("  seed_failed: {channel} ({reason})")
+            }
+        }
     }
     Ok(())
 }
@@ -1426,11 +1574,12 @@ mod tests {
     }
 
     #[test]
-    fn decide_profile_action_reuses_when_material_fields_match() {
+    fn decide_profile_action_reuses_when_all_compared_fields_match() {
         let desired = sample_profile();
         let mut existing = sample_profile();
-        // bot_username is not material — diverging here must still Reuse.
+        // Non-compared fields diverging must still Reuse.
         existing.bot_username = "stale-username".to_string();
+        existing.monitored_channels = vec!["extra-channel".to_string()];
         assert_eq!(
             decide_profile_action(&desired, Some(&existing)),
             ProfileAction::Reuse
@@ -1438,31 +1587,83 @@ mod tests {
     }
 
     #[test]
-    fn decide_profile_action_refreshes_on_material_diff() {
-        let desired = sample_profile();
-        let mut existing = sample_profile();
-        existing.server_url = "https://old.example.com".to_string();
-        existing.team_name = "old-team".to_string();
-        let action = decide_profile_action(&desired, Some(&existing));
-        match action {
+    fn decide_profile_action_refreshes_on_refreshable_diff_only() {
+        let mut desired = sample_profile();
+        desired.env_name = "NEW_TOKEN_ENV".to_string();
+        let existing = sample_profile();
+        match decide_profile_action(&desired, Some(&existing)) {
             ProfileAction::Refresh(diff) => {
-                let fields: Vec<&str> = diff.iter().map(|d| d.field.as_str()).collect();
-                assert!(fields.contains(&"server_url"));
-                assert!(fields.contains(&"team_name"));
-                assert_eq!(fields.len(), 2);
+                assert_eq!(diff.len(), 1);
+                assert_eq!(diff[0].field, "env_name");
             }
             other => panic!("expected Refresh, got {other:?}"),
         }
     }
 
     #[test]
-    fn material_diff_excludes_name_and_bot_username() {
+    fn decide_profile_action_hard_errors_on_identity_drift() {
+        let desired = sample_profile();
+        let mut existing = sample_profile();
+        existing.server_url = "https://old.example.com".to_string();
+        existing.team_name = "old-team".to_string();
+        match decide_profile_action(&desired, Some(&existing)) {
+            ProfileAction::IdentityDrift(diff) => {
+                let fields: Vec<&str> = diff.iter().map(|d| d.field.as_str()).collect();
+                assert!(fields.contains(&"server_url"));
+                assert!(fields.contains(&"team_name"));
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("expected IdentityDrift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_drift_takes_precedence_over_refreshable_diff() {
+        // When both identity and refreshable fields differ, IdentityDrift wins so the
+        // operator sees the hard-error rather than a silent refresh.
+        let mut desired = sample_profile();
+        desired.env_name = "NEW_TOKEN_ENV".to_string();
+        let mut existing = sample_profile();
+        existing.scope = "other-scope".to_string();
+        match decide_profile_action(&desired, Some(&existing)) {
+            ProfileAction::IdentityDrift(diff) => {
+                let fields: Vec<&str> = diff.iter().map(|d| d.field.as_str()).collect();
+                assert_eq!(fields, vec!["scope"]);
+            }
+            other => panic!("expected IdentityDrift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refreshable_diff_excludes_identity_and_non_env_fields() {
         let mut a = sample_profile();
         let mut b = sample_profile();
         a.name = "a-name".to_string();
         b.name = "b-name".to_string();
         a.bot_username = "bot-a".to_string();
         b.bot_username = "bot-b".to_string();
-        assert!(material_profile_diff(&a, &b).is_empty());
+        a.monitored_channels = vec!["chan-a".to_string()];
+        b.monitored_channels = vec!["chan-b".to_string()];
+        assert!(refreshable_profile_diff(&a, &b).is_empty());
+        assert!(identity_surface_diff(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn merge_forward_preserves_non_env_fields() {
+        // devrev item #3: refresh path must not wipe monitored_channels / ipc.
+        let mut existing = sample_profile();
+        existing.monitored_channels = vec!["per-008".to_string(), "per-009".to_string()];
+        existing.env_file = Some(PathBuf::from("/secrets/bravo.env"));
+        let mut desired = sample_profile();
+        desired.env_name = "REFRESHED_TOKEN_ENV".to_string();
+        // Desired comes from env — env does not populate monitored_channels or env_file.
+        assert!(desired.monitored_channels.is_empty());
+        assert_eq!(desired.env_file, None);
+
+        let merged = merge_forward_for_refresh(desired, &existing);
+        assert_eq!(merged.monitored_channels, existing.monitored_channels);
+        assert_eq!(merged.env_file, existing.env_file);
+        // Env-owned field still took the desired value.
+        assert_eq!(merged.env_name, "REFRESHED_TOKEN_ENV");
     }
 }
