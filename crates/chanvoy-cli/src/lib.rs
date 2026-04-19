@@ -603,9 +603,11 @@ async fn handle_auto_setup(
             // (`chanvoy-daemon::start`). Refresh writes to disk but the live daemon
             // keeps its stale copy, so env_name / credential_mode / capability_class
             // changes — and crucially a rotated token — would not take effect until
-            // an unrelated restart. Stop the daemon if running so the subsequent
-            // `ensure_daemon_running` spawns a fresh one against the updated profile.
-            if let Err(err) = stop_daemon_for_refresh(&validated.name).await {
+            // an unrelated restart. Stop the daemon if present (even when healthy)
+            // so the subsequent `ensure_daemon_running` spawns a fresh one against
+            // the updated profile. The Reuse path gets analogous zombie protection
+            // inside `ensure_daemon_running` itself.
+            if let Err(err) = stop_daemon_if_present(&validated.name).await {
                 print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
                 process::exit(EXIT_DAEMON_FAILED);
             }
@@ -824,6 +826,17 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
     if ping(profile).await.is_ok() {
         return Ok(DaemonState::AlreadyRunning);
     }
+    // `ping()` failing does not mean the daemon is absent — it is the
+    // `daemon_status` RPC, which calls `whoami()` against Mattermost, so a
+    // running daemon with a revoked / invalid token fails ping while still
+    // holding the socket. Blindly spawning here would leave that zombie
+    // alive while a fresh daemon bound to the same profile — the
+    // two-daemons-one-profile condition secrev F5 and devrev flagged.
+    //
+    // Call stop_daemon_if_present before spawning; it short-circuits when no
+    // socket exists (normal cold-start case), and issues a local shutdown
+    // RPC (independent of Mattermost health) when one does.
+    stop_daemon_if_present(profile).await?;
     let exe = std::env::current_exe()?;
     Command::new(exe)
         .arg("--profile")
@@ -844,22 +857,21 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
 }
 
 /// Stop the daemon if it is present, and wait until its socket is actually gone
-/// so the caller's subsequent ensure_daemon_running spawns a fresh instance.
-/// Used on the Refresh path so that refreshed profile fields (token env,
-/// credential_mode, capability_class) and rotated tokens actually take effect.
+/// so the caller's subsequent spawn lands on a clean slate.
 ///
 /// **Daemon presence is detected via socket file existence, not via `ping()`.**
 /// `ping()` is the `daemon_status` RPC which internally calls `whoami()` against
 /// Mattermost (`chanvoy-daemon::dispatch_request`, "daemon_status" arm). A daemon
-/// running with a revoked credential — the exact scenario that motivates a
-/// token-rotation refresh — fails ping while being very much alive. Falling back
-/// to socket existence ensures the stop path catches those zombies.
+/// running with a revoked credential fails ping while being very much alive.
+/// Falling back to socket existence ensures the stop path catches those zombies
+/// on both the Refresh path (explicit stop to force reload) and the Reuse path
+/// (invoked from ensure_daemon_running when ping fails).
 ///
 /// The daemon's `shutdown` RPC is handled locally (no Mattermost calls) so it
 /// works even when `whoami()` is failing. A stale socket (process already gone)
 /// surfaces as `DaemonError::NotRunning` from `stop()`; that is treated as
 /// no-op since the next `daemon::start()` cleans up the stale socket.
-async fn stop_daemon_for_refresh(profile: &str) -> Result<(), CliError> {
+async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
     let socket = socket_path_for_profile(profile);
     if !socket.exists() {
         return Ok(());
