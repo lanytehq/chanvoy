@@ -598,6 +598,16 @@ async fn handle_auto_setup(
                 Err(err) => return exit_on_preflight(json, err),
             };
             store_profile(&validated)?;
+            // A running daemon holds Profile + token in-memory from the last start
+            // (`chanvoy-daemon::start`). Refresh writes to disk but the live daemon
+            // keeps its stale copy, so env_name / credential_mode / capability_class
+            // changes — and crucially a rotated token — would not take effect until
+            // an unrelated restart. Stop the daemon if running so the subsequent
+            // `ensure_daemon_running` spawns a fresh one against the updated profile.
+            if let Err(err) = stop_daemon_for_refresh(&validated.name).await {
+                print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
+                process::exit(EXIT_DAEMON_FAILED);
+            }
             (ProfileState::Refreshed, validated, diff)
         }
         ProfileAction::Reuse => {
@@ -634,8 +644,22 @@ async fn handle_auto_setup(
         .await
     {
         Ok(SeedCursorsResult { outcomes }) => outcomes.into_iter().map(SeedOutcome::from).collect(),
+        Err(DaemonError::NotRunning(_)) => {
+            // Daemon died between the health check and the seed RPC. This is a
+            // daemon health failure (exit 4), not a per-channel seed problem
+            // (exit 1). auto-setup's contract requires a healthy daemon at the
+            // point of success — soft-degraded would mask the collapse.
+            print_auto_setup_error(
+                json,
+                "daemon_unreachable",
+                "daemon socket unavailable during seed_cursors RPC — daemon exited after the health check",
+            )?;
+            process::exit(EXIT_DAEMON_FAILED);
+        }
         Err(err) => {
-            // Membership enumeration or daemon RPC itself failed — surface explicitly.
+            // Other failures (upstream Mattermost errors during enumeration,
+            // serialization issues) surface as a single synthetic seed failure.
+            // Profile is still coherent; readiness flips to degraded (exit 1).
             vec![SeedOutcome::Failed {
                 channel: "<membership-enumeration>".to_string(),
                 reason: err.to_string(),
@@ -816,6 +840,28 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     Err(DaemonError::NotRunning(profile.to_string()).into())
+}
+
+/// Stop the daemon if it is running, and wait until its socket is actually gone
+/// so the caller's subsequent ensure_daemon_running spawns a fresh instance.
+/// No-op if the daemon is not running. Used on the Refresh path so that
+/// refreshed profile fields (token env, capability_class) actually take effect.
+async fn stop_daemon_for_refresh(profile: &str) -> Result<(), CliError> {
+    if ping(profile).await.is_err() {
+        return Ok(());
+    }
+    // Best-effort shutdown RPC; ignore transport errors here because the poll
+    // loop below is the authoritative check.
+    let _ = stop(profile).await;
+    for _ in 0..20 {
+        if ping(profile).await.is_err() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err(CliError::Bootstrap(format!(
+        "daemon for profile {profile} did not exit within 5s of shutdown request"
+    )))
 }
 
 #[derive(Debug, PartialEq, Eq)]
