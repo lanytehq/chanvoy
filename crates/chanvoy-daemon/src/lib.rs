@@ -901,61 +901,39 @@ async fn record_channel_cursor_if_absent(
 /// Implements PER-009 option (b): seed only on explicit auto-setup, never clobber,
 /// leave empty channels explicitly unseeded, surface per-channel failures.
 async fn seed_cursors(state: &AppState) -> Result<chanvoy_core::SeedCursorsResult, CoreError> {
-    let channels = state.client.list_channels().await?;
     let existing: std::collections::BTreeSet<String> = {
         let attention = state.attention_state.lock().await;
         attention.channels.keys().cloned().collect()
     };
-    let mut outcomes: Vec<chanvoy_core::SeededChannelOutcome> = Vec::new();
+    // Enumeration + HEAD fetch lives in chanvoy_core for wiremock-testable isolation.
+    // This wrapper serializes writes through the attention-state mutex and filters
+    // post_message races via the no-clobber helper.
+    let outcomes = chanvoy_core::compute_seed_outcomes(&state.client, &existing).await?;
+    let mut persisted: Vec<chanvoy_core::SeededChannelOutcome> = Vec::new();
     let mut newly_seeded: Vec<String> = Vec::new();
-    for channel in channels {
-        // Channel scope: only public ("O") and private ("P") team channels carry
-        // channel cursors. DM ("D") and group-DM ("G") channels are addressed via
-        // the mentions cursor and are not seeded here.
-        if channel.channel_type != "O" && channel.channel_type != "P" {
-            continue;
-        }
-        if existing.contains(&channel.name) {
-            continue;
-        }
-        let head = match state
-            .client
-            .latest_channel_messages_by_id(&channel.id, 1)
-            .await
-        {
-            Ok(posts) => posts,
-            Err(err) => {
-                outcomes.push(chanvoy_core::SeededChannelOutcome::Failed {
-                    channel: channel.name.clone(),
-                    reason: err.to_string(),
-                });
-                continue;
+    for outcome in outcomes {
+        match outcome {
+            chanvoy_core::SeededChannelOutcome::Seeded { channel, post_id } => {
+                match record_channel_cursor_if_absent(state, &channel, &post_id).await {
+                    Ok(true) => {
+                        newly_seeded.push(channel.clone());
+                        persisted
+                            .push(chanvoy_core::SeededChannelOutcome::Seeded { channel, post_id });
+                    }
+                    Ok(false) => {
+                        // Lost a race with another writer (e.g., post_message between
+                        // the pre-filter read and the record). Existing cursor wins
+                        // under the monotonic rule — surface nothing.
+                    }
+                    Err(err) => {
+                        persisted.push(chanvoy_core::SeededChannelOutcome::Failed {
+                            channel,
+                            reason: err.to_string(),
+                        });
+                    }
+                }
             }
-        };
-        let Some(latest) = head.last() else {
-            outcomes.push(chanvoy_core::SeededChannelOutcome::UnseededEmptyChannel {
-                channel: channel.name,
-            });
-            continue;
-        };
-        match record_channel_cursor_if_absent(state, &channel.name, &latest.id).await {
-            Ok(true) => {
-                newly_seeded.push(channel.name.clone());
-                outcomes.push(chanvoy_core::SeededChannelOutcome::Seeded {
-                    channel: channel.name,
-                    post_id: latest.id.clone(),
-                });
-            }
-            Ok(false) => {
-                // Lost a race with another writer (e.g., post_message between the pre-filter
-                // and the record). Treat as already-seeded; no new outcome to surface.
-            }
-            Err(err) => {
-                outcomes.push(chanvoy_core::SeededChannelOutcome::Failed {
-                    channel: channel.name,
-                    reason: err.to_string(),
-                });
-            }
+            other => persisted.push(other),
         }
     }
     if !newly_seeded.is_empty() {
@@ -965,7 +943,9 @@ async fn seed_cursors(state: &AppState) -> Result<chanvoy_core::SeedCursorsResul
             "chanvoy auto-setup seeded cursors"
         );
     }
-    Ok(chanvoy_core::SeedCursorsResult { outcomes })
+    Ok(chanvoy_core::SeedCursorsResult {
+        outcomes: persisted,
+    })
 }
 
 async fn unread_notifications(state: &AppState) -> Result<UnreadNotifications, CoreError> {
