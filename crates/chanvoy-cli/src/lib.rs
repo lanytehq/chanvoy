@@ -249,11 +249,19 @@ fn init_tracing() {
 }
 
 async fn execute(cli: Cli) -> Result<(), CliError> {
+    // auto-setup is the bootstrap / repair surface and must not depend on resolving
+    // an existing persisted profile — a malformed unrelated profile would otherwise
+    // block the very path meant to fix it. Dispatch before resolve_profile_name.
+    // The --profile flag (cli.profile) acts as an explicit name override for
+    // auto-setup; it is NOT resolved against the persisted profile set.
+    if let CommandSet::AutoSetup(args) = cli.command {
+        return handle_auto_setup(cli.json, cli.profile.as_deref(), args).await;
+    }
     let profile = resolve_profile_name(cli.profile.as_deref())?;
     match cli.command {
+        CommandSet::AutoSetup(_) => unreachable!("dispatched above"),
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
         CommandSet::Profile(command) => handle_profile(&profile, cli.json, command).await,
-        CommandSet::AutoSetup(args) => handle_auto_setup(cli.json, args).await,
         CommandSet::Whoami => print_identity(cli.json, &daemon_client(&profile).whoami().await?),
         CommandSet::Channels => {
             print_value(cli.json, &daemon_client(&profile).list_channels().await?)
@@ -553,8 +561,12 @@ async fn handle_profile(
     }
 }
 
-async fn handle_auto_setup(json: bool, args: AutoSetupArgs) -> Result<(), CliError> {
-    let desired = match build_desired_profile_from_env() {
+async fn handle_auto_setup(
+    json: bool,
+    profile_override: Option<&str>,
+    args: AutoSetupArgs,
+) -> Result<(), CliError> {
+    let desired = match build_desired_profile_from_env(profile_override) {
         Ok(profile) => profile,
         Err(err) => {
             print_auto_setup_error(json, "env_input", &err.to_string())?;
@@ -729,11 +741,15 @@ fn print_identity_drift_error(json: bool, diff: &[ProfileFieldDiff]) -> Result<(
     Ok(())
 }
 
-fn build_desired_profile_from_env() -> Result<Profile, CliError> {
+fn build_desired_profile_from_env(profile_override: Option<&str>) -> Result<Profile, CliError> {
     let role = required_env("LANYTE_AGENT_ROLE")?;
     let scope = required_env("LANYTE_AGENT_SCOPE")?;
     let server_url = required_env("LANYTE_MM_URL")?;
-    let name = env_var_nonempty("CHANVOY_PROFILE").unwrap_or_else(|| role.clone());
+    // Precedence: explicit --profile flag > CHANVOY_PROFILE env > role-derived default.
+    let name = profile_override
+        .map(ToString::to_string)
+        .or_else(|| env_var_nonempty("CHANVOY_PROFILE"))
+        .unwrap_or_else(|| role.clone());
     let team_name = derive_team_name(&scope);
 
     let profile = Profile {
@@ -753,7 +769,21 @@ fn build_desired_profile_from_env() -> Result<Profile, CliError> {
         ipc: None,
     };
     validate_profile_create_args(&profile)?;
+    // Missing credential is an env-input problem (exit 2), not a remote preflight
+    // failure (exit 3). Probe token availability here so the exit table matches
+    // the brief contract.
+    check_token_available(&profile)?;
     Ok(profile)
+}
+
+/// Probe the configured credential source for the token without returning its value.
+/// Missing / empty credential maps to `CliError::Bootstrap` so the caller exits as
+/// env-input (EXIT_ENV_INPUT). Other load errors (e.g., unreadable env_file) also
+/// map here since they are local contract failures.
+fn check_token_available(profile: &Profile) -> Result<(), CliError> {
+    load_token(profile).map(|_| ()).map_err(|err| {
+        CliError::Bootstrap(format!("token unavailable via {}: {err}", profile.env_name))
+    })
 }
 
 async fn validate_and_finalize_profile(mut profile: Profile) -> Result<Profile, CliError> {
@@ -1669,6 +1699,34 @@ mod tests {
         b.monitored_channels = vec!["chan-b".to_string()];
         assert!(refreshable_profile_diff(&a, &b).is_empty());
         assert!(identity_surface_diff(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn check_token_available_maps_missing_env_to_bootstrap() {
+        // devrev finding #2 (chanvoy#7): missing token env is an env-input failure
+        // (exit 2), not a remote preflight failure (exit 3). Pin the mapping.
+        let unique = "CHANVOY_UNSET_TOKEN_FOR_UNIT_TEST_98765_XYZ";
+        unsafe { env::remove_var(unique) };
+        let profile = Profile {
+            name: "test".to_string(),
+            role: "test".to_string(),
+            scope: "test".to_string(),
+            provider: Provider::Mattermost,
+            bot_username: String::new(),
+            team_name: "t".to_string(),
+            server_url: "https://mm.example.com".to_string(),
+            env_name: unique.to_string(),
+            env_file: None,
+            credential_mode: CredentialMode::EnvName,
+            capability_class: CapabilityClass::Standard,
+            monitored_channels: Vec::new(),
+            ipc: None,
+        };
+        let err = check_token_available(&profile).expect_err("must fail when env unset");
+        assert!(
+            matches!(err, CliError::Bootstrap(_)),
+            "expected Bootstrap (maps to EXIT_ENV_INPUT), got {err:?}"
+        );
     }
 
     #[test]
