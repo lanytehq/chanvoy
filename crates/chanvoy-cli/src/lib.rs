@@ -4,10 +4,11 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    list_profiles, load_active_profile, load_token, store_active_profile, store_profile,
-    CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus, DmConversation, Identity,
-    MattermostClient, Message, Notification, PostReceipt, Profile, ProfileStatus, Provider,
-    SeedCursorsResult, SeededChannelOutcome, UnreadNotifications, WaitResult, DEFAULT_TEAM,
+    list_profiles, load_active_profile, load_token, socket_path_for_profile, store_active_profile,
+    store_profile, CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus,
+    DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt, Profile,
+    ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
+    WaitResult, DEFAULT_TEAM,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -842,19 +843,34 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
     Err(DaemonError::NotRunning(profile.to_string()).into())
 }
 
-/// Stop the daemon if it is running, and wait until its socket is actually gone
+/// Stop the daemon if it is present, and wait until its socket is actually gone
 /// so the caller's subsequent ensure_daemon_running spawns a fresh instance.
-/// No-op if the daemon is not running. Used on the Refresh path so that
-/// refreshed profile fields (token env, capability_class) actually take effect.
+/// Used on the Refresh path so that refreshed profile fields (token env,
+/// credential_mode, capability_class) and rotated tokens actually take effect.
+///
+/// **Daemon presence is detected via socket file existence, not via `ping()`.**
+/// `ping()` is the `daemon_status` RPC which internally calls `whoami()` against
+/// Mattermost (`chanvoy-daemon::dispatch_request`, "daemon_status" arm). A daemon
+/// running with a revoked credential — the exact scenario that motivates a
+/// token-rotation refresh — fails ping while being very much alive. Falling back
+/// to socket existence ensures the stop path catches those zombies.
+///
+/// The daemon's `shutdown` RPC is handled locally (no Mattermost calls) so it
+/// works even when `whoami()` is failing. A stale socket (process already gone)
+/// surfaces as `DaemonError::NotRunning` from `stop()`; that is treated as
+/// no-op since the next `daemon::start()` cleans up the stale socket.
 async fn stop_daemon_for_refresh(profile: &str) -> Result<(), CliError> {
-    if ping(profile).await.is_err() {
+    let socket = socket_path_for_profile(profile);
+    if !socket.exists() {
         return Ok(());
     }
-    // Best-effort shutdown RPC; ignore transport errors here because the poll
-    // loop below is the authoritative check.
-    let _ = stop(profile).await;
+    match stop(profile).await {
+        Ok(_) => {}
+        Err(DaemonError::NotRunning(_)) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    }
     for _ in 0..20 {
-        if ping(profile).await.is_err() {
+        if !socket_path_for_profile(profile).exists() {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
