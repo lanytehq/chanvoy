@@ -3,7 +3,7 @@ MSRV := $(shell awk -F\" '/^rust-version =/ {print $$2; exit}' Cargo.toml)
 GONEAT_FMT := @if command -v goneat >/dev/null 2>&1; then goneat format --types yaml,json,markdown --folders . --finalize-eof --quiet; else echo "goneat not found; skipping non-Rust formatting"; fi
 GONEAT_ASSESS := @if command -v goneat >/dev/null 2>&1; then goneat assess . --categories lint --check; else echo "goneat not found; skipping goneat assess"; fi
 
-.PHONY: all clean check fmt quality test build ensure-msrv msrv precommit prepush pr-final
+.PHONY: all clean check fmt quality test test-integration build ensure-msrv msrv precommit prepush pr-final
 
 all: check
 
@@ -14,6 +14,9 @@ check:
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace --all-targets
+
+test-integration:
+	cargo test --package chanvoy --test restart_harness -- --ignored --nocapture
 
 fmt:
 	cargo fmt
@@ -44,6 +47,7 @@ pr-final: ensure-msrv
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace --all-targets
+	cargo test --package chanvoy --test restart_harness -- --ignored
 	cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] pr-final gate passed"
 

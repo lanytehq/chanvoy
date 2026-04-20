@@ -158,7 +158,12 @@ name = "chanvoy"
 version = "0.1.0"
 dependencies = [
  "chanvoy-cli",
+ "chanvoy-core",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "toml",
+ "wiremock",
 ]
 
 [[package]]

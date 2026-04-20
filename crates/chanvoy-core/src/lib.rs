@@ -546,12 +546,24 @@ pub fn default_profile_dir() -> PathBuf {
 }
 
 pub fn default_chanvoy_config_dir() -> PathBuf {
+    // `CHANVOY_CONFIG_DIR` is an explicit override used by the integration test
+    // harness for cross-platform isolation (the `dirs` crate does not honor
+    // XDG_CONFIG_HOME on macOS), and available to operators on non-standard
+    // systems. When unset, fall through to the platform-conventional location.
+    if let Some(dir) = env::var_os("CHANVOY_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("lanytehq/chanvoy")
 }
 
 pub fn default_runtime_dir() -> PathBuf {
+    // `CHANVOY_RUNTIME_DIR` mirrors the config-dir override for symmetry.
+    // Otherwise prefer XDG_RUNTIME_DIR, then dirs::runtime_dir, then temp_dir.
+    if let Some(dir) = env::var_os("CHANVOY_RUNTIME_DIR") {
+        return PathBuf::from(dir);
+    }
     env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .or_else(dirs::runtime_dir)
