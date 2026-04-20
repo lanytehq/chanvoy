@@ -568,6 +568,10 @@ async fn dispatch_request(
             }
             Err(e) => Err(DaemonError::from(e)),
         },
+        "seed_cursors" => seed_cursors(state)
+            .await
+            .map(to_value)
+            .map_err(DaemonError::from),
         "shutdown" => {
             if let Some(sender) = shutdown_tx.lock().await.take() {
                 let _ = sender.send(());
@@ -870,6 +874,80 @@ async fn record_notifications_cursor(
     Ok(())
 }
 
+/// Record a channel cursor only if none already exists for that channel.
+/// Returns true if the cursor was written (channel was unseeded). Monotonic
+/// guard — PER-009 seed pass must never clobber an existing anchor.
+async fn record_channel_cursor_if_absent(
+    state: &AppState,
+    channel: &str,
+    post_id: &str,
+) -> Result<bool, CoreError> {
+    let mut attention = state.attention_state.lock().await;
+    if attention.channels.contains_key(channel) {
+        return Ok(false);
+    }
+    attention.channels.insert(
+        channel.to_string(),
+        chanvoy_core::ChannelCursorState {
+            last_seen_post_id: Some(post_id.to_string()),
+            updated_at: Some(chanvoy_core::now_unix_millis()),
+        },
+    );
+    store_attention_state(&state.profile.name, &attention)?;
+    Ok(true)
+}
+
+/// Seed cursors for bot-member channels that do not yet have a stored cursor.
+/// Implements PER-009 option (b): seed only on explicit auto-setup, never clobber,
+/// leave empty channels explicitly unseeded, surface per-channel failures.
+async fn seed_cursors(state: &AppState) -> Result<chanvoy_core::SeedCursorsResult, CoreError> {
+    let existing: std::collections::BTreeSet<String> = {
+        let attention = state.attention_state.lock().await;
+        attention.channels.keys().cloned().collect()
+    };
+    // Enumeration + HEAD fetch lives in chanvoy_core for wiremock-testable isolation.
+    // This wrapper serializes writes through the attention-state mutex and filters
+    // post_message races via the no-clobber helper.
+    let outcomes = chanvoy_core::compute_seed_outcomes(&state.client, &existing).await?;
+    let mut persisted: Vec<chanvoy_core::SeededChannelOutcome> = Vec::new();
+    let mut newly_seeded: Vec<String> = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            chanvoy_core::SeededChannelOutcome::Seeded { channel, post_id } => {
+                match record_channel_cursor_if_absent(state, &channel, &post_id).await {
+                    Ok(true) => {
+                        newly_seeded.push(channel.clone());
+                        persisted
+                            .push(chanvoy_core::SeededChannelOutcome::Seeded { channel, post_id });
+                    }
+                    Ok(false) => {
+                        // Lost a race with another writer (e.g., post_message between
+                        // the pre-filter read and the record). Existing cursor wins
+                        // under the monotonic rule — surface nothing.
+                    }
+                    Err(err) => {
+                        persisted.push(chanvoy_core::SeededChannelOutcome::Failed {
+                            channel,
+                            reason: err.to_string(),
+                        });
+                    }
+                }
+            }
+            other => persisted.push(other),
+        }
+    }
+    if !newly_seeded.is_empty() {
+        info!(
+            profile = %state.profile.name,
+            channels = ?newly_seeded,
+            "chanvoy auto-setup seeded cursors"
+        );
+    }
+    Ok(chanvoy_core::SeedCursorsResult {
+        outcomes: persisted,
+    })
+}
+
 async fn unread_notifications(state: &AppState) -> Result<UnreadNotifications, CoreError> {
     let anchor = {
         let attention = state.attention_state.lock().await;
@@ -1108,6 +1186,10 @@ impl DaemonClient {
 
     pub async fn daemon_status(&self) -> Result<DaemonStatus, DaemonError> {
         self.call("daemon_status", serde_json::json!({})).await
+    }
+
+    pub async fn seed_cursors(&self) -> Result<chanvoy_core::SeedCursorsResult, DaemonError> {
+        self.call("seed_cursors", serde_json::json!({})).await
     }
 
     pub async fn shutdown(&self) -> Result<ShutdownResult, DaemonError> {

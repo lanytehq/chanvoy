@@ -335,6 +335,69 @@ pub struct CheckResult {
     pub newest_post_id: Option<String>,
 }
 
+/// Per-channel outcome of a seed-cursors pass. See PER-009 / #per-009 for the contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SeededChannelOutcome {
+    Seeded { channel: String, post_id: String },
+    UnseededEmptyChannel { channel: String },
+    Failed { channel: String, reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SeedCursorsResult {
+    pub outcomes: Vec<SeededChannelOutcome>,
+}
+
+/// Enumerate bot memberships and compute the per-channel seed outcome for PER-009
+/// option (b). Writes are the caller's responsibility — typically the daemon, which
+/// serializes them under its attention-state mutex via a no-clobber helper.
+///
+/// - Returns `Seeded{channel, post_id}` for bot-member channels that had no entry in
+///   `existing_cursors` and whose latest post fetch succeeded.
+/// - Returns `UnseededEmptyChannel{channel}` for joined channels with zero posts
+///   (intentional absence, not a failure — does not degrade readiness).
+/// - Returns `Failed{channel, reason}` for per-channel HEAD-fetch errors. Does not
+///   abort the pass; degrades overall readiness when aggregated.
+/// - Skips DM (`D`) and group-DM (`G`) pseudo-channels; those are addressed via the
+///   mentions cursor.
+pub async fn compute_seed_outcomes(
+    client: &MattermostClient,
+    existing_cursors: &std::collections::BTreeSet<String>,
+) -> Result<Vec<SeededChannelOutcome>, CoreError> {
+    let channels = client.list_channels().await?;
+    let mut outcomes = Vec::new();
+    for channel in channels {
+        if channel.channel_type != "O" && channel.channel_type != "P" {
+            continue;
+        }
+        if existing_cursors.contains(&channel.name) {
+            continue;
+        }
+        let head = match client.latest_channel_messages_by_id(&channel.id, 1).await {
+            Ok(posts) => posts,
+            Err(err) => {
+                outcomes.push(SeededChannelOutcome::Failed {
+                    channel: channel.name,
+                    reason: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let Some(latest) = head.last() else {
+            outcomes.push(SeededChannelOutcome::UnseededEmptyChannel {
+                channel: channel.name,
+            });
+            continue;
+        };
+        outcomes.push(SeededChannelOutcome::Seeded {
+            channel: channel.name,
+            post_id: latest.id.clone(),
+        });
+    }
+    Ok(outcomes)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnreadNotifications {
     pub count: usize,
@@ -2409,5 +2472,288 @@ monitored_channels = ["per-003", "per-004"]
     fn is_auth_error_rejects_normal_event() {
         let frame = r#"{"event":"posted","data":{"post":"{}"}}"#;
         assert!(!is_auth_error(frame));
+    }
+
+    // ---- PER-009 wiremock integration tests ----
+    //
+    // Cover reviewer-named merge-gate paths at the MattermostClient + compute_seed_outcomes
+    // layer: invalid-token (401), team-missing (404), bot-not-in-team (403), preflight
+    // happy path, partial-seed (per-channel fetch failure), empty-channel-seed, monotonic
+    // skip of already-cursored channels, DM-channel skip.
+    //
+    // End-to-end coverage (daemon spawn, actual auto-setup exit codes) is intentionally
+    // deferred to a follow-up lifecycle harness (PER-008C expansion) — it requires
+    // binary-spawn infrastructure outside this PR's scope.
+
+    mod per_009_seed {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn test_profile(server_url: &str) -> Profile {
+            Profile {
+                name: "bravo-devlead".to_string(),
+                role: "bravo-devlead".to_string(),
+                scope: "lanytehq".to_string(),
+                provider: Provider::Mattermost,
+                bot_username: "agent-bravo-devlead".to_string(),
+                team_name: "org-lanytehq".to_string(),
+                server_url: server_url.to_string(),
+                env_name: "LANYTE_MM_TOKEN".to_string(),
+                env_file: None,
+                credential_mode: CredentialMode::EnvName,
+                capability_class: CapabilityClass::Standard,
+                monitored_channels: Vec::new(),
+                ipc: None,
+            }
+        }
+
+        async fn mock_whoami(server: &MockServer, status: u16) {
+            let response = if status == 200 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "bot-id-123",
+                    "username": "agent-bravo-devlead",
+                    "is_bot": true,
+                    "nickname": null,
+                    "email": null,
+                }))
+            } else {
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "status_code": status,
+                    "message": "mock error",
+                }))
+            };
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me"))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+
+        async fn mock_team(server: &MockServer, team_name: &str, status: u16) {
+            let response = if status == 200 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "team-id-456",
+                    "name": team_name,
+                }))
+            } else {
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "status_code": status,
+                    "message": "mock team error",
+                }))
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v4/teams/name/{team_name}")))
+                .respond_with(response)
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn preflight_401_surfaces_as_api_unauthorized() {
+            let server = MockServer::start().await;
+            mock_whoami(&server, 401).await;
+
+            let client =
+                MattermostClient::new(&test_profile(&server.uri()), "bad-token".into()).unwrap();
+            let err = client.whoami().await.expect_err("whoami must fail on 401");
+            match err {
+                CoreError::Api { status, .. } => assert_eq!(status.as_u16(), 401),
+                other => panic!("expected Api{{401}}, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn preflight_team_404_surfaces_as_api_not_found() {
+            let server = MockServer::start().await;
+            mock_whoami(&server, 200).await;
+            mock_team(&server, "org-lanytehq", 404).await;
+
+            let client =
+                MattermostClient::new(&test_profile(&server.uri()), "token".into()).unwrap();
+            let err = client
+                .validate_team_access()
+                .await
+                .expect_err("validate_team_access must fail when team missing");
+            match err {
+                CoreError::Api { status, .. } => assert_eq!(status.as_u16(), 404),
+                other => panic!("expected Api{{404}}, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn preflight_team_403_surfaces_as_api_forbidden() {
+            let server = MockServer::start().await;
+            mock_whoami(&server, 200).await;
+            mock_team(&server, "org-lanytehq", 403).await;
+
+            let client =
+                MattermostClient::new(&test_profile(&server.uri()), "token".into()).unwrap();
+            let err = client
+                .validate_team_access()
+                .await
+                .expect_err("validate_team_access must fail when bot not in team");
+            match err {
+                CoreError::Api { status, .. } => assert_eq!(status.as_u16(), 403),
+                other => panic!("expected Api{{403}}, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn preflight_happy_path_validates_team_access() {
+            let server = MockServer::start().await;
+            mock_whoami(&server, 200).await;
+            mock_team(&server, "org-lanytehq", 200).await;
+
+            let client =
+                MattermostClient::new(&test_profile(&server.uri()), "token".into()).unwrap();
+            client.whoami().await.unwrap();
+            client.validate_team_access().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn compute_seed_outcomes_mixed_channels() {
+            let server = MockServer::start().await;
+            mock_whoami(&server, 200).await;
+            mock_team(&server, "org-lanytehq", 200).await;
+
+            // /users/me/teams/{team_id}/channels -> three team channels plus one DM
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me/teams/team-id-456/channels"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "ch-public-seeded", "name": "bravo-team", "display_name": "Bravo", "type": "O"},
+                    {"id": "ch-private-empty", "name": "per-009-private", "display_name": "PER-009", "type": "P"},
+                    {"id": "ch-public-failed", "name": "flaky-channel", "display_name": "Flaky", "type": "O"},
+                    {"id": "ch-dm", "name": "dm-channel", "display_name": "", "type": "D"},
+                ])))
+                .mount(&server)
+                .await;
+            // Seeded channel returns a head post.
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch-public-seeded/posts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "posts": {
+                        "post-head-xyz": {
+                            "id": "post-head-xyz",
+                            "user_id": "user-1",
+                            "message": "hi",
+                            "create_at": 1_776_000_000_000_i64,
+                            "username": "user-1",
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+            // Empty channel returns zero posts.
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch-private-empty/posts"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "posts": {} })),
+                )
+                .mount(&server)
+                .await;
+            // Flaky channel fails HEAD fetch.
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch-public-failed/posts"))
+                .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "status_code": 500,
+                    "message": "upstream error",
+                })))
+                .mount(&server)
+                .await;
+
+            let client =
+                MattermostClient::new(&test_profile(&server.uri()), "token".into()).unwrap();
+            let existing = std::collections::BTreeSet::new();
+            let outcomes = compute_seed_outcomes(&client, &existing).await.unwrap();
+
+            // DM channel must be skipped entirely — not present in outcomes.
+            assert!(!outcomes
+                .iter()
+                .any(|o| matches!(o, SeededChannelOutcome::Seeded { channel, .. } if channel == "dm-channel")));
+
+            let seeded: Vec<_> = outcomes
+                .iter()
+                .filter_map(|o| match o {
+                    SeededChannelOutcome::Seeded { channel, post_id } => {
+                        Some((channel.as_str(), post_id.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(seeded, vec![("bravo-team", "post-head-xyz")]);
+
+            let empty: Vec<_> = outcomes
+                .iter()
+                .filter_map(|o| match o {
+                    SeededChannelOutcome::UnseededEmptyChannel { channel } => {
+                        Some(channel.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(empty, vec!["per-009-private"]);
+
+            let failed: Vec<_> = outcomes
+                .iter()
+                .filter_map(|o| match o {
+                    SeededChannelOutcome::Failed { channel, .. } => Some(channel.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(failed, vec!["flaky-channel"]);
+        }
+
+        #[tokio::test]
+        async fn compute_seed_outcomes_skips_already_cursored_channels() {
+            // Monotonic guarantee at the enumeration layer: a channel that already has a
+            // stored cursor must not appear in outcomes (the daemon's write-side
+            // if-absent guard is defense-in-depth, not the primary mechanism).
+            let server = MockServer::start().await;
+            mock_whoami(&server, 200).await;
+            mock_team(&server, "org-lanytehq", 200).await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me/teams/team-id-456/channels"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "ch-existing", "name": "bravo-team", "display_name": "Bravo", "type": "O"},
+                    {"id": "ch-new", "name": "per-009", "display_name": "PER-009", "type": "O"},
+                ])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch-new/posts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "posts": {
+                        "post-new": {
+                            "id": "post-new",
+                            "user_id": "u",
+                            "message": "x",
+                            "create_at": 1_776_000_000_000_i64,
+                            "username": "u",
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+            // Intentionally no mock for ch-existing/posts — if seeder fetched HEAD there,
+            // the test fails (wiremock returns 404 for unmocked paths, surfacing as Failed).
+
+            let client =
+                MattermostClient::new(&test_profile(&server.uri()), "token".into()).unwrap();
+            let mut existing = std::collections::BTreeSet::new();
+            existing.insert("bravo-team".to_string());
+            let outcomes = compute_seed_outcomes(&client, &existing).await.unwrap();
+
+            let channels: Vec<_> = outcomes
+                .iter()
+                .map(|o| match o {
+                    SeededChannelOutcome::Seeded { channel, .. }
+                    | SeededChannelOutcome::UnseededEmptyChannel { channel }
+                    | SeededChannelOutcome::Failed { channel, .. } => channel.as_str(),
+                })
+                .collect();
+            assert_eq!(channels, vec!["per-009"]);
+        }
     }
 }

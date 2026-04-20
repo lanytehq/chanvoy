@@ -29,7 +29,7 @@ Check with `echo $LANYTE_AGENT_ROLE $LANYTE_AGENT_SCOPE $LANYTE_AGENT_TEAM` befo
 - This repo is the Mattermost/chat bridge peer for the Lanyte platform.
 - This repo is standalone. Do not add dependencies on crates in the lanyte workspace.
 - Use feature branches and PRs; no direct pushes to `main`.
-- Keep Rust MSRV at `1.85.0` and avoid nightly features.
+- Keep Rust MSRV at `1.89.0` and avoid nightly features.
 - Follow the agentic attribution format from dev-warmup.md §5 (email: `noreply@lanytehq.dev`).
 
 ## Attribution

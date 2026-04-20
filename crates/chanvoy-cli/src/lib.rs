@@ -4,10 +4,11 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    list_profiles, load_active_profile, load_token, store_active_profile, store_profile,
-    CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus, DmConversation, Identity,
-    MattermostClient, Message, Notification, PostReceipt, Profile, ProfileStatus, Provider,
-    UnreadNotifications, WaitResult, DEFAULT_TEAM,
+    list_profiles, load_active_profile, load_token, socket_path_for_profile, store_active_profile,
+    store_profile, CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus,
+    DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt, Profile,
+    ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
+    WaitResult, DEFAULT_TEAM,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -63,6 +64,16 @@ enum CommandSet {
     Wait(WaitArgs),
     #[command(subcommand)]
     Channel(ChannelCommand),
+    /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
+    AutoSetup(AutoSetupArgs),
+}
+
+#[derive(Debug, Args)]
+struct AutoSetupArgs {
+    /// Do not set the resulting profile as active. Use when bootstrapping or repairing a
+    /// secondary profile without stealing active-profile resolution (multi-profile operators).
+    #[arg(long)]
+    no_activate: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -239,8 +250,17 @@ fn init_tracing() {
 }
 
 async fn execute(cli: Cli) -> Result<(), CliError> {
+    // auto-setup is the bootstrap / repair surface and must not depend on resolving
+    // an existing persisted profile — a malformed unrelated profile would otherwise
+    // block the very path meant to fix it. Dispatch before resolve_profile_name.
+    // The --profile flag (cli.profile) acts as an explicit name override for
+    // auto-setup; it is NOT resolved against the persisted profile set.
+    if let CommandSet::AutoSetup(args) = cli.command {
+        return handle_auto_setup(cli.json, cli.profile.as_deref(), args).await;
+    }
     let profile = resolve_profile_name(cli.profile.as_deref())?;
     match cli.command {
+        CommandSet::AutoSetup(_) => unreachable!("dispatched above"),
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
         CommandSet::Profile(command) => handle_profile(&profile, cli.json, command).await,
         CommandSet::Whoami => print_identity(cli.json, &daemon_client(&profile).whoami().await?),
@@ -540,6 +560,545 @@ async fn handle_profile(
             store_profile_and_maybe_activate(json, &profile, args.activate)
         }
     }
+}
+
+async fn handle_auto_setup(
+    json: bool,
+    profile_override: Option<&str>,
+    args: AutoSetupArgs,
+) -> Result<(), CliError> {
+    let desired = match build_desired_profile_from_env(profile_override) {
+        Ok(profile) => profile,
+        Err(err) => {
+            print_auto_setup_error(json, "env_input", &err.to_string())?;
+            process::exit(EXIT_ENV_INPUT);
+        }
+    };
+
+    let existing = match chanvoy_core::load_profile(&desired.name) {
+        Ok(existing) => Some(existing),
+        Err(chanvoy_core::CoreError::ProfileNotFound(_)) => None,
+        Err(err) => return Err(err.into()),
+    };
+
+    let action = decide_profile_action(&desired, existing.as_ref());
+    let (profile_state, persisted_profile, refresh_diff) = match action {
+        ProfileAction::Create => {
+            let validated = match validate_and_finalize_profile(desired).await {
+                Ok(profile) => profile,
+                Err(err) => return exit_on_preflight(json, err),
+            };
+            store_profile(&validated)?;
+            (ProfileState::Created, validated, Vec::new())
+        }
+        ProfileAction::Refresh(diff) => {
+            let existing = existing.clone().expect("Refresh implies existing profile");
+            let merged = merge_forward_for_refresh(desired, &existing);
+            let validated = match validate_and_finalize_profile(merged).await {
+                Ok(profile) => profile,
+                Err(err) => return exit_on_preflight(json, err),
+            };
+            store_profile(&validated)?;
+            // A running daemon holds Profile + token in-memory from the last start
+            // (`chanvoy-daemon::start`). Refresh writes to disk but the live daemon
+            // keeps its stale copy, so env_name / credential_mode / capability_class
+            // changes — and crucially a rotated token — would not take effect until
+            // an unrelated restart. Stop the daemon if present (even when healthy)
+            // so the subsequent `ensure_daemon_running` spawns a fresh one against
+            // the updated profile. The Reuse path gets analogous zombie protection
+            // inside `ensure_daemon_running` itself.
+            if let Err(err) = stop_daemon_if_present(&validated.name).await {
+                print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
+                process::exit(EXIT_DAEMON_FAILED);
+            }
+            (ProfileState::Refreshed, validated, diff)
+        }
+        ProfileAction::Reuse => {
+            let existing = existing.expect("Reuse implies existing profile");
+            // AC #3 (amended brief): team/token validation must happen against
+            // the *current* env credential before reporting success, on every
+            // path including Reuse. Without this, a token rotated in place
+            // under the same env var name would be unobserved and the report
+            // would claim success based purely on token-source presence from
+            // `check_token_available`, never proving the token actually works
+            // for the configured team.
+            let validated = match validate_and_finalize_profile(existing.clone()).await {
+                Ok(profile) => profile,
+                Err(err) => return exit_on_preflight(json, err),
+            };
+            // If the env credential now authenticates as a different bot than
+            // the persisted profile, the running daemon (if any) is holding a
+            // token for a different identity. Promote to a refresh-style
+            // reload so the daemon uses the env-current credential and the
+            // stored profile reflects reality. bot_username drift on a Reuse
+            // is not classified as EXIT_IDENTITY_DRIFT because the brief lists
+            // bot_username as "derived / ignored for drift" at the
+            // decide_profile_action phase; treating a post-whoami change as a
+            // surfaced refresh is consistent with that rule.
+            if validated.bot_username != existing.bot_username {
+                store_profile(&validated)?;
+                if let Err(err) = stop_daemon_if_present(&validated.name).await {
+                    print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
+                    process::exit(EXIT_DAEMON_FAILED);
+                }
+                let diff = vec![ProfileFieldDiff {
+                    field: "bot_username".to_string(),
+                    from: existing.bot_username.clone(),
+                    to: validated.bot_username.clone(),
+                }];
+                (ProfileState::Refreshed, validated, diff)
+            } else {
+                (ProfileState::Reused, validated, Vec::new())
+            }
+        }
+        ProfileAction::IdentityDrift(diff) => {
+            print_identity_drift_error(json, &diff)?;
+            process::exit(EXIT_IDENTITY_DRIFT);
+        }
+    };
+
+    let activate_requested = !args.no_activate;
+    let active_before = load_active_profile()?;
+    let is_active_now = match active_before.as_deref() {
+        Some(name) if name == persisted_profile.name => true,
+        _ if activate_requested => {
+            store_active_profile(&persisted_profile.name)?;
+            true
+        }
+        _ => false,
+    };
+
+    let daemon_state = match ensure_daemon_running(&persisted_profile.name).await {
+        Ok(state) => state,
+        Err(err) => {
+            print_auto_setup_error(json, "daemon_start", &err.to_string())?;
+            process::exit(EXIT_DAEMON_FAILED);
+        }
+    };
+
+    let seed_outcomes: Vec<SeedOutcome> = match daemon_client(&persisted_profile.name)
+        .seed_cursors()
+        .await
+    {
+        Ok(SeedCursorsResult { outcomes }) => outcomes.into_iter().map(SeedOutcome::from).collect(),
+        Err(DaemonError::NotRunning(_)) => {
+            // Daemon died between the health check and the seed RPC. This is a
+            // daemon health failure (exit 4), not a per-channel seed problem
+            // (exit 1). auto-setup's contract requires a healthy daemon at the
+            // point of success — soft-degraded would mask the collapse.
+            print_auto_setup_error(
+                json,
+                "daemon_unreachable",
+                "daemon socket unavailable during seed_cursors RPC — daemon exited after the health check",
+            )?;
+            process::exit(EXIT_DAEMON_FAILED);
+        }
+        Err(err) => {
+            // Other failures (upstream Mattermost errors during enumeration,
+            // serialization issues) surface as a single synthetic seed failure.
+            // Profile is still coherent; readiness flips to degraded (exit 1).
+            vec![SeedOutcome::Failed {
+                channel: "<membership-enumeration>".to_string(),
+                reason: err.to_string(),
+            }]
+        }
+    };
+    let degraded = seed_outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, SeedOutcome::Failed { .. }));
+
+    let report = AutoSetupReport {
+        profile_name: persisted_profile.name.clone(),
+        bot_username: persisted_profile.bot_username.clone(),
+        profile_state,
+        daemon_state,
+        is_active: is_active_now,
+        refresh_diff,
+        seed_outcomes,
+        degraded,
+    };
+
+    print_auto_setup_report(json, &report)?;
+    if degraded {
+        process::exit(EXIT_SOFT_DEGRADED);
+    }
+    Ok(())
+}
+
+const EXIT_SOFT_DEGRADED: i32 = 1;
+const EXIT_ENV_INPUT: i32 = 2;
+const EXIT_PREFLIGHT_FAILED: i32 = 3;
+const EXIT_DAEMON_FAILED: i32 = 4;
+const EXIT_IDENTITY_DRIFT: i32 = 5;
+
+fn exit_on_preflight(json: bool, err: CliError) -> Result<(), CliError> {
+    let (code, message) = classify_preflight_error(&err);
+    print_auto_setup_error(json, code, &message)?;
+    process::exit(EXIT_PREFLIGHT_FAILED);
+}
+
+fn classify_preflight_error(err: &CliError) -> (&'static str, String) {
+    if let CliError::Core(chanvoy_core::CoreError::Api { status, message }) = err {
+        let code = match status.as_u16() {
+            401 => "token_invalid",
+            403 => "bot_not_in_team",
+            404 => "team_missing",
+            _ => "preflight_failed",
+        };
+        return (code, format!("{status}: {message}"));
+    }
+    ("preflight_failed", err.to_string())
+}
+
+fn merge_forward_for_refresh(mut desired: Profile, existing: &Profile) -> Profile {
+    // Non-env-owned fields survive refresh to avoid wiping operator-configured state
+    // (monitored_channels, IPC config, env_file). Env-owned fields come from `desired`.
+    desired.monitored_channels = existing.monitored_channels.clone();
+    desired.ipc = existing.ipc.clone();
+    if desired.env_file.is_none() && existing.env_file.is_some() {
+        desired.env_file = existing.env_file.clone();
+    }
+    desired
+}
+
+fn print_auto_setup_error(json: bool, code: &str, message: &str) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error_code": code,
+                "message": message,
+            }))?
+        );
+    } else {
+        eprintln!("{code}: {message}");
+    }
+    Ok(())
+}
+
+fn print_identity_drift_error(json: bool, diff: &[ProfileFieldDiff]) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "error_code": "identity_drift",
+                "message": "persisted profile identity does not match env-derived identity; refusing silent refresh",
+                "drift": diff,
+                "recovery": "resolve the mismatch (correct the env, or rename/remove the persisted profile), then re-run auto-setup",
+            }))?
+        );
+    } else {
+        eprintln!("identity_drift: persisted profile identity does not match env-derived identity");
+        for field in diff {
+            eprintln!(
+                "  * {}: persisted={} env={}",
+                field.field, field.from, field.to
+            );
+        }
+        eprintln!(
+            "recovery: resolve the mismatch (correct the env, or rename/remove the persisted profile), then re-run auto-setup"
+        );
+    }
+    Ok(())
+}
+
+fn build_desired_profile_from_env(profile_override: Option<&str>) -> Result<Profile, CliError> {
+    let role = required_env("LANYTE_AGENT_ROLE")?;
+    let scope = required_env("LANYTE_AGENT_SCOPE")?;
+    let server_url = required_env("LANYTE_MM_URL")?;
+    // Precedence: explicit --profile flag > CHANVOY_PROFILE env > role-derived default.
+    let name = profile_override
+        .map(ToString::to_string)
+        .or_else(|| env_var_nonempty("CHANVOY_PROFILE"))
+        .unwrap_or_else(|| role.clone());
+    let team_name = derive_team_name(&scope);
+
+    let profile = Profile {
+        name,
+        role,
+        scope,
+        provider: Provider::Mattermost,
+        bot_username: String::new(),
+        team_name,
+        server_url,
+        env_name: env_var_nonempty("CHANVOY_TOKEN_ENV_NAME")
+            .unwrap_or_else(|| "LANYTE_MM_TOKEN".to_string()),
+        env_file: None,
+        credential_mode: CredentialMode::EnvName,
+        capability_class: CapabilityClass::Standard,
+        monitored_channels: Vec::new(),
+        ipc: None,
+    };
+    validate_profile_create_args(&profile)?;
+    // Missing credential is an env-input problem (exit 2), not a remote preflight
+    // failure (exit 3). Probe token availability here so the exit table matches
+    // the brief contract.
+    check_token_available(&profile)?;
+    Ok(profile)
+}
+
+/// Probe the configured credential source for the token without returning its value.
+/// Missing / empty credential maps to `CliError::Bootstrap` so the caller exits as
+/// env-input (EXIT_ENV_INPUT). Other load errors (e.g., unreadable env_file) also
+/// map here since they are local contract failures.
+fn check_token_available(profile: &Profile) -> Result<(), CliError> {
+    load_token(profile).map(|_| ()).map_err(|err| {
+        CliError::Bootstrap(format!("token unavailable via {}: {err}", profile.env_name))
+    })
+}
+
+async fn validate_and_finalize_profile(mut profile: Profile) -> Result<Profile, CliError> {
+    let token = load_token(&profile)?;
+    let client = MattermostClient::new(&profile, token)?;
+    let identity = client.whoami().await?;
+    client.validate_team_access().await?;
+    profile.bot_username = identity.username;
+    Ok(profile)
+}
+
+async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
+    if ping(profile).await.is_ok() {
+        return Ok(DaemonState::AlreadyRunning);
+    }
+    // `ping()` failing does not mean the daemon is absent — it is the
+    // `daemon_status` RPC, which calls `whoami()` against Mattermost, so a
+    // running daemon with a revoked / invalid token fails ping while still
+    // holding the socket. Blindly spawning here would leave that zombie
+    // alive while a fresh daemon bound to the same profile — the
+    // two-daemons-one-profile condition secrev F5 and devrev flagged.
+    //
+    // Call stop_daemon_if_present before spawning; it short-circuits when no
+    // socket exists (normal cold-start case), and issues a local shutdown
+    // RPC (independent of Mattermost health) when one does.
+    stop_daemon_if_present(profile).await?;
+    let exe = std::env::current_exe()?;
+    Command::new(exe)
+        .arg("--profile")
+        .arg(profile)
+        .arg("daemon")
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    for _ in 0..20 {
+        if ping(profile).await.is_ok() {
+            return Ok(DaemonState::Started);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err(DaemonError::NotRunning(profile.to_string()).into())
+}
+
+/// Stop the daemon if it is present, and wait until its socket is actually gone
+/// so the caller's subsequent spawn lands on a clean slate.
+///
+/// **Daemon presence is detected via socket file existence, not via `ping()`.**
+/// `ping()` is the `daemon_status` RPC which internally calls `whoami()` against
+/// Mattermost (`chanvoy-daemon::dispatch_request`, "daemon_status" arm). A daemon
+/// running with a revoked credential fails ping while being very much alive.
+/// Falling back to socket existence ensures the stop path catches those zombies
+/// on both the Refresh path (explicit stop to force reload) and the Reuse path
+/// (invoked from ensure_daemon_running when ping fails).
+///
+/// The daemon's `shutdown` RPC is handled locally (no Mattermost calls) so it
+/// works even when `whoami()` is failing. A stale socket (process already gone)
+/// surfaces as `DaemonError::NotRunning` from `stop()`; that is treated as
+/// no-op since the next `daemon::start()` cleans up the stale socket.
+async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
+    let socket = socket_path_for_profile(profile);
+    if !socket.exists() {
+        return Ok(());
+    }
+    match stop(profile).await {
+        Ok(_) => {}
+        Err(DaemonError::NotRunning(_)) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    }
+    for _ in 0..20 {
+        if !socket_path_for_profile(profile).exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err(CliError::Bootstrap(format!(
+        "daemon for profile {profile} did not exit within 5s of shutdown request"
+    )))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProfileAction {
+    Create,
+    Refresh(Vec<ProfileFieldDiff>),
+    Reuse,
+    IdentityDrift(Vec<ProfileFieldDiff>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ProfileFieldDiff {
+    field: String,
+    from: String,
+    to: String,
+}
+
+fn decide_profile_action(desired: &Profile, existing: Option<&Profile>) -> ProfileAction {
+    let Some(existing) = existing else {
+        return ProfileAction::Create;
+    };
+    let identity_diff = identity_surface_diff(existing, desired);
+    if !identity_diff.is_empty() {
+        return ProfileAction::IdentityDrift(identity_diff);
+    }
+    let refreshable_diff = refreshable_profile_diff(existing, desired);
+    if refreshable_diff.is_empty() {
+        ProfileAction::Reuse
+    } else {
+        ProfileAction::Refresh(refreshable_diff)
+    }
+}
+
+/// Fields that define WHO this profile is talking as and WHERE. Any change here must
+/// hard-error (exit 5) — silent refresh would let one persisted attention state slide
+/// across identities.
+fn identity_surface_diff(from: &Profile, to: &Profile) -> Vec<ProfileFieldDiff> {
+    let mut diff = Vec::new();
+    push_if_diff(&mut diff, "role", &from.role, &to.role);
+    push_if_diff(&mut diff, "scope", &from.scope, &to.scope);
+    push_if_diff(&mut diff, "server_url", &from.server_url, &to.server_url);
+    push_if_diff(&mut diff, "team_name", &from.team_name, &to.team_name);
+    diff
+}
+
+/// Fields that are safely refreshable on env change.
+fn refreshable_profile_diff(from: &Profile, to: &Profile) -> Vec<ProfileFieldDiff> {
+    let mut diff = Vec::new();
+    push_if_diff(&mut diff, "env_name", &from.env_name, &to.env_name);
+    push_if_diff(
+        &mut diff,
+        "credential_mode",
+        &format!("{:?}", from.credential_mode),
+        &format!("{:?}", to.credential_mode),
+    );
+    push_if_diff(
+        &mut diff,
+        "capability_class",
+        &format!("{:?}", from.capability_class),
+        &format!("{:?}", to.capability_class),
+    );
+    // Excluded from all diffs: `name` (key), `bot_username` (derived from token),
+    // `monitored_channels`, `ipc`, `env_file`, `provider` (pass through via merge-forward).
+    diff
+}
+
+fn push_if_diff(diff: &mut Vec<ProfileFieldDiff>, field: &str, from: &str, to: &str) {
+    if from != to {
+        diff.push(ProfileFieldDiff {
+            field: field.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileState {
+    Created,
+    Refreshed,
+    Reused,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DaemonState {
+    AlreadyRunning,
+    Started,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SeedOutcome {
+    /// Cursor seeded to HEAD for a channel that had no stored anchor.
+    Seeded { channel: String, post_id: String },
+    /// Joined channel has no posts yet — explicitly left unseeded. Not a failure.
+    UnseededEmptyChannel { channel: String },
+    /// Seed attempt failed (membership enumeration error or per-channel HEAD fetch error).
+    /// Flips overall report to degraded.
+    Failed { channel: String, reason: String },
+}
+
+impl From<SeededChannelOutcome> for SeedOutcome {
+    fn from(outcome: SeededChannelOutcome) -> Self {
+        match outcome {
+            SeededChannelOutcome::Seeded { channel, post_id } => {
+                SeedOutcome::Seeded { channel, post_id }
+            }
+            SeededChannelOutcome::UnseededEmptyChannel { channel } => {
+                SeedOutcome::UnseededEmptyChannel { channel }
+            }
+            SeededChannelOutcome::Failed { channel, reason } => {
+                SeedOutcome::Failed { channel, reason }
+            }
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AutoSetupReport {
+    profile_name: String,
+    bot_username: String,
+    profile_state: ProfileState,
+    daemon_state: DaemonState,
+    is_active: bool,
+    degraded: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    refresh_diff: Vec<ProfileFieldDiff>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    seed_outcomes: Vec<SeedOutcome>,
+}
+
+fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), CliError> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    // Short status lines first (narrow-terminal friendly per A5 / entarch #7).
+    let profile_line = match report.profile_state {
+        ProfileState::Created => format!("profile {} created", report.profile_name),
+        ProfileState::Refreshed => format!("profile {} refreshed", report.profile_name),
+        ProfileState::Reused => format!("profile {} reused", report.profile_name),
+    };
+    let daemon_line = match report.daemon_state {
+        DaemonState::AlreadyRunning => "daemon already running".to_string(),
+        DaemonState::Started => "daemon started".to_string(),
+    };
+    println!("{profile_line}");
+    println!("{daemon_line}");
+    println!("bot_username: {}", report.bot_username);
+    if report.is_active {
+        println!("active: {}", report.profile_name);
+    }
+    if report.degraded {
+        println!("status: degraded (see seed outcomes below)");
+    }
+    // Detail sections follow.
+    for field in &report.refresh_diff {
+        println!("  refresh {}: {} -> {}", field.field, field.from, field.to);
+    }
+    for outcome in &report.seed_outcomes {
+        match outcome {
+            SeedOutcome::Seeded { channel, post_id } => {
+                println!("  seeded: {channel} -> {post_id}")
+            }
+            SeedOutcome::UnseededEmptyChannel { channel } => {
+                println!("  unseeded: {channel} (empty channel)")
+            }
+            SeedOutcome::Failed { channel, reason } => {
+                println!("  seed_failed: {channel} ({reason})")
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_profile_name(profile: Option<&str>) -> Result<String, CliError> {
@@ -1149,5 +1708,151 @@ mod tests {
     fn unread_notifications_render_as_count_only() {
         let unread = UnreadNotifications { count: 4 };
         assert_eq!(unread.to_human_string(), "unread: 4");
+    }
+
+    fn sample_profile() -> Profile {
+        Profile {
+            name: "bravo-devlead".to_string(),
+            role: "bravo-devlead".to_string(),
+            scope: "lanytehq".to_string(),
+            provider: Provider::Mattermost,
+            bot_username: "agent-bravo-devlead".to_string(),
+            team_name: "org-lanytehq".to_string(),
+            server_url: "https://mm.example.com".to_string(),
+            env_name: "LANYTE_MM_TOKEN".to_string(),
+            env_file: None,
+            credential_mode: CredentialMode::EnvName,
+            capability_class: CapabilityClass::Standard,
+            monitored_channels: Vec::new(),
+            ipc: None,
+        }
+    }
+
+    #[test]
+    fn decide_profile_action_creates_when_absent() {
+        let desired = sample_profile();
+        assert_eq!(decide_profile_action(&desired, None), ProfileAction::Create);
+    }
+
+    #[test]
+    fn decide_profile_action_reuses_when_all_compared_fields_match() {
+        let desired = sample_profile();
+        let mut existing = sample_profile();
+        // Non-compared fields diverging must still Reuse.
+        existing.bot_username = "stale-username".to_string();
+        existing.monitored_channels = vec!["extra-channel".to_string()];
+        assert_eq!(
+            decide_profile_action(&desired, Some(&existing)),
+            ProfileAction::Reuse
+        );
+    }
+
+    #[test]
+    fn decide_profile_action_refreshes_on_refreshable_diff_only() {
+        let mut desired = sample_profile();
+        desired.env_name = "NEW_TOKEN_ENV".to_string();
+        let existing = sample_profile();
+        match decide_profile_action(&desired, Some(&existing)) {
+            ProfileAction::Refresh(diff) => {
+                assert_eq!(diff.len(), 1);
+                assert_eq!(diff[0].field, "env_name");
+            }
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_profile_action_hard_errors_on_identity_drift() {
+        let desired = sample_profile();
+        let mut existing = sample_profile();
+        existing.server_url = "https://old.example.com".to_string();
+        existing.team_name = "old-team".to_string();
+        match decide_profile_action(&desired, Some(&existing)) {
+            ProfileAction::IdentityDrift(diff) => {
+                let fields: Vec<&str> = diff.iter().map(|d| d.field.as_str()).collect();
+                assert!(fields.contains(&"server_url"));
+                assert!(fields.contains(&"team_name"));
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("expected IdentityDrift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_drift_takes_precedence_over_refreshable_diff() {
+        // When both identity and refreshable fields differ, IdentityDrift wins so the
+        // operator sees the hard-error rather than a silent refresh.
+        let mut desired = sample_profile();
+        desired.env_name = "NEW_TOKEN_ENV".to_string();
+        let mut existing = sample_profile();
+        existing.scope = "other-scope".to_string();
+        match decide_profile_action(&desired, Some(&existing)) {
+            ProfileAction::IdentityDrift(diff) => {
+                let fields: Vec<&str> = diff.iter().map(|d| d.field.as_str()).collect();
+                assert_eq!(fields, vec!["scope"]);
+            }
+            other => panic!("expected IdentityDrift, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refreshable_diff_excludes_identity_and_non_env_fields() {
+        let mut a = sample_profile();
+        let mut b = sample_profile();
+        a.name = "a-name".to_string();
+        b.name = "b-name".to_string();
+        a.bot_username = "bot-a".to_string();
+        b.bot_username = "bot-b".to_string();
+        a.monitored_channels = vec!["chan-a".to_string()];
+        b.monitored_channels = vec!["chan-b".to_string()];
+        assert!(refreshable_profile_diff(&a, &b).is_empty());
+        assert!(identity_surface_diff(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn check_token_available_maps_missing_env_to_bootstrap() {
+        // devrev finding #2 (chanvoy#7): missing token env is an env-input failure
+        // (exit 2), not a remote preflight failure (exit 3). Pin the mapping.
+        let unique = "CHANVOY_UNSET_TOKEN_FOR_UNIT_TEST_98765_XYZ";
+        unsafe { env::remove_var(unique) };
+        let profile = Profile {
+            name: "test".to_string(),
+            role: "test".to_string(),
+            scope: "test".to_string(),
+            provider: Provider::Mattermost,
+            bot_username: String::new(),
+            team_name: "t".to_string(),
+            server_url: "https://mm.example.com".to_string(),
+            env_name: unique.to_string(),
+            env_file: None,
+            credential_mode: CredentialMode::EnvName,
+            capability_class: CapabilityClass::Standard,
+            monitored_channels: Vec::new(),
+            ipc: None,
+        };
+        let err = check_token_available(&profile).expect_err("must fail when env unset");
+        assert!(
+            matches!(err, CliError::Bootstrap(_)),
+            "expected Bootstrap (maps to EXIT_ENV_INPUT), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn merge_forward_preserves_non_env_fields() {
+        // devrev item #3: refresh path must not wipe monitored_channels / ipc.
+        let mut existing = sample_profile();
+        existing.monitored_channels = vec!["per-008".to_string(), "per-009".to_string()];
+        existing.env_file = Some(PathBuf::from("/secrets/bravo.env"));
+        let mut desired = sample_profile();
+        desired.env_name = "REFRESHED_TOKEN_ENV".to_string();
+        // Desired comes from env — env does not populate monitored_channels or env_file.
+        assert!(desired.monitored_channels.is_empty());
+        assert_eq!(desired.env_file, None);
+
+        let merged = merge_forward_for_refresh(desired, &existing);
+        assert_eq!(merged.monitored_channels, existing.monitored_channels);
+        assert_eq!(merged.env_file, existing.env_file);
+        // Env-owned field still took the desired value.
+        assert_eq!(merged.env_name, "REFRESHED_TOKEN_ENV");
     }
 }
