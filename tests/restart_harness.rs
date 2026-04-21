@@ -429,43 +429,22 @@ async fn stop_daemon_cleanly(env: &TestEnv, mut child: Child) -> bool {
 /// as a test failure instead of a hang.
 async fn kill_daemon(mut child: Child) {
     let pid = child.id().expect("child pid present before kill");
-    let t0 = std::time::Instant::now();
-    let force_kill_result = sysprims_signal::force_kill(pid);
-    let t_force_kill = t0.elapsed();
-    if let Err(err) = force_kill_result {
+    if let Err(err) = sysprims_signal::force_kill(pid) {
         panic!("kill_daemon: sysprims force_kill({pid}) failed: {err}");
     }
-    // Probe OS-visible liveness BEFORE tokio's wait() so we can separate
-    // "SIGKILL not delivered / daemon alive" from "daemon dead but wait()
-    // not waking". Poll every 50ms for up to 2s.
-    let liveness_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut observed_dead: Option<Duration> = None;
-    while std::time::Instant::now() < liveness_deadline {
-        if sysprims_proc::get_process(pid).is_err() {
-            observed_dead = Some(t0.elapsed());
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let t_before_wait = t0.elapsed();
-    let wait_outcome = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    let t_after_wait = t0.elapsed();
-    if wait_outcome.is_err() || observed_dead.is_none() {
-        eprintln!(
-            "\nkill_daemon diagnostic pid={pid}:\n\
-             - force_kill returned Ok after {t_force_kill:?}\n\
-             - os-liveness observed_dead: {observed_dead:?}\n\
-             - wait() start={t_before_wait:?} end={t_after_wait:?} outcome={wait_outcome:?}\n"
-        );
-    }
-    if observed_dead.is_none() {
-        panic!("kill_daemon: pid {pid} still alive 2s after force_kill → SIGNAL DELIVERY FAILURE");
-    }
-    match wait_outcome {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => panic!("kill_daemon: wait errored: {err}"),
+    // Reap the child via tokio's `wait()` with a bounded timeout. `wait()`
+    // is the authoritative exit signal: it succeeds iff the OS has reaped
+    // the process. This is platform-agnostic — unlike `sysprims_proc::get_process`,
+    // which returns Ok on Linux for zombie children (exited but not yet
+    // waited-on), causing false "still alive" observations in tests that
+    // use it as a liveness probe before wait(). A healthy SIGKILL round-trip
+    // completes in <100ms; 5s is generous. Timeout = real signal-delivery
+    // or reactor failure, surface as test failure rather than hanging.
+    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(_status)) => {}
+        Ok(Err(err)) => panic!("kill_daemon: wait errored for pid {pid}: {err}"),
         Err(_) => panic!(
-            "kill_daemon: pid {pid} died at {observed_dead:?} but tokio wait() timed out after 5s → REACTOR ISSUE"
+            "kill_daemon: pid {pid} not reaped within 5s of force_kill → signal-delivery or reactor failure"
         ),
     }
 }
