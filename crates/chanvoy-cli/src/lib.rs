@@ -4,10 +4,10 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    list_profiles, load_active_profile, load_token, socket_path_for_profile, store_active_profile,
-    store_profile, CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus,
-    DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt, Profile,
-    ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
+    list_profiles, load_active_profile, load_token, pid_path_for_profile, socket_path_for_profile,
+    store_active_profile, store_profile, CapabilityClass, Channel, CheckResult, CredentialMode,
+    DaemonStatus, DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt,
+    Profile, ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
     WaitResult, DEFAULT_TEAM,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
@@ -857,19 +857,29 @@ async fn validate_and_finalize_profile(mut profile: Profile) -> Result<Profile, 
 }
 
 async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
-    if ping(profile).await.is_ok() {
+    // Bound the health-check ping. A wedged daemon (SIGSTOPed, deadlocked,
+    // or stuck in an I/O wait) leaves the socket open but never responds
+    // to `daemon_status` RPCs. Without this timeout, auto-setup hangs
+    // indefinitely on the health check instead of routing through the
+    // zombie-stop path. Timeout-fail is treated identically to ping-fail
+    // for subsequent logic.
+    let ping_outcome = tokio::time::timeout(PING_TIMEOUT, ping(profile)).await;
+    if matches!(ping_outcome, Ok(Ok(_))) {
         return Ok(DaemonState::AlreadyRunning);
     }
-    // `ping()` failing does not mean the daemon is absent — it is the
-    // `daemon_status` RPC, which calls `whoami()` against Mattermost, so a
-    // running daemon with a revoked / invalid token fails ping while still
-    // holding the socket. Blindly spawning here would leave that zombie
-    // alive while a fresh daemon bound to the same profile — the
-    // two-daemons-one-profile condition secrev F5 and devrev flagged.
+    // `ping()` failing (or timing out) does not mean the daemon is absent
+    // — it is the `daemon_status` RPC, which calls `whoami()` against
+    // Mattermost. A running daemon with a revoked / invalid token fails
+    // ping while still holding the socket. A wedged daemon hangs ping
+    // entirely. Blindly spawning in either case would leave that zombie
+    // alive alongside a fresh daemon — the two-daemons-one-profile
+    // condition secrev F5 / devrev F6 flagged.
     //
-    // Call stop_daemon_if_present before spawning; it short-circuits when no
-    // socket exists (normal cold-start case), and issues a local shutdown
-    // RPC (independent of Mattermost health) when one does.
+    // Call stop_daemon_if_present before spawning; it short-circuits when
+    // no socket exists (normal cold-start), uses the local `shutdown` RPC
+    // when a daemon is responsive (even if whoami is failing), and falls
+    // back to a direct pid-file-driven SIGKILL when the shutdown RPC
+    // itself hangs or cannot be served.
     stop_daemon_if_present(profile).await?;
     let exe = std::env::current_exe()?;
     Command::new(exe)
@@ -910,10 +920,19 @@ async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
     if !socket.exists() {
         return Ok(());
     }
-    match stop(profile).await {
-        Ok(_) => {}
-        Err(DaemonError::NotRunning(_)) => return Ok(()),
-        Err(err) => return Err(err.into()),
+    // Try graceful shutdown with a bounded timeout. A wedged daemon
+    // (SIGSTOPed, deadlocked, or stuck on a blocking dependency) holds
+    // the socket but never accepts the shutdown RPC. If the RPC doesn't
+    // complete in SHUTDOWN_RPC_TIMEOUT, fall through to the pid-file
+    // force-kill fallback instead of blocking auto-setup indefinitely.
+    let stop_outcome = tokio::time::timeout(SHUTDOWN_RPC_TIMEOUT, stop(profile)).await;
+    match stop_outcome {
+        Ok(Ok(_)) => {}
+        Ok(Err(DaemonError::NotRunning(_))) => return Ok(()),
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => {
+            // RPC timed out — daemon is wedged. Fall through to force-kill.
+        }
     }
     for _ in 0..20 {
         if !socket_path_for_profile(profile).exists() {
@@ -921,10 +940,60 @@ async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+    // Socket still present after the shutdown grace window. Force-kill
+    // the pid recorded in the runtime-dir pid file, then sweep the
+    // SIGKILL-orphaned runtime files (SIGKILL skips the daemon's own
+    // `cleanup_runtime_files`). Uses `kill` via std::process::Command
+    // instead of pulling sysprims into the prod graph — a single-purpose
+    // shell-out is cheaper than a new prod dependency for one fallback.
+    if let Some(pid) = read_daemon_pid_for_force_kill(profile) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        // Wait for the process to be reaped so the next start() doesn't
+        // see an inconsistent pid/socket state.
+        for _ in 0..20 {
+            if !is_pid_alive(pid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        // Sweep SIGKILL-orphaned runtime files. Ignoring errors because
+        // either file may already be absent.
+        let _ = std::fs::remove_file(socket_path_for_profile(profile));
+        let _ = std::fs::remove_file(pid_path_for_profile(profile));
+        return Ok(());
+    }
     Err(CliError::Bootstrap(format!(
-        "daemon for profile {profile} did not exit within 5s of shutdown request"
+        "daemon for profile {profile} did not exit within the shutdown grace \
+         window and no pid file was readable for the force-kill fallback"
     )))
 }
+
+/// Read the daemon's pid from the runtime-dir pid file. Returns None on any
+/// read/parse error — the caller falls through to a bootstrap error in that
+/// case, which surfaces EXIT_DAEMON_FAILED with a clear message.
+fn read_daemon_pid_for_force_kill(profile: &str) -> Option<u32> {
+    let pid_path = pid_path_for_profile(profile);
+    std::fs::read_to_string(pid_path).ok()?.trim().parse().ok()
+}
+
+/// Check whether a pid is live without sending a signal. Uses `kill -0`
+/// (POSIX: "check for existence without signalling") via shell-out to avoid
+/// a libc/nix/sysprims dep for a single predicate. Exit 0 = alive,
+/// non-zero (e.g., ESRCH) = not alive.
+fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const SHUTDOWN_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug, PartialEq, Eq)]
 enum ProfileAction {
