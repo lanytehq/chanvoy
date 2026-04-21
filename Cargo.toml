@@ -42,3 +42,17 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 [dependencies]
 chanvoy-cli = { path = "crates/chanvoy-cli" }
 tokio = { workspace = true }
+
+[dev-dependencies]
+chanvoy-core = { path = "crates/chanvoy-core" }
+serde_json = { workspace = true }
+# sysprims is the 3leaps-org primitive for process management. Used in the
+# restart harness for reliable SIGKILL delivery (tokio::process::Child::start_kill
+# has observed delivery gaps on macOS in a test context). Same git-pin pattern
+# chanvoy-ipc uses for ipcprims.
+sysprims-proc = { git = "https://github.com/3leaps/sysprims.git", tag = "v0.1.16" }
+sysprims-signal = { git = "https://github.com/3leaps/sysprims.git", tag = "v0.1.16" }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+wiremock = "0.6"
