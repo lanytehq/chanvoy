@@ -912,9 +912,15 @@ async fn auto_setup_stops_zombie_and_respawns() {
         auto_setup_command(&env, "lanytehq", "bravo-devlead").output(),
     )
     .await;
-    // Always resume daemon1 so teardown can reap it cleanly.
+    // Always resume daemon1 so teardown can reap it cleanly. On the happy
+    // path the second auto-setup's force-kill fallback has already reaped
+    // daemon1, so this CONT typically hits a nonexistent pid — that's
+    // expected, and both stdout and stderr are silenced so the resulting
+    // `kill: <pid>: No such process` doesn't clutter green test output.
     let _ = std::process::Command::new("kill")
         .args(["-CONT", &pid_before.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     let out2 = out2_result
         .expect("auto-setup #2 must complete within 30s")
