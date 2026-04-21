@@ -891,8 +891,16 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    for _ in 0..20 {
-        if ping(profile).await.is_ok() {
+    // Each per-iteration `ping()` is bounded the same way as the
+    // pre-spawn health check, for the same reason: a freshly spawned
+    // daemon could wedge during startup (deadlocked WebSocket init,
+    // stuck dependency probe) and leave us polling a ping that never
+    // returns. The outer deadline bounds total wait to a fixed budget
+    // independent of per-iteration timeout.
+    let spawn_ready_deadline = std::time::Instant::now() + SPAWN_READY_DEADLINE;
+    while std::time::Instant::now() < spawn_ready_deadline {
+        let ping_outcome = tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping(profile)).await;
+        if matches!(ping_outcome, Ok(Ok(_))) {
             return Ok(DaemonState::Started);
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -994,6 +1002,15 @@ fn is_pid_alive(pid: u32) -> bool {
 
 const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const SHUTDOWN_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Per-iteration ping budget on the post-spawn readiness poll. Shorter than
+/// `PING_TIMEOUT` because a healthy fresh daemon should answer quickly; a
+/// slow ping during spawn polling signals "not ready yet, keep waiting"
+/// rather than a wedged-daemon classification (that's what the outer
+/// deadline handles).
+const POST_SPAWN_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+/// Total time budget for the post-spawn readiness loop. Bounds the worst-
+/// case wait across all iterations independent of per-ping timing.
+const SPAWN_READY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, PartialEq, Eq)]
 enum ProfileAction {
