@@ -316,9 +316,13 @@ async fn attention_commands_do_not_mutate_state_file() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
-/// Text output for `attention list` after a post is human-readable
-/// (doesn't just format-panic), contains the key columns, and
-/// includes the channel row with its post-cursor source.
+/// Text output for `attention list` after a post is human-readable,
+/// contains the full column set (including the `CHECKED` freshness
+/// column from D1), and the CHECKED column becomes a populated
+/// timestamp after a `check_channel` pass. entarch's 2026-04-22
+/// finding: `last_checked_at` was surfaced in JSON + `show` text
+/// but missing from the `list` text renderer, dropping the D1
+/// freshness signal.
 #[tokio::test]
 #[ignore = "integration: run via make test-integration"]
 async fn attention_list_text_output_renders() {
@@ -328,10 +332,15 @@ async fn attention_list_text_output_renders() {
         .await;
     env.mock_channel_lookup("bravo-team", "chan-id-b6").await;
     env.mock_post_create("post-id-b6").await;
+    // Mount a `/posts/{id}` 200 so `check` succeeds (non-stale probe
+    // path, populates last_checked_at with a fresh verdict).
+    env.mock_post_lookup("post-id-b6", "chan-id-b6", true).await;
+    env.mock_channel_posts("chan-id-b6", &[]).await;
 
     let daemon = spawn_daemon(&env).await;
     let _ = run_chanvoy(&env, &["post", "bravo-team", "hi"]).await;
 
+    // Phase 1: list before any check → CHECKED column present but "—".
     let out = run_chanvoy(&env, &["attention", "list"]).await;
     assert!(
         out.status.success(),
@@ -344,6 +353,10 @@ async fn attention_list_text_output_renders() {
         "text output has header row; stdout={stdout}"
     );
     assert!(
+        stdout.contains("CHECKED"),
+        "text output surfaces the CHECKED column (D1 last_checked_at freshness); stdout={stdout}"
+    );
+    assert!(
         stdout.contains("bravo-team"),
         "text output lists the tracked channel; stdout={stdout}"
     );
@@ -354,6 +367,32 @@ async fn attention_list_text_output_renders() {
     assert!(
         stdout.contains("mentions:"),
         "text output surfaces mentions sibling; stdout={stdout}"
+    );
+
+    // Phase 2: run check, then re-list. CHECKED column must now hold
+    // a timestamp for the bravo-team row, not the "—" placeholder.
+    let check_out = run_chanvoy(&env, &["check", "bravo-team"]).await;
+    // check exits 1 when no new messages (our mocked posts returns empty)
+    // — either 0 or 1 is fine here; what matters is that the probe ran.
+    assert!(
+        check_out.status.code() == Some(0) || check_out.status.code() == Some(1),
+        "check must run, stderr={}",
+        String::from_utf8_lossy(&check_out.stderr)
+    );
+    let out_after = run_chanvoy(&env, &["attention", "list"]).await;
+    assert!(out_after.status.success());
+    let stdout_after = String::from_utf8_lossy(&out_after.stdout);
+    // Find the bravo-team row and verify the last column (CHECKED) is
+    // no longer "—". Parse by splitting on the row prefix and checking
+    // the tail contains a year-shaped timestamp ("2026-").
+    let row = stdout_after
+        .lines()
+        .find(|line| line.starts_with("bravo-team "))
+        .unwrap_or_else(|| panic!("bravo-team row missing from text list; stdout={stdout_after}"));
+    assert!(
+        row.contains("2026-"),
+        "bravo-team row's CHECKED column must have a timestamp after check, \
+         not '—'; row={row}"
     );
 
     let _ = stop_daemon_cleanly(&env, daemon).await;

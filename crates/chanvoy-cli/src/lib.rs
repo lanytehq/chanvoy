@@ -1226,21 +1226,28 @@ fn render_attention_list_text(result: &AttentionListResult) -> String {
     if result.channels.is_empty() {
         out.push_str("(no tracked channels)\n");
     } else {
+        // CHECKED column (freshness of the staleness verdict) is load-
+        // bearing for D1 — operators need to distinguish "freshly
+        // verified" from "never checked since establishment" (cxotech's
+        // refinement, entarch's 2026-04-22 review finding). Columns
+        // tightened slightly from the brief's example to keep the line
+        // within ~100 chars on narrow terminals.
         out.push_str(&format!(
-            "{:<30} {:<22} {:<24} UPDATED\n",
-            "CHANNEL", "SOURCE", "NEWEST_SEEN"
+            "{:<24} {:<20} {:<20} {:<18} CHECKED\n",
+            "CHANNEL", "SOURCE", "NEWEST_SEEN", "UPDATED"
         ));
         for entry in &result.channels {
             out.push_str(&format!(
-                "{:<30} {:<22} {:<24} {}\n",
-                truncate(&entry.channel, 30),
+                "{:<24} {:<20} {:<20} {:<18} {}\n",
+                truncate(&entry.channel, 24),
                 attention_source_label(&entry.source),
                 entry
                     .newest_seen
                     .as_deref()
-                    .map(|s| truncate(s, 24).to_string())
+                    .map(|s| truncate(s, 20).to_string())
                     .unwrap_or_else(|| "—".to_string()),
                 format_ts(entry.updated_at),
+                format_ts(entry.last_checked_at),
             ));
         }
     }
