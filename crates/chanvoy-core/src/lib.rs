@@ -324,6 +324,11 @@ pub struct CheckChannelParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttentionShowParams {
+    pub channel: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckResult {
     pub channel: String,
     #[serde(default)]
@@ -347,6 +352,71 @@ pub enum SeededChannelOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SeedCursorsResult {
     pub outcomes: Vec<SeededChannelOutcome>,
+}
+
+/// Discriminator for the source of a channel's attention anchor, surfaced
+/// by `attention list` / `attention show`. Matches the vocabulary used by
+/// `CheckResult.anchor_source` so operator-parsing agents don't need a
+/// second vocabulary.
+///
+/// - `NoAnchor`: channel is tracked but no cursor value — first-use or
+///   freshly cleared state.
+/// - `PostCursor`: cursor established by a successful `post_message`.
+/// - `NotificationsCursor`: only valid on the mentions sibling structure;
+///   kept here for symmetry so wire shape is stable across list / show.
+/// - `StaleCursor`: daemon's last `check_channel` pass on this cursor
+///   observed `AnchorNotFound` / `AnchorChannelMismatch`. Persisted
+///   via `ChannelCursorState::last_known_stale`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionSource {
+    #[default]
+    NoAnchor,
+    PostCursor,
+    NotificationsCursor,
+    StaleCursor,
+}
+
+/// One row in `attention list`'s channels table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttentionChannelEntry {
+    pub channel: String,
+    pub source: AttentionSource,
+    #[serde(default)]
+    pub newest_seen: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+    #[serde(default)]
+    pub last_checked_at: Option<i64>,
+}
+
+/// Mention-cursor entry for `attention list`'s `mentions` sibling.
+/// Mentions are profile-scoped, not channel-scoped, so they surface
+/// outside the channels table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AttentionMentionEntry {
+    pub source: AttentionSource,
+    #[serde(default)]
+    pub newest_seen: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+/// `attention list` wire shape — channels table + mentions sibling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AttentionListResult {
+    pub profile: String,
+    pub channels: Vec<AttentionChannelEntry>,
+    pub mentions: AttentionMentionEntry,
+}
+
+/// `attention show <channel>` wire shape. Includes the channel entry
+/// plus the profile-scoped mention state (cheap to surface alongside).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttentionShowResult {
+    pub profile: String,
+    pub channel: AttentionChannelEntry,
+    pub mentions: AttentionMentionEntry,
 }
 
 /// Enumerate bot memberships and compute the per-channel seed outcome for PER-009
@@ -417,6 +487,25 @@ pub struct ChannelCursorState {
     pub last_seen_post_id: Option<String>,
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// Last-known staleness verdict for this cursor. Set true when
+    /// `check_channel` detects the anchor post has been deleted
+    /// (`AnchorNotFound`) or moved channels (`AnchorChannelMismatch`).
+    /// Cleared on any successful cursor write. Powers `attention list`'s
+    /// `stale_cursor` discriminator without per-call Mattermost probes —
+    /// consistent with the strict-read-only contract on the `attention`
+    /// prefix (see PER-008B amendment).
+    ///
+    /// `#[serde(default)]` preserves on-disk back-compat for state files
+    /// written by earlier daemon versions.
+    #[serde(default)]
+    pub last_known_stale: bool,
+    /// Unix-millis timestamp of the last `check_channel` pass that
+    /// probed this cursor's anchor (success or stale). Distinct from
+    /// `updated_at` (cursor-value update time). Surfaced by
+    /// `attention list` / `show` so operators can tell "freshly verified"
+    /// from "never checked since establishment."
+    #[serde(default)]
+    pub last_checked_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2214,6 +2303,8 @@ mod tests {
                 ChannelCursorState {
                     last_seen_post_id: Some("post-123".to_string()),
                     updated_at: Some(1_776_000_000_000),
+                    last_known_stale: false,
+                    last_checked_at: None,
                 },
             )]),
             mentions: MentionCursorState {
