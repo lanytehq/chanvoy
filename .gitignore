@@ -3,3 +3,7 @@
 **/*.rs.bk
 .DS_Store
 AGENTS.local.md
+
+# Agent-scratch directories (lanyte-ctx checkpoint handoffs etc.)
+/.tmp/
+/tmp/
