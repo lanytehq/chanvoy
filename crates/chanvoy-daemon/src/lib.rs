@@ -7,14 +7,14 @@ use std::{fs, io};
 use chanvoy_core::{
     daemon_event_to_notification, load_attention_state, load_profile, load_token,
     pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile, store_attention_state,
-    AddMemberParams, ArchiveChannelParams, AttentionState, CapabilityClass, Channel,
-    CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind,
-    DaemonEventPayloadInner, DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation,
-    EventBus, IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient,
-    MattermostWs, NotificationsParams, NotifyParams, PostMessageParams, Profile, ProfileStatus,
-    Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult, SubscribeParams,
-    SubscriptionAck, SubscriptionFilter, UnreadNotifications, UnsubscribeParams, WaitChannelParams,
-    WaitResult, WsState,
+    AddMemberParams, ArchiveChannelParams, AttentionShowParams, AttentionState, CapabilityClass,
+    Channel, CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent,
+    DaemonEventKind, DaemonEventPayloadInner, DaemonHealth, DaemonStatus, DirectMessageParams,
+    DmConversation, EventBus, IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    MattermostClient, MattermostWs, NotificationsParams, NotifyParams, PostMessageParams, Profile,
+    ProfileStatus, Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult,
+    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnreadNotifications, UnsubscribeParams,
+    WaitChannelParams, WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -572,6 +572,14 @@ async fn dispatch_request(
             .await
             .map(to_value)
             .map_err(DaemonError::from),
+        "attention_list" => Ok(to_value(attention_list(state).await)),
+        "attention_show" => {
+            parse_and_call(&request.params, |params: AttentionShowParams| async move {
+                Ok::<_, CoreError>(attention_show(state, &params.channel).await)
+            })
+            .await
+            .map(to_value)
+        }
         "shutdown" => {
             if let Some(sender) = shutdown_tx.lock().await.take() {
                 let _ = sender.send(());
@@ -817,10 +825,21 @@ async fn check_channel(
         .read_channel_after(channel, &anchor_post_id)
         .await
     {
-        Ok(messages) => messages,
+        Ok(messages) => {
+            // Freshness verdict: cursor probed and anchor still present.
+            // Persist `last_known_stale=false` + `last_checked_at=now` so
+            // `attention list` / `show` can surface the verdict without
+            // its own probe (PER-008B D1: cached staleness, cxotech's
+            // `last_checked_at` refinement).
+            if anchor_source == "daemon_cursor" {
+                record_staleness_verdict(state, channel, false).await;
+            }
+            messages
+        }
         Err(CoreError::AnchorNotFound(_)) | Err(CoreError::AnchorChannelMismatch { .. })
             if anchor_source == "daemon_cursor" =>
         {
+            record_staleness_verdict(state, channel, true).await;
             return Ok(stale_cursor_check_result(channel));
         }
         Err(error) => return Err(error),
@@ -846,11 +865,16 @@ async fn record_channel_cursor(
     post_id: &str,
 ) -> Result<(), CoreError> {
     let mut attention = state.attention_state.lock().await;
+    // Every cursor-write path is a staleness-clearing event per the
+    // PER-008B D1 guardrail: the new cursor value is fresh, by definition
+    // not stale, and has not yet been checked.
     attention.channels.insert(
         channel.to_string(),
         chanvoy_core::ChannelCursorState {
             last_seen_post_id: Some(post_id.to_string()),
             updated_at: Some(chanvoy_core::now_unix_millis()),
+            last_known_stale: false,
+            last_checked_at: None,
         },
     );
     store_attention_state(&state.profile.name, &attention)?;
@@ -886,15 +910,130 @@ async fn record_channel_cursor_if_absent(
     if attention.channels.contains_key(channel) {
         return Ok(false);
     }
+    // A freshly-seeded cursor is by definition non-stale and unchecked.
     attention.channels.insert(
         channel.to_string(),
         chanvoy_core::ChannelCursorState {
             last_seen_post_id: Some(post_id.to_string()),
             updated_at: Some(chanvoy_core::now_unix_millis()),
+            last_known_stale: false,
+            last_checked_at: None,
         },
     );
     store_attention_state(&state.profile.name, &attention)?;
     Ok(true)
+}
+
+/// Persist the staleness verdict for a channel cursor. Updates both
+/// `last_known_stale` and `last_checked_at` (Unix ms) on the existing
+/// cursor entry, without touching `last_seen_post_id` / `updated_at`
+/// (the cursor value itself is unchanged — only our knowledge of its
+/// freshness).
+///
+/// No-op if the channel has no persisted cursor (staleness is a cursor
+/// attribute, not a channel attribute). Errors on attention-state
+/// persistence are logged but not returned — staleness cache is a
+/// best-effort optimization for `attention list`'s fast path, and
+/// failing a `check_channel` call because we couldn't persist the
+/// verdict would be the wrong trade.
+async fn record_staleness_verdict(state: &AppState, channel: &str, stale: bool) {
+    let mut attention = state.attention_state.lock().await;
+    let Some(cursor) = attention.channels.get_mut(channel) else {
+        return;
+    };
+    cursor.last_known_stale = stale;
+    cursor.last_checked_at = Some(chanvoy_core::now_unix_millis());
+    if let Err(err) = store_attention_state(&state.profile.name, &attention) {
+        tracing::warn!(
+            profile = %state.profile.name,
+            channel = %channel,
+            %err,
+            "failed to persist staleness verdict; attention list may show stale verdict"
+        );
+    }
+}
+
+/// Build `AttentionListResult` from the daemon's current attention state.
+/// Pure-read; never mutates. Powers the `attention list` RPC.
+async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
+    let attention = state.attention_state.lock().await;
+    let channels = attention
+        .channels
+        .iter()
+        .map(|(name, cursor)| chanvoy_core::AttentionChannelEntry {
+            channel: name.clone(),
+            source: attention_source_for_channel(cursor),
+            newest_seen: cursor.last_seen_post_id.clone(),
+            updated_at: cursor.updated_at,
+            last_checked_at: cursor.last_checked_at,
+        })
+        .collect();
+    let mentions = chanvoy_core::AttentionMentionEntry {
+        source: attention_source_for_mentions(&attention.mentions),
+        newest_seen: attention.mentions.last_seen_post_id.clone(),
+        updated_at: attention.mentions.updated_at,
+    };
+    chanvoy_core::AttentionListResult {
+        profile: state.profile.name.clone(),
+        channels,
+        mentions,
+    }
+}
+
+/// Build `AttentionShowResult` for a specific channel. Returns an entry
+/// with `source = NoAnchor` when the channel is not tracked, rather than
+/// erroring — operators asking about an untracked channel want that
+/// confirmed, not a bare error.
+async fn attention_show(state: &AppState, channel: &str) -> chanvoy_core::AttentionShowResult {
+    let attention = state.attention_state.lock().await;
+    let entry = match attention.channels.get(channel) {
+        Some(cursor) => chanvoy_core::AttentionChannelEntry {
+            channel: channel.to_string(),
+            source: attention_source_for_channel(cursor),
+            newest_seen: cursor.last_seen_post_id.clone(),
+            updated_at: cursor.updated_at,
+            last_checked_at: cursor.last_checked_at,
+        },
+        None => chanvoy_core::AttentionChannelEntry {
+            channel: channel.to_string(),
+            source: chanvoy_core::AttentionSource::NoAnchor,
+            newest_seen: None,
+            updated_at: None,
+            last_checked_at: None,
+        },
+    };
+    let mentions = chanvoy_core::AttentionMentionEntry {
+        source: attention_source_for_mentions(&attention.mentions),
+        newest_seen: attention.mentions.last_seen_post_id.clone(),
+        updated_at: attention.mentions.updated_at,
+    };
+    chanvoy_core::AttentionShowResult {
+        profile: state.profile.name.clone(),
+        channel: entry,
+        mentions,
+    }
+}
+
+fn attention_source_for_channel(
+    cursor: &chanvoy_core::ChannelCursorState,
+) -> chanvoy_core::AttentionSource {
+    if cursor.last_seen_post_id.is_none() {
+        chanvoy_core::AttentionSource::NoAnchor
+    } else if cursor.last_known_stale {
+        chanvoy_core::AttentionSource::StaleCursor
+    } else {
+        chanvoy_core::AttentionSource::PostCursor
+    }
+}
+
+fn attention_source_for_mentions(
+    mentions: &chanvoy_core::MentionCursorState,
+) -> chanvoy_core::AttentionSource {
+    if mentions.last_seen_post_id.is_some() {
+        chanvoy_core::AttentionSource::NotificationsCursor
+    } else {
+        chanvoy_core::AttentionSource::NoAnchor
+    }
 }
 
 /// Seed cursors for bot-member channels that do not yet have a stored cursor.
@@ -1186,6 +1325,23 @@ impl DaemonClient {
 
     pub async fn daemon_status(&self) -> Result<DaemonStatus, DaemonError> {
         self.call("daemon_status", serde_json::json!({})).await
+    }
+
+    pub async fn attention_list(&self) -> Result<chanvoy_core::AttentionListResult, DaemonError> {
+        self.call("attention_list", serde_json::json!({})).await
+    }
+
+    pub async fn attention_show(
+        &self,
+        channel: &str,
+    ) -> Result<chanvoy_core::AttentionShowResult, DaemonError> {
+        self.call(
+            "attention_show",
+            serde_json::to_value(AttentionShowParams {
+                channel: channel.to_string(),
+            })?,
+        )
+        .await
     }
 
     pub async fn seed_cursors(&self) -> Result<chanvoy_core::SeedCursorsResult, DaemonError> {

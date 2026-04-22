@@ -5,10 +5,10 @@ use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
     list_profiles, load_active_profile, load_token, pid_path_for_profile, socket_path_for_profile,
-    store_active_profile, store_profile, CapabilityClass, Channel, CheckResult, CredentialMode,
-    DaemonStatus, DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt,
-    Profile, ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
-    WaitResult, DEFAULT_TEAM,
+    store_active_profile, store_profile, AttentionListResult, AttentionShowResult, AttentionSource,
+    CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus, DmConversation, Identity,
+    MattermostClient, Message, Notification, PostReceipt, Profile, ProfileStatus, Provider,
+    SeedCursorsResult, SeededChannelOutcome, UnreadNotifications, WaitResult, DEFAULT_TEAM,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -66,6 +66,25 @@ enum CommandSet {
     Channel(ChannelCommand),
     /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
     AutoSetup(AutoSetupArgs),
+    /// Inspect daemon-held attention state (cursors, staleness verdicts).
+    /// Strictly read-only: never mutates daemon state, never issues
+    /// Mattermost API calls. See PER-008B.
+    #[command(subcommand)]
+    Attention(AttentionCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum AttentionCommand {
+    /// List tracked channels and cursor state for a profile.
+    List,
+    /// Show single-channel attention-state detail.
+    Show(AttentionShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct AttentionShowArgs {
+    /// Channel name.
+    channel: String,
 }
 
 #[derive(Debug, Args)]
@@ -412,6 +431,16 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 }),
                 &format!("added: @{} → #{}", args.username, args.channel),
             )
+        }
+        CommandSet::Attention(AttentionCommand::List) => {
+            let result = daemon_client(&profile).attention_list().await?;
+            print_json_or_text(cli.json, &result, &render_attention_list_text(&result))
+        }
+        CommandSet::Attention(AttentionCommand::Show(args)) => {
+            let result = daemon_client(&profile)
+                .attention_show(&args.channel)
+                .await?;
+            print_json_or_text(cli.json, &result, &render_attention_show_text(&result))
         }
     }
 }
@@ -1185,6 +1214,100 @@ fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), C
         }
     }
     Ok(())
+}
+
+/// PER-008B text-format renderers. JSON shape is owned by the core
+/// result structs; these helpers only build a narrow-terminal-friendly
+/// human view. Both commands are strictly read-only — no daemon-state
+/// mutation, no Mattermost API calls.
+fn render_attention_list_text(result: &AttentionListResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("profile: {}\n", result.profile));
+    if result.channels.is_empty() {
+        out.push_str("(no tracked channels)\n");
+    } else {
+        out.push_str(&format!(
+            "{:<30} {:<22} {:<24} UPDATED\n",
+            "CHANNEL", "SOURCE", "NEWEST_SEEN"
+        ));
+        for entry in &result.channels {
+            out.push_str(&format!(
+                "{:<30} {:<22} {:<24} {}\n",
+                truncate(&entry.channel, 30),
+                attention_source_label(&entry.source),
+                entry
+                    .newest_seen
+                    .as_deref()
+                    .map(|s| truncate(s, 24).to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                format_ts(entry.updated_at),
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "\nmentions: source={} newest_seen={} updated={}\n",
+        attention_source_label(&result.mentions.source),
+        result.mentions.newest_seen.as_deref().unwrap_or("—"),
+        format_ts(result.mentions.updated_at),
+    ));
+    out
+}
+
+fn render_attention_show_text(result: &AttentionShowResult) -> String {
+    let entry = &result.channel;
+    let mut out = String::new();
+    out.push_str(&format!("profile: {}\n", result.profile));
+    out.push_str(&format!("channel: {}\n", entry.channel));
+    out.push_str(&format!(
+        "source:  {}\n",
+        attention_source_label(&entry.source)
+    ));
+    out.push_str(&format!(
+        "newest_seen:     {}\n",
+        entry.newest_seen.as_deref().unwrap_or("—")
+    ));
+    out.push_str(&format!(
+        "updated_at:      {}\n",
+        format_ts(entry.updated_at)
+    ));
+    out.push_str(&format!(
+        "last_checked_at: {}\n",
+        format_ts(entry.last_checked_at)
+    ));
+    out.push_str(&format!(
+        "\nmentions: source={} newest_seen={} updated={}\n",
+        attention_source_label(&result.mentions.source),
+        result.mentions.newest_seen.as_deref().unwrap_or("—"),
+        format_ts(result.mentions.updated_at),
+    ));
+    out
+}
+
+fn attention_source_label(source: &AttentionSource) -> &'static str {
+    match source {
+        AttentionSource::NoAnchor => "no_anchor",
+        AttentionSource::PostCursor => "post_cursor",
+        AttentionSource::NotificationsCursor => "notifications_cursor",
+        AttentionSource::StaleCursor => "stale_cursor",
+    }
+}
+
+fn format_ts(millis: Option<i64>) -> String {
+    let Some(ms) = millis else {
+        return "—".to_string();
+    };
+    match Utc.timestamp_millis_opt(ms).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%MZ").to_string(),
+        None => ms.to_string(),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max]
+    }
 }
 
 fn resolve_profile_name(profile: Option<&str>) -> Result<String, CliError> {
