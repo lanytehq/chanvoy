@@ -116,6 +116,71 @@ async fn attention_list_and_show_after_post() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
+/// `attention list` surfaces profile `monitored_channels` that have
+/// no persisted cursor as `no_anchor` rows — the tracked-but-
+/// uncursored state is explicitly part of AC #1 / #6 (devrev finding
+/// 2026-04-22). Without this, operators configuring monitored_channels
+/// would see those channels missing from `attention list` until a
+/// post or seed cursors them.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn attention_list_includes_monitored_but_uncursored_channels() {
+    let env = TestEnv::new("per-008b-monitored-uncursored").await;
+    // Profile declares two monitored channels; neither has a cursor yet.
+    env.write_profile_with_monitored(
+        "agent-bravo-devlead",
+        "org-lanytehq",
+        &["bravo-team", "per-008"],
+    );
+    env.mock_baseline("bot-id-b7", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("per-009", "chan-id-b7-per009")
+        .await;
+    env.mock_post_create("post-id-b7").await;
+
+    let daemon = spawn_daemon(&env).await;
+
+    // Post to a channel NOT in monitored_channels so the list spans the
+    // union: monitored ∪ cursored = {bravo-team, per-008, per-009}.
+    let post_out = run_chanvoy(&env, &["post", "per-009", "hi"]).await;
+    assert!(
+        post_out.status.success(),
+        "post must succeed, stderr={}",
+        String::from_utf8_lossy(&post_out.stderr)
+    );
+
+    let out = run_chanvoy(&env, &["--json", "attention", "list"]).await;
+    assert!(out.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json list parses");
+    let channels = parsed["channels"].as_array().expect("channels array");
+    assert_eq!(
+        channels.len(),
+        3,
+        "expected all three channels (bravo-team, per-008 monitored-uncursored; per-009 cursored); got {channels:?}"
+    );
+    let by_name: std::collections::BTreeMap<&str, &serde_json::Value> = channels
+        .iter()
+        .map(|c| (c["channel"].as_str().unwrap(), c))
+        .collect();
+    assert_eq!(
+        by_name["bravo-team"]["source"].as_str(),
+        Some("no_anchor"),
+        "monitored-but-uncursored channel must surface as no_anchor"
+    );
+    assert_eq!(
+        by_name["per-008"]["source"].as_str(),
+        Some("no_anchor"),
+        "monitored-but-uncursored channel must surface as no_anchor"
+    );
+    assert_eq!(
+        by_name["per-009"]["source"].as_str(),
+        Some("post_cursor"),
+        "cursored channel (not in monitored_channels) still surfaces"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
 /// `attention show` on an untracked channel returns a `no_anchor`
 /// entry with null cursor fields, not an error.
 #[tokio::test]

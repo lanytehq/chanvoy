@@ -955,17 +955,42 @@ async fn record_staleness_verdict(state: &AppState, channel: &str, stale: bool) 
 
 /// Build `AttentionListResult` from the daemon's current attention state.
 /// Pure-read; never mutates. Powers the `attention list` RPC.
+///
+/// Channel set is the union of:
+/// - `state.profile.monitored_channels` — operator-declared tracked
+///   channels, which may not yet have a persisted cursor (surface as
+///   `no_anchor` so the operator can see "this channel is tracked but
+///   uncursored"). Without this, AC #1 / #6 would miss the tracked-
+///   but-uncursored state — exactly the operator view the brief's
+///   example output illustrates (devrev finding, 2026-04-22).
+/// - `attention.channels.keys()` — channels with at least one
+///   persisted cursor. This includes post-established cursors for
+///   channels that may or may not be in `monitored_channels`.
+///
+/// Emitting a `BTreeSet` union gives stable lexicographic ordering
+/// across runs.
 async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
     let attention = state.attention_state.lock().await;
-    let channels = attention
-        .channels
-        .iter()
-        .map(|(name, cursor)| chanvoy_core::AttentionChannelEntry {
-            channel: name.clone(),
-            source: attention_source_for_channel(cursor),
-            newest_seen: cursor.last_seen_post_id.clone(),
-            updated_at: cursor.updated_at,
-            last_checked_at: cursor.last_checked_at,
+    let mut channel_names: std::collections::BTreeSet<String> =
+        state.profile.monitored_channels.iter().cloned().collect();
+    channel_names.extend(attention.channels.keys().cloned());
+    let channels = channel_names
+        .into_iter()
+        .map(|name| match attention.channels.get(&name) {
+            Some(cursor) => chanvoy_core::AttentionChannelEntry {
+                channel: name,
+                source: attention_source_for_channel(cursor),
+                newest_seen: cursor.last_seen_post_id.clone(),
+                updated_at: cursor.updated_at,
+                last_checked_at: cursor.last_checked_at,
+            },
+            None => chanvoy_core::AttentionChannelEntry {
+                channel: name,
+                source: chanvoy_core::AttentionSource::NoAnchor,
+                newest_seen: None,
+                updated_at: None,
+                last_checked_at: None,
+            },
         })
         .collect();
     let mentions = chanvoy_core::AttentionMentionEntry {

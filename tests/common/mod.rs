@@ -101,7 +101,20 @@ impl TestEnv {
     }
 
     /// Write a default profile TOML pointing at the mock server.
+    /// `monitored_channels` defaults to empty.
     pub fn write_default_profile(&self, bot_username: &str, team_name: &str) {
+        self.write_profile_with_monitored(bot_username, team_name, &[]);
+    }
+
+    /// Write a profile with explicit `monitored_channels`. Used by tests
+    /// that need to exercise the tracked-but-uncursored path (PER-008B
+    /// `attention list` union semantics — devrev finding 2026-04-22).
+    pub fn write_profile_with_monitored(
+        &self,
+        bot_username: &str,
+        team_name: &str,
+        monitored_channels: &[&str],
+    ) {
         let profile = Profile {
             name: self.profile_name.clone(),
             role: "bravo-devlead".to_string(),
@@ -114,7 +127,7 @@ impl TestEnv {
             env_file: None,
             credential_mode: chanvoy_core::CredentialMode::EnvName,
             capability_class: chanvoy_core::CapabilityClass::Standard,
-            monitored_channels: Vec::new(),
+            monitored_channels: monitored_channels.iter().map(|s| s.to_string()).collect(),
             ipc: None,
         };
         let dir = self.profile_path().parent().unwrap().to_path_buf();
