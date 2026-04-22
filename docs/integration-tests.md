@@ -21,6 +21,10 @@ both for test isolation and for production use on non-standard layouts). Each
 test uses a unique `--profile <slug>` so socket/pid/state filenames never
 collide. Parent-process env is never mutated.
 
+Shared harness primitives live in `tests/common/mod.rs` (mounted via
+`mod common;` from each integration test file). Test-specific helpers
+stay in the file that uses them.
+
 ## What's covered
 
 **PER-008C restart harness** (`tests/restart_harness.rs`):
@@ -64,6 +68,34 @@ actually landed during PER-009) are caught.
   Refreshed because the env-current credential authenticates as a
   different bot. Asserts persisted profile update, daemon restart, and
   JSON report structure (`profile_state=refreshed` + diff entry).
+
+**PER-008B attention-state inspection** (`tests/attention_inspection.rs`):
+
+Exercises the `chanvoy attention list` / `chanvoy attention show`
+commands end-to-end. The central reviewer ask (devrev, 2026-04-21) is
+the **non-mutation invariant** — adding these commands leaves daemon
+state identical before and after. Asserted by byte-comparing the
+persisted state file across CLI invocations, not by code-reading the
+read-only claim.
+
+- `attention_list_cold_state_is_empty` — daemon with no tracked
+  channels returns empty channels list + `no_anchor` mentions.
+- `attention_list_and_show_after_post` — post establishes a
+  `post_cursor`; both list and show surface the channel with the
+  expected source + newest_seen.
+- `attention_show_untracked_channel_is_no_anchor` — show on an
+  untracked channel returns a `no_anchor` entry (not an error).
+- `attention_list_shows_stale_cursor_after_check` — post establishes
+  cursor; mock flips `/posts/<id>` to 404; `check` detects staleness
+  and caches the verdict on `ChannelCursorState`; subsequent `list`
+  shows `source=stale_cursor` with populated `last_checked_at`. This
+  is the D1 cached-staleness shape aligned with cxotech + devrev.
+- `attention_commands_do_not_mutate_state_file` — snapshots state-file
+  bytes before + after list/show invocations (both JSON and text
+  paths), asserts byte-equal. devrev's explicit non-mutation ask.
+- `attention_list_text_output_renders` — smoke test for the text
+  output contract: header row, channel row, source label, mentions
+  sibling all present.
 
 ## Harness conventions
 
