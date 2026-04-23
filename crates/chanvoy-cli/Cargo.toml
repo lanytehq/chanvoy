@@ -11,6 +11,11 @@ chanvoy-daemon = { path = "../chanvoy-daemon" }
 chrono = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
+# libc: PER-008D detachment uses libc::setsid in pre_exec on the
+# auto-setup spawn path (see ensure_daemon_running). Already present in
+# the workspace dep tree via sysprims and reqwest; declared explicitly
+# here for the direct dependency.
+libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

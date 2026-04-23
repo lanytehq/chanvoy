@@ -114,9 +114,51 @@ read-only claim.
 - **Mock server state**: `TestEnv::reset_mocks()` + explicit re-mount
   between phases; phase-1 responders cannot silently satisfy phase-2
   assertions.
-- **Teardown**: Phase 3 tests spawn detached daemons (via `auto-setup`),
-  so each explicitly calls `teardown_auto_setup_daemon` to reap any
-  leftover pid via `sysprims_signal::force_kill` on the pid-file contents.
+- **Teardown**: Phase 3 / 4 tests spawn detached daemons (via
+  `auto-setup`), so each explicitly calls `teardown_auto_setup_daemon`
+  to reap any leftover pid via `sysprims_signal::force_kill` on the
+  pid-file contents. **Plus** an `AutoSetupDaemonGuard` (`let _guard =
+  env.daemon_guard();`) RAII guard with a sync `Drop` that re-runs the
+  pid-file kill on test panic — important since PER-008D's setsid
+  detachment means the daemon really does survive the test process.
+  Without the guard, a panicking test would leak a real backgrounded
+  daemon.
+
+## Daemon lifecycle model (PER-008D detachment)
+
+`chanvoy auto-setup` spawns the daemon as a detached process: the spawn
+site in `ensure_daemon_running` (`crates/chanvoy-cli/src/lib.rs`) calls
+`libc::setsid()` via `pre_exec`, making the daemon the leader of a new
+session and process group with no controlling terminal. Operational
+consequence: the daemon survives the spawning shell's exit, including
+the controlling terminal closing (no `SIGHUP` propagation). Operators
+returning to the same machine in a fresh session find the daemon still
+running on its profile socket.
+
+Direct `chanvoy daemon serve` (the foreground / debug path) is **not**
+detached — it intentionally stays attached to the spawning shell so
+operators can `Ctrl-C` it and follow logs. Use `auto-setup` for the
+durable case, `daemon serve` for the foreground-debug case. PER-008D
+explicitly narrowed detachment to the auto-setup path.
+
+## PER-008D detachment tests (Phase 4)
+
+- `auto_setup_daemon_detaches_into_new_session` — spawns auto-setup as
+  an intermediate process via `Command::spawn() + wait()`, then
+  asserts:
+  - `libc::getsid(daemon_pid) == daemon_pid` — daemon is its own
+    session leader (load-bearing setsid contract; uniform across
+    Linux init / systemd-user / macOS launchd)
+  - `sysprims_proc::get_process(daemon_pid).ppid != intermediate_pid`
+    — daemon was reparented away from the intermediate (corroborating
+    evidence that the auto-setup CLI subprocess exited cleanly)
+  - `chanvoy daemon status` answers — detachment did not break socket
+    / RPC machinery
+- `auto_setup_detached_daemon_state_survives_session_transition` —
+  end-to-end model of "Session A spawns daemon, Session B uses it":
+  posts via the detached daemon in Session A, then a fresh CLI
+  invocation (Session B) inspects attention state and observes
+  Session A's cursor.
 
 ## Adding a test
 

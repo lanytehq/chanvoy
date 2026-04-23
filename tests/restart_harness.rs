@@ -411,6 +411,7 @@ async fn auto_setup_recovers_from_stale_socket() {
         String::from_utf8_lossy(&out.stderr),
     );
 
+    let _guard = env.daemon_guard();
     let pid = read_daemon_pid(&env).expect("fresh daemon pid file present");
     assert!(
         sysprims_proc::get_process(pid).is_ok(),
@@ -449,6 +450,7 @@ async fn auto_setup_stops_zombie_and_respawns() {
         "first auto-setup must succeed; stderr={}",
         String::from_utf8_lossy(&out1.stderr)
     );
+    let _guard = env.daemon_guard();
     let pid_before = read_daemon_pid(&env).expect("daemon pid after first auto-setup");
     assert!(sysprims_proc::get_process(pid_before).is_ok());
 
@@ -545,6 +547,7 @@ async fn auto_setup_promotes_reuse_to_refreshed_on_bot_username_drift() {
         "first auto-setup must succeed; stderr={}",
         String::from_utf8_lossy(&out1.stderr)
     );
+    let _guard = env.daemon_guard();
     let profile_before = read_persisted_profile(&env);
     assert_eq!(profile_before.bot_username, "bot-alpha");
     let pid_before = read_daemon_pid(&env).expect("pid after first auto-setup");
@@ -600,6 +603,188 @@ async fn auto_setup_promotes_reuse_to_refreshed_on_bot_username_drift() {
                 && entry["from"].as_str() == Some("bot-alpha")
                 && entry["to"].as_str() == Some("bot-beta")),
         "refresh_diff must include the bot_username transition; report={report}"
+    );
+
+    teardown_auto_setup_daemon(&env).await;
+}
+
+// ---- Phase 4: PER-008D detachment ----
+//
+// Auto-setup must spawn a daemon that survives the spawning shell's
+// termination. Implementation lands `setsid(2)` via `pre_exec` on the
+// `Command` built in `ensure_daemon_running` (chanvoy-cli). These
+// tests verify the structural detachment without requiring a pty:
+//
+// - the daemon is its own session leader (`getsid(daemon_pid) ==
+//   daemon_pid`) — direct proof setsid took effect, uniform across
+//   Linux init / systemd-user / macOS launchd
+// - the daemon is reparented away from the intermediate spawning
+//   process — corroborating evidence that auto-setup's CLI
+//   subprocess exited and the daemon is no longer in its process tree
+//
+// PER-008C Phase 3 tests pass without detachment because the test
+// harness has no controlling terminal (no TTY → no SIGHUP). Phase 4
+// asserts the structural detachment that operators need in real
+// shell sessions.
+
+/// AC #1/#3 — daemon survives the auto-setup invocation that spawned
+/// it AND is reachable from a fresh CLI invocation. Verifies the
+/// load-bearing setsid contract via getsid + ppid checks.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_daemon_detaches_into_new_session() {
+    let env = TestEnv::new("per-008d-detachment-newsession").await;
+    env.mock_baseline("bot-id-d1", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_empty_memberships("team-id-456").await;
+
+    // Spawn auto-setup as our intermediate process. We use spawn() +
+    // wait() (rather than output().await) so we can capture the
+    // intermediate's pid for the reparenting assertion below.
+    let mut intermediate = env
+        .chanvoy_command()
+        .env("LANYTE_AGENT_ROLE", "bravo-devlead")
+        .env("LANYTE_AGENT_SCOPE", "lanytehq")
+        .env("LANYTE_MM_URL", env.server_url())
+        .env("LANYTE_MM_TEAM", "org-lanytehq")
+        .env("CHANVOY_PROFILE", &env.profile_name)
+        .arg("--json")
+        .arg("auto-setup")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn intermediate auto-setup");
+    let intermediate_pid: u32 = intermediate.id().expect("intermediate pid");
+    let exit = intermediate.wait().await.expect("intermediate wait");
+    assert!(
+        exit.success(),
+        "intermediate auto-setup must exit 0 (daemon spawn happens during this run)"
+    );
+
+    let daemon_pid = read_daemon_pid(&env).expect("daemon pid file present after auto-setup");
+    let _guard = env.daemon_guard();
+
+    // SETSID PROOF: daemon must be its own session leader. setsid(2)
+    // makes the calling process the leader of a new session whose
+    // session id equals its pid. If detachment did not happen, the
+    // daemon would be in the intermediate's session (sid = intermediate
+    // ancestor's pid).
+    //
+    // SAFETY: libc::getsid is a normal syscall, not in a post-fork
+    // context. The unsafe is purely the FFI requirement.
+    let daemon_sid = unsafe { libc::getsid(daemon_pid as i32) };
+    assert!(
+        daemon_sid > 0,
+        "getsid(daemon_pid={daemon_pid}) returned {daemon_sid}; errno may indicate the process is gone"
+    );
+    assert_eq!(
+        daemon_sid as u32, daemon_pid,
+        "daemon must be its own session leader (sid == pid); got sid={daemon_sid}, pid={daemon_pid}. \
+         This is the load-bearing setsid contract — without it, SIGHUP from the spawning shell's \
+         terminal close propagates to the daemon."
+    );
+
+    // REPARENTING HYGIENE: after intermediate exits, daemon's ppid must
+    // not equal the intermediate's pid. Robust across init / systemd-
+    // user-subreaper / launchd — we don't pin to ppid==1.
+    let info =
+        sysprims_proc::get_process(daemon_pid).expect("daemon must be alive after detachment");
+    assert_ne!(
+        info.ppid, intermediate_pid,
+        "daemon ppid should be reparented away from intermediate auto-setup CLI \
+         (intermediate exited, daemon should be owned by init / launchd / subreaper); \
+         got ppid={} intermediate_pid={intermediate_pid}",
+        info.ppid
+    );
+    assert_ne!(
+        info.ppid, daemon_pid,
+        "ppid sanity: daemon cannot be its own parent"
+    );
+
+    // Reachability proof: daemon answers RPC from a fresh CLI
+    // invocation, confirming session-detachment did not break the
+    // socket / RPC machinery.
+    let status_out = run_chanvoy(&env, &["daemon", "status"]).await;
+    assert!(
+        status_out.status.success(),
+        "daemon must answer status RPC after detachment; stderr={}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+
+    // Explicit teardown (the guard's sync Drop is the safety net for
+    // panic paths only).
+    teardown_auto_setup_daemon(&env).await;
+}
+
+/// AC #3 — attention state is intact when reached from a "fresh
+/// session" (modeled here as a fresh CLI invocation against the
+/// detached daemon). Cursor-write performed via `chanvoy post` is
+/// observable via `attention list` even though the original auto-setup
+/// CLI has exited.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_detached_daemon_state_survives_session_transition() {
+    let env = TestEnv::new("per-008d-state-survives").await;
+    env.mock_baseline("bot-id-d2", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_empty_memberships("team-id-456").await;
+    env.mock_channel_lookup("bravo-team", "chan-id-d2").await;
+    env.mock_post_create("post-id-d2").await;
+
+    // Session A: auto-setup spawns the daemon, then the spawning CLI
+    // exits. The daemon detaches and survives.
+    let auto_setup_out = env
+        .chanvoy_command()
+        .env("LANYTE_AGENT_ROLE", "bravo-devlead")
+        .env("LANYTE_AGENT_SCOPE", "lanytehq")
+        .env("LANYTE_MM_URL", env.server_url())
+        .env("LANYTE_MM_TEAM", "org-lanytehq")
+        .env("CHANVOY_PROFILE", &env.profile_name)
+        .arg("--json")
+        .arg("auto-setup")
+        .output()
+        .await
+        .expect("auto-setup");
+    assert!(
+        auto_setup_out.status.success(),
+        "auto-setup must succeed; stderr={}",
+        String::from_utf8_lossy(&auto_setup_out.stderr)
+    );
+    let _guard = env.daemon_guard();
+
+    // Session A continues: post a message via the detached daemon.
+    let post_out = run_chanvoy(&env, &["post", "bravo-team", "session-A"]).await;
+    assert!(
+        post_out.status.success(),
+        "post must succeed against detached daemon; stderr={}",
+        String::from_utf8_lossy(&post_out.stderr)
+    );
+
+    // "Session B" (modeled as a separate CLI invocation): inspect
+    // attention state. The daemon is the same one from Session A —
+    // detachment means the state from Session A's post is observable
+    // here.
+    let list_out = run_chanvoy(&env, &["--json", "attention", "list"]).await;
+    assert!(list_out.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&list_out.stdout).expect("json list parses");
+    let bravo_team = parsed["channels"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|c| c["channel"].as_str() == Some("bravo-team"))
+        })
+        .expect("bravo-team entry present after Session A's post");
+    assert_eq!(
+        bravo_team["source"].as_str(),
+        Some("post_cursor"),
+        "Session A's cursor must be observable in Session B's inspection"
+    );
+    assert_eq!(
+        bravo_team["newest_seen"].as_str(),
+        Some("post-id-d2"),
+        "cursor value preserved across session transition"
     );
 
     teardown_auto_setup_daemon(&env).await;
