@@ -271,6 +271,19 @@ impl TestEnv {
             .await;
     }
 
+    /// Construct an `AutoSetupDaemonGuard` for this env's profile. The
+    /// returned guard's Drop reads the pid file and force-kills any
+    /// surviving daemon process. Pair with auto-setup invocations so a
+    /// panicking test doesn't leak a detached daemon onto the dev
+    /// machine (load-bearing once PER-008D's setsid landed).
+    pub fn daemon_guard(&self) -> AutoSetupDaemonGuard {
+        AutoSetupDaemonGuard {
+            pid_path: self
+                .chanvoy_runtime_dir()
+                .join(format!("{}.pid", self.profile_name)),
+        }
+    }
+
     /// Build a `chanvoy` command with this env's isolation. Parent env
     /// is untouched; all path overrides + token go child-only.
     pub fn chanvoy_command(&self) -> Command {
@@ -408,6 +421,48 @@ pub async fn stop_daemon_cleanly(env: &TestEnv, mut child: Child) -> bool {
     }
     let _ = child.wait().await;
     false
+}
+
+/// Sync-Drop guard for daemons spawned by `chanvoy auto-setup`. Once
+/// PER-008D's setsid detachment lands, an auto-setup-spawned daemon
+/// truly survives its parent — including a panicking test process.
+/// Without an RAII cleanup, a single panic between auto-setup and the
+/// explicit `teardown_auto_setup_daemon` call leaks a real backgrounded
+/// daemon onto the dev machine. The guard reads the pid file and
+/// `libc::kill(pid, SIGKILL)`s on Drop. Sync-only because Drop cannot
+/// be async; ESRCH (no such process — happy-path teardown beat us to
+/// it) is silently swallowed.
+///
+/// Usage in tests:
+/// ```ignore
+/// let env = TestEnv::new("per-008d-...").await;
+/// // ... auto-setup runs, spawns the detached daemon ...
+/// let _guard = env.daemon_guard();
+/// // ... rest of test; on panic the guard's Drop kills the daemon
+/// ```
+pub struct AutoSetupDaemonGuard {
+    pid_path: PathBuf,
+}
+
+impl Drop for AutoSetupDaemonGuard {
+    fn drop(&mut self) {
+        let Ok(contents) = std::fs::read_to_string(&self.pid_path) else {
+            return;
+        };
+        let Ok(pid) = contents.trim().parse::<i32>() else {
+            return;
+        };
+        // SAFETY: `libc::kill` with SIGKILL is async-signal-safe and
+        // takes only a pid + signal. We are NOT in a post-fork context
+        // here — Drop runs in normal Rust code. The unsafe is required
+        // only because libc::kill is an FFI call. SIGKILL is harmless
+        // when the target pid no longer exists (ESRCH); we don't read
+        // errno because the failure mode is acceptable on the happy
+        // path (explicit teardown ran first).
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+    }
 }
 
 /// SIGKILL the daemon via `sysprims_signal::force_kill` and reap via

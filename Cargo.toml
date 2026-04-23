@@ -45,6 +45,10 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 chanvoy-core = { path = "crates/chanvoy-core" }
+# libc: PER-008D test harness uses `libc::getsid` to assert the daemon
+# is its own session leader (proof that setsid took effect). Also used
+# by `AutoSetupDaemonGuard`'s sync-Drop force-kill path.
+libc = "0.2"
 serde_json = { workspace = true }
 # sysprims is the 3leaps-org primitive for process management. Used in the
 # restart harness for reliable SIGKILL delivery (tokio::process::Child::start_kill

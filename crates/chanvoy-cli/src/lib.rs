@@ -911,15 +911,16 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
     // itself hangs or cannot be served.
     stop_daemon_if_present(profile).await?;
     let exe = std::env::current_exe()?;
-    Command::new(exe)
-        .arg("--profile")
+    let mut cmd = Command::new(exe);
+    cmd.arg("--profile")
         .arg(profile)
         .arg("daemon")
         .arg("serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    detach_into_new_session(&mut cmd);
+    cmd.spawn()?;
     // Each per-iteration `ping()` is bounded the same way as the
     // pre-spawn health check, for the same reason: a freshly spawned
     // daemon could wedge during startup (deadlocked WebSocket init,
@@ -935,6 +936,51 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     Err(DaemonError::NotRunning(profile.to_string()).into())
+}
+
+/// Detach the spawned daemon into a new session so it survives the
+/// termination of the spawning shell. Without this, the daemon stays in
+/// the spawning shell's process group and session: when the shell exits
+/// (or its controlling terminal closes), the daemon receives `SIGHUP`
+/// and dies. Operators returning to a machine then find no running
+/// daemon despite an earlier successful `auto-setup` — the PER-008D
+/// motivating failure mode.
+///
+/// `setsid(2)` makes the new process the leader of a new session and
+/// process group with no controlling terminal. `SIGHUP` from the
+/// parent's terminal close cannot reach it.
+///
+/// Mirrors the `pre_exec(|| { libc::setsid()... })` pattern used by
+/// `sysprims-cli`'s own guard daemon. If sysprims later exposes a
+/// public `detached_command()` primitive (tracked in the lanytehq /
+/// sysprims memo at `.plans/memos/lanytehq/`), migrate to that.
+#[cfg(unix)]
+fn detach_into_new_session(cmd: &mut Command) {
+    // tokio::process::Command exposes pre_exec directly on Unix — no
+    // separate trait import needed.
+    //
+    // SAFETY: pre_exec runs in the post-fork child between fork() and
+    // execve(). Only async-signal-safe operations are permitted here
+    // (POSIX async-signal-safe list). `libc::setsid` is on that list.
+    // The closure performs no allocation, no logging, no locking, no
+    // Rust runtime operations — only the syscall and an io::Error
+    // construction on failure (Error::last_os_error reads errno, also
+    // async-signal-safe).
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_into_new_session(_cmd: &mut Command) {
+    // chanvoy is Unix-only for v1; this stub exists so the call site
+    // compiles cleanly under hypothetical non-Unix builds. PER-008D's
+    // detachment story is Unix-shaped (setsid / process groups).
 }
 
 /// Stop the daemon if it is present, and wait until its socket is actually gone

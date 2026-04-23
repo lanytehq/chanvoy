@@ -168,6 +168,7 @@ version = "0.1.0"
 dependencies = [
  "chanvoy-cli",
  "chanvoy-core",
+ "libc",
  "serde_json",
  "sysprims-proc",
  "sysprims-signal",
@@ -186,6 +187,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
