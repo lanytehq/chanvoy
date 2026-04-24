@@ -1809,6 +1809,9 @@ impl HumanReadable for DaemonStatus {
         if self.ws_suspected_gap == Some(true) {
             out.push_str("\nsuspected_gap: yes");
         }
+        if let Some(err) = &self.mattermost_last_error {
+            out.push_str(&format!("\nmattermost_last_error: {}", err));
+        }
         out
     }
 }

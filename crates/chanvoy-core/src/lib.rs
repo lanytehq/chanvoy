@@ -173,6 +173,80 @@ pub enum DaemonHealthState {
 
 pub const RECOVERY_GRACE_MS: i64 = 10_000;
 
+/// Snapshot of websocket state for building a `DaemonStatus` without
+/// holding any locks. All fields reflect a single atomic read moment.
+pub struct WsStatusSnapshot {
+    pub connection_state: Option<WsConnectionState>,
+    pub last_event_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub reconnect_count: Option<u64>,
+    pub last_disconnect_at: Option<i64>,
+    pub last_recovered_at: Option<i64>,
+    pub suspected_gap: Option<bool>,
+    pub recovering_until: i64,
+}
+
+/// Snapshot of IPC state for building a `DaemonStatus` without holding
+/// any locks.
+pub struct IpcStatusSnapshot {
+    pub connected: Option<bool>,
+    pub peer_id: Option<String>,
+    pub reconnect_count: Option<u64>,
+}
+
+/// Build a `DaemonStatus` from pre-computed snapshots.
+///
+/// Pure function — no mutation, no I/O. Intended for `daemon_status` to
+/// remain a local read that does not fail when Mattermost reachability
+/// is lost: `whoami` errors surface as data (`mattermost_ok=false`,
+/// `mattermost_last_error=Some`, `mattermost_username` falls back to
+/// the profile's configured bot username) rather than failing the RPC.
+///
+/// This matters in exactly the outage class PER-010 addresses — a
+/// sleep/wake or transient network loss can take down the REST path
+/// alongside the WS, and that is when the operator most needs to see
+/// the new reconnect-health fields. Making status pure-local keeps the
+/// surface available during the failure window. PER-010, entarch.
+#[allow(clippy::too_many_arguments)]
+pub fn build_daemon_status(
+    profile_name: String,
+    socket_path: PathBuf,
+    configured_bot_username: String,
+    whoami_result: Result<String, String>,
+    ws: WsStatusSnapshot,
+    ipc: IpcStatusSnapshot,
+    now_millis: i64,
+) -> DaemonStatus {
+    let (mattermost_username, mattermost_ok, mattermost_last_error) = match whoami_result {
+        Ok(username) => (username, true, None),
+        Err(msg) => (configured_bot_username, false, Some(msg)),
+    };
+    let health = derive_daemon_health(
+        now_millis,
+        ws.connection_state,
+        ws.suspected_gap.unwrap_or(false),
+        ws.recovering_until,
+    );
+    DaemonStatus {
+        profile_name,
+        socket_path,
+        mattermost_username,
+        mattermost_ok,
+        ws_connection_state: ws.connection_state,
+        ws_last_event_at: ws.last_event_at,
+        ws_last_error: ws.last_error,
+        ws_reconnect_count: ws.reconnect_count,
+        ipc_connected: ipc.connected,
+        ipc_peer_id: ipc.peer_id,
+        ipc_reconnect_count: ipc.reconnect_count,
+        health,
+        ws_last_disconnect_at: ws.last_disconnect_at,
+        ws_last_recovered_at: ws.last_recovered_at,
+        ws_suspected_gap: ws.suspected_gap,
+        mattermost_last_error,
+    }
+}
+
 pub fn derive_daemon_health(
     now_millis: i64,
     connection_state: Option<WsConnectionState>,
@@ -619,6 +693,8 @@ pub struct DaemonStatus {
     pub ws_last_recovered_at: Option<i64>,
     #[serde(default)]
     pub ws_suspected_gap: Option<bool>,
+    #[serde(default)]
+    pub mattermost_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -3112,6 +3188,101 @@ monitored_channels = ["per-003", "per-004"]
             // Let both task timers fire; only the second should stamp.
             tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 200)).await;
             assert!(ws.last_recovered_at.load(Ordering::Relaxed) > 0);
+        }
+
+        fn ws_snapshot_for(
+            connection_state: Option<WsConnectionState>,
+            suspected_gap: Option<bool>,
+            last_disconnect_at: Option<i64>,
+            reconnect_count: Option<u64>,
+            recovering_until: i64,
+        ) -> WsStatusSnapshot {
+            WsStatusSnapshot {
+                connection_state,
+                last_event_at: None,
+                last_error: None,
+                reconnect_count,
+                last_disconnect_at,
+                last_recovered_at: None,
+                suspected_gap,
+                recovering_until,
+            }
+        }
+
+        fn ipc_absent() -> IpcStatusSnapshot {
+            IpcStatusSnapshot {
+                connected: None,
+                peer_id: None,
+                reconnect_count: None,
+            }
+        }
+
+        #[test]
+        fn build_status_surfaces_reconnect_fields_when_whoami_fails() {
+            // PER-010 entarch finding: `daemon_status` must remain a
+            // local read when Mattermost reachability is lost. In the
+            // sleep/wake / transient-network outage class this PR is
+            // about, REST `whoami` can fail alongside the WS — and the
+            // operator needs the new reconnect-health fields precisely
+            // then. The RPC must not error out; whoami failure becomes
+            // data.
+            let now = 1_777_050_000_000;
+            let ws = ws_snapshot_for(
+                Some(WsConnectionState::Disconnected),
+                Some(true),
+                Some(now - 30_000),
+                Some(4),
+                0,
+            );
+            let status = build_daemon_status(
+                "bravo-devlead".to_string(),
+                PathBuf::from("/tmp/chanvoy/bravo-devlead.sock"),
+                "agent-bravo-devlead".to_string(),
+                Err("io error: connection refused".to_string()),
+                ws,
+                ipc_absent(),
+                now,
+            );
+            assert!(!status.mattermost_ok);
+            assert_eq!(status.mattermost_username, "agent-bravo-devlead");
+            assert_eq!(
+                status.mattermost_last_error.as_deref(),
+                Some("io error: connection refused")
+            );
+            // The reconnect-health surface must be populated regardless.
+            assert_eq!(
+                status.ws_connection_state,
+                Some(WsConnectionState::Disconnected)
+            );
+            assert_eq!(status.health, Some(DaemonHealthState::Disconnected));
+            assert_eq!(status.ws_suspected_gap, Some(true));
+            assert_eq!(status.ws_last_disconnect_at, Some(now - 30_000));
+            assert_eq!(status.ws_reconnect_count, Some(4));
+        }
+
+        #[test]
+        fn build_status_uses_whoami_username_when_ok() {
+            let now = 1_777_050_000_000;
+            let ws = ws_snapshot_for(
+                Some(WsConnectionState::Healthy),
+                Some(false),
+                None,
+                Some(0),
+                0,
+            );
+            let status = build_daemon_status(
+                "bravo-devlead".to_string(),
+                PathBuf::from("/tmp/chanvoy/bravo-devlead.sock"),
+                "agent-bravo-devlead".to_string(),
+                Ok("agent-bravo-devlead".to_string()),
+                ws,
+                ipc_absent(),
+                now,
+            );
+            assert!(status.mattermost_ok);
+            assert_eq!(status.mattermost_username, "agent-bravo-devlead");
+            assert_eq!(status.mattermost_last_error, None);
+            assert_eq!(status.health, Some(DaemonHealthState::Healthy));
         }
 
         #[tokio::test]
