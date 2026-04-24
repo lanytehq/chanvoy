@@ -1818,6 +1818,7 @@ pub struct WsState {
     pub suspected_gap: Arc<AtomicBool>,
     pub recovering_until: Arc<AtomicI64>,
     pub last_recovered_at: Arc<AtomicI64>,
+    pub catchup_in_flight: Arc<AtomicBool>,
 }
 
 impl Default for WsState {
@@ -1838,6 +1839,7 @@ impl WsState {
             suspected_gap: Arc::new(AtomicBool::new(false)),
             recovering_until: Arc::new(AtomicI64::new(0)),
             last_recovered_at: Arc::new(AtomicI64::new(0)),
+            catchup_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1892,6 +1894,26 @@ impl WsState {
         let ws = Arc::clone(self);
         tokio::spawn(async move {
             sleep(Duration::from_millis((RECOVERY_GRACE_MS + 10) as u64)).await;
+            if ws.recovering_until.load(Ordering::Relaxed) != target {
+                return;
+            }
+            // Wait for this cycle's catchup to finish before clearing.
+            // Otherwise a slow catchup can set `suspected_gap=true`
+            // *after* the grace task has already run, leaving the
+            // daemon stuck in recovering until a later reconnect.
+            // PER-010, secrev follow-up.
+            let wait_start = tokio::time::Instant::now();
+            while ws.catchup_in_flight.load(Ordering::Relaxed) {
+                if wait_start.elapsed() >= Duration::from_secs(60) {
+                    // Pathologically slow catchup — don't clear.
+                    // `suspected_gap` stays at whatever catchup last
+                    // set it to; a later reconnect will resolve.
+                    return;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+            // Re-check target after the wait in case a new reconnect
+            // restamped it while we were waiting on catchup.
             if ws.recovering_until.load(Ordering::Relaxed) != target {
                 return;
             }
@@ -2270,10 +2292,20 @@ impl MattermostWs {
     }
 
     async fn reconnect_catchup(&self) {
+        // Mark this cycle's catchup as in-flight so the grace-window
+        // task (armed before we entered this function) will wait for
+        // us to finish before clearing suspected_gap. Otherwise a slow
+        // catchup — many monitored channels, slow REST — can leave the
+        // grace task firing early, clearing a gap that hadn't been
+        // flagged yet, then catchup sets the gap post-hoc with no
+        // further clear. PER-010, secrev follow-up.
+        self.ws_state
+            .catchup_in_flight
+            .store(true, Ordering::Relaxed);
         // Each reconnect cycle starts with a clean slate. If this cycle's
         // outage exceeded the 5-min window and emits a Gap below, we'll
-        // re-flag suspected_gap — sticky across the healthy window until
-        // the next reconnect cycle proves it clean. PER-010.
+        // re-flag suspected_gap; the arm_recovery_window task clears it
+        // at grace-window completion (after we finish).
         self.ws_state.suspected_gap.store(false, Ordering::Relaxed);
         let five_min_ago = now_unix_millis() - (5 * 60 * 1000);
         let disconnect_at = self.ws_state.last_disconnect_at.load(Ordering::Relaxed);
@@ -2342,6 +2374,9 @@ impl MattermostWs {
                 }),
             });
         }
+        self.ws_state
+            .catchup_in_flight
+            .store(false, Ordering::Relaxed);
     }
 
     async fn resolve_channel_name(&self, channel_id: &str) -> String {
@@ -3367,6 +3402,61 @@ monitored_channels = ["per-003", "per-004"]
             let (conn2, gap2, ru2) = snapshot(&ws);
             assert_eq!(
                 derive_daemon_health(now2, Some(conn2), gap2, ru2),
+                Some(DaemonHealthState::Healthy)
+            );
+        }
+
+        #[tokio::test]
+        async fn gap_detected_after_grace_still_returns_to_healthy() {
+            // secrev follow-up: on a slow catchup path, the grace-task
+            // can fire before reconnect_catchup sets suspected_gap. If
+            // the task cleared unconditionally at that moment, the
+            // post-hoc Gap from catchup would leave the daemon stuck
+            // in recovering / suspected_gap=true until a *later*
+            // reconnect cycle — defeating the fix.
+            //
+            // This test simulates a catchup still in flight when the
+            // grace window expires: the task must wait for catchup to
+            // finish before deciding whether to clear.
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Healthy).await;
+            // Mark catchup as in-flight BEFORE arming the grace task,
+            // mirroring the real flow (arm -> await catchup; catchup
+            // raises the flag at entry).
+            ws.catchup_in_flight.store(true, Ordering::Relaxed);
+            ws.arm_recovery_window();
+
+            // Let the grace window fully elapse. The task must be
+            // parked on the catchup-in-flight wait, not already done.
+            tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 300)).await;
+            assert_eq!(
+                ws.last_recovered_at.load(Ordering::Relaxed),
+                0,
+                "task must wait for catchup to complete, not clear early"
+            );
+
+            // Now simulate catchup finally completing — and emitting a
+            // gap post-expiry. This is the worst case secrev described.
+            ws.suspected_gap.store(true, Ordering::Relaxed);
+            ws.catchup_in_flight.store(false, Ordering::Relaxed);
+
+            // Give the task's 200ms poll a couple of cycles to pick up
+            // the flag change and apply the clear.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            assert!(
+                !ws.suspected_gap.load(Ordering::Relaxed),
+                "suspected_gap must clear once catchup completes, even post-grace"
+            );
+            assert!(
+                ws.last_recovered_at.load(Ordering::Relaxed) > 0,
+                "last_recovered_at must be stamped after catchup completes"
+            );
+            let now = now_unix_millis();
+            let (conn, gap, ru) = snapshot(&ws);
+            assert_eq!(
+                derive_daemon_health(now, Some(conn), gap, ru),
                 Some(DaemonHealthState::Healthy)
             );
         }
