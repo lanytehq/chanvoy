@@ -1766,10 +1766,16 @@ impl WsState {
     /// Stamp `recovering_until = now + RECOVERY_GRACE_MS` and spawn an
     /// idempotent one-shot task that stamps `last_recovered_at` when the
     /// grace window elapses, provided no later reconnect has restamped
-    /// the target and the transport is still Healthy. Intended to be
-    /// called once per successful reconnect, immediately after the
-    /// transport transitions to Healthy.
+    /// the target and the transport is still Healthy.
+    ///
+    /// No-op on cold start (`last_disconnect_at == 0`): `Recovering` is
+    /// a reconnect-health signal, not a normal-startup state. Callers
+    /// may invoke this on every auth-success; gating lives here so all
+    /// paths share one rule.
     pub fn arm_recovery_window(self: &Arc<Self>) {
+        if self.last_disconnect_at.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let target = now_unix_millis() + RECOVERY_GRACE_MS;
         self.recovering_until.store(target, Ordering::Relaxed);
         let ws = Arc::clone(self);
@@ -3078,6 +3084,7 @@ monitored_channels = ["per-003", "per-004"]
             // task sleeps RECOVERY_GRACE_MS + 10, so we rely on the real
             // constant here for a small-but-real wait.
             let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
             ws.set_state(WsConnectionState::Healthy).await;
             ws.arm_recovery_window();
             tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 200)).await;
@@ -3087,6 +3094,7 @@ monitored_channels = ["per-003", "per-004"]
         #[tokio::test]
         async fn grace_window_task_is_idempotent_against_later_reconnect() {
             let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
             ws.set_state(WsConnectionState::Healthy).await;
             ws.arm_recovery_window();
             // Restamp immediately — later reconnect — which invalidates the
@@ -3104,6 +3112,21 @@ monitored_channels = ["per-003", "per-004"]
             // Let both task timers fire; only the second should stamp.
             tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 200)).await;
             assert!(ws.last_recovered_at.load(Ordering::Relaxed) > 0);
+        }
+
+        #[tokio::test]
+        async fn cold_start_auth_does_not_arm_recovery() {
+            // First successful auth on a fresh daemon: no prior disconnect,
+            // so `arm_recovery_window` must be a no-op and derived health
+            // must be Healthy — not Recovering. Recovering is a reconnect
+            // signal, not a startup state.
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.arm_recovery_window();
+            assert_eq!(ws.recovering_until.load(Ordering::Relaxed), 0);
+            let (conn, gap, ru) = snapshot(&ws);
+            let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
+            assert_eq!(health, Some(DaemonHealthState::Healthy));
         }
     }
 }
