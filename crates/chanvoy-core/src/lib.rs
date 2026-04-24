@@ -1867,9 +1867,17 @@ impl WsState {
     }
 
     /// Stamp `recovering_until = now + RECOVERY_GRACE_MS` and spawn an
-    /// idempotent one-shot task that stamps `last_recovered_at` when the
-    /// grace window elapses, provided no later reconnect has restamped
-    /// the target and the transport is still Healthy.
+    /// idempotent one-shot task that, at grace-window completion,
+    /// stamps `last_recovered_at` and clears `suspected_gap` — provided
+    /// no later reconnect has restamped the target and the transport
+    /// is still Healthy.
+    ///
+    /// Grace-window completion is the "recovery confirmed" moment: a
+    /// gap that was flagged during this cycle's `reconnect_catchup`
+    /// resolves when the grace elapses cleanly. Without clearing here,
+    /// a daemon could report `recovering` / `suspected_gap=true` for
+    /// hours after one sleep-wake, since the only other clear is at
+    /// the entry of a *later* reconnect cycle. PER-010, secrev.
     ///
     /// No-op on cold start (`last_disconnect_at == 0`): `Recovering` is
     /// a reconnect-health signal, not a normal-startup state. Callers
@@ -1891,6 +1899,7 @@ impl WsState {
             if matches!(conn, WsConnectionState::Healthy) {
                 ws.last_recovered_at
                     .store(now_unix_millis(), Ordering::Relaxed);
+                ws.suspected_gap.store(false, Ordering::Relaxed);
             }
         });
     }
@@ -3310,6 +3319,56 @@ monitored_channels = ["per-003", "per-004"]
             assert_eq!(status.mattermost_username, "agent-bravo-devlead");
             assert_eq!(status.mattermost_last_error, None);
             assert_eq!(status.health, Some(DaemonHealthState::Healthy));
+        }
+
+        #[tokio::test]
+        async fn gap_triggered_recovery_clears_suspected_gap_after_grace() {
+            // secrev blocker: a >5min outage flags suspected_gap=true,
+            // and derive_daemon_health maps Healthy + suspected_gap to
+            // Recovering. Without clearing at grace-window completion,
+            // the daemon would report recovering / suspected_gap=true
+            // for hours after one sleep-wake event, until a *later*
+            // reconnect cycle happened to clear it. The clear must
+            // happen when the current reconnect's grace window
+            // completes cleanly — no additional reconnect required.
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.arm_recovery_window();
+            // A gap was detected during this reconnect's catchup path.
+            ws.suspected_gap.store(true, Ordering::Relaxed);
+
+            // Within the grace window: derived health is Recovering
+            // because suspected_gap=true (AND we're inside the grace
+            // window — either condition is sufficient).
+            let now = now_unix_millis();
+            let (conn, gap, ru) = snapshot(&ws);
+            assert!(gap, "precondition: suspected_gap should be set");
+            assert_eq!(
+                derive_daemon_health(now, Some(conn), gap, ru),
+                Some(DaemonHealthState::Recovering)
+            );
+
+            // After the grace window elapses without a new disconnect:
+            // the task stamps last_recovered_at AND clears
+            // suspected_gap. Derived health returns to Healthy without
+            // a second reconnect cycle.
+            tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 200)).await;
+
+            assert!(
+                ws.last_recovered_at.load(Ordering::Relaxed) > 0,
+                "last_recovered_at must be stamped at grace-window completion"
+            );
+            assert!(
+                !ws.suspected_gap.load(Ordering::Relaxed),
+                "suspected_gap must clear at grace-window completion"
+            );
+            let now2 = now_unix_millis();
+            let (conn2, gap2, ru2) = snapshot(&ws);
+            assert_eq!(
+                derive_daemon_health(now2, Some(conn2), gap2, ru2),
+                Some(DaemonHealthState::Healthy)
+            );
         }
 
         #[tokio::test]
