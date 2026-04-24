@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -159,6 +159,140 @@ pub enum WsConnectionState {
     Connecting,
     Healthy,
     Degraded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonHealthState {
+    Disconnected,
+    Connecting,
+    Healthy,
+    Degraded,
+    Recovering,
+}
+
+pub const RECOVERY_GRACE_MS: i64 = 10_000;
+
+/// Upper bound for the Mattermost reachability probe used by
+/// `daemon_status`. Short enough that the status surface stays
+/// responsive when REST is stalled (the same outage class PER-010 is
+/// about), long enough to tolerate normal network latency on a
+/// healthy path. PER-010, entarch.
+pub const STATUS_PROBE_TIMEOUT_MS: u64 = 2_000;
+
+/// Time-bound a Mattermost identity probe. On success returns the
+/// username; on remote error or local timeout returns a printable
+/// error string, ready to feed `build_daemon_status` as
+/// `whoami_result: Err(...)`.
+///
+/// `daemon_status` must return promptly even when the reachability
+/// probe does not complete — a stalled REST call would otherwise wedge
+/// the RPC exactly when the operator needs the reconnect-health
+/// surface to diagnose. PER-010, entarch.
+pub async fn probe_whoami(client: &MattermostClient, timeout_ms: u64) -> Result<String, String> {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), client.whoami()).await {
+        Ok(Ok(identity)) => Ok(identity.username),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "reachability probe timed out after {}ms",
+            timeout_ms
+        )),
+    }
+}
+
+/// Snapshot of websocket state for building a `DaemonStatus` without
+/// holding any locks. All fields reflect a single atomic read moment.
+pub struct WsStatusSnapshot {
+    pub connection_state: Option<WsConnectionState>,
+    pub last_event_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub reconnect_count: Option<u64>,
+    pub last_disconnect_at: Option<i64>,
+    pub last_recovered_at: Option<i64>,
+    pub suspected_gap: Option<bool>,
+    pub recovering_until: i64,
+}
+
+/// Snapshot of IPC state for building a `DaemonStatus` without holding
+/// any locks.
+pub struct IpcStatusSnapshot {
+    pub connected: Option<bool>,
+    pub peer_id: Option<String>,
+    pub reconnect_count: Option<u64>,
+}
+
+/// Build a `DaemonStatus` from pre-computed snapshots.
+///
+/// Pure function — no mutation, no I/O. Intended for `daemon_status` to
+/// remain a local read that does not fail when Mattermost reachability
+/// is lost: `whoami` errors surface as data (`mattermost_ok=false`,
+/// `mattermost_last_error=Some`, `mattermost_username` falls back to
+/// the profile's configured bot username) rather than failing the RPC.
+///
+/// This matters in exactly the outage class PER-010 addresses — a
+/// sleep/wake or transient network loss can take down the REST path
+/// alongside the WS, and that is when the operator most needs to see
+/// the new reconnect-health fields. Making status pure-local keeps the
+/// surface available during the failure window. PER-010, entarch.
+#[allow(clippy::too_many_arguments)]
+pub fn build_daemon_status(
+    profile_name: String,
+    socket_path: PathBuf,
+    configured_bot_username: String,
+    whoami_result: Result<String, String>,
+    ws: WsStatusSnapshot,
+    ipc: IpcStatusSnapshot,
+    now_millis: i64,
+) -> DaemonStatus {
+    let (mattermost_username, mattermost_ok, mattermost_last_error) = match whoami_result {
+        Ok(username) => (username, true, None),
+        Err(msg) => (configured_bot_username, false, Some(msg)),
+    };
+    let health = derive_daemon_health(
+        now_millis,
+        ws.connection_state,
+        ws.suspected_gap.unwrap_or(false),
+        ws.recovering_until,
+    );
+    DaemonStatus {
+        profile_name,
+        socket_path,
+        mattermost_username,
+        mattermost_ok,
+        ws_connection_state: ws.connection_state,
+        ws_last_event_at: ws.last_event_at,
+        ws_last_error: ws.last_error,
+        ws_reconnect_count: ws.reconnect_count,
+        ipc_connected: ipc.connected,
+        ipc_peer_id: ipc.peer_id,
+        ipc_reconnect_count: ipc.reconnect_count,
+        health,
+        ws_last_disconnect_at: ws.last_disconnect_at,
+        ws_last_recovered_at: ws.last_recovered_at,
+        ws_suspected_gap: ws.suspected_gap,
+        mattermost_last_error,
+    }
+}
+
+pub fn derive_daemon_health(
+    now_millis: i64,
+    connection_state: Option<WsConnectionState>,
+    suspected_gap: bool,
+    recovering_until_millis: i64,
+) -> Option<DaemonHealthState> {
+    let state = connection_state?;
+    Some(match state {
+        WsConnectionState::Disconnected => DaemonHealthState::Disconnected,
+        WsConnectionState::Connecting => DaemonHealthState::Connecting,
+        WsConnectionState::Degraded => DaemonHealthState::Degraded,
+        WsConnectionState::Healthy => {
+            if now_millis < recovering_until_millis || suspected_gap {
+                DaemonHealthState::Recovering
+            } else {
+                DaemonHealthState::Healthy
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -578,6 +712,16 @@ pub struct DaemonStatus {
     pub ipc_peer_id: Option<String>,
     #[serde(default)]
     pub ipc_reconnect_count: Option<u64>,
+    #[serde(default)]
+    pub health: Option<DaemonHealthState>,
+    #[serde(default)]
+    pub ws_last_disconnect_at: Option<i64>,
+    #[serde(default)]
+    pub ws_last_recovered_at: Option<i64>,
+    #[serde(default)]
+    pub ws_suspected_gap: Option<bool>,
+    #[serde(default)]
+    pub mattermost_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1671,6 +1815,10 @@ pub struct WsState {
     pub reconnect_count: Arc<AtomicU64>,
     pub last_disconnect_at: Arc<AtomicI64>,
     pub last_disconnect_seq: AtomicU64,
+    pub suspected_gap: Arc<AtomicBool>,
+    pub recovering_until: Arc<AtomicI64>,
+    pub last_recovered_at: Arc<AtomicI64>,
+    pub catchup_in_flight: Arc<AtomicBool>,
 }
 
 impl Default for WsState {
@@ -1688,6 +1836,10 @@ impl WsState {
             reconnect_count: Arc::new(AtomicU64::new(0)),
             last_disconnect_at: Arc::new(AtomicI64::new(0)),
             last_disconnect_seq: AtomicU64::new(0),
+            suspected_gap: Arc::new(AtomicBool::new(false)),
+            recovering_until: Arc::new(AtomicI64::new(0)),
+            last_recovered_at: Arc::new(AtomicI64::new(0)),
+            catchup_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1714,6 +1866,64 @@ impl WsState {
 
     pub fn bump_reconnect(&self) {
         self.reconnect_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stamp `recovering_until = now + RECOVERY_GRACE_MS` and spawn an
+    /// idempotent one-shot task that, at grace-window completion,
+    /// stamps `last_recovered_at` and clears `suspected_gap` — provided
+    /// no later reconnect has restamped the target and the transport
+    /// is still Healthy.
+    ///
+    /// Grace-window completion is the "recovery confirmed" moment: a
+    /// gap that was flagged during this cycle's `reconnect_catchup`
+    /// resolves when the grace elapses cleanly. Without clearing here,
+    /// a daemon could report `recovering` / `suspected_gap=true` for
+    /// hours after one sleep-wake, since the only other clear is at
+    /// the entry of a *later* reconnect cycle. PER-010, secrev.
+    ///
+    /// No-op on cold start (`last_disconnect_at == 0`): `Recovering` is
+    /// a reconnect-health signal, not a normal-startup state. Callers
+    /// may invoke this on every auth-success; gating lives here so all
+    /// paths share one rule.
+    pub fn arm_recovery_window(self: &Arc<Self>) {
+        if self.last_disconnect_at.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let target = now_unix_millis() + RECOVERY_GRACE_MS;
+        self.recovering_until.store(target, Ordering::Relaxed);
+        let ws = Arc::clone(self);
+        tokio::spawn(async move {
+            sleep(Duration::from_millis((RECOVERY_GRACE_MS + 10) as u64)).await;
+            if ws.recovering_until.load(Ordering::Relaxed) != target {
+                return;
+            }
+            // Wait for this cycle's catchup to finish before clearing.
+            // Otherwise a slow catchup can set `suspected_gap=true`
+            // *after* the grace task has already run, leaving the
+            // daemon stuck in recovering until a later reconnect.
+            // PER-010, secrev follow-up.
+            let wait_start = tokio::time::Instant::now();
+            while ws.catchup_in_flight.load(Ordering::Relaxed) {
+                if wait_start.elapsed() >= Duration::from_secs(60) {
+                    // Pathologically slow catchup — don't clear.
+                    // `suspected_gap` stays at whatever catchup last
+                    // set it to; a later reconnect will resolve.
+                    return;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+            // Re-check target after the wait in case a new reconnect
+            // restamped it while we were waiting on catchup.
+            if ws.recovering_until.load(Ordering::Relaxed) != target {
+                return;
+            }
+            let conn = *ws.connection_state.lock().await;
+            if matches!(conn, WsConnectionState::Healthy) {
+                ws.last_recovered_at
+                    .store(now_unix_millis(), Ordering::Relaxed);
+                ws.suspected_gap.store(false, Ordering::Relaxed);
+            }
+        });
     }
 }
 
@@ -1897,6 +2107,7 @@ impl MattermostWs {
                                         .set_state(WsConnectionState::Healthy)
                                         .await;
                                     info!("websocket authenticated and healthy");
+                                    self.ws_state.arm_recovery_window();
                                     self.event_bus.emit(DaemonEvent {
                                         seq: 0,
                                         kind: DaemonEventKind::ConnectionStateChanged,
@@ -2081,6 +2292,21 @@ impl MattermostWs {
     }
 
     async fn reconnect_catchup(&self) {
+        // Mark this cycle's catchup as in-flight so the grace-window
+        // task (armed before we entered this function) will wait for
+        // us to finish before clearing suspected_gap. Otherwise a slow
+        // catchup — many monitored channels, slow REST — can leave the
+        // grace task firing early, clearing a gap that hadn't been
+        // flagged yet, then catchup sets the gap post-hoc with no
+        // further clear. PER-010, secrev follow-up.
+        self.ws_state
+            .catchup_in_flight
+            .store(true, Ordering::Relaxed);
+        // Each reconnect cycle starts with a clean slate. If this cycle's
+        // outage exceeded the 5-min window and emits a Gap below, we'll
+        // re-flag suspected_gap; the arm_recovery_window task clears it
+        // at grace-window completion (after we finish).
+        self.ws_state.suspected_gap.store(false, Ordering::Relaxed);
         let five_min_ago = now_unix_millis() - (5 * 60 * 1000);
         let disconnect_at = self.ws_state.last_disconnect_at.load(Ordering::Relaxed);
         let outage_exceeded_window = disconnect_at > 0 && disconnect_at < five_min_ago;
@@ -2135,6 +2361,7 @@ impl MattermostWs {
         }
 
         if outage_exceeded_window {
+            self.ws_state.suspected_gap.store(true, Ordering::Relaxed);
             let missed_from = self.ws_state.last_disconnect_seq.load(Ordering::Relaxed);
             let missed_to = self.event_bus.current_seq();
             self.event_bus.emit(DaemonEvent {
@@ -2147,6 +2374,9 @@ impl MattermostWs {
                 }),
             });
         }
+        self.ws_state
+            .catchup_in_flight
+            .store(false, Ordering::Relaxed);
     }
 
     async fn resolve_channel_name(&self, channel_id: &str) -> String {
@@ -2857,6 +3087,459 @@ monitored_channels = ["per-003", "per-004"]
                 })
                 .collect();
             assert_eq!(channels, vec!["per-009"]);
+        }
+    }
+
+    mod reconnect_health {
+        use super::*;
+        use std::sync::atomic::Ordering;
+
+        #[test]
+        fn derive_none_when_no_transport() {
+            assert_eq!(derive_daemon_health(1000, None, false, 0), None);
+        }
+
+        #[test]
+        fn derive_maps_non_healthy_transport_one_to_one() {
+            let now = 1_000_000;
+            assert_eq!(
+                derive_daemon_health(now, Some(WsConnectionState::Disconnected), false, 0),
+                Some(DaemonHealthState::Disconnected)
+            );
+            assert_eq!(
+                derive_daemon_health(now, Some(WsConnectionState::Connecting), false, 0),
+                Some(DaemonHealthState::Connecting)
+            );
+            assert_eq!(
+                derive_daemon_health(now, Some(WsConnectionState::Degraded), false, 0),
+                Some(DaemonHealthState::Degraded)
+            );
+        }
+
+        #[test]
+        fn derive_healthy_when_transport_healthy_and_no_grace_no_gap() {
+            let now = 1_000_000;
+            assert_eq!(
+                derive_daemon_health(now, Some(WsConnectionState::Healthy), false, 0),
+                Some(DaemonHealthState::Healthy)
+            );
+        }
+
+        #[test]
+        fn derive_recovering_during_grace_window() {
+            let now = 1_000_000;
+            let recovering_until = now + 5_000;
+            assert_eq!(
+                derive_daemon_health(
+                    now,
+                    Some(WsConnectionState::Healthy),
+                    false,
+                    recovering_until
+                ),
+                Some(DaemonHealthState::Recovering)
+            );
+        }
+
+        #[test]
+        fn derive_recovering_when_suspected_gap_even_after_grace() {
+            let now = 1_000_000;
+            assert_eq!(
+                derive_daemon_health(now, Some(WsConnectionState::Healthy), true, 0),
+                Some(DaemonHealthState::Recovering)
+            );
+        }
+
+        #[test]
+        fn derive_healthy_after_grace_elapsed_no_gap() {
+            let now = 1_000_000;
+            let recovering_until = now - 1;
+            assert_eq!(
+                derive_daemon_health(
+                    now,
+                    Some(WsConnectionState::Healthy),
+                    false,
+                    recovering_until
+                ),
+                Some(DaemonHealthState::Healthy)
+            );
+        }
+
+        // AC #6 state-machine coverage operating directly on WsState.
+        // WS-lifecycle helpers (`arm_recovery_window`) and `reconnect_catchup`
+        // are exercised at the WsState level because the full transport loop
+        // requires a live Mattermost server. These tests pin the
+        // agent-gating contract: given a specific WsState snapshot, the
+        // derived health is correct.
+
+        fn snapshot(ws: &WsState) -> (WsConnectionState, bool, i64) {
+            // connection_state is a Mutex<T>; tests read it via try_lock
+            // since no other task holds it here.
+            let conn = ws.connection_state.try_lock().map(|g| *g).unwrap();
+            let gap = ws.suspected_gap.load(Ordering::Relaxed);
+            let ru = ws.recovering_until.load(Ordering::Relaxed);
+            (conn, gap, ru)
+        }
+
+        #[tokio::test]
+        async fn healthy_steady_state_reads_healthy() {
+            let ws = WsState::new();
+            ws.set_state(WsConnectionState::Healthy).await;
+            let (conn, gap, ru) = snapshot(&ws);
+            let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
+            assert_eq!(health, Some(DaemonHealthState::Healthy));
+        }
+
+        #[tokio::test]
+        async fn disconnect_stamps_last_disconnect_and_reads_disconnected() {
+            let ws = WsState::new();
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.set_state(WsConnectionState::Disconnected).await;
+            let (conn, gap, ru) = snapshot(&ws);
+            assert!(ws.last_disconnect_at.load(Ordering::Relaxed) > 0);
+            let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
+            assert_eq!(health, Some(DaemonHealthState::Disconnected));
+        }
+
+        #[tokio::test]
+        async fn reconnect_within_grace_reads_recovering() {
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.arm_recovery_window();
+            // Within the grace window the derived health must be Recovering.
+            let (conn, gap, ru) = snapshot(&ws);
+            let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
+            assert_eq!(health, Some(DaemonHealthState::Recovering));
+            assert!(ru > now_unix_millis());
+        }
+
+        #[tokio::test]
+        async fn suspected_gap_keeps_recovering_past_grace() {
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.suspected_gap.store(true, Ordering::Relaxed);
+            // recovering_until is 0 (grace window elapsed in the past), but
+            // suspected_gap alone should hold Recovering.
+            let (conn, gap, ru) = snapshot(&ws);
+            let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
+            assert_eq!(health, Some(DaemonHealthState::Recovering));
+        }
+
+        #[tokio::test]
+        async fn grace_window_task_stamps_last_recovered_at_when_still_healthy() {
+            // Shorten the wait by arming with a tiny recovering_until; the
+            // task sleeps RECOVERY_GRACE_MS + 10, so we rely on the real
+            // constant here for a small-but-real wait.
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.arm_recovery_window();
+            tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 200)).await;
+            assert!(ws.last_recovered_at.load(Ordering::Relaxed) > 0);
+        }
+
+        #[tokio::test]
+        async fn grace_window_task_is_idempotent_against_later_reconnect() {
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.arm_recovery_window();
+            // Restamp immediately — later reconnect — which invalidates the
+            // first task's target equality check.
+            let first_target = ws.recovering_until.load(Ordering::Relaxed);
+            // Advance enough for the first task to wake up, but NOT enough
+            // for the second target's task to wake up.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            ws.arm_recovery_window();
+            let second_target = ws.recovering_until.load(Ordering::Relaxed);
+            assert!(
+                second_target > first_target,
+                "restamp must advance the target"
+            );
+            // Let both task timers fire; only the second should stamp.
+            tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 200)).await;
+            assert!(ws.last_recovered_at.load(Ordering::Relaxed) > 0);
+        }
+
+        fn ws_snapshot_for(
+            connection_state: Option<WsConnectionState>,
+            suspected_gap: Option<bool>,
+            last_disconnect_at: Option<i64>,
+            reconnect_count: Option<u64>,
+            recovering_until: i64,
+        ) -> WsStatusSnapshot {
+            WsStatusSnapshot {
+                connection_state,
+                last_event_at: None,
+                last_error: None,
+                reconnect_count,
+                last_disconnect_at,
+                last_recovered_at: None,
+                suspected_gap,
+                recovering_until,
+            }
+        }
+
+        fn ipc_absent() -> IpcStatusSnapshot {
+            IpcStatusSnapshot {
+                connected: None,
+                peer_id: None,
+                reconnect_count: None,
+            }
+        }
+
+        #[test]
+        fn build_status_surfaces_reconnect_fields_when_whoami_fails() {
+            // PER-010 entarch finding: `daemon_status` must remain a
+            // local read when Mattermost reachability is lost. In the
+            // sleep/wake / transient-network outage class this PR is
+            // about, REST `whoami` can fail alongside the WS — and the
+            // operator needs the new reconnect-health fields precisely
+            // then. The RPC must not error out; whoami failure becomes
+            // data.
+            let now = 1_777_050_000_000;
+            let ws = ws_snapshot_for(
+                Some(WsConnectionState::Disconnected),
+                Some(true),
+                Some(now - 30_000),
+                Some(4),
+                0,
+            );
+            let status = build_daemon_status(
+                "bravo-devlead".to_string(),
+                PathBuf::from("/tmp/chanvoy/bravo-devlead.sock"),
+                "agent-bravo-devlead".to_string(),
+                Err("io error: connection refused".to_string()),
+                ws,
+                ipc_absent(),
+                now,
+            );
+            assert!(!status.mattermost_ok);
+            assert_eq!(status.mattermost_username, "agent-bravo-devlead");
+            assert_eq!(
+                status.mattermost_last_error.as_deref(),
+                Some("io error: connection refused")
+            );
+            // The reconnect-health surface must be populated regardless.
+            assert_eq!(
+                status.ws_connection_state,
+                Some(WsConnectionState::Disconnected)
+            );
+            assert_eq!(status.health, Some(DaemonHealthState::Disconnected));
+            assert_eq!(status.ws_suspected_gap, Some(true));
+            assert_eq!(status.ws_last_disconnect_at, Some(now - 30_000));
+            assert_eq!(status.ws_reconnect_count, Some(4));
+        }
+
+        #[test]
+        fn build_status_uses_whoami_username_when_ok() {
+            let now = 1_777_050_000_000;
+            let ws = ws_snapshot_for(
+                Some(WsConnectionState::Healthy),
+                Some(false),
+                None,
+                Some(0),
+                0,
+            );
+            let status = build_daemon_status(
+                "bravo-devlead".to_string(),
+                PathBuf::from("/tmp/chanvoy/bravo-devlead.sock"),
+                "agent-bravo-devlead".to_string(),
+                Ok("agent-bravo-devlead".to_string()),
+                ws,
+                ipc_absent(),
+                now,
+            );
+            assert!(status.mattermost_ok);
+            assert_eq!(status.mattermost_username, "agent-bravo-devlead");
+            assert_eq!(status.mattermost_last_error, None);
+            assert_eq!(status.health, Some(DaemonHealthState::Healthy));
+        }
+
+        #[tokio::test]
+        async fn gap_triggered_recovery_clears_suspected_gap_after_grace() {
+            // secrev blocker: a >5min outage flags suspected_gap=true,
+            // and derive_daemon_health maps Healthy + suspected_gap to
+            // Recovering. Without clearing at grace-window completion,
+            // the daemon would report recovering / suspected_gap=true
+            // for hours after one sleep-wake event, until a *later*
+            // reconnect cycle happened to clear it. The clear must
+            // happen when the current reconnect's grace window
+            // completes cleanly — no additional reconnect required.
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.arm_recovery_window();
+            // A gap was detected during this reconnect's catchup path.
+            ws.suspected_gap.store(true, Ordering::Relaxed);
+
+            // Within the grace window: derived health is Recovering
+            // because suspected_gap=true (AND we're inside the grace
+            // window — either condition is sufficient).
+            let now = now_unix_millis();
+            let (conn, gap, ru) = snapshot(&ws);
+            assert!(gap, "precondition: suspected_gap should be set");
+            assert_eq!(
+                derive_daemon_health(now, Some(conn), gap, ru),
+                Some(DaemonHealthState::Recovering)
+            );
+
+            // After the grace window elapses without a new disconnect:
+            // the task stamps last_recovered_at AND clears
+            // suspected_gap. Derived health returns to Healthy without
+            // a second reconnect cycle.
+            tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 200)).await;
+
+            assert!(
+                ws.last_recovered_at.load(Ordering::Relaxed) > 0,
+                "last_recovered_at must be stamped at grace-window completion"
+            );
+            assert!(
+                !ws.suspected_gap.load(Ordering::Relaxed),
+                "suspected_gap must clear at grace-window completion"
+            );
+            let now2 = now_unix_millis();
+            let (conn2, gap2, ru2) = snapshot(&ws);
+            assert_eq!(
+                derive_daemon_health(now2, Some(conn2), gap2, ru2),
+                Some(DaemonHealthState::Healthy)
+            );
+        }
+
+        #[tokio::test]
+        async fn gap_detected_after_grace_still_returns_to_healthy() {
+            // secrev follow-up: on a slow catchup path, the grace-task
+            // can fire before reconnect_catchup sets suspected_gap. If
+            // the task cleared unconditionally at that moment, the
+            // post-hoc Gap from catchup would leave the daemon stuck
+            // in recovering / suspected_gap=true until a *later*
+            // reconnect cycle — defeating the fix.
+            //
+            // This test simulates a catchup still in flight when the
+            // grace window expires: the task must wait for catchup to
+            // finish before deciding whether to clear.
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Healthy).await;
+            // Mark catchup as in-flight BEFORE arming the grace task,
+            // mirroring the real flow (arm -> await catchup; catchup
+            // raises the flag at entry).
+            ws.catchup_in_flight.store(true, Ordering::Relaxed);
+            ws.arm_recovery_window();
+
+            // Let the grace window fully elapse. The task must be
+            // parked on the catchup-in-flight wait, not already done.
+            tokio::time::sleep(Duration::from_millis((RECOVERY_GRACE_MS as u64) + 300)).await;
+            assert_eq!(
+                ws.last_recovered_at.load(Ordering::Relaxed),
+                0,
+                "task must wait for catchup to complete, not clear early"
+            );
+
+            // Now simulate catchup finally completing — and emitting a
+            // gap post-expiry. This is the worst case secrev described.
+            ws.suspected_gap.store(true, Ordering::Relaxed);
+            ws.catchup_in_flight.store(false, Ordering::Relaxed);
+
+            // Give the task's 200ms poll a couple of cycles to pick up
+            // the flag change and apply the clear.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            assert!(
+                !ws.suspected_gap.load(Ordering::Relaxed),
+                "suspected_gap must clear once catchup completes, even post-grace"
+            );
+            assert!(
+                ws.last_recovered_at.load(Ordering::Relaxed) > 0,
+                "last_recovered_at must be stamped after catchup completes"
+            );
+            let now = now_unix_millis();
+            let (conn, gap, ru) = snapshot(&ws);
+            assert_eq!(
+                derive_daemon_health(now, Some(conn), gap, ru),
+                Some(DaemonHealthState::Healthy)
+            );
+        }
+
+        #[tokio::test]
+        async fn probe_whoami_returns_promptly_when_remote_is_stalled() {
+            // entarch follow-up blocker: `daemon_status` must return
+            // promptly even when the Mattermost reachability probe does
+            // not complete. A stalled REST call (TCP black-hole, DNS
+            // wedge, slow-loris) previously hung the whole RPC, making
+            // the reconnect-health surface disappear in the same outage
+            // class PER-010 is meant to diagnose. Prove the timeout
+            // wrapper fires well before the server's configured delay.
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            // Simulate a stalled REST call: whoami would eventually
+            // return 200 after 5s, but the probe must not wait.
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(5))
+                        .set_body_json(serde_json::json!({
+                            "id": "bot-id-123",
+                            "username": "agent-bravo-devlead",
+                            "is_bot": true,
+                            "nickname": null,
+                            "email": null,
+                        })),
+                )
+                .mount(&server)
+                .await;
+
+            let profile = Profile {
+                name: "bravo-devlead".to_string(),
+                role: "bravo-devlead".to_string(),
+                scope: "lanytehq".to_string(),
+                provider: Provider::Mattermost,
+                bot_username: "agent-bravo-devlead".to_string(),
+                team_name: "org-lanytehq".to_string(),
+                server_url: server.uri(),
+                env_name: "LANYTE_MM_TOKEN".to_string(),
+                env_file: None,
+                credential_mode: CredentialMode::EnvName,
+                capability_class: CapabilityClass::Standard,
+                monitored_channels: Vec::new(),
+                ipc: None,
+            };
+            let client = MattermostClient::new(&profile, "token".into()).unwrap();
+
+            let t0 = std::time::Instant::now();
+            let result = probe_whoami(&client, 200).await;
+            let elapsed = t0.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(1_500),
+                "probe_whoami must return before server's 5s delay; elapsed={:?}",
+                elapsed
+            );
+            match result {
+                Err(msg) => assert!(
+                    msg.contains("timed out"),
+                    "expected timeout error, got {msg:?}"
+                ),
+                Ok(_) => panic!("probe must not return Ok when the remote stalls past timeout"),
+            }
+        }
+
+        #[tokio::test]
+        async fn cold_start_auth_does_not_arm_recovery() {
+            // First successful auth on a fresh daemon: no prior disconnect,
+            // so `arm_recovery_window` must be a no-op and derived health
+            // must be Healthy — not Recovering. Recovering is a reconnect
+            // signal, not a startup state.
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.arm_recovery_window();
+            assert_eq!(ws.recovering_until.load(Ordering::Relaxed), 0);
+            let (conn, gap, ru) = snapshot(&ws);
+            let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
+            assert_eq!(health, Some(DaemonHealthState::Healthy));
         }
     }
 }

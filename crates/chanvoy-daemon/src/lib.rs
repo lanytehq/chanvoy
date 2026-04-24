@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use chanvoy_core::{
-    daemon_event_to_notification, load_attention_state, load_profile, load_token,
+    daemon_event_to_notification, load_attention_state, load_profile, load_token, now_unix_millis,
     pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile, store_attention_state,
     AddMemberParams, ArchiveChannelParams, AttentionShowParams, AttentionState, CapabilityClass,
     Channel, CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent,
@@ -522,52 +522,71 @@ async fn dispatch_request(
             server_url: state.profile.server_url.clone(),
             socket_path: state.socket_path.clone(),
         })),
-        "daemon_status" => match state.client.whoami().await {
-            Ok(identity) => {
+        "daemon_status" => {
+            use std::sync::atomic::Ordering;
+            let ws_snapshot = {
                 let ws_guard = state.ws_state_holder.lock().await;
-                let (conn_state, last_event, last_error, reconnect_count) = match ws_guard.as_ref()
-                {
+                match ws_guard.as_ref() {
                     Some(ws) => {
                         let conn = *ws.connection_state.lock().await;
-                        let last = ws.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+                        let last = ws.last_event_at.load(Ordering::Relaxed);
                         let err = ws.last_error.lock().await.clone();
-                        let rc = ws
-                            .reconnect_count
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        (
-                            Some(conn),
-                            if last > 0 { Some(last) } else { None },
-                            err,
-                            Some(rc),
-                        )
+                        let rc = ws.reconnect_count.load(Ordering::Relaxed);
+                        let ldx = ws.last_disconnect_at.load(Ordering::Relaxed);
+                        let lrx = ws.last_recovered_at.load(Ordering::Relaxed);
+                        let gap = ws.suspected_gap.load(Ordering::Relaxed);
+                        let ru = ws.recovering_until.load(Ordering::Relaxed);
+                        chanvoy_core::WsStatusSnapshot {
+                            connection_state: Some(conn),
+                            last_event_at: if last > 0 { Some(last) } else { None },
+                            last_error: err,
+                            reconnect_count: Some(rc),
+                            last_disconnect_at: if ldx > 0 { Some(ldx) } else { None },
+                            last_recovered_at: if lrx > 0 { Some(lrx) } else { None },
+                            suspected_gap: Some(gap),
+                            recovering_until: ru,
+                        }
                     }
-                    None => (None, None, None, None),
-                };
-                Ok(to_value(DaemonStatus {
-                    profile_name: state.profile.name.clone(),
-                    socket_path: state.socket_path.clone(),
-                    mattermost_username: identity.username,
-                    mattermost_ok: true,
-                    ws_connection_state: conn_state,
-                    ws_last_event_at: last_event,
-                    ws_last_error: last_error,
-                    ws_reconnect_count: reconnect_count,
-                    ipc_connected: match &state.ipc_state {
-                        Some(s) => Some(s.lock().await.connected),
-                        None => None,
+                    None => chanvoy_core::WsStatusSnapshot {
+                        connection_state: None,
+                        last_event_at: None,
+                        last_error: None,
+                        reconnect_count: None,
+                        last_disconnect_at: None,
+                        last_recovered_at: None,
+                        suspected_gap: None,
+                        recovering_until: 0,
                     },
-                    ipc_peer_id: match &state.ipc_state {
-                        Some(s) => s.lock().await.peer_id.clone(),
-                        None => None,
-                    },
-                    ipc_reconnect_count: match &state.ipc_state {
-                        Some(s) => Some(s.lock().await.reconnect_count),
-                        None => None,
-                    },
-                }))
-            }
-            Err(e) => Err(DaemonError::from(e)),
-        },
+                }
+            };
+            let ipc_snapshot = match &state.ipc_state {
+                Some(s) => {
+                    let g = s.lock().await;
+                    chanvoy_core::IpcStatusSnapshot {
+                        connected: Some(g.connected),
+                        peer_id: g.peer_id.clone(),
+                        reconnect_count: Some(g.reconnect_count),
+                    }
+                }
+                None => chanvoy_core::IpcStatusSnapshot {
+                    connected: None,
+                    peer_id: None,
+                    reconnect_count: None,
+                },
+            };
+            let whoami_result =
+                chanvoy_core::probe_whoami(&state.client, chanvoy_core::STATUS_PROBE_TIMEOUT_MS)
+                    .await;
+            Ok(to_value(chanvoy_core::build_daemon_status(
+                state.profile.name.clone(),
+                state.socket_path.clone(),
+                state.profile.bot_username.clone(),
+                whoami_result,
+                ws_snapshot,
+                ipc_snapshot,
+                now_unix_millis(),
+            )))
+        }
         "seed_cursors" => seed_cursors(state)
             .await
             .map(to_value)

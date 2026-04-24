@@ -6,9 +6,10 @@ use std::{env, ffi::OsStr};
 use chanvoy_core::{
     list_profiles, load_active_profile, load_token, pid_path_for_profile, socket_path_for_profile,
     store_active_profile, store_profile, AttentionListResult, AttentionShowResult, AttentionSource,
-    CapabilityClass, Channel, CheckResult, CredentialMode, DaemonStatus, DmConversation, Identity,
-    MattermostClient, Message, Notification, PostReceipt, Profile, ProfileStatus, Provider,
-    SeedCursorsResult, SeededChannelOutcome, UnreadNotifications, WaitResult, DEFAULT_TEAM,
+    CapabilityClass, Channel, CheckResult, CredentialMode, DaemonHealthState, DaemonStatus,
+    DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt, Profile,
+    ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
+    WaitResult, WsConnectionState, DEFAULT_TEAM,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -1771,13 +1772,66 @@ impl HumanReadable for ProfileStatus {
 
 impl HumanReadable for DaemonStatus {
     fn to_human_string(&self) -> String {
-        format!(
+        let mut out = format!(
             "profile: {}\nsocket: {}\nmattermost_username: {}\nmattermost_ok: {}",
             self.profile_name,
             self.socket_path.display(),
             self.mattermost_username,
             self.mattermost_ok
-        )
+        );
+        if let Some(h) = self.health {
+            out.push_str(&format!("\nhealth: {}", health_label(h)));
+        }
+        if let Some(state) = self.ws_connection_state {
+            out.push_str(&format!("\nws_state: {}", ws_state_label(state)));
+        }
+        if let Some(rc) = self.ws_reconnect_count {
+            out.push_str(&format!("\nreconnect_count: {}", rc));
+        }
+        if let Some(last_event) = self.ws_last_event_at {
+            out.push_str(&format!(
+                "\nws_last_event_at: {}",
+                format_timestamp(last_event)
+            ));
+        }
+        if let Some(last_disc) = self.ws_last_disconnect_at {
+            out.push_str(&format!(
+                "\nws_last_disconnect_at: {}",
+                format_timestamp(last_disc)
+            ));
+        }
+        if let Some(last_rec) = self.ws_last_recovered_at {
+            out.push_str(&format!(
+                "\nws_last_recovered_at: {}",
+                format_timestamp(last_rec)
+            ));
+        }
+        if self.ws_suspected_gap == Some(true) {
+            out.push_str("\nsuspected_gap: yes");
+        }
+        if let Some(err) = &self.mattermost_last_error {
+            out.push_str(&format!("\nmattermost_last_error: {}", err));
+        }
+        out
+    }
+}
+
+fn health_label(h: DaemonHealthState) -> &'static str {
+    match h {
+        DaemonHealthState::Healthy => "healthy",
+        DaemonHealthState::Connecting => "connecting",
+        DaemonHealthState::Degraded => "degraded",
+        DaemonHealthState::Disconnected => "disconnected",
+        DaemonHealthState::Recovering => "recovering",
+    }
+}
+
+fn ws_state_label(s: WsConnectionState) -> &'static str {
+    match s {
+        WsConnectionState::Disconnected => "disconnected",
+        WsConnectionState::Connecting => "connecting",
+        WsConnectionState::Healthy => "healthy",
+        WsConnectionState::Degraded => "degraded",
     }
 }
 
