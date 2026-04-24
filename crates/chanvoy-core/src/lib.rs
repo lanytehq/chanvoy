@@ -1762,6 +1762,29 @@ impl WsState {
     pub fn bump_reconnect(&self) {
         self.reconnect_count.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Stamp `recovering_until = now + RECOVERY_GRACE_MS` and spawn an
+    /// idempotent one-shot task that stamps `last_recovered_at` when the
+    /// grace window elapses, provided no later reconnect has restamped
+    /// the target and the transport is still Healthy. Intended to be
+    /// called once per successful reconnect, immediately after the
+    /// transport transitions to Healthy.
+    pub fn arm_recovery_window(self: &Arc<Self>) {
+        let target = now_unix_millis() + RECOVERY_GRACE_MS;
+        self.recovering_until.store(target, Ordering::Relaxed);
+        let ws = Arc::clone(self);
+        tokio::spawn(async move {
+            sleep(Duration::from_millis((RECOVERY_GRACE_MS + 10) as u64)).await;
+            if ws.recovering_until.load(Ordering::Relaxed) != target {
+                return;
+            }
+            let conn = *ws.connection_state.lock().await;
+            if matches!(conn, WsConnectionState::Healthy) {
+                ws.last_recovered_at
+                    .store(now_unix_millis(), Ordering::Relaxed);
+            }
+        });
+    }
 }
 
 pub struct MattermostWs {
@@ -1944,6 +1967,7 @@ impl MattermostWs {
                                         .set_state(WsConnectionState::Healthy)
                                         .await;
                                     info!("websocket authenticated and healthy");
+                                    self.ws_state.arm_recovery_window();
                                     self.event_bus.emit(DaemonEvent {
                                         seq: 0,
                                         kind: DaemonEventKind::ConnectionStateChanged,
@@ -2128,6 +2152,13 @@ impl MattermostWs {
     }
 
     async fn reconnect_catchup(&self) {
+        // Each reconnect cycle starts with a clean slate. If this cycle's
+        // outage exceeded the 5-min window and emits a Gap below, we'll
+        // re-flag suspected_gap — sticky across the healthy window until
+        // the next reconnect cycle proves it clean. PER-010.
+        self.ws_state
+            .suspected_gap
+            .store(false, Ordering::Relaxed);
         let five_min_ago = now_unix_millis() - (5 * 60 * 1000);
         let disconnect_at = self.ws_state.last_disconnect_at.load(Ordering::Relaxed);
         let outage_exceeded_window = disconnect_at > 0 && disconnect_at < five_min_ago;
@@ -2182,6 +2213,9 @@ impl MattermostWs {
         }
 
         if outage_exceeded_window {
+            self.ws_state
+                .suspected_gap
+                .store(true, Ordering::Relaxed);
             let missed_from = self.ws_state.last_disconnect_seq.load(Ordering::Relaxed);
             let missed_to = self.event_bus.current_seq();
             self.event_bus.emit(DaemonEvent {
