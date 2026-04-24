@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -159,6 +159,39 @@ pub enum WsConnectionState {
     Connecting,
     Healthy,
     Degraded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonHealthState {
+    Disconnected,
+    Connecting,
+    Healthy,
+    Degraded,
+    Recovering,
+}
+
+pub const RECOVERY_GRACE_MS: i64 = 10_000;
+
+pub fn derive_daemon_health(
+    now_millis: i64,
+    connection_state: Option<WsConnectionState>,
+    suspected_gap: bool,
+    recovering_until_millis: i64,
+) -> Option<DaemonHealthState> {
+    let state = connection_state?;
+    Some(match state {
+        WsConnectionState::Disconnected => DaemonHealthState::Disconnected,
+        WsConnectionState::Connecting => DaemonHealthState::Connecting,
+        WsConnectionState::Degraded => DaemonHealthState::Degraded,
+        WsConnectionState::Healthy => {
+            if now_millis < recovering_until_millis || suspected_gap {
+                DaemonHealthState::Recovering
+            } else {
+                DaemonHealthState::Healthy
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -578,6 +611,14 @@ pub struct DaemonStatus {
     pub ipc_peer_id: Option<String>,
     #[serde(default)]
     pub ipc_reconnect_count: Option<u64>,
+    #[serde(default)]
+    pub health: Option<DaemonHealthState>,
+    #[serde(default)]
+    pub ws_last_disconnect_at: Option<i64>,
+    #[serde(default)]
+    pub ws_last_recovered_at: Option<i64>,
+    #[serde(default)]
+    pub ws_suspected_gap: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1671,6 +1712,9 @@ pub struct WsState {
     pub reconnect_count: Arc<AtomicU64>,
     pub last_disconnect_at: Arc<AtomicI64>,
     pub last_disconnect_seq: AtomicU64,
+    pub suspected_gap: Arc<AtomicBool>,
+    pub recovering_until: Arc<AtomicI64>,
+    pub last_recovered_at: Arc<AtomicI64>,
 }
 
 impl Default for WsState {
@@ -1688,6 +1732,9 @@ impl WsState {
             reconnect_count: Arc::new(AtomicU64::new(0)),
             last_disconnect_at: Arc::new(AtomicI64::new(0)),
             last_disconnect_seq: AtomicU64::new(0),
+            suspected_gap: Arc::new(AtomicBool::new(false)),
+            recovering_until: Arc::new(AtomicI64::new(0)),
+            last_recovered_at: Arc::new(AtomicI64::new(0)),
         }
     }
 

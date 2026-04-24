@@ -5,16 +5,17 @@ use std::sync::Arc;
 use std::{fs, io};
 
 use chanvoy_core::{
-    daemon_event_to_notification, load_attention_state, load_profile, load_token,
-    pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile, store_attention_state,
-    AddMemberParams, ArchiveChannelParams, AttentionShowParams, AttentionState, CapabilityClass,
-    Channel, CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent,
-    DaemonEventKind, DaemonEventPayloadInner, DaemonHealth, DaemonStatus, DirectMessageParams,
-    DmConversation, EventBus, IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    MattermostClient, MattermostWs, NotificationsParams, NotifyParams, PostMessageParams, Profile,
-    ProfileStatus, Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult,
-    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnreadNotifications, UnsubscribeParams,
-    WaitChannelParams, WaitResult, WsState,
+    daemon_event_to_notification, derive_daemon_health, load_attention_state, load_profile,
+    load_token, now_unix_millis, pid_path_for_profile, rpc_error, rpc_result,
+    socket_path_for_profile, store_attention_state, AddMemberParams, ArchiveChannelParams,
+    AttentionShowParams, AttentionState, CapabilityClass, Channel, CheckChannelParams, CheckResult,
+    CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
+    DaemonHealth, DaemonHealthState, DaemonStatus, DirectMessageParams, DmConversation, EventBus,
+    IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient,
+    MattermostWs, NotificationsParams, NotifyParams, PostMessageParams, Profile, ProfileStatus,
+    Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult, SubscribeParams,
+    SubscriptionAck, SubscriptionFilter, UnreadNotifications, UnsubscribeParams, WaitChannelParams,
+    WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -524,25 +525,46 @@ async fn dispatch_request(
         })),
         "daemon_status" => match state.client.whoami().await {
             Ok(identity) => {
+                use std::sync::atomic::Ordering;
                 let ws_guard = state.ws_state_holder.lock().await;
-                let (conn_state, last_event, last_error, reconnect_count) = match ws_guard.as_ref()
-                {
+                let (
+                    conn_state,
+                    last_event,
+                    last_error,
+                    reconnect_count,
+                    last_disconnect_at,
+                    last_recovered_at,
+                    suspected_gap,
+                    recovering_until,
+                ) = match ws_guard.as_ref() {
                     Some(ws) => {
                         let conn = *ws.connection_state.lock().await;
-                        let last = ws.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+                        let last = ws.last_event_at.load(Ordering::Relaxed);
                         let err = ws.last_error.lock().await.clone();
-                        let rc = ws
-                            .reconnect_count
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let rc = ws.reconnect_count.load(Ordering::Relaxed);
+                        let ldx = ws.last_disconnect_at.load(Ordering::Relaxed);
+                        let lrx = ws.last_recovered_at.load(Ordering::Relaxed);
+                        let gap = ws.suspected_gap.load(Ordering::Relaxed);
+                        let ru = ws.recovering_until.load(Ordering::Relaxed);
                         (
                             Some(conn),
                             if last > 0 { Some(last) } else { None },
                             err,
                             Some(rc),
+                            if ldx > 0 { Some(ldx) } else { None },
+                            if lrx > 0 { Some(lrx) } else { None },
+                            Some(gap),
+                            ru,
                         )
                     }
-                    None => (None, None, None, None),
+                    None => (None, None, None, None, None, None, None, 0),
                 };
+                let health: Option<DaemonHealthState> = derive_daemon_health(
+                    now_unix_millis(),
+                    conn_state,
+                    suspected_gap.unwrap_or(false),
+                    recovering_until,
+                );
                 Ok(to_value(DaemonStatus {
                     profile_name: state.profile.name.clone(),
                     socket_path: state.socket_path.clone(),
@@ -564,6 +586,10 @@ async fn dispatch_request(
                         Some(s) => Some(s.lock().await.reconnect_count),
                         None => None,
                     },
+                    health,
+                    ws_last_disconnect_at: last_disconnect_at,
+                    ws_last_recovered_at: last_recovered_at,
+                    ws_suspected_gap: suspected_gap,
                 }))
             }
             Err(e) => Err(DaemonError::from(e)),
