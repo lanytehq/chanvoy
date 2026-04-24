@@ -574,10 +574,9 @@ async fn dispatch_request(
                     reconnect_count: None,
                 },
             };
-            let whoami_result = match state.client.whoami().await {
-                Ok(identity) => Ok(identity.username),
-                Err(e) => Err(e.to_string()),
-            };
+            let whoami_result =
+                chanvoy_core::probe_whoami(&state.client, chanvoy_core::STATUS_PROBE_TIMEOUT_MS)
+                    .await;
             Ok(to_value(chanvoy_core::build_daemon_status(
                 state.profile.name.clone(),
                 state.socket_path.clone(),

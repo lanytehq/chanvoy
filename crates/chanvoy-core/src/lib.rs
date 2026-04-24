@@ -173,6 +173,33 @@ pub enum DaemonHealthState {
 
 pub const RECOVERY_GRACE_MS: i64 = 10_000;
 
+/// Upper bound for the Mattermost reachability probe used by
+/// `daemon_status`. Short enough that the status surface stays
+/// responsive when REST is stalled (the same outage class PER-010 is
+/// about), long enough to tolerate normal network latency on a
+/// healthy path. PER-010, entarch.
+pub const STATUS_PROBE_TIMEOUT_MS: u64 = 2_000;
+
+/// Time-bound a Mattermost identity probe. On success returns the
+/// username; on remote error or local timeout returns a printable
+/// error string, ready to feed `build_daemon_status` as
+/// `whoami_result: Err(...)`.
+///
+/// `daemon_status` must return promptly even when the reachability
+/// probe does not complete — a stalled REST call would otherwise wedge
+/// the RPC exactly when the operator needs the reconnect-health
+/// surface to diagnose. PER-010, entarch.
+pub async fn probe_whoami(client: &MattermostClient, timeout_ms: u64) -> Result<String, String> {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), client.whoami()).await {
+        Ok(Ok(identity)) => Ok(identity.username),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "reachability probe timed out after {}ms",
+            timeout_ms
+        )),
+    }
+}
+
 /// Snapshot of websocket state for building a `DaemonStatus` without
 /// holding any locks. All fields reflect a single atomic read moment.
 pub struct WsStatusSnapshot {
@@ -3283,6 +3310,72 @@ monitored_channels = ["per-003", "per-004"]
             assert_eq!(status.mattermost_username, "agent-bravo-devlead");
             assert_eq!(status.mattermost_last_error, None);
             assert_eq!(status.health, Some(DaemonHealthState::Healthy));
+        }
+
+        #[tokio::test]
+        async fn probe_whoami_returns_promptly_when_remote_is_stalled() {
+            // entarch follow-up blocker: `daemon_status` must return
+            // promptly even when the Mattermost reachability probe does
+            // not complete. A stalled REST call (TCP black-hole, DNS
+            // wedge, slow-loris) previously hung the whole RPC, making
+            // the reconnect-health surface disappear in the same outage
+            // class PER-010 is meant to diagnose. Prove the timeout
+            // wrapper fires well before the server's configured delay.
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            // Simulate a stalled REST call: whoami would eventually
+            // return 200 after 5s, but the probe must not wait.
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(5))
+                        .set_body_json(serde_json::json!({
+                            "id": "bot-id-123",
+                            "username": "agent-bravo-devlead",
+                            "is_bot": true,
+                            "nickname": null,
+                            "email": null,
+                        })),
+                )
+                .mount(&server)
+                .await;
+
+            let profile = Profile {
+                name: "bravo-devlead".to_string(),
+                role: "bravo-devlead".to_string(),
+                scope: "lanytehq".to_string(),
+                provider: Provider::Mattermost,
+                bot_username: "agent-bravo-devlead".to_string(),
+                team_name: "org-lanytehq".to_string(),
+                server_url: server.uri(),
+                env_name: "LANYTE_MM_TOKEN".to_string(),
+                env_file: None,
+                credential_mode: CredentialMode::EnvName,
+                capability_class: CapabilityClass::Standard,
+                monitored_channels: Vec::new(),
+                ipc: None,
+            };
+            let client = MattermostClient::new(&profile, "token".into()).unwrap();
+
+            let t0 = std::time::Instant::now();
+            let result = probe_whoami(&client, 200).await;
+            let elapsed = t0.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(1_500),
+                "probe_whoami must return before server's 5s delay; elapsed={:?}",
+                elapsed
+            );
+            match result {
+                Err(msg) => assert!(
+                    msg.contains("timed out"),
+                    "expected timeout error, got {msg:?}"
+                ),
+                Ok(_) => panic!("probe must not return Ok when the remote stalls past timeout"),
+            }
         }
 
         #[tokio::test]
