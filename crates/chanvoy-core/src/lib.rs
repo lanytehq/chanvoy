@@ -918,6 +918,165 @@ pub fn store_profile(profile: &Profile) -> Result<PathBuf, CoreError> {
     Ok(path)
 }
 
+/// Fallback policy for chanvoy CLI default profile resolution.
+///
+/// PER-012 / crucible spec §"Chanvoy Profile Naming". Side-effecting
+/// verbs whose target uncertainty could disrupt another operator's
+/// state on a shared dev machine MUST resolve via explicit sources
+/// only. Read/inspect/post verbs may consult the broader fallback
+/// chain (single running daemon, then `active_profile` marker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPolicy {
+    /// Resolve only via explicit sources: `--profile` flag,
+    /// `CHANVOY_PROFILE` env var, or `LANYTE_AGENT_ROLE` +
+    /// `LANYTE_AGENT_SCOPE` exact-name match. Refuse on any fallback.
+    /// Used by daemon lifecycle verbs (`daemon stop` etc.) where a
+    /// stale fallback could affect another operator's daemon.
+    ExplicitOnly,
+    /// In addition to explicit sources, allow single-running-daemon
+    /// and `active_profile` fallbacks. Used by read/inspect/post verbs
+    /// where mis-attribution risk is bounded by membership/permissions.
+    AllowReadFallbacks,
+}
+
+/// Inputs to the pure profile resolver. All fields are I/O snapshots —
+/// the caller is responsible for gathering them; the resolver itself
+/// is side-effect-free for testability.
+pub struct ResolverInputs<'a> {
+    pub profiles: &'a [String],
+    pub running_daemon_profiles: &'a [String],
+    pub active_profile: Option<&'a str>,
+    pub env_role: Option<&'a str>,
+    pub env_scope: Option<&'a str>,
+    pub env_chanvoy_profile: Option<&'a str>,
+}
+
+/// Reasons the resolver may refuse. Each variant is a distinct
+/// operator-visible failure mode with a tailored remediation hint.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ResolverError {
+    #[error(
+        "CHANVOY_PROFILE is set to '{name}' but no such profile exists; \
+         create it or unset the env var. Available profiles: {available:?}"
+    )]
+    EnvProfileNotFound {
+        name: String,
+        available: Vec<String>,
+    },
+    #[error(
+        "env identity is {role}/{scope} but no profile named '{expected}' exists; \
+         run `chanvoy auto-setup` to materialize it. Available profiles: {available:?}"
+    )]
+    EnvExactMatchNotFound {
+        role: String,
+        scope: String,
+        expected: String,
+        available: Vec<String>,
+    },
+    #[error(
+        "multiple chanvoy daemons are running ({running:?}); \
+         pass --profile to disambiguate"
+    )]
+    AmbiguousMultiDaemon { running: Vec<String> },
+    #[error(
+        "destructive verb requires explicit profile selection; \
+         pass --profile, set CHANVOY_PROFILE, or source an identity script. \
+         Available profiles: {available:?}"
+    )]
+    DestructiveRequiresExplicit { available: Vec<String> },
+    #[error(
+        "unable to resolve a chanvoy profile; \
+         pass --profile or set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE. \
+         Available profiles: {available:?}"
+    )]
+    CannotResolve { available: Vec<String> },
+}
+
+/// Resolve the chanvoy profile a CLI invocation should target.
+///
+/// Implements the canonical rule from
+/// `lanyte-crucible/docs/specs/agent-chat-conventions.md`
+/// §"Chanvoy Profile Naming":
+///
+/// 1. Explicit `--profile` flag — always wins, no validation.
+/// 2. `CHANVOY_PROFILE` env — refuse if the named profile does not exist.
+/// 3. `${LANYTE_AGENT_ROLE}-${LANYTE_AGENT_SCOPE}` exact-name match —
+///    refuse hard when the env is set but no canonical-name profile
+///    exists, rather than fall through to a different identity (this
+///    is the silent mis-attribution class PER-012 closes).
+/// 4. Single running daemon (only with `AllowReadFallbacks`).
+/// 5. `active_profile` marker file (only with `AllowReadFallbacks`).
+/// 6. Refuse with the live-profile list.
+///
+/// Pure function: no I/O. The caller must provide a snapshot of the
+/// relevant filesystem and environment state via `ResolverInputs`.
+pub fn resolve_profile_name(
+    profile_flag: Option<&str>,
+    policy: FallbackPolicy,
+    inputs: &ResolverInputs<'_>,
+) -> Result<String, ResolverError> {
+    // Rule 1: explicit --profile flag — operator's stated intent.
+    if let Some(name) = profile_flag {
+        return Ok(name.to_string());
+    }
+
+    let available = || inputs.profiles.to_vec();
+
+    // Rule 2: CHANVOY_PROFILE env. Must point at an existing profile.
+    if let Some(name) = inputs.env_chanvoy_profile {
+        if inputs.profiles.iter().any(|p| p == name) {
+            return Ok(name.to_string());
+        }
+        return Err(ResolverError::EnvProfileNotFound {
+            name: name.to_string(),
+            available: available(),
+        });
+    }
+
+    // Rule 3: ${ROLE}-${SCOPE} exact-name. Hard-refuse on env-set-no-match.
+    if let (Some(role), Some(scope)) = (inputs.env_role, inputs.env_scope) {
+        let expected = format!("{role}-{scope}");
+        if inputs.profiles.iter().any(|p| p == &expected) {
+            return Ok(expected);
+        }
+        return Err(ResolverError::EnvExactMatchNotFound {
+            role: role.to_string(),
+            scope: scope.to_string(),
+            expected,
+            available: available(),
+        });
+    }
+
+    // Below this point is fallback territory; explicit-only verbs refuse.
+    if matches!(policy, FallbackPolicy::ExplicitOnly) {
+        return Err(ResolverError::DestructiveRequiresExplicit {
+            available: available(),
+        });
+    }
+
+    // Rule 4: single running daemon.
+    match inputs.running_daemon_profiles.len() {
+        0 => {} // continue to rule 5
+        1 => return Ok(inputs.running_daemon_profiles[0].clone()),
+        _ => {
+            return Err(ResolverError::AmbiguousMultiDaemon {
+                running: inputs.running_daemon_profiles.to_vec(),
+            });
+        }
+    }
+
+    // Rule 5: active_profile marker file. Below env + daemon — never
+    // overrides env-derived resolution. Demoted in PER-012, Option A.
+    if let Some(active) = inputs.active_profile {
+        return Ok(active.to_string());
+    }
+
+    // Rule 6: refuse.
+    Err(ResolverError::CannotResolve {
+        available: available(),
+    })
+}
+
 pub fn load_attention_state(profile_name: &str) -> Result<AttentionState, CoreError> {
     let path = attention_state_path(profile_name);
     match fs::read_to_string(path) {
@@ -3540,6 +3699,342 @@ monitored_channels = ["per-003", "per-004"]
             let (conn, gap, ru) = snapshot(&ws);
             let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
             assert_eq!(health, Some(DaemonHealthState::Healthy));
+        }
+    }
+
+    mod resolver {
+        use super::*;
+
+        fn inputs<'a>(
+            profiles: &'a [String],
+            running: &'a [String],
+            active: Option<&'a str>,
+            role: Option<&'a str>,
+            scope: Option<&'a str>,
+            chanvoy_profile: Option<&'a str>,
+        ) -> ResolverInputs<'a> {
+            ResolverInputs {
+                profiles,
+                running_daemon_profiles: running,
+                active_profile: active,
+                env_role: role,
+                env_scope: scope,
+                env_chanvoy_profile: chanvoy_profile,
+            }
+        }
+
+        fn names(items: &[&str]) -> Vec<String> {
+            items.iter().map(|s| s.to_string()).collect()
+        }
+
+        // -- Rule 1: explicit --profile flag wins, unconditional. ----------
+
+        #[test]
+        fn explicit_flag_wins_even_when_env_disagrees() {
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                Some("cxotech-lanytehq"),
+                Some("bravo-devlead"),
+                Some("lanytehq"),
+                None,
+            );
+            let resolved = resolve_profile_name(
+                Some("cxotech-lanytehq"),
+                FallbackPolicy::ExplicitOnly,
+                &inputs,
+            )
+            .unwrap();
+            assert_eq!(resolved, "cxotech-lanytehq");
+        }
+
+        #[test]
+        fn explicit_flag_is_not_validated_against_profile_list() {
+            // The flag is the operator's stated intent. If it points
+            // at a profile that doesn't exist, downstream daemon-RPC
+            // errors will surface that — the resolver does not
+            // second-guess explicit operator input.
+            let inputs = inputs(&[], &[], None, None, None, None);
+            let resolved = resolve_profile_name(
+                Some("typo-profile"),
+                FallbackPolicy::AllowReadFallbacks,
+                &inputs,
+            )
+            .unwrap();
+            assert_eq!(resolved, "typo-profile");
+        }
+
+        // -- Rule 2: CHANVOY_PROFILE env, must exist (devrev pin). ---------
+
+        #[test]
+        fn chanvoy_profile_env_resolves_when_profile_exists() {
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-enacthq"]);
+            let inputs = inputs(&profiles, &[], None, None, None, Some("cxotech-enacthq"));
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs).unwrap();
+            assert_eq!(resolved, "cxotech-enacthq");
+        }
+
+        #[test]
+        fn chanvoy_profile_env_refuses_when_profile_missing() {
+            // devrev pin: do NOT fall through to env-derived exact /
+            // single-daemon / active_profile when CHANVOY_PROFILE is
+            // set to a non-existent name. Refuse with the live list.
+            let profiles = names(&["bravo-devlead-lanytehq"]);
+            let running = names(&["bravo-devlead-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &running,
+                Some("bravo-devlead-lanytehq"),
+                Some("bravo-devlead"),
+                Some("lanytehq"),
+                Some("nonexistent-profile"),
+            );
+            let err = resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs)
+                .unwrap_err();
+            match err {
+                ResolverError::EnvProfileNotFound { name, .. } => {
+                    assert_eq!(name, "nonexistent-profile");
+                }
+                other => panic!("expected EnvProfileNotFound, got {other:?}"),
+            }
+        }
+
+        // -- Rule 3: ${ROLE}-${SCOPE} exact-name. --------------------------
+
+        #[test]
+        fn env_exact_name_wins_when_profile_exists() {
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                None,
+                Some("bravo-devlead"),
+                Some("lanytehq"),
+                None,
+            );
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs).unwrap();
+            assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+
+        #[test]
+        fn env_exact_name_wins_over_sibling_profiles_sharing_role_scope() {
+            // The PER-010 trace: sibling profiles `*-bootstrap` and
+            // `*-custom-team` exist alongside the canonical name. The
+            // old resolver bailed on this ambiguity; the new resolver
+            // resolves to the exact canonical name and ignores the
+            // siblings.
+            let profiles = names(&[
+                "bravo-devlead-lanytehq",
+                "bravo-devlead-bootstrap",
+                "bravo-devlead-custom-team",
+            ]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                None,
+                Some("bravo-devlead"),
+                Some("lanytehq"),
+                None,
+            );
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs).unwrap();
+            assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+
+        #[test]
+        fn env_set_but_no_exact_match_refuses_hard() {
+            // Hard refuse — falling through to single-daemon or
+            // active_profile when the operator's env states
+            // bravo-devlead/lanytehq is exactly the silent
+            // mis-attribution class PER-012 closes.
+            let profiles = names(&["cxotech-lanytehq", "dispatch-lanytehq"]);
+            let running = names(&["cxotech-lanytehq"]); // single daemon present
+            let inputs = inputs(
+                &profiles,
+                &running,
+                Some("cxotech-lanytehq"),
+                Some("bravo-devlead"),
+                Some("lanytehq"),
+                None,
+            );
+            let err = resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs)
+                .unwrap_err();
+            match err {
+                ResolverError::EnvExactMatchNotFound {
+                    expected,
+                    role,
+                    scope,
+                    ..
+                } => {
+                    assert_eq!(expected, "bravo-devlead-lanytehq");
+                    assert_eq!(role, "bravo-devlead");
+                    assert_eq!(scope, "lanytehq");
+                }
+                other => panic!("expected EnvExactMatchNotFound, got {other:?}"),
+            }
+        }
+
+        // -- Rule 4: single running daemon (AllowReadFallbacks only). ------
+
+        #[test]
+        fn env_unset_single_daemon_resolves_with_read_fallbacks() {
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-lanytehq"]);
+            let running = names(&["cxotech-lanytehq"]);
+            let inputs = inputs(&profiles, &running, None, None, None, None);
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs).unwrap();
+            assert_eq!(resolved, "cxotech-lanytehq");
+        }
+
+        #[test]
+        fn env_unset_multi_daemon_refuses_with_running_list() {
+            let profiles = names(&["a-x", "b-x", "c-x"]);
+            let running = names(&["a-x", "b-x"]);
+            let inputs = inputs(&profiles, &running, None, None, None, None);
+            let err = resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs)
+                .unwrap_err();
+            match err {
+                ResolverError::AmbiguousMultiDaemon { running } => {
+                    assert_eq!(running, names(&["a-x", "b-x"]));
+                }
+                other => panic!("expected AmbiguousMultiDaemon, got {other:?}"),
+            }
+        }
+
+        // -- Rule 5: active_profile fallback (AllowReadFallbacks only). ----
+
+        #[test]
+        fn env_unset_no_daemons_active_profile_resolves_with_read_fallbacks() {
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                Some("bravo-devlead-lanytehq"),
+                None,
+                None,
+                None,
+            );
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs).unwrap();
+            assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+
+        #[test]
+        fn active_profile_never_overrides_env_derived() {
+            // Reverse case for AC #2: env says bravo-devlead-lanytehq;
+            // active_profile says cxotech-lanytehq. Env wins.
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                Some("cxotech-lanytehq"),
+                Some("bravo-devlead"),
+                Some("lanytehq"),
+                None,
+            );
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs).unwrap();
+            assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+
+        // -- Rule 6: refuse with available list. ---------------------------
+
+        #[test]
+        fn no_inputs_at_all_refuses_with_available_list() {
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-lanytehq"]);
+            let inputs = inputs(&profiles, &[], None, None, None, None);
+            let err = resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs)
+                .unwrap_err();
+            match err {
+                ResolverError::CannotResolve { available } => {
+                    assert_eq!(available, profiles);
+                }
+                other => panic!("expected CannotResolve, got {other:?}"),
+            }
+        }
+
+        // -- ExplicitOnly policy. ------------------------------------------
+
+        #[test]
+        fn explicit_only_refuses_on_single_daemon_fallback() {
+            // Side-effecting verb: even a single-running-daemon
+            // resolution is unsafe when the operator hasn't stated
+            // intent via flag or env.
+            let profiles = names(&["dispatch-lanytehq"]);
+            let running = names(&["dispatch-lanytehq"]);
+            let inputs = inputs(&profiles, &running, None, None, None, None);
+            let err =
+                resolve_profile_name(None, FallbackPolicy::ExplicitOnly, &inputs).unwrap_err();
+            assert!(matches!(
+                err,
+                ResolverError::DestructiveRequiresExplicit { .. }
+            ));
+        }
+
+        #[test]
+        fn explicit_only_refuses_on_active_profile_fallback() {
+            let profiles = names(&["bravo-devlead-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                Some("bravo-devlead-lanytehq"),
+                None,
+                None,
+                None,
+            );
+            let err =
+                resolve_profile_name(None, FallbackPolicy::ExplicitOnly, &inputs).unwrap_err();
+            assert!(matches!(
+                err,
+                ResolverError::DestructiveRequiresExplicit { .. }
+            ));
+        }
+
+        #[test]
+        fn explicit_only_accepts_explicit_flag() {
+            let inputs = inputs(&[], &[], None, None, None, None);
+            let resolved = resolve_profile_name(
+                Some("bravo-devlead-lanytehq"),
+                FallbackPolicy::ExplicitOnly,
+                &inputs,
+            )
+            .unwrap();
+            assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+
+        #[test]
+        fn explicit_only_accepts_chanvoy_profile_env_when_valid() {
+            let profiles = names(&["bravo-devlead-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                None,
+                None,
+                None,
+                Some("bravo-devlead-lanytehq"),
+            );
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::ExplicitOnly, &inputs).unwrap();
+            assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+
+        #[test]
+        fn explicit_only_accepts_env_exact_name_match() {
+            let profiles = names(&["bravo-devlead-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                None,
+                Some("bravo-devlead"),
+                Some("lanytehq"),
+                None,
+            );
+            let resolved =
+                resolve_profile_name(None, FallbackPolicy::ExplicitOnly, &inputs).unwrap();
+            assert_eq!(resolved, "bravo-devlead-lanytehq");
         }
     }
 }
