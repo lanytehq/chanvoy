@@ -2072,6 +2072,58 @@ mod tests {
         assert_eq!(profile.team_name, "org-enacthq");
     }
 
+    /// RAII guard for clean-bootstrap tests. `save_and_clear` snapshots
+    /// the four env vars that participate in the resolver, clears them,
+    /// and returns a guard whose `Drop` impl restores the prior values
+    /// — including on panic-unwind paths. Combined with
+    /// `CONFIG_ENV_LOCK` this prevents test-state leak across runs and
+    /// keeps later tests from seeing the wrong failure if a current
+    /// test panics mid-execution. PER-012A devrev follow-up pin.
+    struct EnvSnapshot {
+        config_dir: Option<std::ffi::OsString>,
+        role: Option<std::ffi::OsString>,
+        scope: Option<std::ffi::OsString>,
+        chanvoy_profile: Option<std::ffi::OsString>,
+    }
+
+    impl EnvSnapshot {
+        fn save_and_clear(temp_config_dir: &std::path::Path) -> Self {
+            let snap = Self {
+                config_dir: env::var_os("CHANVOY_CONFIG_DIR"),
+                role: env::var_os("LANYTE_AGENT_ROLE"),
+                scope: env::var_os("LANYTE_AGENT_SCOPE"),
+                chanvoy_profile: env::var_os("CHANVOY_PROFILE"),
+            };
+            unsafe {
+                env::set_var(OsStr::new("CHANVOY_CONFIG_DIR"), temp_config_dir);
+                env::remove_var(OsStr::new("LANYTE_AGENT_ROLE"));
+                env::remove_var(OsStr::new("LANYTE_AGENT_SCOPE"));
+                env::remove_var(OsStr::new("CHANVOY_PROFILE"));
+            }
+            snap
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            // `take()` is the canonical way to move `Option<T>` out of
+            // a `&mut self` borrow that `Drop::drop` provides.
+            unsafe {
+                restore_env("CHANVOY_CONFIG_DIR", self.config_dir.take());
+                restore_env("LANYTE_AGENT_ROLE", self.role.take());
+                restore_env("LANYTE_AGENT_SCOPE", self.scope.take());
+                restore_env("CHANVOY_PROFILE", self.chanvoy_profile.take());
+            }
+        }
+    }
+
+    unsafe fn restore_env(name: &str, prior: Option<std::ffi::OsString>) {
+        match prior {
+            Some(v) => unsafe { env::set_var(OsStr::new(name), v) },
+            None => unsafe { env::remove_var(OsStr::new(name)) },
+        }
+    }
+
     // Hold the env lock across `execute(cli).await` deliberately. The
     // lock serializes test functions that mutate process-global env;
     // dropping it before the await would let a parallel test mutate
@@ -2093,22 +2145,82 @@ mod tests {
         // mirroring auto-setup's path.
         let dir = tempfile::tempdir().unwrap();
         let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            env::set_var(OsStr::new("CHANVOY_CONFIG_DIR"), dir.path());
-            env::remove_var(OsStr::new("LANYTE_AGENT_ROLE"));
-            env::remove_var(OsStr::new("LANYTE_AGENT_SCOPE"));
-            env::remove_var(OsStr::new("CHANVOY_PROFILE"));
-        }
+        let _env_snap = EnvSnapshot::save_and_clear(dir.path());
         let cli = Cli {
             profile: None,
             json: true,
             command: CommandSet::Profile(ProfileCommand::List),
         };
-        let result = execute(cli).await;
-        unsafe {
-            env::remove_var(OsStr::new("CHANVOY_CONFIG_DIR"));
-        }
-        result.expect("profile list must succeed on clean bootstrap");
+        // `_env_snap`'s Drop restores env at scope exit, including on
+        // panic-unwind paths from `execute()` or `expect()`.
+        execute(cli)
+            .await
+            .expect("profile list must succeed on clean bootstrap");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn profile_create_succeeds_on_clean_bootstrap_with_valid_args() {
+        // PER-012A: closes the create-half of PER-012 AC #7. The list-
+        // half sibling test pins that the management-verb resolver
+        // bypass fixes empty-config enumeration; this test pins that
+        // the same bypass fixes empty-config creation. Together they
+        // establish the full fresh-bootstrap regression envelope
+        // (secrev's original PER-012 finding).
+        //
+        // Also re-pins AC #6 (no `org-lanytehq` hardcoded default for
+        // `--team-name`): we omit `--team-name` and assert the derived
+        // value is `org-<scope>` from the positional scope arg.
+        //
+        // Pure storage-only test by design: no daemon, no Mattermost,
+        // no token material. Dummy `--env-name` value avoids implying
+        // `profile create` validates token material — that path is
+        // `create-from-env`'s job, not `create`'s.
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_snap = EnvSnapshot::save_and_clear(dir.path());
+
+        let create_args = ProfileCreateArgs {
+            name: "delta-devlead-enacthq".into(),
+            role: "delta-devlead".into(),
+            scope: "enacthq".into(),
+            bot_username: "agent-delta-devlead".into(),
+            server_url: "https://mm.example.com".into(),
+            env_name: "DUMMY_TOKEN_VAR".into(),
+            team_name: None, // omitted -> re-pins AC #6 derivation
+            env_file: None,
+            credential_mode: CliCredentialMode::EnvName,
+            capability_class: CliCapabilityClass::Standard,
+            activate: false,
+        };
+        let cli = Cli {
+            profile: None,
+            json: true,
+            command: CommandSet::Profile(ProfileCommand::Create(create_args)),
+        };
+
+        // `_env_snap`'s Drop restores env at scope exit, including
+        // panic-unwind paths from any of the assertions below. Capture
+        // `list_profiles()` while CHANVOY_CONFIG_DIR still points at
+        // the tempdir (the env snapshot is restored on scope exit, not
+        // here).
+        execute(cli)
+            .await
+            .expect("profile create must succeed on clean bootstrap (resolver-bypass contract)");
+        let profiles =
+            list_profiles().expect("list_profiles must succeed against the fresh config dir");
+        let created = profiles
+            .iter()
+            .find(|p| p.name == "delta-devlead-enacthq")
+            .expect("created profile must be present in list_profiles output");
+        assert_eq!(created.role, "delta-devlead");
+        assert_eq!(created.scope, "enacthq");
+        assert_eq!(created.bot_username, "agent-delta-devlead");
+        assert_eq!(created.env_name, "DUMMY_TOKEN_VAR");
+        // AC #6 re-pin: with no `--team-name` flag, team must be
+        // derived from the positional scope arg, not the historical
+        // hardcoded `org-lanytehq` default.
+        assert_eq!(created.team_name, "org-enacthq");
     }
 
     #[test]
