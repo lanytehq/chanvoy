@@ -985,6 +985,15 @@ pub enum ResolverError {
     )]
     DestructiveRequiresExplicit { available: Vec<String> },
     #[error(
+        "the persistent active_profile marker points at '{name}' but no such profile exists \
+         (likely renamed or deleted); pass --profile, set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE, \
+         or run `chanvoy auto-setup` to refresh the marker. Available profiles: {available:?}"
+    )]
+    ActiveProfileNotFound {
+        name: String,
+        available: Vec<String>,
+    },
+    #[error(
         "unable to resolve a chanvoy profile; \
          pass --profile or set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE. \
          Available profiles: {available:?}"
@@ -1067,8 +1076,20 @@ pub fn resolve_profile_name(
 
     // Rule 5: active_profile marker file. Below env + daemon — never
     // overrides env-derived resolution. Demoted in PER-012, Option A.
+    // Validate membership the same way rule 2 validates
+    // CHANVOY_PROFILE: a marker pointing at a deleted/renamed profile
+    // is dead state, not a valid resolution. Surface the stale-marker
+    // diagnosis with its own variant rather than silent fall-through
+    // so the operator's remediation path is clear (refresh marker via
+    // auto-setup, or delete it). PER-012, entarch follow-up.
     if let Some(active) = inputs.active_profile {
-        return Ok(active.to_string());
+        if inputs.profiles.iter().any(|p| p == active) {
+            return Ok(active.to_string());
+        }
+        return Err(ResolverError::ActiveProfileNotFound {
+            name: active.to_string(),
+            available: available(),
+        });
     }
 
     // Rule 6: refuse.
@@ -3938,6 +3959,36 @@ monitored_channels = ["per-003", "per-004"]
             let resolved =
                 resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs).unwrap();
             assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+
+        #[test]
+        fn stale_active_profile_pointer_refuses_with_dedicated_variant() {
+            // entarch follow-up: a marker pointing at a deleted /
+            // renamed profile is dead state. Once dispatch runs the
+            // bare-profile rename sweep, every operator's active_profile
+            // file may briefly point at a name that no longer exists.
+            // The resolver must validate membership (same as rule 2 for
+            // CHANVOY_PROFILE) and refuse with an actionable error
+            // rather than returning the dead name and forcing a later
+            // ProfileNotFound / NotRunning failure to diagnose for them.
+            let profiles = names(&["bravo-devlead-lanytehq", "cxotech-lanytehq"]);
+            let inputs = inputs(
+                &profiles,
+                &[],
+                Some("bravo-devlead"), // bare name, post-rename-sweep stale
+                None,
+                None,
+                None,
+            );
+            let err = resolve_profile_name(None, FallbackPolicy::AllowReadFallbacks, &inputs)
+                .unwrap_err();
+            match err {
+                ResolverError::ActiveProfileNotFound { name, available } => {
+                    assert_eq!(name, "bravo-devlead");
+                    assert_eq!(available, profiles);
+                }
+                other => panic!("expected ActiveProfileNotFound, got {other:?}"),
+            }
         }
 
         // -- Rule 6: refuse with available list. ---------------------------
