@@ -9,7 +9,7 @@ use chanvoy_core::{
     CapabilityClass, Channel, CheckResult, CredentialMode, DaemonHealthState, DaemonStatus,
     DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt, Profile,
     ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
-    WaitResult, WsConnectionState, DEFAULT_TEAM,
+    WaitResult, WsConnectionState,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -853,11 +853,15 @@ fn build_desired_profile_from_env(profile_override: Option<&str>) -> Result<Prof
     let role = required_env("LANYTE_AGENT_ROLE")?;
     let scope = required_env("LANYTE_AGENT_SCOPE")?;
     let server_url = required_env("LANYTE_MM_URL")?;
-    // Precedence: explicit --profile flag > CHANVOY_PROFILE env > role-derived default.
+    // Precedence: explicit --profile flag > CHANVOY_PROFILE env > canonical
+    // `<role>-<scope>` derived from sourced identity. PER-012 / entarch:
+    // synthesizing a bare `<role>` here would undercut the resolver fix
+    // every time auto-setup runs, since the materialized profile name
+    // would not match the canonical resolution target.
     let name = profile_override
         .map(ToString::to_string)
         .or_else(|| env_var_nonempty("CHANVOY_PROFILE"))
-        .unwrap_or_else(|| role.clone());
+        .unwrap_or_else(|| format!("{role}-{scope}"));
     let team_name = derive_team_name(&scope);
 
     let profile = Profile {
@@ -1470,8 +1474,12 @@ async fn profile_from_env_args(args: &ProfileCreateFromEnvArgs) -> Result<Profil
     let scope = required_env("LANYTE_AGENT_SCOPE")?;
     let server_url = required_env("LANYTE_MM_URL")?;
 
+    // PER-012: default to canonical `<role>-<scope>` matching the
+    // identity-script stem, not bare `<role>`. Explicit --name still
+    // overrides for non-canonical cases.
+    let default_name = format!("{role}-{scope}");
     let mut profile = Profile {
-        name: args.name.clone().unwrap_or_else(|| role.clone()),
+        name: args.name.clone().unwrap_or(default_name),
         role,
         scope: scope.clone(),
         provider: Provider::Mattermost,
@@ -1507,14 +1515,20 @@ async fn profile_from_env_args(args: &ProfileCreateFromEnvArgs) -> Result<Profil
 }
 
 fn derive_team_name(scope: &str) -> String {
+    // PER-012: removed the silent fallback to `org-lanytehq` for empty
+    // scope — that hardcoded default produced wrong-org profiles when
+    // called under a non-lanytehq identity. The two callers
+    // (`build_desired_profile_from_env`, `profile_from_env_args`) both
+    // require `LANYTE_AGENT_SCOPE` upstream via `required_env`, so the
+    // empty-scope path is unreachable; debug_assert pins the invariant.
     if let Some(team) = env_var_nonempty("LANYTE_MM_TEAM") {
         return team;
     }
-    if scope.is_empty() {
-        DEFAULT_TEAM.to_string()
-    } else {
-        format!("org-{scope}")
-    }
+    debug_assert!(
+        !scope.is_empty(),
+        "derive_team_name called with empty scope; callers must enforce LANYTE_AGENT_SCOPE"
+    );
+    format!("org-{scope}")
 }
 
 fn required_env(name: &str) -> Result<String, CliError> {
@@ -1975,6 +1989,17 @@ mod tests {
         unsafe { env::set_var(OsStr::new("LANYTE_MM_TEAM"), OsStr::new("custom-team")) };
         assert_eq!(derive_team_name("lanytehq"), "custom-team");
         unsafe { env::remove_var(OsStr::new("LANYTE_MM_TEAM")) };
+    }
+
+    #[test]
+    fn team_name_derives_org_scope_for_non_lanytehq_scope() {
+        // PER-012: removed the silent fallback to `org-lanytehq`.
+        // For scopes other than lanytehq the derived team must follow
+        // the scope, not bias to the historical default.
+        unsafe { env::remove_var(OsStr::new("LANYTE_MM_TEAM")) };
+        assert_eq!(derive_team_name("enacthq"), "org-enacthq");
+        assert_eq!(derive_team_name("fulmenhq"), "org-fulmenhq");
+        assert_eq!(derive_team_name("lanytehq"), "org-lanytehq");
     }
 
     #[test]
