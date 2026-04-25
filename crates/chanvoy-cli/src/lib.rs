@@ -29,6 +29,14 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("bootstrap error: {0}")]
     Bootstrap(String),
+    #[error(transparent)]
+    Resolver(chanvoy_core::ResolverError),
+}
+
+impl From<chanvoy_core::ResolverError> for CliError {
+    fn from(value: chanvoy_core::ResolverError) -> Self {
+        CliError::Resolver(value)
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -278,7 +286,16 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     if let CommandSet::AutoSetup(args) = cli.command {
         return handle_auto_setup(cli.json, cli.profile.as_deref(), args).await;
     }
-    let profile = resolve_profile_name(cli.profile.as_deref())?;
+    // PER-012: side-effecting verbs that could disrupt another operator's
+    // daemon on a shared dev machine resolve via explicit sources only.
+    // Read/inspect/post verbs may consult the broader fallback chain.
+    // Only `daemon stop` qualifies in the current verb surface; widening
+    // requires an explicit policy choice in the brief.
+    let policy = match &cli.command {
+        CommandSet::Daemon(DaemonCommand::Stop) => chanvoy_core::FallbackPolicy::ExplicitOnly,
+        _ => chanvoy_core::FallbackPolicy::AllowReadFallbacks,
+    };
+    let profile = resolve_profile_name(cli.profile.as_deref(), policy)?;
     match cli.command {
         CommandSet::AutoSetup(_) => unreachable!("dispatched above"),
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
@@ -1364,67 +1381,56 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-fn resolve_profile_name(profile: Option<&str>) -> Result<String, CliError> {
-    if let Some(profile) = profile {
-        return Ok(profile.to_string());
-    }
-    if let Some(profile) = resolve_env_profile_name()? {
-        return Ok(profile);
-    }
-    Ok(load_active_profile()?.unwrap_or_else(|| "default".to_string()))
-}
-
-fn resolve_env_profile_name() -> Result<Option<String>, CliError> {
-    let explicit = env_var_nonempty("CHANVOY_PROFILE");
-    let role = env_var_nonempty("LANYTE_AGENT_ROLE");
-    let scope = env_var_nonempty("LANYTE_AGENT_SCOPE");
+/// Thin wrapper that gathers I/O snapshots (profiles list, running
+/// daemons, active_profile, env) and delegates to the pure resolver in
+/// chanvoy-core. The pure function carries the policy logic; this
+/// wrapper only handles the side-effecting bits.
+fn resolve_profile_name(
+    profile_flag: Option<&str>,
+    policy: chanvoy_core::FallbackPolicy,
+) -> Result<String, CliError> {
     let profiles = list_profiles()?;
+    let profile_names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let running = list_running_daemon_profiles(&profiles);
+    let active = load_active_profile()?;
+    let env_role = env_var_nonempty("LANYTE_AGENT_ROLE");
+    let env_scope = env_var_nonempty("LANYTE_AGENT_SCOPE");
+    let env_chanvoy_profile = env_var_nonempty("CHANVOY_PROFILE");
 
-    Ok(derive_env_profile_name(
-        explicit.as_deref(),
-        role.as_deref(),
-        scope.as_deref(),
-        &profiles,
-    ))
+    let inputs = chanvoy_core::ResolverInputs {
+        profiles: &profile_names,
+        running_daemon_profiles: &running,
+        active_profile: active.as_deref(),
+        env_role: env_role.as_deref(),
+        env_scope: env_scope.as_deref(),
+        env_chanvoy_profile: env_chanvoy_profile.as_deref(),
+    };
+
+    Ok(chanvoy_core::resolve_profile_name(
+        profile_flag,
+        policy,
+        &inputs,
+    )?)
 }
 
-fn derive_env_profile_name(
-    explicit: Option<&str>,
-    role: Option<&str>,
-    scope: Option<&str>,
-    profiles: &[Profile],
-) -> Option<String> {
-    if let Some(explicit) = explicit {
-        return Some(explicit.to_string());
-    }
-
-    let role = role?;
-
-    if let Some(scope) = scope {
-        let mut scoped_matches = profiles
-            .iter()
-            .filter(|profile| profile.role == role && profile.scope == scope);
-        let first = scoped_matches.next();
-        if let Some(first) = first {
-            if scoped_matches.next().is_none() {
-                return Some(first.name.clone());
-            }
-            return None;
-        }
-    }
-
-    if profiles.iter().any(|profile| profile.name == role) {
-        return Some(role.to_string());
-    }
-
-    let mut matches = profiles.iter().filter(|profile| profile.role == role);
-
-    let first = matches.next()?;
-    if matches.next().is_none() {
-        Some(first.name.clone())
-    } else {
-        None
-    }
+/// Enumerate profiles whose daemons appear to be running on this
+/// machine. A daemon is considered running if its socket exists, its
+/// pid file exists, and the recorded pid is alive. This is a best-
+/// effort observation for the resolver's single-tenant fallback —
+/// stale state surfaces as a downstream RPC error, not silent
+/// mis-attribution.
+fn list_running_daemon_profiles(profiles: &[Profile]) -> Vec<String> {
+    profiles
+        .iter()
+        .filter(|p| {
+            socket_path_for_profile(&p.name).exists()
+                && pid_path_for_profile(&p.name).exists()
+                && read_daemon_pid_for_force_kill(&p.name)
+                    .map(is_pid_alive)
+                    .unwrap_or(false)
+        })
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 fn validate_profile_create_args(profile: &Profile) -> Result<(), CliError> {
@@ -1956,45 +1962,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn env_profile_resolution_prefers_scope_match_over_name_match() {
-        let profiles = vec![
-            Profile {
-                name: "bravo-devlead".to_string(),
-                role: "bravo-devlead".to_string(),
-                scope: "other-scope".to_string(),
-                provider: Provider::Mattermost,
-                bot_username: "other-bot".to_string(),
-                team_name: "org-other-scope".to_string(),
-                server_url: "https://mm.example.com".to_string(),
-                env_name: "LANYTE_MM_TOKEN".to_string(),
-                env_file: None,
-                credential_mode: CredentialMode::EnvName,
-                capability_class: CapabilityClass::Standard,
-                monitored_channels: Vec::new(),
-                ipc: None,
-            },
-            Profile {
-                name: "bravo-devlead-lanytehq".to_string(),
-                role: "bravo-devlead".to_string(),
-                scope: "lanytehq".to_string(),
-                provider: Provider::Mattermost,
-                bot_username: "agent-bravo-devlead".to_string(),
-                team_name: "org-lanytehq".to_string(),
-                server_url: "https://mm.example.com".to_string(),
-                env_name: "LANYTE_MM_TOKEN".to_string(),
-                env_file: None,
-                credential_mode: CredentialMode::EnvName,
-                capability_class: CapabilityClass::Standard,
-                monitored_channels: Vec::new(),
-                ipc: None,
-            },
-        ];
-
-        let resolved =
-            derive_env_profile_name(None, Some("bravo-devlead"), Some("lanytehq"), &profiles);
-        assert_eq!(resolved.as_deref(), Some("bravo-devlead-lanytehq"));
-    }
+    // The previous `env_profile_resolution_prefers_scope_match_over_name_match`
+    // test exercised the legacy `derive_env_profile_name` function whose
+    // role+scope-filter-then-fall-through logic was replaced in PER-012. The
+    // equivalent contract — env-derived `${role}-${scope}` exact-name match
+    // wins, including over sibling profiles sharing role+scope — is now
+    // pinned by `chanvoy_core::tests::resolver::*` (see
+    // `env_exact_name_wins_over_sibling_profiles_sharing_role_scope`).
 
     #[test]
     fn team_name_uses_mattermost_env_when_present() {
