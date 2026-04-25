@@ -704,15 +704,22 @@ async fn handle_auto_setup(
         }
     };
 
+    // PER-012 AC #3: persist the active marker unconditionally when
+    // activate_requested. Previous logic skipped the store when the
+    // file already matched, which was order-dependent in subtle ways
+    // (a stale on-disk write between load and store, or any external
+    // mutation, could leave the printed "active:" line out of sync
+    // with the file). Always-persist removes the gap entirely; the
+    // store is one small idempotent write.
     let activate_requested = !args.no_activate;
-    let active_before = load_active_profile()?;
-    let is_active_now = match active_before.as_deref() {
-        Some(name) if name == persisted_profile.name => true,
-        _ if activate_requested => {
-            store_active_profile(&persisted_profile.name)?;
-            true
-        }
-        _ => false,
+    let is_active_now = if activate_requested {
+        store_active_profile(&persisted_profile.name)?;
+        true
+    } else {
+        load_active_profile()?
+            .as_deref()
+            .map(|name| name == persisted_profile.name)
+            .unwrap_or(false)
     };
 
     let daemon_state = match ensure_daemon_running(&persisted_profile.name).await {
