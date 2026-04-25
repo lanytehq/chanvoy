@@ -9,7 +9,7 @@ use chanvoy_core::{
     CapabilityClass, Channel, CheckResult, CredentialMode, DaemonHealthState, DaemonStatus,
     DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt, Profile,
     ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
-    WaitResult, WsConnectionState, DEFAULT_TEAM,
+    WaitResult, WsConnectionState,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -29,6 +29,14 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("bootstrap error: {0}")]
     Bootstrap(String),
+    #[error(transparent)]
+    Resolver(chanvoy_core::ResolverError),
+}
+
+impl From<chanvoy_core::ResolverError> for CliError {
+    fn from(value: chanvoy_core::ResolverError) -> Self {
+        CliError::Resolver(value)
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -213,8 +221,13 @@ struct ProfileCreateArgs {
     server_url: String,
     #[arg(long = "env-name")]
     env_name: String,
-    #[arg(long, default_value = "org-lanytehq")]
-    team_name: String,
+    /// Team name (e.g., `org-lanytehq`). Defaults to `org-${scope}`
+    /// derived from the positional `<scope>` argument; pass explicitly
+    /// only when the team name does not follow the convention. The old
+    /// hardcoded `org-lanytehq` default was a single-org bias removed
+    /// in PER-012.
+    #[arg(long)]
+    team_name: Option<String>,
     #[arg(long)]
     env_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliCredentialMode::EnvName)]
@@ -278,11 +291,32 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     if let CommandSet::AutoSetup(args) = cli.command {
         return handle_auto_setup(cli.json, cli.profile.as_deref(), args).await;
     }
-    let profile = resolve_profile_name(cli.profile.as_deref())?;
+    // PER-012 secrev follow-up: profile-management verbs operate on
+    // profile storage directly and do not need a resolved target — and
+    // running them through the resolver breaks bootstrap. A fresh
+    // operator (including a new-org adopter) running
+    // `chanvoy profile list` or `chanvoy profile create` with no env,
+    // no daemons, and an empty config dir would otherwise hit
+    // `CannotResolve` before the command surface even ran. Dispatch
+    // them before the resolver, like `auto-setup`.
+    if let CommandSet::Profile(command) = cli.command {
+        return handle_profile(cli.json, command).await;
+    }
+    // Side-effecting verbs that could disrupt another operator's daemon
+    // on a shared dev machine resolve via explicit sources only.
+    // Read/inspect/post verbs may consult the broader fallback chain.
+    // Only `daemon stop` qualifies in the current verb surface; widening
+    // requires an explicit policy choice in the brief.
+    let policy = match &cli.command {
+        CommandSet::Daemon(DaemonCommand::Stop) => chanvoy_core::FallbackPolicy::ExplicitOnly,
+        _ => chanvoy_core::FallbackPolicy::AllowReadFallbacks,
+    };
+    let profile = resolve_profile_name(cli.profile.as_deref(), policy)?;
     match cli.command {
-        CommandSet::AutoSetup(_) => unreachable!("dispatched above"),
+        CommandSet::AutoSetup(_) | CommandSet::Profile(_) => {
+            unreachable!("dispatched above")
+        }
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
-        CommandSet::Profile(command) => handle_profile(&profile, cli.json, command).await,
         CommandSet::Whoami => print_identity(cli.json, &daemon_client(&profile).whoami().await?),
         CommandSet::Channels => {
             print_value(cli.json, &daemon_client(&profile).list_channels().await?)
@@ -562,22 +596,28 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
     }
 }
 
-async fn handle_profile(
-    profile: &str,
-    json: bool,
-    command: ProfileCommand,
-) -> Result<(), CliError> {
+async fn handle_profile(json: bool, command: ProfileCommand) -> Result<(), CliError> {
     match command {
         ProfileCommand::List => print_value(json, &list_profiles()?),
         ProfileCommand::Active => {
-            let active = load_active_profile()?.unwrap_or_else(|| profile.to_string());
+            // PER-012: display the marker file's contents directly. The
+            // pre-PER-012 shortcut of falling back to the resolver-derived
+            // name when the marker was empty conflated "what's persisted"
+            // with "what would resolve right now" — operator could see a
+            // profile name and reasonably believe it was activated when it
+            // was just env-derived. Truthful answer: print null/empty when
+            // no marker is set.
+            let active = load_active_profile()?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({ "active_profile": active }))?
                 );
             } else {
-                println!("{active}");
+                match active {
+                    Some(name) => println!("{name}"),
+                    None => println!("(none)"),
+                }
             }
             Ok(())
         }
@@ -687,15 +727,22 @@ async fn handle_auto_setup(
         }
     };
 
+    // PER-012 AC #3: persist the active marker unconditionally when
+    // activate_requested. Previous logic skipped the store when the
+    // file already matched, which was order-dependent in subtle ways
+    // (a stale on-disk write between load and store, or any external
+    // mutation, could leave the printed "active:" line out of sync
+    // with the file). Always-persist removes the gap entirely; the
+    // store is one small idempotent write.
     let activate_requested = !args.no_activate;
-    let active_before = load_active_profile()?;
-    let is_active_now = match active_before.as_deref() {
-        Some(name) if name == persisted_profile.name => true,
-        _ if activate_requested => {
-            store_active_profile(&persisted_profile.name)?;
-            true
-        }
-        _ => false,
+    let is_active_now = if activate_requested {
+        store_active_profile(&persisted_profile.name)?;
+        true
+    } else {
+        load_active_profile()?
+            .as_deref()
+            .map(|name| name == persisted_profile.name)
+            .unwrap_or(false)
     };
 
     let daemon_state = match ensure_daemon_running(&persisted_profile.name).await {
@@ -836,11 +883,15 @@ fn build_desired_profile_from_env(profile_override: Option<&str>) -> Result<Prof
     let role = required_env("LANYTE_AGENT_ROLE")?;
     let scope = required_env("LANYTE_AGENT_SCOPE")?;
     let server_url = required_env("LANYTE_MM_URL")?;
-    // Precedence: explicit --profile flag > CHANVOY_PROFILE env > role-derived default.
+    // Precedence: explicit --profile flag > CHANVOY_PROFILE env > canonical
+    // `<role>-<scope>` derived from sourced identity. PER-012 / entarch:
+    // synthesizing a bare `<role>` here would undercut the resolver fix
+    // every time auto-setup runs, since the materialized profile name
+    // would not match the canonical resolution target.
     let name = profile_override
         .map(ToString::to_string)
         .or_else(|| env_var_nonempty("CHANVOY_PROFILE"))
-        .unwrap_or_else(|| role.clone());
+        .unwrap_or_else(|| format!("{role}-{scope}"));
     let team_name = derive_team_name(&scope);
 
     let profile = Profile {
@@ -1364,67 +1415,56 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-fn resolve_profile_name(profile: Option<&str>) -> Result<String, CliError> {
-    if let Some(profile) = profile {
-        return Ok(profile.to_string());
-    }
-    if let Some(profile) = resolve_env_profile_name()? {
-        return Ok(profile);
-    }
-    Ok(load_active_profile()?.unwrap_or_else(|| "default".to_string()))
-}
-
-fn resolve_env_profile_name() -> Result<Option<String>, CliError> {
-    let explicit = env_var_nonempty("CHANVOY_PROFILE");
-    let role = env_var_nonempty("LANYTE_AGENT_ROLE");
-    let scope = env_var_nonempty("LANYTE_AGENT_SCOPE");
+/// Thin wrapper that gathers I/O snapshots (profiles list, running
+/// daemons, active_profile, env) and delegates to the pure resolver in
+/// chanvoy-core. The pure function carries the policy logic; this
+/// wrapper only handles the side-effecting bits.
+fn resolve_profile_name(
+    profile_flag: Option<&str>,
+    policy: chanvoy_core::FallbackPolicy,
+) -> Result<String, CliError> {
     let profiles = list_profiles()?;
+    let profile_names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let running = list_running_daemon_profiles(&profiles);
+    let active = load_active_profile()?;
+    let env_role = env_var_nonempty("LANYTE_AGENT_ROLE");
+    let env_scope = env_var_nonempty("LANYTE_AGENT_SCOPE");
+    let env_chanvoy_profile = env_var_nonempty("CHANVOY_PROFILE");
 
-    Ok(derive_env_profile_name(
-        explicit.as_deref(),
-        role.as_deref(),
-        scope.as_deref(),
-        &profiles,
-    ))
+    let inputs = chanvoy_core::ResolverInputs {
+        profiles: &profile_names,
+        running_daemon_profiles: &running,
+        active_profile: active.as_deref(),
+        env_role: env_role.as_deref(),
+        env_scope: env_scope.as_deref(),
+        env_chanvoy_profile: env_chanvoy_profile.as_deref(),
+    };
+
+    Ok(chanvoy_core::resolve_profile_name(
+        profile_flag,
+        policy,
+        &inputs,
+    )?)
 }
 
-fn derive_env_profile_name(
-    explicit: Option<&str>,
-    role: Option<&str>,
-    scope: Option<&str>,
-    profiles: &[Profile],
-) -> Option<String> {
-    if let Some(explicit) = explicit {
-        return Some(explicit.to_string());
-    }
-
-    let role = role?;
-
-    if let Some(scope) = scope {
-        let mut scoped_matches = profiles
-            .iter()
-            .filter(|profile| profile.role == role && profile.scope == scope);
-        let first = scoped_matches.next();
-        if let Some(first) = first {
-            if scoped_matches.next().is_none() {
-                return Some(first.name.clone());
-            }
-            return None;
-        }
-    }
-
-    if profiles.iter().any(|profile| profile.name == role) {
-        return Some(role.to_string());
-    }
-
-    let mut matches = profiles.iter().filter(|profile| profile.role == role);
-
-    let first = matches.next()?;
-    if matches.next().is_none() {
-        Some(first.name.clone())
-    } else {
-        None
-    }
+/// Enumerate profiles whose daemons appear to be running on this
+/// machine. A daemon is considered running if its socket exists, its
+/// pid file exists, and the recorded pid is alive. This is a best-
+/// effort observation for the resolver's single-tenant fallback —
+/// stale state surfaces as a downstream RPC error, not silent
+/// mis-attribution.
+fn list_running_daemon_profiles(profiles: &[Profile]) -> Vec<String> {
+    profiles
+        .iter()
+        .filter(|p| {
+            socket_path_for_profile(&p.name).exists()
+                && pid_path_for_profile(&p.name).exists()
+                && read_daemon_pid_for_force_kill(&p.name)
+                    .map(is_pid_alive)
+                    .unwrap_or(false)
+        })
+        .map(|p| p.name.clone())
+        .collect()
 }
 
 fn validate_profile_create_args(profile: &Profile) -> Result<(), CliError> {
@@ -1435,13 +1475,21 @@ fn validate_profile_create_args(profile: &Profile) -> Result<(), CliError> {
 }
 
 fn profile_from_create_args(args: &ProfileCreateArgs) -> Profile {
+    // PER-012 AC #6: when --team-name is absent, derive `org-${scope}`
+    // from the positional scope arg rather than falling back to the
+    // historical hardcoded `org-lanytehq`. Explicit flag still wins
+    // for non-conventional team names.
+    let team_name = args
+        .team_name
+        .clone()
+        .unwrap_or_else(|| format!("org-{}", args.scope));
     Profile {
         name: args.name.clone(),
         role: args.role.clone(),
         scope: args.scope.clone(),
         provider: Provider::Mattermost,
         bot_username: args.bot_username.clone(),
-        team_name: args.team_name.clone(),
+        team_name,
         server_url: args.server_url.clone(),
         env_name: args.env_name.clone(),
         env_file: args.env_file.clone(),
@@ -1464,8 +1512,12 @@ async fn profile_from_env_args(args: &ProfileCreateFromEnvArgs) -> Result<Profil
     let scope = required_env("LANYTE_AGENT_SCOPE")?;
     let server_url = required_env("LANYTE_MM_URL")?;
 
+    // PER-012: default to canonical `<role>-<scope>` matching the
+    // identity-script stem, not bare `<role>`. Explicit --name still
+    // overrides for non-canonical cases.
+    let default_name = format!("{role}-{scope}");
     let mut profile = Profile {
-        name: args.name.clone().unwrap_or_else(|| role.clone()),
+        name: args.name.clone().unwrap_or(default_name),
         role,
         scope: scope.clone(),
         provider: Provider::Mattermost,
@@ -1501,14 +1553,20 @@ async fn profile_from_env_args(args: &ProfileCreateFromEnvArgs) -> Result<Profil
 }
 
 fn derive_team_name(scope: &str) -> String {
+    // PER-012: removed the silent fallback to `org-lanytehq` for empty
+    // scope — that hardcoded default produced wrong-org profiles when
+    // called under a non-lanytehq identity. The two callers
+    // (`build_desired_profile_from_env`, `profile_from_env_args`) both
+    // require `LANYTE_AGENT_SCOPE` upstream via `required_env`, so the
+    // empty-scope path is unreachable; debug_assert pins the invariant.
     if let Some(team) = env_var_nonempty("LANYTE_MM_TEAM") {
         return team;
     }
-    if scope.is_empty() {
-        DEFAULT_TEAM.to_string()
-    } else {
-        format!("org-{scope}")
-    }
+    debug_assert!(
+        !scope.is_empty(),
+        "derive_team_name called with empty scope; callers must enforce LANYTE_AGENT_SCOPE"
+    );
+    format!("org-{scope}")
 }
 
 fn required_env(name: &str) -> Result<String, CliError> {
@@ -1862,6 +1920,13 @@ fn format_dm_timestamp(millis: i64) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::sync::Mutex;
+
+    /// Serialize env-mutating tests in this module. Cargo runs tests on
+    /// multiple threads by default, and bare `env::set_var` /
+    /// `env::remove_var` calls would otherwise race with each other and
+    /// with any test that reads the same vars.
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn identity_uses_lanyte_chat_shape() {
@@ -1956,51 +2021,113 @@ mod tests {
         );
     }
 
-    #[test]
-    fn env_profile_resolution_prefers_scope_match_over_name_match() {
-        let profiles = vec![
-            Profile {
-                name: "bravo-devlead".to_string(),
-                role: "bravo-devlead".to_string(),
-                scope: "other-scope".to_string(),
-                provider: Provider::Mattermost,
-                bot_username: "other-bot".to_string(),
-                team_name: "org-other-scope".to_string(),
-                server_url: "https://mm.example.com".to_string(),
-                env_name: "LANYTE_MM_TOKEN".to_string(),
-                env_file: None,
-                credential_mode: CredentialMode::EnvName,
-                capability_class: CapabilityClass::Standard,
-                monitored_channels: Vec::new(),
-                ipc: None,
-            },
-            Profile {
-                name: "bravo-devlead-lanytehq".to_string(),
-                role: "bravo-devlead".to_string(),
-                scope: "lanytehq".to_string(),
-                provider: Provider::Mattermost,
-                bot_username: "agent-bravo-devlead".to_string(),
-                team_name: "org-lanytehq".to_string(),
-                server_url: "https://mm.example.com".to_string(),
-                env_name: "LANYTE_MM_TOKEN".to_string(),
-                env_file: None,
-                credential_mode: CredentialMode::EnvName,
-                capability_class: CapabilityClass::Standard,
-                monitored_channels: Vec::new(),
-                ipc: None,
-            },
-        ];
-
-        let resolved =
-            derive_env_profile_name(None, Some("bravo-devlead"), Some("lanytehq"), &profiles);
-        assert_eq!(resolved.as_deref(), Some("bravo-devlead-lanytehq"));
-    }
+    // The previous `env_profile_resolution_prefers_scope_match_over_name_match`
+    // test exercised the legacy `derive_env_profile_name` function whose
+    // role+scope-filter-then-fall-through logic was replaced in PER-012. The
+    // equivalent contract — env-derived `${role}-${scope}` exact-name match
+    // wins, including over sibling profiles sharing role+scope — is now
+    // pinned by `chanvoy_core::tests::resolver::*` (see
+    // `env_exact_name_wins_over_sibling_profiles_sharing_role_scope`).
 
     #[test]
     fn team_name_uses_mattermost_env_when_present() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { env::set_var(OsStr::new("LANYTE_MM_TEAM"), OsStr::new("custom-team")) };
         assert_eq!(derive_team_name("lanytehq"), "custom-team");
         unsafe { env::remove_var(OsStr::new("LANYTE_MM_TEAM")) };
+    }
+
+    #[test]
+    fn team_name_derives_org_scope_for_non_lanytehq_scope() {
+        // PER-012: removed the silent fallback to `org-lanytehq`.
+        // For scopes other than lanytehq the derived team must follow
+        // the scope, not bias to the historical default.
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { env::remove_var(OsStr::new("LANYTE_MM_TEAM")) };
+        assert_eq!(derive_team_name("enacthq"), "org-enacthq");
+        assert_eq!(derive_team_name("fulmenhq"), "org-fulmenhq");
+        assert_eq!(derive_team_name("lanytehq"), "org-lanytehq");
+    }
+
+    #[test]
+    fn profile_create_team_name_derives_from_scope_when_flag_absent() {
+        // PER-012 AC #6 / devrev follow-up blocker: `profile create`
+        // no longer hardcodes `org-lanytehq` as the team-name default
+        // at the clap level. When --team-name is absent, derive from
+        // the (required positional) scope arg.
+        let args = ProfileCreateArgs {
+            name: "delta-devlead-enacthq".into(),
+            role: "delta-devlead".into(),
+            scope: "enacthq".into(),
+            bot_username: "agent-delta-devlead".into(),
+            server_url: "https://mm.example.com".into(),
+            env_name: "LANYTE_MM_TOKEN".into(),
+            team_name: None,
+            env_file: None,
+            credential_mode: CliCredentialMode::EnvName,
+            capability_class: CliCapabilityClass::Standard,
+            activate: false,
+        };
+        let profile = profile_from_create_args(&args);
+        assert_eq!(profile.team_name, "org-enacthq");
+    }
+
+    // Hold the env lock across `execute(cli).await` deliberately. The
+    // lock serializes test functions that mutate process-global env;
+    // dropping it before the await would let a parallel test mutate
+    // env while our `execute` runs, breaking the bootstrap precondition.
+    // Every grabber of this lock is a test function — no tokio task
+    // competes for it — so the cross-await hold cannot deadlock here.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn profile_list_succeeds_on_clean_bootstrap_with_no_env_no_profiles() {
+        // secrev follow-up blocker: the centralized resolver was running
+        // before every command except `auto-setup`, which broke
+        // profile-management verbs that operate on storage directly. A
+        // fresh operator (or new-org adopter) installing chanvoy and
+        // running `chanvoy profile list` with empty config dir, no env,
+        // and no daemons would hit `CannotResolve { available: [] }`
+        // before the management surface ran. Bootstrap was unreachable.
+        //
+        // Post-fix: profile management dispatches before the resolver,
+        // mirroring auto-setup's path.
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            env::set_var(OsStr::new("CHANVOY_CONFIG_DIR"), dir.path());
+            env::remove_var(OsStr::new("LANYTE_AGENT_ROLE"));
+            env::remove_var(OsStr::new("LANYTE_AGENT_SCOPE"));
+            env::remove_var(OsStr::new("CHANVOY_PROFILE"));
+        }
+        let cli = Cli {
+            profile: None,
+            json: true,
+            command: CommandSet::Profile(ProfileCommand::List),
+        };
+        let result = execute(cli).await;
+        unsafe {
+            env::remove_var(OsStr::new("CHANVOY_CONFIG_DIR"));
+        }
+        result.expect("profile list must succeed on clean bootstrap");
+    }
+
+    #[test]
+    fn profile_create_team_name_uses_explicit_flag_when_provided() {
+        let args = ProfileCreateArgs {
+            name: "n".into(),
+            role: "r".into(),
+            scope: "enacthq".into(),
+            bot_username: "b".into(),
+            server_url: "https://mm.example.com".into(),
+            env_name: "LANYTE_MM_TOKEN".into(),
+            team_name: Some("custom-team".into()),
+            env_file: None,
+            credential_mode: CliCredentialMode::EnvName,
+            capability_class: CliCapabilityClass::Standard,
+            activate: false,
+        };
+        let profile = profile_from_create_args(&args);
+        assert_eq!(profile.team_name, "custom-team");
     }
 
     #[test]
