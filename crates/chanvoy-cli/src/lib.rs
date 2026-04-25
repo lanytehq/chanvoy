@@ -2072,11 +2072,13 @@ mod tests {
         assert_eq!(profile.team_name, "org-enacthq");
     }
 
-    /// Helper for clean-bootstrap tests: snapshot the four env vars
-    /// that participate in the resolver, clear them, then return a
-    /// guard that restores prior values on drop. Combined with
-    /// `CONFIG_ENV_LOCK` this prevents test-state leak across runs.
-    /// PER-012A.
+    /// RAII guard for clean-bootstrap tests. `save_and_clear` snapshots
+    /// the four env vars that participate in the resolver, clears them,
+    /// and returns a guard whose `Drop` impl restores the prior values
+    /// — including on panic-unwind paths. Combined with
+    /// `CONFIG_ENV_LOCK` this prevents test-state leak across runs and
+    /// keeps later tests from seeing the wrong failure if a current
+    /// test panics mid-execution. PER-012A devrev follow-up pin.
     struct EnvSnapshot {
         config_dir: Option<std::ffi::OsString>,
         role: Option<std::ffi::OsString>,
@@ -2100,13 +2102,17 @@ mod tests {
             }
             snap
         }
+    }
 
-        fn restore(self) {
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            // `take()` is the canonical way to move `Option<T>` out of
+            // a `&mut self` borrow that `Drop::drop` provides.
             unsafe {
-                restore_env("CHANVOY_CONFIG_DIR", self.config_dir);
-                restore_env("LANYTE_AGENT_ROLE", self.role);
-                restore_env("LANYTE_AGENT_SCOPE", self.scope);
-                restore_env("CHANVOY_PROFILE", self.chanvoy_profile);
+                restore_env("CHANVOY_CONFIG_DIR", self.config_dir.take());
+                restore_env("LANYTE_AGENT_ROLE", self.role.take());
+                restore_env("LANYTE_AGENT_SCOPE", self.scope.take());
+                restore_env("CHANVOY_PROFILE", self.chanvoy_profile.take());
             }
         }
     }
@@ -2139,15 +2145,17 @@ mod tests {
         // mirroring auto-setup's path.
         let dir = tempfile::tempdir().unwrap();
         let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let env_snap = EnvSnapshot::save_and_clear(dir.path());
+        let _env_snap = EnvSnapshot::save_and_clear(dir.path());
         let cli = Cli {
             profile: None,
             json: true,
             command: CommandSet::Profile(ProfileCommand::List),
         };
-        let result = execute(cli).await;
-        env_snap.restore();
-        result.expect("profile list must succeed on clean bootstrap");
+        // `_env_snap`'s Drop restores env at scope exit, including on
+        // panic-unwind paths from `execute()` or `expect()`.
+        execute(cli)
+            .await
+            .expect("profile list must succeed on clean bootstrap");
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -2170,7 +2178,7 @@ mod tests {
         // `create-from-env`'s job, not `create`'s.
         let dir = tempfile::tempdir().unwrap();
         let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let env_snap = EnvSnapshot::save_and_clear(dir.path());
+        let _env_snap = EnvSnapshot::save_and_clear(dir.path());
 
         let create_args = ProfileCreateArgs {
             name: "delta-devlead-enacthq".into(),
@@ -2191,17 +2199,16 @@ mod tests {
             command: CommandSet::Profile(ProfileCommand::Create(create_args)),
         };
 
-        let result = execute(cli).await;
-        // Capture durable state while CHANVOY_CONFIG_DIR still points at
-        // the tempdir (i.e., before env restore).
-        let listed = list_profiles();
-
-        env_snap.restore();
-
-        // Now assertions. Restoration is done first so a panic here
-        // cannot leave the parent test process with mutated env.
-        result.expect("profile create must succeed on clean bootstrap (resolver-bypass contract)");
-        let profiles = listed.expect("list_profiles must succeed against the fresh config dir");
+        // `_env_snap`'s Drop restores env at scope exit, including
+        // panic-unwind paths from any of the assertions below. Capture
+        // `list_profiles()` while CHANVOY_CONFIG_DIR still points at
+        // the tempdir (the env snapshot is restored on scope exit, not
+        // here).
+        execute(cli)
+            .await
+            .expect("profile create must succeed on clean bootstrap (resolver-bypass contract)");
+        let profiles =
+            list_profiles().expect("list_profiles must succeed against the fresh config dir");
         let created = profiles
             .iter()
             .find(|p| p.name == "delta-devlead-enacthq")
