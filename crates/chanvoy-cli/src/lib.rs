@@ -221,8 +221,13 @@ struct ProfileCreateArgs {
     server_url: String,
     #[arg(long = "env-name")]
     env_name: String,
-    #[arg(long, default_value = "org-lanytehq")]
-    team_name: String,
+    /// Team name (e.g., `org-lanytehq`). Defaults to `org-${scope}`
+    /// derived from the positional `<scope>` argument; pass explicitly
+    /// only when the team name does not follow the convention. The old
+    /// hardcoded `org-lanytehq` default was a single-org bias removed
+    /// in PER-012.
+    #[arg(long)]
+    team_name: Option<String>,
     #[arg(long)]
     env_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliCredentialMode::EnvName)]
@@ -1452,13 +1457,21 @@ fn validate_profile_create_args(profile: &Profile) -> Result<(), CliError> {
 }
 
 fn profile_from_create_args(args: &ProfileCreateArgs) -> Profile {
+    // PER-012 AC #6: when --team-name is absent, derive `org-${scope}`
+    // from the positional scope arg rather than falling back to the
+    // historical hardcoded `org-lanytehq`. Explicit flag still wins
+    // for non-conventional team names.
+    let team_name = args
+        .team_name
+        .clone()
+        .unwrap_or_else(|| format!("org-{}", args.scope));
     Profile {
         name: args.name.clone(),
         role: args.role.clone(),
         scope: args.scope.clone(),
         provider: Provider::Mattermost,
         bot_username: args.bot_username.clone(),
-        team_name: args.team_name.clone(),
+        team_name,
         server_url: args.server_url.clone(),
         env_name: args.env_name.clone(),
         env_file: args.env_file.clone(),
@@ -2007,6 +2020,48 @@ mod tests {
         assert_eq!(derive_team_name("enacthq"), "org-enacthq");
         assert_eq!(derive_team_name("fulmenhq"), "org-fulmenhq");
         assert_eq!(derive_team_name("lanytehq"), "org-lanytehq");
+    }
+
+    #[test]
+    fn profile_create_team_name_derives_from_scope_when_flag_absent() {
+        // PER-012 AC #6 / devrev follow-up blocker: `profile create`
+        // no longer hardcodes `org-lanytehq` as the team-name default
+        // at the clap level. When --team-name is absent, derive from
+        // the (required positional) scope arg.
+        let args = ProfileCreateArgs {
+            name: "delta-devlead-enacthq".into(),
+            role: "delta-devlead".into(),
+            scope: "enacthq".into(),
+            bot_username: "agent-delta-devlead".into(),
+            server_url: "https://mm.example.com".into(),
+            env_name: "LANYTE_MM_TOKEN".into(),
+            team_name: None,
+            env_file: None,
+            credential_mode: CliCredentialMode::EnvName,
+            capability_class: CliCapabilityClass::Standard,
+            activate: false,
+        };
+        let profile = profile_from_create_args(&args);
+        assert_eq!(profile.team_name, "org-enacthq");
+    }
+
+    #[test]
+    fn profile_create_team_name_uses_explicit_flag_when_provided() {
+        let args = ProfileCreateArgs {
+            name: "n".into(),
+            role: "r".into(),
+            scope: "enacthq".into(),
+            bot_username: "b".into(),
+            server_url: "https://mm.example.com".into(),
+            env_name: "LANYTE_MM_TOKEN".into(),
+            team_name: Some("custom-team".into()),
+            env_file: None,
+            credential_mode: CliCredentialMode::EnvName,
+            capability_class: CliCapabilityClass::Standard,
+            activate: false,
+        };
+        let profile = profile_from_create_args(&args);
+        assert_eq!(profile.team_name, "custom-team");
     }
 
     #[test]
