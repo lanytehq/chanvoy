@@ -291,8 +291,19 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     if let CommandSet::AutoSetup(args) = cli.command {
         return handle_auto_setup(cli.json, cli.profile.as_deref(), args).await;
     }
-    // PER-012: side-effecting verbs that could disrupt another operator's
-    // daemon on a shared dev machine resolve via explicit sources only.
+    // PER-012 secrev follow-up: profile-management verbs operate on
+    // profile storage directly and do not need a resolved target — and
+    // running them through the resolver breaks bootstrap. A fresh
+    // operator (including a new-org adopter) running
+    // `chanvoy profile list` or `chanvoy profile create` with no env,
+    // no daemons, and an empty config dir would otherwise hit
+    // `CannotResolve` before the command surface even ran. Dispatch
+    // them before the resolver, like `auto-setup`.
+    if let CommandSet::Profile(command) = cli.command {
+        return handle_profile(cli.json, command).await;
+    }
+    // Side-effecting verbs that could disrupt another operator's daemon
+    // on a shared dev machine resolve via explicit sources only.
     // Read/inspect/post verbs may consult the broader fallback chain.
     // Only `daemon stop` qualifies in the current verb surface; widening
     // requires an explicit policy choice in the brief.
@@ -302,9 +313,10 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     };
     let profile = resolve_profile_name(cli.profile.as_deref(), policy)?;
     match cli.command {
-        CommandSet::AutoSetup(_) => unreachable!("dispatched above"),
+        CommandSet::AutoSetup(_) | CommandSet::Profile(_) => {
+            unreachable!("dispatched above")
+        }
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
-        CommandSet::Profile(command) => handle_profile(&profile, cli.json, command).await,
         CommandSet::Whoami => print_identity(cli.json, &daemon_client(&profile).whoami().await?),
         CommandSet::Channels => {
             print_value(cli.json, &daemon_client(&profile).list_channels().await?)
@@ -584,22 +596,28 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
     }
 }
 
-async fn handle_profile(
-    profile: &str,
-    json: bool,
-    command: ProfileCommand,
-) -> Result<(), CliError> {
+async fn handle_profile(json: bool, command: ProfileCommand) -> Result<(), CliError> {
     match command {
         ProfileCommand::List => print_value(json, &list_profiles()?),
         ProfileCommand::Active => {
-            let active = load_active_profile()?.unwrap_or_else(|| profile.to_string());
+            // PER-012: display the marker file's contents directly. The
+            // pre-PER-012 shortcut of falling back to the resolver-derived
+            // name when the marker was empty conflated "what's persisted"
+            // with "what would resolve right now" — operator could see a
+            // profile name and reasonably believe it was activated when it
+            // was just env-derived. Truthful answer: print null/empty when
+            // no marker is set.
+            let active = load_active_profile()?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({ "active_profile": active }))?
                 );
             } else {
-                println!("{active}");
+                match active {
+                    Some(name) => println!("{name}"),
+                    None => println!("(none)"),
+                }
             }
             Ok(())
         }
@@ -1902,6 +1920,13 @@ fn format_dm_timestamp(millis: i64) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::sync::Mutex;
+
+    /// Serialize env-mutating tests in this module. Cargo runs tests on
+    /// multiple threads by default, and bare `env::set_var` /
+    /// `env::remove_var` calls would otherwise race with each other and
+    /// with any test that reads the same vars.
+    static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn identity_uses_lanyte_chat_shape() {
@@ -2006,6 +2031,7 @@ mod tests {
 
     #[test]
     fn team_name_uses_mattermost_env_when_present() {
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { env::set_var(OsStr::new("LANYTE_MM_TEAM"), OsStr::new("custom-team")) };
         assert_eq!(derive_team_name("lanytehq"), "custom-team");
         unsafe { env::remove_var(OsStr::new("LANYTE_MM_TEAM")) };
@@ -2016,6 +2042,7 @@ mod tests {
         // PER-012: removed the silent fallback to `org-lanytehq`.
         // For scopes other than lanytehq the derived team must follow
         // the scope, not bias to the historical default.
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { env::remove_var(OsStr::new("LANYTE_MM_TEAM")) };
         assert_eq!(derive_team_name("enacthq"), "org-enacthq");
         assert_eq!(derive_team_name("fulmenhq"), "org-fulmenhq");
@@ -2043,6 +2070,45 @@ mod tests {
         };
         let profile = profile_from_create_args(&args);
         assert_eq!(profile.team_name, "org-enacthq");
+    }
+
+    // Hold the env lock across `execute(cli).await` deliberately. The
+    // lock serializes test functions that mutate process-global env;
+    // dropping it before the await would let a parallel test mutate
+    // env while our `execute` runs, breaking the bootstrap precondition.
+    // Every grabber of this lock is a test function — no tokio task
+    // competes for it — so the cross-await hold cannot deadlock here.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn profile_list_succeeds_on_clean_bootstrap_with_no_env_no_profiles() {
+        // secrev follow-up blocker: the centralized resolver was running
+        // before every command except `auto-setup`, which broke
+        // profile-management verbs that operate on storage directly. A
+        // fresh operator (or new-org adopter) installing chanvoy and
+        // running `chanvoy profile list` with empty config dir, no env,
+        // and no daemons would hit `CannotResolve { available: [] }`
+        // before the management surface ran. Bootstrap was unreachable.
+        //
+        // Post-fix: profile management dispatches before the resolver,
+        // mirroring auto-setup's path.
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            env::set_var(OsStr::new("CHANVOY_CONFIG_DIR"), dir.path());
+            env::remove_var(OsStr::new("LANYTE_AGENT_ROLE"));
+            env::remove_var(OsStr::new("LANYTE_AGENT_SCOPE"));
+            env::remove_var(OsStr::new("CHANVOY_PROFILE"));
+        }
+        let cli = Cli {
+            profile: None,
+            json: true,
+            command: CommandSet::Profile(ProfileCommand::List),
+        };
+        let result = execute(cli).await;
+        unsafe {
+            env::remove_var(OsStr::new("CHANVOY_CONFIG_DIR"));
+        }
+        result.expect("profile list must succeed on clean bootstrap");
     }
 
     #[test]
