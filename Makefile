@@ -117,44 +117,75 @@ prepush: precommit build msrv version-check
 version: ## Print current version
 	@cat $(VERSION_FILE)
 
-version-patch: ## Bump patch version (0.1.0 -> 0.1.1) in VERSION + sync Cargo.toml
+version-patch: ## Bump patch version (0.1.0 -> 0.1.1): Cargo.toml first, VERSION on success
 	@current=$$(cat $(VERSION_FILE)); \
 	major=$$(echo $$current | cut -d. -f1); \
 	minor=$$(echo $$current | cut -d. -f2); \
 	patch=$$(echo $$current | cut -d. -f3); \
-	new_patch=$$((patch + 1)); \
-	new_version="$$major.$$minor.$$new_patch"; \
+	new_version="$$major.$$minor.$$((patch + 1))"; \
+	if ! command -v cargo-set-version >/dev/null 2>&1; then \
+		echo "[!!] cargo-set-version not installed (cargo install cargo-edit)"; \
+		exit 1; \
+	fi; \
+	if ! cargo set-version --workspace "$$new_version"; then \
+		echo "[!!] cargo set-version failed; VERSION not changed"; \
+		echo "     (note: cargo-set-version refuses downgrades; edit manifests manually for those)"; \
+		exit 1; \
+	fi; \
 	echo "$$new_version" > $(VERSION_FILE); \
-	echo "Version bumped: $$current -> $$new_version"
-	@$(MAKE) --no-print-directory version-sync
+	echo "Version bumped: $$current -> $$new_version (VERSION + Cargo.toml)"
 
-version-minor: ## Bump minor version (0.1.0 -> 0.2.0) in VERSION + sync Cargo.toml
+version-minor: ## Bump minor version (0.1.0 -> 0.2.0): Cargo.toml first, VERSION on success
 	@current=$$(cat $(VERSION_FILE)); \
 	major=$$(echo $$current | cut -d. -f1); \
 	minor=$$(echo $$current | cut -d. -f2); \
-	new_minor=$$((minor + 1)); \
-	new_version="$$major.$$new_minor.0"; \
+	new_version="$$major.$$((minor + 1)).0"; \
+	if ! command -v cargo-set-version >/dev/null 2>&1; then \
+		echo "[!!] cargo-set-version not installed (cargo install cargo-edit)"; \
+		exit 1; \
+	fi; \
+	if ! cargo set-version --workspace "$$new_version"; then \
+		echo "[!!] cargo set-version failed; VERSION not changed"; \
+		echo "     (note: cargo-set-version refuses downgrades; edit manifests manually for those)"; \
+		exit 1; \
+	fi; \
 	echo "$$new_version" > $(VERSION_FILE); \
-	echo "Version bumped: $$current -> $$new_version"
-	@$(MAKE) --no-print-directory version-sync
+	echo "Version bumped: $$current -> $$new_version (VERSION + Cargo.toml)"
 
-version-major: ## Bump major version (0.1.0 -> 1.0.0) in VERSION + sync Cargo.toml
+version-major: ## Bump major version (0.1.0 -> 1.0.0): Cargo.toml first, VERSION on success
 	@current=$$(cat $(VERSION_FILE)); \
 	major=$$(echo $$current | cut -d. -f1); \
-	new_major=$$((major + 1)); \
-	new_version="$$new_major.0.0"; \
+	new_version="$$((major + 1)).0.0"; \
+	if ! command -v cargo-set-version >/dev/null 2>&1; then \
+		echo "[!!] cargo-set-version not installed (cargo install cargo-edit)"; \
+		exit 1; \
+	fi; \
+	if ! cargo set-version --workspace "$$new_version"; then \
+		echo "[!!] cargo set-version failed; VERSION not changed"; \
+		echo "     (note: cargo-set-version refuses downgrades; edit manifests manually for those)"; \
+		exit 1; \
+	fi; \
 	echo "$$new_version" > $(VERSION_FILE); \
-	echo "Version bumped: $$current -> $$new_version"
-	@$(MAKE) --no-print-directory version-sync
+	echo "Version bumped: $$current -> $$new_version (VERSION + Cargo.toml)"
 
-version-set: ## Set explicit version (V=X.Y.Z) in VERSION + sync Cargo.toml
+version-set: ## Set explicit version (V=X.Y.Z): Cargo.toml first, VERSION on success
 	@if [ -z "$(V)" ]; then \
 		echo "Usage: make version-set V=1.2.3"; \
 		exit 1; \
 	fi
-	@echo "$(V)" > $(VERSION_FILE)
-	@echo "Version set to $(V)"
-	@$(MAKE) --no-print-directory version-sync
+	@current=$$(cat $(VERSION_FILE)); \
+	new_version="$(V)"; \
+	if ! command -v cargo-set-version >/dev/null 2>&1; then \
+		echo "[!!] cargo-set-version not installed (cargo install cargo-edit)"; \
+		exit 1; \
+	fi; \
+	if ! cargo set-version --workspace "$$new_version"; then \
+		echo "[!!] cargo set-version failed; VERSION not changed"; \
+		echo "     (note: cargo-set-version refuses downgrades; edit manifests manually for those)"; \
+		exit 1; \
+	fi; \
+	echo "$$new_version" > $(VERSION_FILE); \
+	echo "Version set: $$current -> $$new_version (VERSION + Cargo.toml)"
 
 version-sync: ## Sync VERSION file to Cargo.toml across workspace and crates
 	@ver=$$(cat $(VERSION_FILE)); \

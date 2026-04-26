@@ -149,7 +149,7 @@ When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profi
 2. **`CHANVOY_PROFILE` env var** — explicit override. Refuses if the named profile doesn't exist on disk.
 3. **Env-derived `<role>-<scope>` exact-name** — when `LANYTE_AGENT_ROLE` and `LANYTE_AGENT_SCOPE` are set, resolves to the profile named exactly `<role>-<scope>`. Refuses with the available-profile list if no exact match exists (does not silently fall through to a different identity).
 4. **Single running daemon** — if exactly one chanvoy daemon is currently running on this machine, that profile is used.
-5. **`active_profile` marker** — single-tenant convenience. Only consulted when env vars are unset and no daemon is running. Updated by `chanvoy auto-setup` and by `--activate` on `chanvoy profile create` / `chanvoy profile create-from-env`.
+5. **`active_profile` marker** — single-tenant convenience. Only consulted when env vars are unset and no daemon is running. Updated explicitly by `chanvoy auto-setup` and by `--activate` on `chanvoy profile create` / `chanvoy profile create-from-env`. Also updated implicitly: `profile create` / `profile create-from-env` (without `--activate`) will activate a freshly created profile when no active marker exists yet, so first-profile setup leaves the marker pointing at the new profile.
 6. **Refuse** — print the available-profile list and require explicit `--profile`.
 
 Two carve-outs:

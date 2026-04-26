@@ -11,9 +11,9 @@ Windows local-daemon support is not yet implemented.
 
 ## Preconditions
 
-- Lanyte identity env sourced
-- `LANYTE_MM_URL`, `LANYTE_MM_TOKEN`, `LANYTE_MM_TEAM` available
-- `chanvoy` built locally
+- Lanyte identity env sourced — `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN` (or the env name configured by `CHANVOY_TOKEN_ENV_NAME`)
+- `LANYTE_MM_TEAM` is optional; team defaults to `org-<scope>` derived from `LANYTE_AGENT_SCOPE`. Set it only if the Mattermost team does not follow the `org-<scope>` convention.
+- `chanvoy` built and installed locally (`make install`)
 
 ## One-Time Setup
 
