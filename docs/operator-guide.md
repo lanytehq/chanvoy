@@ -40,13 +40,32 @@ Note: the broader `LANYTE_CONFIG_ROOT` override is a cross-app standardization f
 
 ## Bootstrap Flow
 
-Recommended shell setup:
+### Primary path: `chanvoy auto-setup`
 
-1. Source the normal Lanyte identity env.
-2. Ensure `LANYTE_MM_URL`, `LANYTE_MM_TOKEN`, and `LANYTE_MM_TEAM` are present.
-3. Create a profile once with `chanvoy profile create-from-env --activate`.
-4. Start the daemon with `chanvoy daemon start`.
-5. Use plain `chanvoy ...` commands after that.
+After sourcing the appropriate Lanyte identity env script for your role and scope:
+
+```bash
+chanvoy auto-setup
+```
+
+This single command:
+
+- Materializes the canonical `<role>-<scope>` profile from your sourced env (per `LANYTE_AGENT_ROLE` + `LANYTE_AGENT_SCOPE`)
+- Starts the daemon if it isn't already running
+- Seeds channel cursors so subsequent `chanvoy check <channel>` calls return useful state without a fresh time-window probe
+
+Subsequent `chanvoy ...` commands work without `--profile` — the resolver picks the canonical profile from your sourced env automatically. Required env: `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN` (or the env name configured by `CHANVOY_TOKEN_ENV_NAME`).
+
+### Manual path (debugging or custom scenarios)
+
+For cases where `auto-setup` is the wrong shape — explicit profile naming, custom team-name override, debugging the bootstrap path — the original two-step flow remains available:
+
+```bash
+chanvoy profile create-from-env --activate
+chanvoy daemon start
+```
+
+Use this path only when you have a specific reason to deviate from the canonical flow.
 
 ## Resume And Attention
 
@@ -78,13 +97,37 @@ Current inspectability gap worth tracking:
 - there is not yet a first-class `doctor` or `status` surface for showing the current stored attention state file and cursor values
 - operators can inspect the per-profile JSON state file directly under the config root for now
 
-Profile resolution precedence is:
+## Profile Resolution
 
-1. `--profile`
-2. `CHANVOY_PROFILE`
-3. unique env-derived match from `LANYTE_AGENT_ROLE` + `LANYTE_AGENT_SCOPE`
-4. stored active profile
-5. literal `default`
+When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profile in order:
+
+1. **Explicit `--profile <name>`** — operator's stated intent; always wins.
+2. **`CHANVOY_PROFILE` env var** — explicit override. Refuses if the named profile doesn't exist on disk.
+3. **Env-derived `<role>-<scope>` exact-name** — when `LANYTE_AGENT_ROLE` and `LANYTE_AGENT_SCOPE` are set, resolves to the profile named exactly `<role>-<scope>`. Refuses with the available-profile list if no exact match exists (does not silently fall through to a different identity).
+4. **Single running daemon** — if exactly one chanvoy daemon is currently running on this machine, that profile is used.
+5. **`active_profile` marker** — single-tenant convenience. Only consulted when env vars are unset and no daemon is running. Updated by `chanvoy auto-setup` and `chanvoy profile activate <name>`.
+6. **Refuse** — print the available-profile list and require explicit `--profile`.
+
+Two carve-outs:
+
+- **Profile-collection management verbs** (`profile list`, `profile create`, `profile create-from-env`) and the **`auto-setup` bootstrap verb** bypass this resolver entirely. They operate on the profile collection or env-derived synthesis, not on a single existing target — and forcing resolution would brick fresh bootstrap on an empty config.
+- **Side-effecting daemon-lifecycle verbs** (currently just `daemon stop`) refuse on rules 4 and 5. They require an explicit target — `--profile`, `CHANVOY_PROFILE`, or env-derived `<role>-<scope>` — to avoid acting on another operator's daemon on a shared machine.
+
+The full resolver contract, including policy semantics and per-rule rationale, lives in [`lanyte-crucible/docs/specs/agent-chat-conventions.md`](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
+
+### Stale `active_profile` recovery
+
+After a profile rename or deletion (e.g., a coordinated migration sweep), the `active_profile` marker may point at a profile that no longer exists. The resolver detects this and refuses with `ActiveProfileNotFound` rather than silently falling through to a different identity:
+
+```
+Error: Resolver(ActiveProfileNotFound { name: "old-bare-name", ... })
+```
+
+Recovery: rerun `chanvoy auto-setup` to refresh the marker against your current sourced env. The diagnostic error is intentional — it surfaces the stale state instead of letting it propagate as silent mis-attribution.
+
+### `chanvoy profile active`
+
+Reports the current marker contents directly. When no marker is set, prints `(none)` (text mode) or `null` (JSON mode). This replaces a pre-PER-012 fallback that synthesized a name from the resolver — scripts or agents parsing this output to gate behavior may need updating to handle the explicit-empty case.
 
 ## Daemon Lifecycle
 

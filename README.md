@@ -26,15 +26,18 @@ Remote proxy/control-plane serving is not the validated operating mode yet.
 
 ## Quick Start
 
-After sourcing the normal Lanyte identity env:
+After sourcing the normal Lanyte identity env (so `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and `LANYTE_MM_TOKEN` are set):
 
 ```bash
-cargo build
-target/debug/chanvoy profile create-from-env --activate
-target/debug/chanvoy daemon start
-target/debug/chanvoy whoami
-target/debug/chanvoy read per-007 --since 60
+make install
+chanvoy auto-setup
+chanvoy whoami
+chanvoy read per-007 --since 60
 ```
+
+`chanvoy auto-setup` materializes the canonical `<role>-<scope>` profile, starts the daemon, and seeds channel cursors in one step. Subsequent commands work without `--profile` — the resolver picks the canonical profile from your sourced env.
+
+For development against the working copy without installing, replace `chanvoy` with `cargo run -p chanvoy --` in any of the above. See `docs/operator-guide.md` for the full bootstrap flow, including the manual `profile create-from-env` + `daemon start` path for debugging or custom scenarios.
 
 ## Paths
 
