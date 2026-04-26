@@ -1166,7 +1166,9 @@ pub struct MattermostClient {
 
 impl MattermostClient {
     pub fn new(profile: &Profile, token: String) -> Result<Self, CoreError> {
-        let client = Client::builder().user_agent("chanvoy/0.1.0").build()?;
+        let client = Client::builder()
+            .user_agent(concat!("chanvoy/", env!("CARGO_PKG_VERSION")))
+            .build()?;
         Ok(Self {
             base_url: profile.server_url.trim_end_matches('/').to_string(),
             team_name: profile.team_name.clone(),
