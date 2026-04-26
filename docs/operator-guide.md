@@ -149,7 +149,7 @@ When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profi
 2. **`CHANVOY_PROFILE` env var** — explicit override. Refuses if the named profile doesn't exist on disk.
 3. **Env-derived `<role>-<scope>` exact-name** — when `LANYTE_AGENT_ROLE` and `LANYTE_AGENT_SCOPE` are set, resolves to the profile named exactly `<role>-<scope>`. Refuses with the available-profile list if no exact match exists (does not silently fall through to a different identity).
 4. **Single running daemon** — if exactly one chanvoy daemon is currently running on this machine, that profile is used.
-5. **`active_profile` marker** — single-tenant convenience. Only consulted when env vars are unset and no daemon is running. Updated by `chanvoy auto-setup` and `chanvoy profile activate <name>`.
+5. **`active_profile` marker** — single-tenant convenience. Only consulted when env vars are unset and no daemon is running. Updated by `chanvoy auto-setup` and by `--activate` on `chanvoy profile create` / `chanvoy profile create-from-env`.
 6. **Refuse** — print the available-profile list and require explicit `--profile`.
 
 Two carve-outs:
@@ -171,7 +171,14 @@ Recovery: rerun `chanvoy auto-setup` to refresh the marker against your current 
 
 ### `chanvoy profile active`
 
-Reports the current marker contents directly. When no marker is set, prints `(none)` (text mode) or `null` (JSON mode). This replaces a pre-PER-012 fallback that synthesized a name from the resolver — scripts or agents parsing this output to gate behavior may need updating to handle the explicit-empty case.
+Reports the current marker contents directly. Output shape:
+
+| Marker state | Text mode | JSON mode |
+|---|---|---|
+| Set to `<name>` | `<name>` | `{"active_profile": "<name>"}` |
+| Empty | `(none)` | `{"active_profile": null}` |
+
+This replaces a pre-PER-012 fallback that synthesized a name from the resolver — scripts or agents parsing this output to gate behavior may need updating to handle the explicit-empty case (text `(none)` literal, or `.active_profile` field that may be JSON `null`).
 
 ## Daemon Lifecycle
 

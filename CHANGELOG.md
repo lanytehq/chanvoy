@@ -35,10 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`chanvoy profile active`** now reports `(none)` (text mode) or `null`
-  (JSON mode) when no marker is set, replacing the prior synthetic-name
-  fallback. Scripts or agents that parse this output to gate behavior may
-  need to handle the explicit-empty case.
+- **`chanvoy profile active`** now reports the marker state truthfully
+  when no marker is set: `(none)` in text mode, or
+  `{"active_profile": null}` in JSON mode (a JSON object with a `null`
+  field, not bare `null`). This replaces a prior synthetic-name fallback
+  that returned the resolver's guess. Scripts or agents that parse this
+  output to gate behavior may need to handle the explicit-empty case
+  (text `(none)` literal, or `.active_profile` JSON field that may be
+  `null`).
 - **Default profile resolution** now requires an exact `<role>-<scope>`
   name match against env (`LANYTE_AGENT_ROLE` + `LANYTE_AGENT_SCOPE`).
   Sibling profiles sharing role+scope no longer prevent the canonical match.
