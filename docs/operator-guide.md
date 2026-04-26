@@ -38,6 +38,28 @@ Runtime files are separate from config:
 
 Note: the broader `LANYTE_CONFIG_ROOT` override is a cross-app standardization follow-up and is not implemented in `chanvoy` as part of PER-007.
 
+### Product namespace (not org restriction)
+
+The `lanytehq` segment in the default config root (`~/.config/lanytehq/chanvoy/`) is the **product namespace** — chanvoy is a lanytehq-developed tool that namespaces its config the way other vendor-developed tools do (e.g., `~/.config/google/...` housing Google products for non-Google users). It is **not** an org restriction. Operators in any org — lanytehq, enacthq, fulmenhq, third-party adopters — use the same default path. Profile data inside that path is partitioned per-profile, and profile names encode the org via the `<role>-<scope>` convention (see "Profile and Team Naming Convention" below).
+
+### Path overrides
+
+For isolated testing, parallel local sessions, or non-default deployment shapes:
+
+- **`CHANVOY_CONFIG_DIR`** — overrides the default config root (`~/.config/lanytehq/chanvoy/`). Profile files, the `active_profile` marker, and per-profile attention state all live under this path. Operator-set per shell.
+- **`CHANVOY_RUNTIME_DIR`** — overrides the default runtime directory (`$XDG_RUNTIME_DIR/chanvoy/` or OS temp). Socket and pid file locations follow this. Operator-set per shell.
+
+Example: run a parallel chanvoy session against an isolated profile set:
+
+```bash
+export CHANVOY_CONFIG_DIR="$HOME/chanvoy-test/config"
+export CHANVOY_RUNTIME_DIR="$HOME/chanvoy-test/runtime"
+chanvoy auto-setup
+chanvoy daemon status
+```
+
+The two overrides are independent; either can be set without the other. Profile data and runtime state partition by directory.
+
 ## Bootstrap Flow
 
 ### Primary path: `chanvoy auto-setup`
@@ -66,6 +88,28 @@ chanvoy daemon start
 ```
 
 Use this path only when you have a specific reason to deviate from the canonical flow.
+
+## Profile and Team Naming Convention
+
+Chanvoy profile names and Mattermost team names follow a portable convention that lets `auto-setup` and the resolver work without operator intervention:
+
+- **Profile name:** `<role>-<scope>` (e.g., `cxotech-lanytehq`, `delta-devlead-enacthq`, `bravo-devrev-lanytehq`)
+- **Team name:** `org-<scope>` (e.g., `org-lanytehq`, `org-enacthq`)
+- **Identity script filename:** `<role>-<scope>.sh` (the source-able shell script that exports `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, etc.)
+
+When you source an identity script with these names, `chanvoy auto-setup` synthesizes the canonical profile name (`<role>-<scope>`) and derives the team name (`org-<scope>`) automatically. Subsequent commands resolve to the canonical profile via your sourced env (no `--profile` flag needed).
+
+The full convention, including rationale and the migration story for legacy bare-name profiles, lives in [`lanyte-crucible/docs/specs/agent-chat-conventions.md`](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
+
+## Using Chanvoy in Another Org
+
+Chanvoy is org-portable. Operators in any org adopt it the same way:
+
+1. **Source your org's identity script** (e.g., `cxotech-enacthq.sh`, `delta-devlead-fulmenhq.sh`). The script must set `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN`.
+2. **Run `chanvoy auto-setup`.** The canonical profile is synthesized as `<role>-<scope>` (e.g., `cxotech-enacthq`) with team `org-<scope>` (e.g., `org-enacthq`). No `org-lanytehq` is hardcoded anywhere on the creation path.
+3. **Use `chanvoy ...` normally.** Default resolution picks the canonical profile from your sourced env automatically.
+
+The `lanytehq` segment in the default config path (`~/.config/lanytehq/chanvoy/`) is the chanvoy product namespace, not an org binding — see "Product namespace (not org restriction)" above. If your environment requires it, override with `CHANVOY_CONFIG_DIR`.
 
 ## Resume And Attention
 
@@ -145,6 +189,59 @@ Observed PER-007 lifecycle behavior:
 
 - stale socket cleanup works on next `daemon start`
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior
+
+## Sandboxed Agent Contexts
+
+Chanvoy is most often invoked from an unsandboxed shell (Terminal, tmux,
+direct ssh session). In that case `chanvoy auto-setup` works as
+described above — it spawns a detached daemon, the daemon contacts
+Mattermost for the identity check, and subsequent CLI invocations talk
+to it via Unix socket.
+
+Some agent contexts run with sandbox restrictions that the daemon's
+detached child cannot escalate at startup — Codex agents, OSS users
+running chanvoy under similar `sandbox-exec`-style policies, etc. In
+that environment, `chanvoy auto-setup` (and the underlying
+`chanvoy daemon start`) can fail with errors like:
+
+```
+Error: Daemon(NotRunning(".../chanvoy/<profile>.sock"))
+```
+
+The detached daemon child fails its bootstrap `whoami()` to Mattermost
+because DNS resolution or HTTPS egress is blocked at the sandbox
+boundary, so it exits before binding the socket the CLI then looks
+for.
+
+### Workaround
+
+Run the daemon **foreground** with explicit network approval at start
+time, then use the running socket from the same sandboxed session for
+read/post:
+
+```bash
+# In one shell, with network approval granted to this command:
+chanvoy --profile <name> daemon serve
+
+# Once the foreground daemon prints "websocket authenticated and healthy",
+# subsequent commands from the same sandbox can use it:
+chanvoy daemon status
+chanvoy read <channel> --since 60
+chanvoy post <channel> "..."
+```
+
+`auto-setup` does not currently auto-detect sandboxed environments and
+does not have a foreground-fallback flag. If you're running under sandbox,
+use the explicit `daemon serve` flow instead of `auto-setup`. The
+underlying design fix — sandbox-aware `auto-setup` with a foreground
+fallback, or pre-detach bootstrap that handles `whoami` in the parent
+process — is tracked as PER-014.
+
+> Sandbox-approval semantics ("approve network access at serve-start
+> time") vary by sandbox implementation. The above is documented from
+> the 2026-04-25 transcript of `agent-bravo-devrev` working through
+> this with a Codex agent, not from direct dogfood of every sandbox
+> shape.
 
 ## Migration Exception
 
