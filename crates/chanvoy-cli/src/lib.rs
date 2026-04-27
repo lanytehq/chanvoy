@@ -652,20 +652,20 @@ async fn handle_auto_setup(
     };
 
     let action = decide_profile_action(&desired, existing.as_ref());
-    let (profile_state, persisted_profile, refresh_diff) = match action {
+    let (profile_state, persisted_profile, persisted_identity, refresh_diff) = match action {
         ProfileAction::Create => {
-            let validated = match validate_and_finalize_profile(desired).await {
-                Ok(profile) => profile,
+            let (validated, identity) = match validate_and_finalize_profile(desired).await {
+                Ok(pair) => pair,
                 Err(err) => return exit_on_preflight(json, err),
             };
             store_profile(&validated)?;
-            (ProfileState::Created, validated, Vec::new())
+            (ProfileState::Created, validated, identity, Vec::new())
         }
         ProfileAction::Refresh(diff) => {
             let existing = existing.clone().expect("Refresh implies existing profile");
             let merged = merge_forward_for_refresh(desired, &existing);
-            let validated = match validate_and_finalize_profile(merged).await {
-                Ok(profile) => profile,
+            let (validated, identity) = match validate_and_finalize_profile(merged).await {
+                Ok(pair) => pair,
                 Err(err) => return exit_on_preflight(json, err),
             };
             store_profile(&validated)?;
@@ -681,7 +681,7 @@ async fn handle_auto_setup(
                 print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
                 process::exit(EXIT_DAEMON_FAILED);
             }
-            (ProfileState::Refreshed, validated, diff)
+            (ProfileState::Refreshed, validated, identity, diff)
         }
         ProfileAction::Reuse => {
             let existing = existing.expect("Reuse implies existing profile");
@@ -692,8 +692,9 @@ async fn handle_auto_setup(
             // would claim success based purely on token-source presence from
             // `check_token_available`, never proving the token actually works
             // for the configured team.
-            let validated = match validate_and_finalize_profile(existing.clone()).await {
-                Ok(profile) => profile,
+            let (validated, identity) = match validate_and_finalize_profile(existing.clone()).await
+            {
+                Ok(pair) => pair,
                 Err(err) => return exit_on_preflight(json, err),
             };
             // If the env credential now authenticates as a different bot than
@@ -716,9 +717,9 @@ async fn handle_auto_setup(
                     from: existing.bot_username.clone(),
                     to: validated.bot_username.clone(),
                 }];
-                (ProfileState::Refreshed, validated, diff)
+                (ProfileState::Refreshed, validated, identity, diff)
             } else {
-                (ProfileState::Reused, validated, Vec::new())
+                (ProfileState::Reused, validated, identity, Vec::new())
             }
         }
         ProfileAction::IdentityDrift(diff) => {
@@ -745,7 +746,7 @@ async fn handle_auto_setup(
             .unwrap_or(false)
     };
 
-    let daemon_state = match ensure_daemon_running(&persisted_profile.name).await {
+    let daemon_state = match ensure_daemon_running(&persisted_profile, &persisted_identity).await {
         Ok(state) => state,
         Err(err) => {
             print_auto_setup_error(json, "daemon_start", &err.to_string())?;
@@ -928,23 +929,29 @@ fn check_token_available(profile: &Profile) -> Result<(), CliError> {
     })
 }
 
-async fn validate_and_finalize_profile(mut profile: Profile) -> Result<Profile, CliError> {
+async fn validate_and_finalize_profile(
+    mut profile: Profile,
+) -> Result<(Profile, Identity), CliError> {
     let token = load_token(&profile)?;
     let client = MattermostClient::new(&profile, token)?;
     let identity = client.whoami().await?;
     client.validate_team_access().await?;
-    profile.bot_username = identity.username;
-    Ok(profile)
+    profile.bot_username = identity.username.clone();
+    Ok((profile, identity))
 }
 
-async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
+async fn ensure_daemon_running(
+    profile: &Profile,
+    identity: &Identity,
+) -> Result<DaemonState, CliError> {
     // Bound the health-check ping. A wedged daemon (SIGSTOPed, deadlocked,
     // or stuck in an I/O wait) leaves the socket open but never responds
     // to `daemon_status` RPCs. Without this timeout, auto-setup hangs
     // indefinitely on the health check instead of routing through the
     // zombie-stop path. Timeout-fail is treated identically to ping-fail
     // for subsequent logic.
-    let ping_outcome = tokio::time::timeout(PING_TIMEOUT, ping(profile)).await;
+    let profile_name = profile.name.as_str();
+    let ping_outcome = tokio::time::timeout(PING_TIMEOUT, ping(profile_name)).await;
     if matches!(ping_outcome, Ok(Ok(_))) {
         return Ok(DaemonState::AlreadyRunning);
     }
@@ -961,13 +968,32 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
     // when a daemon is responsive (even if whoami is failing), and falls
     // back to a direct pid-file-driven SIGKILL when the shutdown RPC
     // itself hangs or cannot be served.
-    stop_daemon_if_present(profile).await?;
+    stop_daemon_if_present(profile_name).await?;
+
+    // PER-014: write the bootstrap-state file co-located with the spawn.
+    // Site discipline by structural placement — only `ensure_daemon_running`
+    // emits a bootstrap file, so non-daemon-spawn paths (`profile create`)
+    // cannot produce one by construction. Daemon child reads, validates
+    // (freshness + profile_fingerprint + nonce-env match + username match),
+    // consumes-and-deletes, then binds without calling whoami.
+    let nonce = chanvoy_core::generate_nonce();
+    let bootstrap = chanvoy_core::build_bootstrap_state(
+        profile,
+        identity.id.as_str(),
+        nonce.as_str(),
+        std::process::id(),
+    )
+    .map_err(|err| CliError::Bootstrap(format!("build bootstrap state: {err}")))?;
+    chanvoy_core::write_bootstrap_state(&bootstrap)
+        .map_err(|err| CliError::Bootstrap(format!("write bootstrap state: {err}")))?;
+
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--profile")
-        .arg(profile)
+        .arg(profile_name)
         .arg("daemon")
         .arg("serve")
+        .env(chanvoy_core::BOOTSTRAP_NONCE_ENV, &nonce)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -981,13 +1007,13 @@ async fn ensure_daemon_running(profile: &str) -> Result<DaemonState, CliError> {
     // independent of per-iteration timeout.
     let spawn_ready_deadline = std::time::Instant::now() + SPAWN_READY_DEADLINE;
     while std::time::Instant::now() < spawn_ready_deadline {
-        let ping_outcome = tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping(profile)).await;
+        let ping_outcome = tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping(profile_name)).await;
         if matches!(ping_outcome, Ok(Ok(_))) {
             return Ok(DaemonState::Started);
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    Err(DaemonError::NotRunning(profile.to_string()).into())
+    Err(DaemonError::NotRunning(profile_name.to_string()).into())
 }
 
 /// Detach the spawned daemon into a new session so it survives the

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-27
+
+### Added
+
+- **PER-014: sandbox-aware daemon startup via pre-detach identity bootstrap.**
+  `chanvoy auto-setup` now succeeds in sandboxed agent contexts (Codex,
+  macOS sandboxd, Docker without `--network`, OSS sandbox setups) without
+  manual operator intervention beyond the one-time network-approval
+  prompt that fires for the parent CLI's own `whoami()` call. The
+  detached daemon inherits the validated identity from the parent via a
+  per-profile `<runtime_dir>/<profile>.bootstrap.json` file (mode 0600
+  in 0700 dir; identity-only, no token) plus a one-shot `CHANVOY_BOOTSTRAP_NONCE`
+  env var for anti-replay. The daemon validates freshness (60s),
+  profile fingerprint (SHA-256 over canonical non-secret fields), nonce
+  match, and username match before binding the UDS — no network call
+  pre-bind. WS first-connect failures are absorbed by PER-010's existing
+  reconnect path.
+- **Drift floor (`daemon_status.mattermost_identity_drift`).** Bind-first /
+  probe-after / surface-in-status: a one-shot post-bind `whoami()` probe
+  runs asynchronously (and refreshes on every `daemon_status` call); on
+  identity mismatch (Mattermost-returned username ≠ configured
+  `bot_username`), `daemon_status.mattermost_identity_drift = true` and
+  network-backed RPCs (post / read / check / notifications / etc.)
+  refuse with a clear diagnostic. The local socket stays bound so
+  operators can query `daemon_status` to learn what's wrong.
+- Operator-guide: §"Sandboxed Agent Contexts" rewritten — primary path
+  is now native `auto-setup`; foreground `daemon serve` retained as the
+  rare-case fallback for fully non-interactive batch contexts.
+
+### Changed
+
+- `validate_and_finalize_profile` returns `(Profile, Identity)` instead
+  of `Profile` so the validated `Identity.id` (Mattermost user_id) flows
+  pre-detach into `ensure_daemon_running`. Internal CLI helper; no
+  public-API change.
+- `ensure_daemon_running` now writes the bootstrap-state file and sets
+  the env nonce immediately before spawning the detached daemon. Site
+  discipline by structural placement: only the daemon-spawn path can
+  emit a bootstrap file, by construction; profile-create paths cannot.
+
 ## [0.1.1] - 2026-04-26
 
 ### Added

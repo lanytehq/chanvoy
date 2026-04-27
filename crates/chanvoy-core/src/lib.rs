@@ -1,3 +1,12 @@
+pub mod bootstrap;
+
+pub use bootstrap::{
+    bootstrap_path_for_profile, build_bootstrap_state, compute_profile_fingerprint,
+    consume_bootstrap_state, generate_nonce, read_bootstrap_state, validate_bootstrap_state,
+    write_bootstrap_state, BootstrapError, BootstrapState, BOOTSTRAP_MAX_AGE_SECS,
+    BOOTSTRAP_NONCE_ENV,
+};
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -244,10 +253,18 @@ pub fn build_daemon_status(
     ipc: IpcStatusSnapshot,
     now_millis: i64,
 ) -> DaemonStatus {
-    let (mattermost_username, mattermost_ok, mattermost_last_error) = match whoami_result {
-        Ok(username) => (username, true, None),
-        Err(msg) => (configured_bot_username, false, Some(msg)),
-    };
+    let (mattermost_username, mattermost_ok, mattermost_last_error, mattermost_identity_drift) =
+        match whoami_result {
+            Ok(username) => {
+                let drift = if configured_bot_username.is_empty() {
+                    None
+                } else {
+                    Some(username != configured_bot_username)
+                };
+                (username, true, None, drift)
+            }
+            Err(msg) => (configured_bot_username.clone(), false, Some(msg), None),
+        };
     let health = derive_daemon_health(
         now_millis,
         ws.connection_state,
@@ -271,6 +288,7 @@ pub fn build_daemon_status(
         ws_last_recovered_at: ws.last_recovered_at,
         ws_suspected_gap: ws.suspected_gap,
         mattermost_last_error,
+        mattermost_identity_drift,
     }
 }
 
@@ -722,6 +740,13 @@ pub struct DaemonStatus {
     pub ws_suspected_gap: Option<bool>,
     #[serde(default)]
     pub mattermost_last_error: Option<String>,
+    /// PER-014: post-bind drift signal — `true` when a successful
+    /// `whoami()` returned a username that does NOT match the configured
+    /// `bot_username`. `None` when the probe has not yet completed
+    /// successfully or has not been called. The local socket remains
+    /// bound on drift; network-backed RPCs surface a clear diagnostic.
+    #[serde(default)]
+    pub mattermost_identity_drift: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -3536,6 +3561,71 @@ monitored_channels = ["per-003", "per-004"]
             assert_eq!(status.mattermost_username, "agent-bravo-devlead");
             assert_eq!(status.mattermost_last_error, None);
             assert_eq!(status.health, Some(DaemonHealthState::Healthy));
+            // PER-014: matched probe → drift=Some(false) (probe ran cleanly,
+            // no drift). Distinguishes from None (probe didn't run / failed).
+            assert_eq!(status.mattermost_identity_drift, Some(false));
+        }
+
+        #[test]
+        fn build_status_marks_identity_drift_when_whoami_returns_other_user() {
+            // PER-014 drift floor: the post-bind probe (or any later
+            // daemon_status call) returned a username that does NOT match
+            // the configured bot_username. The status must surface this so
+            // operators can see what's wrong, and the dispatcher can refuse
+            // network-backed RPCs while keeping the local socket bound.
+            let now = 1_777_050_000_000;
+            let ws = ws_snapshot_for(
+                Some(WsConnectionState::Healthy),
+                Some(false),
+                None,
+                Some(0),
+                0,
+            );
+            let status = build_daemon_status(
+                "bravo-devlead".to_string(),
+                PathBuf::from("/tmp/chanvoy/bravo-devlead.sock"),
+                "agent-bravo-devlead".to_string(),
+                // Token now authenticates as a different bot — drift.
+                Ok("agent-impersonator".to_string()),
+                ws,
+                ipc_absent(),
+                now,
+            );
+            assert!(status.mattermost_ok);
+            assert_eq!(status.mattermost_username, "agent-impersonator");
+            assert_eq!(
+                status.mattermost_identity_drift,
+                Some(true),
+                "drift must be surfaced when whoami returns a different username"
+            );
+        }
+
+        #[test]
+        fn build_status_drift_is_none_when_probe_failed() {
+            // When the probe itself failed (network blocked, sandbox,
+            // transient outage), drift cannot be determined — surface
+            // None rather than a misleading false. Operators see
+            // mattermost_ok=false + mattermost_last_error=Some, which
+            // is the right signal in this case.
+            let now = 1_777_050_000_000;
+            let ws = ws_snapshot_for(
+                Some(WsConnectionState::Healthy),
+                Some(false),
+                None,
+                Some(0),
+                0,
+            );
+            let status = build_daemon_status(
+                "bravo-devlead".to_string(),
+                PathBuf::from("/tmp/chanvoy/bravo-devlead.sock"),
+                "agent-bravo-devlead".to_string(),
+                Err("probe timed out".to_string()),
+                ws,
+                ipc_absent(),
+                now,
+            );
+            assert!(!status.mattermost_ok);
+            assert_eq!(status.mattermost_identity_drift, None);
         }
 
         #[tokio::test]
