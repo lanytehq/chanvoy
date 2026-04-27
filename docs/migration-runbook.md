@@ -11,38 +11,35 @@ Windows local-daemon support is not yet implemented.
 
 ## Preconditions
 
-- Lanyte identity env sourced
-- `LANYTE_MM_URL`, `LANYTE_MM_TOKEN`, `LANYTE_MM_TEAM` available
-- `chanvoy` built locally
+- Lanyte identity env sourced — `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN` (or the env name configured by `CHANVOY_TOKEN_ENV_NAME`)
+- `LANYTE_MM_TEAM` is optional; team defaults to `org-<scope>` derived from `LANYTE_AGENT_SCOPE`. Set it only if the Mattermost team does not follow the `org-<scope>` convention.
+- `chanvoy` built and installed locally (`make install`)
 
 ## One-Time Setup
 
-1. Create or refresh the profile from the current shell:
+1. Bootstrap the profile and daemon in one step:
 
 ```bash
-chanvoy profile create-from-env --activate
+chanvoy auto-setup
 ```
 
-2. Start the daemon:
+`auto-setup` materializes the canonical `<role>-<scope>` profile from
+your sourced env, starts the daemon, and seeds channel cursors. Token
+and team are validated against Mattermost before the profile persists
+— a missing or mistyped `LANYTE_MM_TEAM` (when set) or unreachable
+token surfaces here rather than later during channel operations.
 
-```bash
-chanvoy daemon start
-```
-
-3. Verify health:
+2. Verify health:
 
 ```bash
 chanvoy daemon status
 chanvoy whoami
-```
-
-4. Verify the configured team is usable before relying on the profile for normal work:
-
-```bash
 chanvoy channels
 ```
 
-`profile create-from-env` now validates both the token and the configured team before it persists a profile, so a missing or mistyped `LANYTE_MM_TEAM` should fail during bootstrap rather than later during channel operations.
+For the manual two-step path (debugging or custom scenarios), see
+the operator guide's "Bootstrap Flow → Manual path" section. The
+canonical adopter flow is `auto-setup`.
 
 ## Daily Flow
 
@@ -76,11 +73,10 @@ Important semantics:
 
 1. Update evergreen docs and operator references from `lanyte-chat` to `chanvoy`.
 2. Post the planned cutover notice in `ops-updates`.
-3. Bootstrap the target shared-machine profile with `chanvoy profile create-from-env --activate`.
-4. Start and verify the daemon:
+3. Bootstrap the target shared-machine profile with `chanvoy auto-setup`.
+4. Verify the daemon:
 
 ```bash
-chanvoy daemon start
 chanvoy daemon status
 ```
 
