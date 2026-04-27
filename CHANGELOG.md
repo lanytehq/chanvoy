@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **PER-014 review fixes (devrev PR #16, 2026-04-27).** Drift gate now
+  refuses `subscribe` RPCs and suppresses event forwarding to existing
+  subscribers when the identity-drift bit is set — closes the gap where
+  network-sourced WebSocket events could continue flowing for the
+  wrong authenticated bot. `unsubscribe` / `daemon_status` /
+  `profile_status` / `attention` / `shutdown` remain answerable for
+  diagnostic and cleanup. Missing bootstrap-state file behavior split:
+  if `CHANVOY_BOOTSTRAP_NONCE` is set but the file is absent, daemon
+  refuses with `CoreError::BootstrapHandoffFailed` (failed auto-setup
+  handoff — likely runtime-dir drift, sandbox /tmp cleanup, or a
+  consume race); if the env nonce is absent, daemon falls back to
+  legacy `whoami()` (manual `daemon serve` path). Resolution logic
+  factored into `chanvoy_core::resolve_startup_identity` for unit
+  testability; 4 new tests cover the three branches.
+
 ## [0.1.2] - 2026-04-27
 
 ### Added

@@ -227,6 +227,72 @@ pub fn validate_bootstrap_state(
     Ok(())
 }
 
+/// PER-014: outcome of resolving the daemon's startup-identity path.
+/// Returned by [`resolve_startup_identity`] so the daemon's `start()` can
+/// branch cleanly between "trust the parent's handoff" and "fall back to
+/// legacy whoami" without re-implementing the file/env state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapResolution {
+    /// Bootstrap state was valid; daemon should bind using this `user_id`.
+    /// The bootstrap file has already been consumed by `resolve_startup_identity`
+    /// — caller must not re-consume.
+    Validated { user_id: String },
+    /// No bootstrap handoff in flight (nonce env unset, file absent).
+    /// Daemon should fall back to its legacy `whoami()` path. This is
+    /// the right outcome for manual `chanvoy daemon serve` developer-mode
+    /// invocations.
+    Legacy,
+}
+
+/// Resolve which startup-identity path the daemon should take.
+///
+/// Three outcomes per the PER-014 brief, distinguished by whether the
+/// parent advertised a handoff (`CHANVOY_BOOTSTRAP_NONCE` env present)
+/// and whether the per-profile bootstrap-state file exists.
+///
+/// **File present** → `Validated`. Validates freshness + fingerprint +
+/// nonce + username, consumes-and-deletes the file, returns the
+/// parent-supplied `user_id`. Daemon binds with no network call.
+///
+/// **File missing, nonce env set** → `Err(CoreError::BootstrapHandoffFailed)`.
+/// The parent advertised a handoff but the daemon cannot find the file.
+/// Likely runtime-dir drift, sandbox /tmp cleanup, or a consume race;
+/// refuse with a clear diagnostic so operators can distinguish from a
+/// legacy invocation. Per @agent-bravo-devrev's PR #16 finding (2026-04-27).
+///
+/// **File missing, nonce env unset** → `Legacy`. Manual `daemon serve`,
+/// no handoff in flight. Daemon falls back to `client.whoami()` as before.
+///
+/// Pure(ish): no network I/O, only filesystem reads under the runtime
+/// dir + an env-var check. The `consume_bootstrap_state` side effect
+/// fires before the function returns, so callers don't need to clean up.
+pub fn resolve_startup_identity(
+    profile_name: &str,
+    profile: &Profile,
+    env_nonce: Option<&str>,
+) -> Result<BootstrapResolution, CoreError> {
+    let bootstrap = read_bootstrap_state(profile_name).map_err(CoreError::from)?;
+    match (bootstrap, env_nonce) {
+        (Some(state), nonce) => {
+            let validation = validate_bootstrap_state(&state, profile, nonce);
+            // Consume-and-delete unconditionally — bootstrap is single-use.
+            // On validation failure we still want the file gone so a
+            // subsequent legitimate spawn isn't shadowed by poisoned residue.
+            let _ = consume_bootstrap_state(profile_name);
+            validation.map_err(CoreError::from)?;
+            Ok(BootstrapResolution::Validated {
+                user_id: state.user_id,
+            })
+        }
+        (None, Some(_)) => Err(CoreError::BootstrapHandoffFailed {
+            profile: profile_name.to_string(),
+            nonce_env: BOOTSTRAP_NONCE_ENV,
+            path: bootstrap_path_for_profile(profile_name),
+        }),
+        (None, None) => Ok(BootstrapResolution::Legacy),
+    }
+}
+
 /// Build a fresh bootstrap state. Convenience for the parent-side write site
 /// in `ensure_daemon_running`: caller passes validated `Identity` + `Profile`
 /// + a freshly generated nonce, gets back a ready-to-write `BootstrapState`.
@@ -382,11 +448,12 @@ mod tests {
 
     #[test]
     fn write_read_consume_roundtrip_under_runtime_override() {
+        // Hold the env lock so this doesn't race with the resolver tests
+        // (parallel test execution shares env-var state across threads).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Isolate from any real runtime dir on the test machine.
         let tmp = tempfile::tempdir().expect("tempdir");
         let original = std::env::var_os("CHANVOY_RUNTIME_DIR");
-        // SAFETY: tests in this crate run sequentially within this module
-        // by default; we restore the env at the end.
         std::env::set_var("CHANVOY_RUNTIME_DIR", tmp.path());
 
         let p = sample_profile();
@@ -428,5 +495,111 @@ mod tests {
             filename, "alpha-foo-lanytehq.bootstrap.json",
             "filename should follow `<profile>.<ext>` convention",
         );
+    }
+
+    /// Serialize env-mutating tests in this module. `set_var` is process-
+    /// global; cargo runs tests in parallel within a single binary by
+    /// default, so without serialization two tests racing on
+    /// `CHANVOY_RUNTIME_DIR` would each read the other's tempdir.
+    /// Lock at the entry of every test that touches the env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper for resolution tests. Holds the env lock for the duration,
+    /// sets a temp runtime dir, runs the closure with a unique profile
+    /// name, then restores env. Returning the lock guard with the closure
+    /// result lets the caller drop it after assertions.
+    fn with_isolated_runtime<F: FnOnce(&str)>(f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let original = std::env::var_os("CHANVOY_RUNTIME_DIR");
+        std::env::set_var("CHANVOY_RUNTIME_DIR", tmp.path());
+        let profile_name = format!("resolver-test-{}", uuid::Uuid::new_v4());
+        f(&profile_name);
+        if let Some(prev) = original {
+            std::env::set_var("CHANVOY_RUNTIME_DIR", prev);
+        } else {
+            std::env::remove_var("CHANVOY_RUNTIME_DIR");
+        }
+    }
+
+    #[test]
+    fn resolve_returns_validated_when_file_and_nonce_match() {
+        with_isolated_runtime(|profile_name| {
+            let mut p = sample_profile();
+            p.name = profile_name.to_string();
+            let nonce = generate_nonce();
+            let state = build_bootstrap_state(&p, "uid-validated", &nonce, 12345).expect("build");
+            write_bootstrap_state(&state).expect("write");
+            let resolution =
+                resolve_startup_identity(profile_name, &p, Some(&nonce)).expect("resolve");
+            assert_eq!(
+                resolution,
+                BootstrapResolution::Validated {
+                    user_id: "uid-validated".to_string(),
+                },
+            );
+            // Bootstrap file must be consumed.
+            assert!(
+                read_bootstrap_state(profile_name).expect("read").is_none(),
+                "resolver must consume bootstrap file on success"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_returns_legacy_when_no_file_and_no_nonce() {
+        // PER-014 finding #2 path: manual `daemon serve` invocation —
+        // no nonce env, no bootstrap file. Falls back to legacy whoami.
+        with_isolated_runtime(|profile_name| {
+            let mut p = sample_profile();
+            p.name = profile_name.to_string();
+            let resolution = resolve_startup_identity(profile_name, &p, None).expect("resolve");
+            assert_eq!(resolution, BootstrapResolution::Legacy);
+        });
+    }
+
+    #[test]
+    fn resolve_fails_handoff_when_nonce_set_but_file_missing() {
+        // PER-014 finding #2 path: parent's auto-setup advertised a
+        // handoff (CHANVOY_BOOTSTRAP_NONCE present in env) but the
+        // bootstrap file is missing. This is a failed handoff — likely
+        // runtime-dir drift, sandbox /tmp cleanup, or a consume race.
+        // Refuse with a clear diagnostic so operators can distinguish
+        // from the legacy path.
+        with_isolated_runtime(|profile_name| {
+            let mut p = sample_profile();
+            p.name = profile_name.to_string();
+            let err = resolve_startup_identity(profile_name, &p, Some("any-nonce"))
+                .expect_err("must fail with BootstrapHandoffFailed");
+            assert!(
+                matches!(err, CoreError::BootstrapHandoffFailed { .. }),
+                "got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_consumes_file_even_on_validation_failure() {
+        // Defense in depth: a bootstrap file with a wrong nonce is
+        // poisoned residue. Even when validation fails, the file must
+        // be deleted so a subsequent legitimate spawn isn't shadowed.
+        with_isolated_runtime(|profile_name| {
+            let mut p = sample_profile();
+            p.name = profile_name.to_string();
+            let file_nonce = generate_nonce();
+            let state = build_bootstrap_state(&p, "uid-1", &file_nonce, 12345).expect("build");
+            let path = write_bootstrap_state(&state).expect("write");
+            assert!(path.exists());
+
+            let err = resolve_startup_identity(profile_name, &p, Some("wrong-nonce-from-env"))
+                .expect_err("validation must fail on nonce mismatch");
+            // CoreError::Io wraps BootstrapError::NonceMismatch via the
+            // From impl in bootstrap.rs.
+            assert!(matches!(err, CoreError::Io(_)), "got {err:?}");
+            assert!(
+                !path.exists(),
+                "resolver must consume poisoned bootstrap file even on validation failure"
+            );
+        });
     }
 }

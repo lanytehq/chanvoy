@@ -89,53 +89,50 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let token = load_token(&profile)?;
     let client = MattermostClient::new(&profile, token)?;
 
-    // PER-014: prefer the parent-supplied bootstrap state over a network
-    // whoami(). The CLI parent's `validate_and_finalize_profile` already
-    // calls whoami() in interactive shell context (where sandbox approval
-    // can be granted) and writes a per-profile bootstrap-state file with
-    // the validated identity + a one-shot anti-replay nonce. The daemon
-    // child reads it, validates freshness + profile_fingerprint + nonce-env
-    // match + username match, consumes-and-deletes, then binds without any
-    // network call. Sandboxed environments where the detached child cannot
-    // bootstrap network (Codex agents, macOS sandboxd, Docker without
-    // `--network`) succeed here.
+    // PER-014: three startup paths, distinguished by whether the parent
+    // advertised a handoff via `CHANVOY_BOOTSTRAP_NONCE` and whether the
+    // bootstrap-state file is present:
     //
-    // Legacy path: a manual `chanvoy daemon serve` invocation (not via
-    // `auto-setup`) leaves no bootstrap-state file. In that case we fall
-    // through to the original network whoami() — works in unsandboxed
-    // shells and is the right thing for developer-mode invocations.
-    let my_user_id =
-        match chanvoy_core::read_bootstrap_state(profile_name).map_err(CoreError::from)? {
-            Some(state) => {
-                let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
-                let validation =
-                    chanvoy_core::validate_bootstrap_state(&state, &profile, env_nonce.as_deref());
-                // Consume-and-delete unconditionally: a bootstrap file is
-                // single-use. If validation fails, we still want the file
-                // gone so a subsequent legitimate spawn isn't shadowed by
-                // a poisoned residue.
-                let _ = chanvoy_core::consume_bootstrap_state(profile_name);
-                validation.map_err(CoreError::from)?;
-                info!(
-                    profile = profile_name,
-                    "chanvoy daemon trusted pre-validated identity from bootstrap state"
-                );
-                state.user_id
-            }
-            None => {
-                // No bootstrap-state file — legacy / non-auto-setup path.
-                // Network whoami() runs as before.
-                let identity = client.whoami().await?;
-                if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
-                    return Err(CoreError::ProfileIdentityMismatch {
-                        expected: profile.bot_username.clone(),
-                        actual: identity.username,
-                    }
-                    .into());
+    // 1. **File present**: validated bootstrap path. Validate
+    //    freshness + profile_fingerprint + nonce-env match + username
+    //    match, consume-and-delete, bind without a network call. This is
+    //    the auto-setup → sandboxed-daemon-spawn happy path.
+    // 2. **File missing, nonce env set**: failed auto-setup handoff.
+    //    The parent advertised a handoff (env var set) but the daemon
+    //    child could not find the file. Likely runtime-dir drift between
+    //    parent and child, sandbox temp cleanup, or a consume race.
+    //    Refuse with `BootstrapHandoffFailed` so the operator can
+    //    distinguish from a legacy manual invocation. Per
+    //    @agent-bravo-devrev's PR #16 finding (2026-04-27).
+    // 3. **File missing, nonce env absent**: legacy / non-auto-setup
+    //    path. Manual `chanvoy daemon serve`. Fall through to the
+    //    original network whoami() — works in unsandboxed shells and
+    //    is the right thing for developer-mode invocations.
+    let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
+    let resolution =
+        chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())?;
+    let my_user_id = match resolution {
+        chanvoy_core::BootstrapResolution::Validated { user_id } => {
+            info!(
+                profile = profile_name,
+                "chanvoy daemon trusted pre-validated identity from bootstrap state"
+            );
+            user_id
+        }
+        chanvoy_core::BootstrapResolution::Legacy => {
+            // Manual `chanvoy daemon serve` (not via auto-setup): no
+            // handoff in flight. Network whoami() runs as before.
+            let identity = client.whoami().await?;
+            if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
+                return Err(CoreError::ProfileIdentityMismatch {
+                    expected: profile.bot_username.clone(),
+                    actual: identity.username,
                 }
-                identity.id
+                .into());
             }
-        };
+            identity.id
+        }
+    };
     let listener = UnixListener::bind(&socket_path)?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     fs::write(&pid_path, std::process::id().to_string())?;
@@ -342,6 +339,22 @@ async fn handle_client(
             } => {
                 match recv_result {
                     Ok(event) => {
+                        // PER-014: if identity drift is set, suppress
+                        // forwarding network-sourced events to subscribed
+                        // clients. The post-bind probe (or a later
+                        // daemon_status call) caught the bot's identity
+                        // diverging from the configured bot_username; the
+                        // drift floor's contract is "no Mattermost-sourced
+                        // data flows while drift is true." Operators query
+                        // daemon_status.mattermost_identity_drift to learn
+                        // why the event stream paused; the local socket
+                        // and `unsubscribe` / `daemon_status` /
+                        // `profile_status` / attention RPCs stay
+                        // answerable. Per @agent-bravo-devrev's PR #16
+                        // finding, 2026-04-27.
+                        if state.identity_drift.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let subs = state.subscriptions.lock().await;
                         let matches_any = client_sub_ids.iter().any(|id| {
                             subs.get(id)
@@ -428,14 +441,22 @@ fn event_matches_filter(event: &DaemonEvent, filter: &SubscriptionFilter) -> boo
     }
 }
 
-/// PER-014: methods that NEVER hit Mattermost. Even when the drift gate
-/// is tripped, these must remain answerable so operators can learn what's
-/// wrong via `daemon_status` and the daemon stays administrable
-/// (`shutdown`, `subscribe`/`unsubscribe`, `profile_status`, attention).
+/// PER-014: methods that NEVER serve Mattermost-sourced data. Even when
+/// the drift gate is tripped, these must remain answerable so operators
+/// can learn what's wrong via `daemon_status` and the daemon stays
+/// administrable (`shutdown`, `unsubscribe`, `profile_status`, attention).
+///
+/// `subscribe` is intentionally NOT on this list: subscriptions forward
+/// Mattermost WebSocket events from the daemon to clients, so accepting
+/// new subscriptions under drift would let network-sourced data flow
+/// for the wrong authenticated bot. Existing subscribers also have
+/// their event forwarding gated on the drift bit (see
+/// `handle_client`'s receive arm). `unsubscribe` stays local so
+/// operators can clean up state without first un-drifting.
+/// (Per @agent-bravo-devrev's PR #16 finding, 2026-04-27.)
 const LOCAL_ONLY_METHODS: &[&str] = &[
     "daemon_status",
     "profile_status",
-    "subscribe",
     "unsubscribe",
     "attention_list",
     "attention_show",

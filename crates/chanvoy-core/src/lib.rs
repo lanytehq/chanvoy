@@ -2,9 +2,9 @@ pub mod bootstrap;
 
 pub use bootstrap::{
     bootstrap_path_for_profile, build_bootstrap_state, compute_profile_fingerprint,
-    consume_bootstrap_state, generate_nonce, read_bootstrap_state, validate_bootstrap_state,
-    write_bootstrap_state, BootstrapError, BootstrapState, BOOTSTRAP_MAX_AGE_SECS,
-    BOOTSTRAP_NONCE_ENV,
+    consume_bootstrap_state, generate_nonce, read_bootstrap_state, resolve_startup_identity,
+    validate_bootstrap_state, write_bootstrap_state, BootstrapError, BootstrapResolution,
+    BootstrapState, BOOTSTRAP_MAX_AGE_SECS, BOOTSTRAP_NONCE_ENV,
 };
 
 use std::collections::BTreeMap;
@@ -769,6 +769,26 @@ pub enum CoreError {
     MissingEnvFile,
     #[error("profile bot username mismatch: expected {expected}, got {actual}")]
     ProfileIdentityMismatch { expected: String, actual: String },
+    /// PER-014: parent-side auto-setup advertised a bootstrap handoff via
+    /// `CHANVOY_BOOTSTRAP_NONCE` but the daemon child could not find the
+    /// per-profile bootstrap-state file. This is a failed handoff (likely
+    /// causes: runtime-dir drift between parent and child, sandbox /tmp
+    /// cleanup, or a consume race), not a legacy manual `daemon serve`
+    /// invocation. Refuse with a clear diagnostic so operators can
+    /// distinguish from the legacy path. Per agent-bravo-devrev's PR #16
+    /// finding (2026-04-27).
+    #[error(
+        "PER-014 bootstrap handoff failed for profile {profile}: \
+         {nonce_env} is set but {path:?} is missing. \
+         Likely runtime-dir drift between auto-setup and daemon, \
+         sandbox temp-dir cleanup, or a consume race. \
+         Re-run `chanvoy auto-setup` to re-validate identity."
+    )]
+    BootstrapHandoffFailed {
+        profile: String,
+        nonce_env: &'static str,
+        path: PathBuf,
+    },
     #[error("anchor post {0} not found")]
     AnchorNotFound(String),
     #[error("anchor post {post_id} is not in channel {channel}")]
