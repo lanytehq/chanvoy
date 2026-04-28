@@ -11,7 +11,7 @@ use chanvoy_core::{
     ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
     WaitResult, WsConnectionState,
 };
-use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
+use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -944,30 +944,42 @@ async fn ensure_daemon_running(
     profile: &Profile,
     identity: &Identity,
 ) -> Result<DaemonState, CliError> {
-    // Bound the health-check ping. A wedged daemon (SIGSTOPed, deadlocked,
-    // or stuck in an I/O wait) leaves the socket open but never responds
-    // to `daemon_status` RPCs. Without this timeout, auto-setup hangs
-    // indefinitely on the health check instead of routing through the
-    // zombie-stop path. Timeout-fail is treated identically to ping-fail
-    // for subsequent logic.
+    // Bound the pre-spawn health-check. Two distinct things can be wrong
+    // with an existing daemon:
+    //   (1) Wedged daemon (SIGSTOPed, deadlocked, I/O-stuck): socket open,
+    //       RPCs never respond. PING_TIMEOUT bounds us so auto-setup
+    //       routes through the zombie-stop path instead of hanging.
+    //   (2) Running daemon with a stale / revoked / drifted token: socket
+    //       open and local RPCs answer fine, but the cached Mattermost
+    //       credential won't survive seed/read calls. PER-014 entarch
+    //       residual finding (2026-04-28): use the network-aware
+    //       `ping_full` (= `daemon_status`, runs `probe_whoami`) at
+    //       the pre-spawn check to surface this case so the existing
+    //       daemon gets stopped and respawned with the freshly
+    //       validated parent credential. The local-only `ping()`
+    //       elsewhere does NOT make that distinction by design.
     let profile_name = profile.name.as_str();
-    let ping_outcome = tokio::time::timeout(PING_TIMEOUT, ping(profile_name)).await;
-    if matches!(ping_outcome, Ok(Ok(_))) {
-        return Ok(DaemonState::AlreadyRunning);
+    let ping_outcome = tokio::time::timeout(PING_TIMEOUT, ping_full(profile_name)).await;
+    if let Ok(Ok(status)) = &ping_outcome {
+        // Daemon is bound AND its network probe completed. Reuse it
+        // only if it's actually healthy (token reachable, no identity
+        // drift). Anything else falls through to the stop+respawn path
+        // so the new daemon picks up the parent's freshly-validated
+        // identity and a current token from the env-name lookup.
+        let drifted = status.mattermost_identity_drift.unwrap_or(false);
+        if status.mattermost_ok && !drifted {
+            return Ok(DaemonState::AlreadyRunning);
+        }
     }
-    // `ping()` failing (or timing out) does not mean the daemon is absent
-    // — it is the `daemon_status` RPC, which calls `whoami()` against
-    // Mattermost. A running daemon with a revoked / invalid token fails
-    // ping while still holding the socket. A wedged daemon hangs ping
-    // entirely. Blindly spawning in either case would leave that zombie
-    // alive alongside a fresh daemon — the two-daemons-one-profile
-    // condition secrev F5 / devrev F6 flagged.
-    //
-    // Call stop_daemon_if_present before spawning; it short-circuits when
-    // no socket exists (normal cold-start), uses the local `shutdown` RPC
-    // when a daemon is responsive (even if whoami is failing), and falls
-    // back to a direct pid-file-driven SIGKILL when the shutdown RPC
-    // itself hangs or cannot be served.
+    // ping_full failing/timing out OR returning unhealthy/drifted does
+    // not mean the daemon is absent — a wedged daemon hangs ping; a
+    // stale-token daemon answers but flunks `mattermost_ok`. Blindly
+    // spawning in either case would leave a zombie alongside the fresh
+    // daemon (two-daemons-one-profile condition secrev F5 / devrev F6
+    // flagged). Call stop_daemon_if_present before spawning; it
+    // short-circuits when no socket exists (normal cold-start), uses
+    // the local `shutdown` RPC when a daemon is responsive, and falls
+    // back to pid-file-driven SIGKILL when shutdown can't be served.
     stop_daemon_if_present(profile_name).await?;
 
     // PER-014: write the bootstrap-state file co-located with the spawn.

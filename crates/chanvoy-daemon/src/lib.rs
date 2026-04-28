@@ -283,24 +283,37 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     })
 }
 
-/// Local-only readiness check for the daemon UDS socket. Used by the CLI's
-/// pre-spawn "is anything already running here?" probe and the post-spawn
-/// "did the daemon I just spawned come up?" loop in `ensure_daemon_running`.
+/// Local-only readiness check for the daemon UDS socket. Use this when
+/// the question is "is the daemon bound and answering RPCs?" — not
+/// "does the daemon's Mattermost token still work?". Calls
+/// `profile_status`, which is in `LOCAL_ONLY_METHODS` and never touches
+/// the network.
 ///
-/// PER-014 (entarch PR #16 finding #2): MUST use a local-only RPC, not
-/// `daemon_status`. `daemon_status` awaits `probe_whoami` against
-/// Mattermost; under sandbox restrictions where REST is stalled rather
-/// than denied, that probe can take longer than the post-spawn ping
-/// timeout, causing `auto-setup` to report `Daemon(NotRunning)` even
-/// though the daemon bound its socket successfully. Reintroducing exactly
-/// the operator-visible failure mode PER-014 was supposed to eliminate.
-///
-/// `profile_status` is in `LOCAL_ONLY_METHODS` and never makes a network
-/// call; if it answers, the daemon is bound and serving RPCs. Operator-
-/// facing health (`chanvoy daemon status` → `status()` → `daemon_status`)
-/// keeps the network probe — that's where operators want it.
+/// PER-014 (entarch PR #16 finding #2): used by `ensure_daemon_running`'s
+/// post-spawn "did the child I just spawned come up?" loop. Under sandbox
+/// restrictions where REST is stalled rather than denied, a daemon_status-
+/// based readiness check could exceed the post-spawn ping timeout and
+/// cause `auto-setup` to report `Daemon(NotRunning)` even though the
+/// daemon bound its socket — exactly the failure mode PER-014 is trying
+/// to eliminate.
 pub async fn ping(profile_name: &str) -> Result<ProfileStatus, DaemonError> {
     daemon_client(profile_name).profile_status().await
+}
+
+/// Network-aware health check for the daemon. Use this when the question
+/// is "is the existing daemon usable?" — i.e., bound AND with a working
+/// Mattermost token AND no identity drift. Calls `daemon_status`, which
+/// runs `probe_whoami` against Mattermost.
+///
+/// PER-014 (entarch PR #16 residual finding, 2026-04-28): used by
+/// `ensure_daemon_running`'s pre-spawn check to decide whether the
+/// existing daemon should be reused or torn down and respawned. A
+/// daemon with a revoked/rotated token or drifted identity must be
+/// replaced rather than reused — the previous semantics relied on
+/// the network probe to surface that, and PER-014's local-only ping()
+/// retarget would otherwise mask it.
+pub async fn ping_full(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
+    daemon_client(profile_name).daemon_status().await
 }
 
 pub async fn stop(profile_name: &str) -> Result<(), DaemonError> {

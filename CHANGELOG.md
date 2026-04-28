@@ -33,7 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout and cause `auto-setup` to report `Daemon(NotRunning)` even
   though the socket was bound — exactly the failure mode PER-014 is
   trying to eliminate. The operator-facing `chanvoy daemon status` keeps
-  the network probe.
+  the network probe. **Pre-spawn check uses a separate network-aware
+  helper** (`ping_full` → `daemon_status`) so a bound-but-unhealthy
+  existing daemon (rotated token, identity drift) gets stopped and
+  respawned with the parent's freshly validated credential — preserves
+  the previous stale-daemon-respawn semantics that local-only ping
+  alone would have masked.
 
 ## [0.1.2] - 2026-04-27
 
