@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **PER-019 review fixes (devrev PR #17, 2026-04-28).** Four behavior-
+  coverage gaps closed:
+  - `chanvoy check --team` and `chanvoy wait --team` now thread the
+    operator's override through to channel resolution. Previously the
+    handlers parsed `team` but called the resolver with `None`,
+    silently routing duplicate-name channels to the primary team.
+  - `chanvoy post --team` cursor recording binds to the same team the
+    side effect landed on. Previously the post API call honored
+    `--team` but `record_channel_cursor` re-resolved with `None`,
+    breaking cursor isolation for duplicate-name channels.
+  - `read --since-last-mine` threads `--team` through
+    `latest_authored_post_id` so the `posts/search` endpoint targets
+    the right team's id.
+  - `<team>/#<channel>` syntax now strips the leading `#` from the
+    channel segment, matching the existing whole-arg `#` trim
+    operators rely on when pasting channel names from the Mattermost
+    UI.
+
 ## [0.1.3] - 2026-04-28
 
 ### Added

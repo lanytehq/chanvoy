@@ -602,7 +602,17 @@ async fn dispatch_request(
         .map(to_value),
         "check_channel" => {
             parse_and_call(&request.params, |params: CheckChannelParams| async move {
-                check_channel(state, &params.channel, params.after_post_id.as_deref()).await
+                // PER-019 (devrev PR #17 finding #1): thread --team
+                // through to the channel resolution so duplicate-name
+                // channels check on the requested team, not the
+                // primary-team default.
+                check_channel(
+                    state,
+                    &params.channel,
+                    params.after_post_id.as_deref(),
+                    params.team.as_deref(),
+                )
+                .await
             })
             .await
             .map(to_value)
@@ -612,7 +622,13 @@ async fn dispatch_request(
                 .client
                 .post_message(&params.channel, &params.message, params.team.as_deref())
                 .await?;
-            record_channel_cursor(state, &params.channel, &receipt.id).await?;
+            // PER-019 (devrev PR #17 finding #2): cursor recording must
+            // bind to the same team the post landed on. Pass the
+            // operator's --team override through; otherwise a
+            // duplicate-name channel could record under the
+            // primary-team key while the post went to Ops.
+            record_channel_cursor(state, &params.channel, &receipt.id, params.team.as_deref())
+                .await?;
             Ok(receipt)
         })
         .await
@@ -665,7 +681,16 @@ async fn dispatch_request(
         .await
         .map(to_value),
         "wait_channel" => parse_and_call(&request.params, |params: WaitChannelParams| async move {
-            wait_for_messages(state, &params.channel, params.timeout_minutes).await
+            // PER-019 (devrev PR #17 finding #1): thread --team into
+            // the wait helper so duplicate-name channels wait on the
+            // requested team's cursor.
+            wait_for_messages(
+                state,
+                &params.channel,
+                params.timeout_minutes,
+                params.team.as_deref(),
+            )
+            .await
         })
         .await
         .map(to_value),
@@ -885,8 +910,19 @@ async fn wait_for_messages(
     state: &AppState,
     channel: &str,
     timeout_minutes: u64,
+    team: Option<&str>,
 ) -> Result<WaitResult, CoreError> {
-    let channel_id = state.client.channel_id_for_name(channel).await?;
+    // PER-019 (devrev PR #17 finding #1): resolve via the cross-team
+    // resolver so duplicate-name channels wait on the requested team.
+    // The previous `channel_id_for_name` path went through the legacy
+    // `channel_id` helper, which now uses the resolver default chain
+    // (primary-first/fallback) but did not honor the operator's
+    // explicit `--team` override.
+    let channel_id = state
+        .client
+        .resolve_channel(channel, team)
+        .await?
+        .channel_id;
 
     let initial = state
         .client
@@ -1034,12 +1070,15 @@ async fn check_channel(
     state: &AppState,
     channel: &str,
     explicit_after: Option<&str>,
+    team: Option<&str>,
 ) -> Result<CheckResult, CoreError> {
     let (anchor, anchor_source) = if let Some(after) = explicit_after {
         (Some(after.to_string()), "explicit_after".to_string())
     } else {
-        // PER-019: lookup uses the qualified `<team>/<channel>` key.
-        let key = qualified_attention_key(state, channel, None).await?;
+        // PER-019 (devrev PR #17 finding #1): lookup uses the operator's
+        // --team override so duplicate-name channels read the cursor
+        // for the requested team, not the primary-team default.
+        let key = qualified_attention_key(state, channel, team).await?;
         let attention = state.attention_state.lock().await;
         let Some(cursor) = attention.channels.get(&key) else {
             return Ok(CheckResult {
@@ -1074,7 +1113,7 @@ async fn check_channel(
 
     let messages = match state
         .client
-        .read_channel_after(channel, &anchor_post_id, None)
+        .read_channel_after(channel, &anchor_post_id, team)
         .await
     {
         Ok(messages) => {
@@ -1084,14 +1123,14 @@ async fn check_channel(
             // its own probe (PER-008B D1: cached staleness, cxotech's
             // `last_checked_at` refinement).
             if anchor_source == "daemon_cursor" {
-                record_staleness_verdict(state, channel, false).await;
+                record_staleness_verdict(state, channel, false, team).await;
             }
             messages
         }
         Err(CoreError::AnchorNotFound(_)) | Err(CoreError::AnchorChannelMismatch { .. })
             if anchor_source == "daemon_cursor" =>
         {
-            record_staleness_verdict(state, channel, true).await;
+            record_staleness_verdict(state, channel, true, team).await;
             return Ok(stale_cursor_check_result(channel));
         }
         Err(error) => return Err(error),
@@ -1132,11 +1171,14 @@ async fn record_channel_cursor(
     state: &AppState,
     channel: &str,
     post_id: &str,
+    team: Option<&str>,
 ) -> Result<(), CoreError> {
-    // PER-019: resolve once to populate the qualified key + metadata.
-    // Cache keeps the team-list lookup cheap; channel-by-name is the
-    // only network cost beyond what the surrounding RPC already paid.
-    let resolved = state.client.resolve_channel(channel, None).await?;
+    // PER-019 (devrev PR #17 finding #2): cursor recording must bind
+    // to the same team the side effect (post / read) landed on.
+    // Threading the operator's `--team` override here matches the
+    // resolver call the surrounding RPC made, so duplicate-name
+    // channels record under the right qualified key.
+    let resolved = state.client.resolve_channel(channel, team).await?;
     let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
     let mut attention = state.attention_state.lock().await;
     // Every cursor-write path is a staleness-clearing event per the
@@ -1224,9 +1266,17 @@ async fn record_channel_cursor_if_absent(
 /// best-effort optimization for `attention list`'s fast path, and
 /// failing a `check_channel` call because we couldn't persist the
 /// verdict would be the wrong trade.
-async fn record_staleness_verdict(state: &AppState, channel: &str, stale: bool) {
-    // PER-019: lookup uses qualified `<team>/<channel>` key.
-    let key = match qualified_attention_key(state, channel, None).await {
+async fn record_staleness_verdict(
+    state: &AppState,
+    channel: &str,
+    stale: bool,
+    team: Option<&str>,
+) {
+    // PER-019 (devrev PR #17 finding #1): lookup uses qualified
+    // `<team>/<channel>` key, honoring the operator's --team override
+    // so duplicate-name channels persist the verdict on the right team's
+    // cursor entry.
+    let key = match qualified_attention_key(state, channel, team).await {
         Ok(k) => k,
         Err(err) => {
             tracing::warn!(

@@ -1723,7 +1723,7 @@ impl MattermostClient {
     ) -> Result<Vec<Message>, CoreError> {
         let my_username = self.whoami().await?.username;
         let after_post_id = self
-            .latest_authored_post_id(channel_name, &my_username)
+            .latest_authored_post_id(channel_name, &my_username, team)
             .await?
             .ok_or_else(|| CoreError::NoPriorAuthoredPost {
                 channel: channel_name.to_string(),
@@ -2200,9 +2200,17 @@ impl MattermostClient {
 
         // Explicit `<team>/<channel>` syntax wins over both the primary
         // chain and the --team flag (operator typed it specifically).
+        // Per devrev's PR #17 finding #4: also strip a leading `#` from
+        // the channel segment so `<team>/#<channel>` works identically
+        // to `<team>/<channel>` (operators routinely include the # when
+        // pasting from the Mattermost UI).
         if let Some((team_slug, channel_name)) = trimmed.split_once('/') {
             return self
-                .resolve_in_team(channel_name, team_slug, ResolutionSource::Explicit)
+                .resolve_in_team(
+                    channel_name.trim_start_matches('#'),
+                    team_slug,
+                    ResolutionSource::Explicit,
+                )
                 .await;
         }
 
@@ -2436,8 +2444,9 @@ impl MattermostClient {
         &self,
         channel_name: &str,
         username: &str,
+        team: Option<&str>,
     ) -> Result<Option<String>, CoreError> {
-        let resolved = self.resolve_channel(channel_name, None).await?;
+        let resolved = self.resolve_channel(channel_name, team).await?;
 
         #[derive(Serialize)]
         struct SearchPayload {
@@ -5094,6 +5103,117 @@ monitored_channels = ["per-003", "per-004"]
             assert_eq!(outcome.quarantined, 0);
             assert!(state.channels.contains_key("org-lanytehq/general"));
             assert!(!state.channels.contains_key("general"));
+        }
+
+        #[tokio::test]
+        async fn devrev_pr17_finding4_explicit_strips_hash_from_channel_segment() {
+            // devrev PR #17 finding #4: `<team>/#<channel>` should
+            // resolve identically to `<team>/<channel>`. Operators
+            // routinely include `#` when pasting channel names from
+            // the Mattermost UI; the resolver must normalize.
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                ],
+            )
+            .await;
+            mock_channel_in_team(&server, "team-ops", "development", "ch-dev").await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let resolved_with_hash = client
+                .resolve_channel("3-leaps-operations/#development", None)
+                .await
+                .unwrap();
+            let resolved_no_hash = client
+                .resolve_channel("3-leaps-operations/development", None)
+                .await
+                .unwrap();
+            assert_eq!(resolved_with_hash.channel_id, resolved_no_hash.channel_id);
+            assert_eq!(resolved_with_hash.team_name, "3-leaps-operations");
+            assert_eq!(resolved_with_hash.channel_name, "development");
+            assert_eq!(
+                resolved_with_hash.resolution_source,
+                ResolutionSource::Explicit
+            );
+        }
+
+        #[tokio::test]
+        async fn devrev_pr17_finding3_since_last_mine_uses_explicit_team() {
+            // devrev PR #17 finding #3: read --since-last-mine had a
+            // bug where `latest_authored_post_id` resolved with team=None
+            // even when the caller passed `team=Some(...)`. With
+            // duplicate-name channels, the search would hit the wrong
+            // team's posts. After the fix, both the search and the
+            // subsequent read should target the explicit team.
+            //
+            // Build a server where the channel name "duplicates" exists
+            // on both teams, and verify that --team Ops directs the
+            // search at Ops's team_id.
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                ],
+            )
+            .await;
+            // Both teams have a channel named "duplicates".
+            mock_channel_in_team(&server, "team-lanytehq", "duplicates", "ch-lh-dup").await;
+            mock_channel_in_team(&server, "team-ops", "duplicates", "ch-ops-dup").await;
+            // Mock search ONLY on Ops's team_id; if the resolver
+            // ignored the override, the search would 404 or land on
+            // the wrong team's mock.
+            Mock::given(method("POST"))
+                .and(path("/api/v4/teams/team-ops/posts/search"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "posts": {
+                        "post-ops-1": { "id": "post-ops-1", "create_at": 1_777_000_000_000_i64 }
+                    }
+                })))
+                .mount(&server)
+                .await;
+            // Whoami needed by read_channel_since_last_mine.
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "bot-id",
+                    "username": "agent-bravo-devlead",
+                    "is_bot": true,
+                    "nickname": null,
+                    "email": null,
+                })))
+                .mount(&server)
+                .await;
+            // Mock the after-anchor read (assert_post_in_channel + posts page).
+            Mock::given(method("GET"))
+                .and(path("/api/v4/posts/post-ops-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "channel_id": "ch-ops-dup"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch-ops-dup/posts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "posts": {}
+                })))
+                .mount(&server)
+                .await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            // No assertion of "primary mock NOT called" — wiremock
+            // doesn't enforce that without `expect`. The fact that
+            // this returns Ok proves the search hit the Ops team's
+            // mock; if it had hit team-lanytehq's team_id, the
+            // unmocked path would 404 and the call would error.
+            let _msgs = client
+                .read_channel_since_last_mine("duplicates", Some("3-leaps-operations"))
+                .await
+                .expect("read should target Ops team");
         }
 
         #[tokio::test]
