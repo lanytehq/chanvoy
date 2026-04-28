@@ -172,6 +172,40 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         _ => None,
     };
 
+    // PER-019 load-time migration: walk pre-PER-019 cursor entries
+    // (keyed by bare channel name) and rewrite them under qualified
+    // `<team_name>/<channel_name>` keys. Ambiguous names quarantine.
+    // Idempotent — already-qualified entries are skipped.
+    let mut attention = load_attention_state(&profile.name)?;
+    match chanvoy_core::migrate_attention_state(&mut attention, &client).await {
+        Ok(outcome) if outcome.migrated + outcome.quarantined > 0 => {
+            info!(
+                profile = profile_name,
+                migrated = outcome.migrated,
+                quarantined = outcome.quarantined,
+                skipped = outcome.skipped,
+                "PER-019 attention-state migration completed"
+            );
+            // Persist the rewritten state so write-time paths land in
+            // qualified-key territory.
+            store_attention_state(&profile.name, &attention)?;
+        }
+        Ok(_) => {
+            // Nothing to migrate — no-op.
+        }
+        Err(err) => {
+            // Migration is best-effort at startup; if the team-list
+            // endpoint is unreachable now, write paths will resolve
+            // lazily and the legacy entries will be rewritten on
+            // first cursor update. Don't block daemon startup.
+            tracing::warn!(
+                profile = profile_name,
+                %err,
+                "PER-019 attention-state migration deferred — write paths will retry"
+            );
+        }
+    }
+
     let state = Arc::new(AppState {
         profile: profile.clone(),
         client,
@@ -181,7 +215,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         subscriptions: Arc::new(Mutex::new(HashMap::new())),
         ws_state_holder: ws_state_holder.clone(),
         ipc_state,
-        attention_state: Arc::new(Mutex::new(load_attention_state(&profile.name)?)),
+        attention_state: Arc::new(Mutex::new(attention)),
         identity_drift,
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -533,6 +567,12 @@ async fn dispatch_request(
             .await
             .map(to_value)
             .map_err(DaemonError::from),
+        "list_channels_across_teams" => state
+            .client
+            .list_channels_across_teams()
+            .await
+            .map(to_value)
+            .map_err(DaemonError::from),
         "list_dms" => state
             .client
             .list_dms()
@@ -540,20 +580,21 @@ async fn dispatch_request(
             .map(to_value)
             .map_err(DaemonError::from),
         "read_channel" => parse_and_call(&request.params, |params: ReadChannelParams| async move {
+            let team = params.team.as_deref();
             if let Some(after_post_id) = params.after_post_id {
                 state
                     .client
-                    .read_channel_after(&params.channel, &after_post_id)
+                    .read_channel_after(&params.channel, &after_post_id, team)
                     .await
             } else if params.since_last_mine {
                 state
                     .client
-                    .read_channel_since_last_mine(&params.channel)
+                    .read_channel_since_last_mine(&params.channel, team)
                     .await
             } else {
                 state
                     .client
-                    .read_channel(&params.channel, params.since_minutes.unwrap_or(60))
+                    .read_channel(&params.channel, params.since_minutes.unwrap_or(60), team)
                     .await
             }
         })
@@ -569,7 +610,7 @@ async fn dispatch_request(
         "post_message" => parse_and_call(&request.params, |params: PostMessageParams| async move {
             let receipt = state
                 .client
-                .post_message(&params.channel, &params.message)
+                .post_message(&params.channel, &params.message, params.team.as_deref())
                 .await?;
             record_channel_cursor(state, &params.channel, &receipt.id).await?;
             Ok(receipt)
@@ -782,7 +823,9 @@ async fn dispatch_request(
         "attention_list" => Ok(to_value(attention_list(state).await)),
         "attention_show" => {
             parse_and_call(&request.params, |params: AttentionShowParams| async move {
-                Ok::<_, CoreError>(attention_show(state, &params.channel).await)
+                Ok::<_, CoreError>(
+                    attention_show(state, &params.channel, params.team.as_deref()).await,
+                )
             })
             .await
             .map(to_value)
@@ -995,8 +1038,10 @@ async fn check_channel(
     let (anchor, anchor_source) = if let Some(after) = explicit_after {
         (Some(after.to_string()), "explicit_after".to_string())
     } else {
+        // PER-019: lookup uses the qualified `<team>/<channel>` key.
+        let key = qualified_attention_key(state, channel, None).await?;
         let attention = state.attention_state.lock().await;
-        let Some(cursor) = attention.channels.get(channel) else {
+        let Some(cursor) = attention.channels.get(&key) else {
             return Ok(CheckResult {
                 channel: channel.to_string(),
                 anchor: None,
@@ -1029,7 +1074,7 @@ async fn check_channel(
 
     let messages = match state
         .client
-        .read_channel_after(channel, &anchor_post_id)
+        .read_channel_after(channel, &anchor_post_id, None)
         .await
     {
         Ok(messages) => {
@@ -1066,22 +1111,48 @@ async fn check_channel(
     })
 }
 
+/// PER-019: resolve a channel argument (possibly `<team>/<channel>` or
+/// bare name) plus an optional `--team` override into the qualified
+/// `<team_name>/<channel_name>` key used by `AttentionState.channels`.
+/// Centralized so every lookup site honors the same resolution chain
+/// the read/post/check verbs use.
+async fn qualified_attention_key(
+    state: &AppState,
+    channel: &str,
+    team: Option<&str>,
+) -> Result<String, CoreError> {
+    let resolved = state.client.resolve_channel(channel, team).await?;
+    Ok(chanvoy_core::attention_key_for(
+        &resolved.team_name,
+        &resolved.channel_name,
+    ))
+}
+
 async fn record_channel_cursor(
     state: &AppState,
     channel: &str,
     post_id: &str,
 ) -> Result<(), CoreError> {
+    // PER-019: resolve once to populate the qualified key + metadata.
+    // Cache keeps the team-list lookup cheap; channel-by-name is the
+    // only network cost beyond what the surrounding RPC already paid.
+    let resolved = state.client.resolve_channel(channel, None).await?;
+    let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
     let mut attention = state.attention_state.lock().await;
     // Every cursor-write path is a staleness-clearing event per the
     // PER-008B D1 guardrail: the new cursor value is fresh, by definition
     // not stale, and has not yet been checked.
     attention.channels.insert(
-        channel.to_string(),
+        key,
         chanvoy_core::ChannelCursorState {
             last_seen_post_id: Some(post_id.to_string()),
             updated_at: Some(chanvoy_core::now_unix_millis()),
             last_known_stale: false,
             last_checked_at: None,
+            channel_id: resolved.channel_id,
+            team_id: resolved.team_id,
+            team_name: resolved.team_name,
+            channel_name: resolved.channel_name,
         },
     );
     store_attention_state(&state.profile.name, &attention)?;
@@ -1113,18 +1184,28 @@ async fn record_channel_cursor_if_absent(
     channel: &str,
     post_id: &str,
 ) -> Result<bool, CoreError> {
+    // PER-019: resolve to qualified key first; only then check absence
+    // under the new key shape. Pre-PER-019 entries with a bare-name key
+    // are migrated at daemon `start()` so by the time we get here the
+    // map is qualified-keyed.
+    let resolved = state.client.resolve_channel(channel, None).await?;
+    let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
     let mut attention = state.attention_state.lock().await;
-    if attention.channels.contains_key(channel) {
+    if attention.channels.contains_key(&key) {
         return Ok(false);
     }
     // A freshly-seeded cursor is by definition non-stale and unchecked.
     attention.channels.insert(
-        channel.to_string(),
+        key,
         chanvoy_core::ChannelCursorState {
             last_seen_post_id: Some(post_id.to_string()),
             updated_at: Some(chanvoy_core::now_unix_millis()),
             last_known_stale: false,
             last_checked_at: None,
+            channel_id: resolved.channel_id,
+            team_id: resolved.team_id,
+            team_name: resolved.team_name,
+            channel_name: resolved.channel_name,
         },
     );
     store_attention_state(&state.profile.name, &attention)?;
@@ -1144,8 +1225,21 @@ async fn record_channel_cursor_if_absent(
 /// failing a `check_channel` call because we couldn't persist the
 /// verdict would be the wrong trade.
 async fn record_staleness_verdict(state: &AppState, channel: &str, stale: bool) {
+    // PER-019: lookup uses qualified `<team>/<channel>` key.
+    let key = match qualified_attention_key(state, channel, None).await {
+        Ok(k) => k,
+        Err(err) => {
+            tracing::warn!(
+                profile = %state.profile.name,
+                channel = %channel,
+                %err,
+                "failed to resolve channel for staleness verdict; skipping persistence"
+            );
+            return;
+        }
+    };
     let mut attention = state.attention_state.lock().await;
-    let Some(cursor) = attention.channels.get_mut(channel) else {
+    let Some(cursor) = attention.channels.get_mut(&key) else {
         return;
     };
     cursor.last_known_stale = stale;
@@ -1216,11 +1310,22 @@ async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
 /// with `source = NoAnchor` when the channel is not tracked, rather than
 /// erroring — operators asking about an untracked channel want that
 /// confirmed, not a bare error.
-async fn attention_show(state: &AppState, channel: &str) -> chanvoy_core::AttentionShowResult {
+async fn attention_show(
+    state: &AppState,
+    channel: &str,
+    team: Option<&str>,
+) -> chanvoy_core::AttentionShowResult {
+    // PER-019: resolve to qualified key first. Failure here surfaces as
+    // NoAnchor rather than an RPC error so the strict-read-only contract
+    // on the `attention` prefix is preserved.
+    let key_lookup = qualified_attention_key(state, channel, team).await;
     let attention = state.attention_state.lock().await;
-    let entry = match attention.channels.get(channel) {
-        Some(cursor) => chanvoy_core::AttentionChannelEntry {
-            channel: channel.to_string(),
+    let entry = match key_lookup
+        .ok()
+        .and_then(|key| attention.channels.get(&key).map(|c| (key, c)))
+    {
+        Some((key, cursor)) => chanvoy_core::AttentionChannelEntry {
+            channel: key,
             source: attention_source_for_channel(cursor),
             newest_seen: cursor.last_seen_post_id.clone(),
             updated_at: cursor.updated_at,
@@ -1375,6 +1480,15 @@ impl DaemonClient {
         self.call("list_channels", serde_json::json!({})).await
     }
 
+    /// PER-019 AC #11: list channels across every team the bot is a
+    /// member of, grouped per team.
+    pub async fn list_channels_across_teams(
+        &self,
+    ) -> Result<Vec<chanvoy_core::TeamChannels>, DaemonError> {
+        self.call("list_channels_across_teams", serde_json::json!({}))
+            .await
+    }
+
     pub async fn list_dms(&self) -> Result<Vec<DmConversation>, DaemonError> {
         self.call("list_dms", serde_json::json!({})).await
     }
@@ -1385,6 +1499,7 @@ impl DaemonClient {
         since_minutes: Option<u64>,
         after_post_id: Option<String>,
         since_last_mine: bool,
+        team: Option<String>,
     ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
         self.call(
             "read_channel",
@@ -1393,6 +1508,7 @@ impl DaemonClient {
                 since_minutes,
                 after_post_id,
                 since_last_mine,
+                team,
             })?,
         )
         .await
@@ -1402,12 +1518,14 @@ impl DaemonClient {
         &self,
         channel: &str,
         after_post_id: Option<String>,
+        team: Option<String>,
     ) -> Result<CheckResult, DaemonError> {
         self.call(
             "check_channel",
             serde_json::to_value(CheckChannelParams {
                 channel: channel.to_string(),
                 after_post_id,
+                team,
             })?,
         )
         .await
@@ -1417,12 +1535,14 @@ impl DaemonClient {
         &self,
         channel: &str,
         message: &str,
+        team: Option<String>,
     ) -> Result<chanvoy_core::PostReceipt, DaemonError> {
         self.call(
             "post_message",
             serde_json::to_value(PostMessageParams {
                 channel: channel.to_string(),
                 message: message.to_string(),
+                team,
             })?,
         )
         .await
@@ -1492,12 +1612,14 @@ impl DaemonClient {
         &self,
         channel: &str,
         timeout_minutes: u64,
+        team: Option<String>,
     ) -> Result<WaitResult, DaemonError> {
         self.call(
             "wait_channel",
             serde_json::to_value(WaitChannelParams {
                 channel: channel.to_string(),
                 timeout_minutes,
+                team,
             })?,
         )
         .await
@@ -1566,11 +1688,13 @@ impl DaemonClient {
     pub async fn attention_show(
         &self,
         channel: &str,
+        team: Option<String>,
     ) -> Result<chanvoy_core::AttentionShowResult, DaemonError> {
         self.call(
             "attention_show",
             serde_json::to_value(AttentionShowParams {
                 channel: channel.to_string(),
+                team,
             })?,
         )
         .await

@@ -441,12 +441,19 @@ pub struct ReadChannelParams {
     pub after_post_id: Option<String>,
     #[serde(default)]
     pub since_last_mine: bool,
+    /// PER-019: optional `--team <slug>` override for cross-team
+    /// disambiguation. Per-invocation only (no profile-level toggle).
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PostMessageParams {
     pub channel: String,
     pub message: String,
+    /// PER-019: optional `--team <slug>` override.
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,11 +480,17 @@ pub struct CheckChannelParams {
     pub channel: String,
     #[serde(default)]
     pub after_post_id: Option<String>,
+    /// PER-019: optional `--team <slug>` override.
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttentionShowParams {
     pub channel: String,
+    /// PER-019: optional `--team <slug>` override.
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -627,10 +640,47 @@ pub struct UnreadNotifications {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AttentionState {
+    /// PER-019: keyed by qualified `<team_name>/<channel_name>` so
+    /// same-named channels on different teams maintain independent
+    /// cursors (AC #6). Pre-PER-019 entries with bare-name keys are
+    /// migrated at daemon `start()` (see `migrate_attention_state`).
     #[serde(default)]
     pub channels: BTreeMap<String, ChannelCursorState>,
     #[serde(default)]
     pub mentions: MentionCursorState,
+    /// PER-019: cursor records that couldn't be migrated cleanly because
+    /// the channel name resolves on multiple member teams. Held aside
+    /// rather than silently bound to one team — operator must reissue
+    /// reads/posts via `--team <slug>` or `<team>/<channel>` syntax to
+    /// re-establish cursors per-team. Surfaced via `attention list` so
+    /// the situation is visible.
+    #[serde(default)]
+    pub quarantined: Vec<QuarantinedCursor>,
+}
+
+/// PER-019: build a qualified attention-state key from a resolved
+/// channel. Mirrors the explicit `<team>/<channel>` syntax operators
+/// already type, so state-file inspection stays human-readable.
+pub fn attention_key_for(team_name: &str, channel_name: &str) -> String {
+    format!("{team_name}/{channel_name}")
+}
+
+/// PER-019: a cursor record that couldn't be migrated because the
+/// channel name was ambiguous across the bot's member teams at
+/// migration time. Preserved verbatim for diagnostic display; the
+/// operator's next read/post/check on the channel re-establishes a
+/// fresh cursor under the qualified key for whichever team they
+/// disambiguated to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuarantinedCursor {
+    /// Original bare channel name (the pre-PER-019 key).
+    pub legacy_channel_name: String,
+    /// Names of the teams the channel resolved on at migration time.
+    pub ambiguous_teams: Vec<String>,
+    /// The original cursor record, preserved as-is.
+    pub state: ChannelCursorState,
+    /// Unix-millis timestamp the migration ran.
+    pub quarantined_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -658,6 +708,19 @@ pub struct ChannelCursorState {
     /// from "never checked since establishment."
     #[serde(default)]
     pub last_checked_at: Option<i64>,
+    /// PER-019 denormalized metadata. Populated on cursor writes after
+    /// the resolver runs; pre-PER-019 records may have empty strings
+    /// until migration touches them. Channel-id is the canonical
+    /// Mattermost identifier; the team/channel name pair is the
+    /// human-readable form preserved for state-file inspection.
+    #[serde(default)]
+    pub channel_id: String,
+    #[serde(default)]
+    pub team_id: String,
+    #[serde(default)]
+    pub team_name: String,
+    #[serde(default)]
+    pub channel_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -678,6 +741,9 @@ pub struct NotifyParams {
 pub struct WaitChannelParams {
     pub channel: String,
     pub timeout_minutes: u64,
+    /// PER-019: optional `--team <slug>` override.
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -789,6 +855,35 @@ pub enum CoreError {
         nonce_env: &'static str,
         path: PathBuf,
     },
+    /// PER-019: channel name not found on any team the bot is a member of.
+    /// Lists the searched teams in the diagnostic so operators can verify
+    /// the spelling and the membership coverage at the same time.
+    #[error(
+        "channel {channel:?} not found on any team you are a member of. \
+         Teams searched: {teams:?}. \
+         If the channel exists on a different team, ask dispatch to add \
+         the bot, or use the `<team>/<channel>` syntax with a team you are \
+         a member of."
+    )]
+    ChannelNotFoundInAnyTeam { channel: String, teams: Vec<String> },
+    /// PER-019: explicit `<team>/<channel>` requested a team the bot is
+    /// not a member of. Distinct from `ChannelNotFoundInAnyTeam` so
+    /// operators can distinguish "I typed the wrong team" from "the bot
+    /// is not in that team yet".
+    #[error(
+        "team {team:?} requested via <team>/<channel> syntax, but you are \
+         not a member of it. Teams you are a member of: {teams:?}."
+    )]
+    NotAMemberOfTeam { team: String, teams: Vec<String> },
+    /// PER-019: channel name resolves on multiple teams the bot is a
+    /// member of. Refuse with the team list so the operator can pick
+    /// via `--team <slug>` or `<team>/<channel>` syntax.
+    #[error(
+        "channel {channel:?} is ambiguous — found on multiple teams: \
+         {teams:?}. Use `--team <slug>` or `<team>/<channel>` syntax to \
+         disambiguate."
+    )]
+    AmbiguousChannel { channel: String, teams: Vec<String> },
     #[error("anchor post {0} not found")]
     AnchorNotFound(String),
     #[error("anchor post {post_id} is not in channel {channel}")]
@@ -1167,6 +1262,131 @@ pub fn store_attention_state(
     Ok(path)
 }
 
+/// PER-019: walk an `AttentionState` and migrate pre-PER-019 cursor
+/// records (keyed by bare channel name) to the new qualified
+/// `<team_name>/<channel_name>` keying with denormalized metadata.
+///
+/// Migration rule (per devrev's PR #40 pin):
+///
+/// - Unique resolution (one match across the bot's member teams) →
+///   migrate cleanly, preserving `last_seen_post_id` /
+///   `last_checked_at` / `last_known_stale` / `updated_at`.
+/// - Ambiguous resolution (multiple member teams have a channel with
+///   this name) → quarantine the record, do not silently bind to one
+///   team. Operator's next read/post on that channel re-establishes a
+///   fresh cursor under the qualified key for the team they pick.
+/// - No resolution (channel not found on any team) → leave the entry
+///   alone. Could be a deleted channel or a bot that lost team
+///   membership; operator visibility comes through `attention list`.
+///
+/// Idempotent: an already-migrated entry (key contains `/`, metadata
+/// populated) walks but rewrites nothing.
+///
+/// Returns the count of entries migrated, quarantined, and skipped so
+/// the caller can log a summary line.
+pub async fn migrate_attention_state(
+    state: &mut AttentionState,
+    client: &MattermostClient,
+) -> Result<MigrationOutcome, CoreError> {
+    let mut migrated = 0usize;
+    let mut quarantined = 0usize;
+    let mut skipped = 0usize;
+    let now = now_unix_millis();
+    let primary_team = client.primary_team_name().to_string();
+
+    let legacy_keys: Vec<String> = state
+        .channels
+        .keys()
+        .filter(|k| !k.contains('/'))
+        .cloned()
+        .collect();
+
+    for legacy_name in legacy_keys {
+        let Some(legacy_state) = state.channels.remove(&legacy_name) else {
+            continue;
+        };
+
+        // Try primary first — if hit there, migrate cleanly even if
+        // fallback teams also have a same-named channel (devrev's pin:
+        // primary-team-first lookup wins).
+        match client
+            .resolve_channel(&legacy_name, Some(&primary_team))
+            .await
+        {
+            Ok(resolved) => {
+                state.channels.insert(
+                    attention_key_for(&resolved.team_name, &resolved.channel_name),
+                    ChannelCursorState {
+                        last_seen_post_id: legacy_state.last_seen_post_id,
+                        updated_at: legacy_state.updated_at,
+                        last_known_stale: legacy_state.last_known_stale,
+                        last_checked_at: legacy_state.last_checked_at,
+                        channel_id: resolved.channel_id,
+                        team_id: resolved.team_id,
+                        team_name: resolved.team_name,
+                        channel_name: resolved.channel_name,
+                    },
+                );
+                migrated += 1;
+            }
+            Err(_) => {
+                // Primary missed; try the fallback path with strict
+                // resolution. Single match → migrate; multiple matches →
+                // quarantine; none → skip.
+                match client.resolve_channel(&legacy_name, None).await {
+                    Ok(resolved) => {
+                        state.channels.insert(
+                            attention_key_for(&resolved.team_name, &resolved.channel_name),
+                            ChannelCursorState {
+                                last_seen_post_id: legacy_state.last_seen_post_id,
+                                updated_at: legacy_state.updated_at,
+                                last_known_stale: legacy_state.last_known_stale,
+                                last_checked_at: legacy_state.last_checked_at,
+                                channel_id: resolved.channel_id,
+                                team_id: resolved.team_id,
+                                team_name: resolved.team_name,
+                                channel_name: resolved.channel_name,
+                            },
+                        );
+                        migrated += 1;
+                    }
+                    Err(CoreError::AmbiguousChannel { teams, .. }) => {
+                        state.quarantined.push(QuarantinedCursor {
+                            legacy_channel_name: legacy_name.clone(),
+                            ambiguous_teams: teams,
+                            state: legacy_state,
+                            quarantined_at: now,
+                        });
+                        quarantined += 1;
+                    }
+                    Err(_) => {
+                        // No match anywhere — leave under legacy key.
+                        // Operator will see it via attention list and
+                        // can clean up explicitly.
+                        state.channels.insert(legacy_name, legacy_state);
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(MigrationOutcome {
+        migrated,
+        quarantined,
+        skipped,
+    })
+}
+
+/// PER-019: return value of [`migrate_attention_state`] for daemon-side
+/// logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationOutcome {
+    pub migrated: usize,
+    pub quarantined: usize,
+    pub skipped: usize,
+}
+
 pub fn load_token(profile: &Profile) -> Result<String, CoreError> {
     match profile.credential_mode {
         CredentialMode::EnvName | CredentialMode::SeclusorRun => {
@@ -1201,12 +1421,84 @@ pub fn minutes_ago_millis(minutes: u64) -> i64 {
     now_unix_millis() - Duration::from_secs(minutes * 60).as_millis() as i64
 }
 
+/// PER-019: cross-team channel resolution outcome.
+///
+/// Internal callers that need the team-id (e.g., for cursor metadata,
+/// post-write team binding, attention display) consume `ResolvedChannel`
+/// directly; callers that only need the bare channel-id (legacy compat)
+/// use `MattermostClient::channel_id_for_name`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedChannel {
+    pub channel_id: String,
+    pub channel_name: String,
+    pub team_id: String,
+    pub team_name: String,
+    pub resolution_source: ResolutionSource,
+}
+
+/// PER-019: which path the γ hybrid resolver matched on. Surfaced in
+/// diagnostics + operator-guide `[fallback]` provenance notation so
+/// operators can tell at a glance whether a name resolved via the
+/// primary team, a fallback team, or an explicit override.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionSource {
+    /// Resolved via the profile's primary team — common case, no extra
+    /// API call beyond the by-name lookup.
+    Primary,
+    /// Resolved via a non-primary team the bot is a member of (γ hybrid
+    /// step 2). Operator-visible diagnostic prefixes this with `[fallback]`.
+    Fallback,
+    /// Resolved via explicit `<team>/<channel>` syntax or `--team` flag
+    /// override. Always wins over the primary/fallback chain.
+    Explicit,
+}
+
+/// PER-019: bot's view of a Mattermost team. Cached inside the client
+/// for cross-team resolution. Identity-bounded to teams the bot is a
+/// member of (`/users/me/teams` endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamInfo {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+}
+
+/// PER-019 AC #11: per-team channel grouping for the cross-team
+/// `chanvoy channels` listing. Keeps the JSON contract structured per
+/// team so consumers can scope without parsing the human format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamChannels {
+    pub team_id: String,
+    pub team_name: String,
+    pub team_display_name: String,
+    pub channels: Vec<Channel>,
+}
+
+/// PER-019: TTL for the bot's team-membership cache. 15 minutes per the
+/// brief — generous enough to amortize the API call across most
+/// operator workflows, short enough that a dispatch-initiated
+/// membership add becomes visible without a manual refresh. The
+/// resolver also force-refreshes on no-match before failing, so a
+/// newly-added team membership is self-healing on next use even if
+/// the TTL hasn't elapsed.
+pub const TEAM_LIST_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug, Clone)]
+struct TeamCacheEntry {
+    teams: Vec<TeamInfo>,
+    fetched_at: std::time::Instant,
+}
+
 #[derive(Clone)]
 pub struct MattermostClient {
     base_url: String,
     team_name: String,
     token: String,
     client: Client,
+    /// PER-019: cached bot team membership. None until first fetch.
+    /// Shared across clones so all daemon contexts see the same cache.
+    team_cache: Arc<tokio::sync::RwLock<Option<TeamCacheEntry>>>,
 }
 
 impl MattermostClient {
@@ -1219,7 +1511,14 @@ impl MattermostClient {
             team_name: profile.team_name.clone(),
             token,
             client,
+            team_cache: Arc::new(tokio::sync::RwLock::new(None)),
         })
+    }
+
+    /// Slug of the profile's primary team. PER-019 uses this as the
+    /// first-try team in the γ hybrid resolution chain.
+    pub fn primary_team_name(&self) -> &str {
+        &self.team_name
     }
 
     pub async fn whoami(&self) -> Result<Identity, CoreError> {
@@ -1244,6 +1543,10 @@ impl MattermostClient {
 
     pub async fn list_channels(&self) -> Result<Vec<Channel>, CoreError> {
         let team_id = self.team_id().await?;
+        self.list_channels_for_team_id(&team_id).await
+    }
+
+    async fn list_channels_for_team_id(&self, team_id: &str) -> Result<Vec<Channel>, CoreError> {
         #[derive(Deserialize)]
         struct RawChannel {
             id: String,
@@ -1270,12 +1573,40 @@ impl MattermostClient {
             .collect())
     }
 
+    /// PER-019 AC #11: list channels across every team the bot is a
+    /// member of. Returned grouped by team for the new default
+    /// `chanvoy channels` output. The single-team `list_channels()` path
+    /// is retained as the `--primary-team` back-compat view.
+    pub async fn list_channels_across_teams(&self) -> Result<Vec<TeamChannels>, CoreError> {
+        let teams = self.list_my_teams().await?;
+        let mut out = Vec::with_capacity(teams.len());
+        for team in teams {
+            let channels = self.list_channels_for_team_id(&team.id).await?;
+            out.push(TeamChannels {
+                team_id: team.id,
+                team_name: team.name,
+                team_display_name: team.display_name,
+                channels,
+            });
+        }
+        // Stable order: primary team first, then alphabetical by slug.
+        out.sort_by(|a, b| {
+            let a_primary = a.team_name == self.team_name;
+            let b_primary = b.team_name == self.team_name;
+            b_primary
+                .cmp(&a_primary)
+                .then(a.team_name.cmp(&b.team_name))
+        });
+        Ok(out)
+    }
+
     pub async fn read_channel(
         &self,
         channel_name: &str,
         since_minutes: u64,
+        team: Option<&str>,
     ) -> Result<Vec<Message>, CoreError> {
-        let channel_id = self.channel_id(channel_name).await?;
+        let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
         let since = minutes_ago_millis(since_minutes);
         #[derive(Deserialize)]
         struct RawPost {
@@ -1315,8 +1646,9 @@ impl MattermostClient {
         &self,
         channel_name: &str,
         after_post_id: &str,
+        team: Option<&str>,
     ) -> Result<Vec<Message>, CoreError> {
-        let channel_id = self.channel_id(channel_name).await?;
+        let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
         self.assert_post_in_channel(&channel_id, channel_name, after_post_id)
             .await?;
 
@@ -1387,6 +1719,7 @@ impl MattermostClient {
     pub async fn read_channel_since_last_mine(
         &self,
         channel_name: &str,
+        team: Option<&str>,
     ) -> Result<Vec<Message>, CoreError> {
         let my_username = self.whoami().await?.username;
         let after_post_id = self
@@ -1397,15 +1730,17 @@ impl MattermostClient {
                 username: my_username.clone(),
             })?;
 
-        self.read_channel_after(channel_name, &after_post_id).await
+        self.read_channel_after(channel_name, &after_post_id, team)
+            .await
     }
 
     pub async fn post_message(
         &self,
         channel_name: &str,
         message: &str,
+        team: Option<&str>,
     ) -> Result<PostReceipt, CoreError> {
-        let channel_id = self.channel_id(channel_name).await?;
+        let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
         #[derive(Serialize)]
         struct Payload<'a> {
             channel_id: &'a str,
@@ -1462,6 +1797,7 @@ impl MattermostClient {
         self.post_message(
             DEFAULT_NOTIFICATIONS_CHANNEL,
             &format!("@{bot_username} **[notify]** {message}"),
+            None,
         )
         .await
     }
@@ -1469,7 +1805,7 @@ impl MattermostClient {
     pub async fn notifications(&self, since_minutes: u64) -> Result<Vec<Notification>, CoreError> {
         let my_username = self.whoami().await?.username;
         let messages = self
-            .read_channel(DEFAULT_NOTIFICATIONS_CHANNEL, since_minutes)
+            .read_channel(DEFAULT_NOTIFICATIONS_CHANNEL, since_minutes, None)
             .await?;
         let notifications = messages
             .into_iter()
@@ -1489,7 +1825,7 @@ impl MattermostClient {
         let my_username = self.whoami().await?.username;
         let messages = match after_post_id {
             Some(post_id) => {
-                self.read_channel_after(DEFAULT_NOTIFICATIONS_CHANNEL, post_id)
+                self.read_channel_after(DEFAULT_NOTIFICATIONS_CHANNEL, post_id, None)
                     .await?
             }
             None => {
@@ -1775,20 +2111,267 @@ impl MattermostClient {
     }
 
     async fn team_id(&self) -> Result<String, CoreError> {
+        self.team_id_for_slug(&self.team_name).await
+    }
+
+    /// Resolve a team slug to a team-id. Used by the γ hybrid resolver for
+    /// both the primary team and any explicit `<team>/<channel>` override.
+    async fn team_id_for_slug(&self, slug: &str) -> Result<String, CoreError> {
         #[derive(Deserialize)]
         struct TeamResponse {
             id: String,
         }
         let team: TeamResponse = self
-            .request(
-                "GET",
-                &format!("/teams/name/{}", self.team_name),
-                None::<Value>,
-            )
+            .request("GET", &format!("/teams/name/{slug}"), None::<Value>)
             .await?;
         Ok(team.id)
     }
 
+    /// PER-019: list the teams the bot is a member of. Identity-bounded —
+    /// `/users/me/teams` returns only what the token already has access
+    /// to. Cached with a 15-minute TTL; the resolver also force-refreshes
+    /// on no-match before failing so newly-added memberships self-heal
+    /// without operator action.
+    pub async fn list_my_teams(&self) -> Result<Vec<TeamInfo>, CoreError> {
+        if let Some(cached) = self.read_cached_teams().await {
+            return Ok(cached);
+        }
+        self.refresh_team_list().await
+    }
+
+    async fn read_cached_teams(&self) -> Option<Vec<TeamInfo>> {
+        let guard = self.team_cache.read().await;
+        match guard.as_ref() {
+            Some(entry) if entry.fetched_at.elapsed() < TEAM_LIST_TTL => Some(entry.teams.clone()),
+            _ => None,
+        }
+    }
+
+    /// Force-refresh the team-list cache. Called at the start of each
+    /// resolver attempt when the cache is stale, and once more on a
+    /// no-match outcome before failing (self-healing for newly-added
+    /// memberships).
+    pub async fn refresh_team_list(&self) -> Result<Vec<TeamInfo>, CoreError> {
+        #[derive(Deserialize)]
+        struct RawTeam {
+            id: String,
+            name: String,
+            display_name: String,
+        }
+        let raw: Vec<RawTeam> = self
+            .request("GET", "/users/me/teams", None::<Value>)
+            .await?;
+        let teams: Vec<TeamInfo> = raw
+            .into_iter()
+            .map(|t| TeamInfo {
+                id: t.id,
+                name: t.name,
+                display_name: t.display_name,
+            })
+            .collect();
+        let mut guard = self.team_cache.write().await;
+        *guard = Some(TeamCacheEntry {
+            teams: teams.clone(),
+            fetched_at: std::time::Instant::now(),
+        });
+        Ok(teams)
+    }
+
+    /// PER-019 γ hybrid resolver. Operator hands in a channel argument
+    /// (possibly `<team>/<channel>` syntax) and an optional `--team`
+    /// override. Resolution chain:
+    ///
+    /// - Explicit `<team>/<channel>` or `--team` override → that team only
+    /// - Primary team first → return on hit
+    /// - Fallback to other member teams → return single hit; refuse on
+    ///   ambiguity; refresh cache once and retry on no-match before
+    ///   failing
+    ///
+    /// Returns a `ResolvedChannel` carrying both ids + slugs and a
+    /// `ResolutionSource` for diagnostic provenance. Specific error
+    /// variants distinguish no-match / not-a-member / ambiguity per
+    /// secrev's pin so operators see the right next-step flag.
+    pub async fn resolve_channel(
+        &self,
+        channel_arg: &str,
+        team_override: Option<&str>,
+    ) -> Result<ResolvedChannel, CoreError> {
+        let trimmed = channel_arg.trim_start_matches('#');
+
+        // Explicit `<team>/<channel>` syntax wins over both the primary
+        // chain and the --team flag (operator typed it specifically).
+        if let Some((team_slug, channel_name)) = trimmed.split_once('/') {
+            return self
+                .resolve_in_team(channel_name, team_slug, ResolutionSource::Explicit)
+                .await;
+        }
+
+        // --team flag wins over the primary/fallback chain.
+        if let Some(team_slug) = team_override {
+            return self
+                .resolve_in_team(trimmed, team_slug, ResolutionSource::Explicit)
+                .await;
+        }
+
+        // Default chain: primary team first.
+        if let Some(resolved) = self
+            .try_channel_in_team(trimmed, &self.team_name, ResolutionSource::Primary)
+            .await?
+        {
+            return Ok(resolved);
+        }
+
+        // Fallback: search across other member teams. Use the cache, then
+        // force one refresh on no-match (self-healing for newly-added
+        // memberships per devrev's PR #40 pin).
+        match self.fallback_search(trimmed).await? {
+            Some(resolved) => Ok(resolved),
+            None => {
+                self.refresh_team_list().await?;
+                match self.fallback_search(trimmed).await? {
+                    Some(resolved) => Ok(resolved),
+                    None => {
+                        let teams = self
+                            .list_my_teams()
+                            .await?
+                            .into_iter()
+                            .map(|t| t.name)
+                            .collect();
+                        Err(CoreError::ChannelNotFoundInAnyTeam {
+                            channel: trimmed.to_string(),
+                            teams,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// Search every non-primary team for the channel name. Returns
+    /// `Some(resolved)` on a unique hit, refuses with `AmbiguousChannel`
+    /// on multiple hits, returns `None` if no team has it (caller decides
+    /// whether to refresh and retry or fail).
+    async fn fallback_search(
+        &self,
+        channel_name: &str,
+    ) -> Result<Option<ResolvedChannel>, CoreError> {
+        let teams = self.list_my_teams().await?;
+        let mut matches: Vec<ResolvedChannel> = Vec::new();
+        for team in &teams {
+            if team.name == self.team_name {
+                continue;
+            }
+            if let Some(resolved) = self
+                .try_channel_in_team_by_id(
+                    channel_name,
+                    &team.id,
+                    &team.name,
+                    ResolutionSource::Fallback,
+                )
+                .await?
+            {
+                matches.push(resolved);
+            }
+        }
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(CoreError::AmbiguousChannel {
+                channel: channel_name.to_string(),
+                teams: matches.into_iter().map(|m| m.team_name).collect(),
+            }),
+        }
+    }
+
+    /// Resolve `channel_name` strictly within `team_slug`. Used by both
+    /// `<team>/<channel>` and `--team` paths. Distinguishes "team not in
+    /// my membership" from "channel not in that team" per secrev's pin.
+    async fn resolve_in_team(
+        &self,
+        channel_name: &str,
+        team_slug: &str,
+        source: ResolutionSource,
+    ) -> Result<ResolvedChannel, CoreError> {
+        let teams = self.list_my_teams().await?;
+        let team = match teams.iter().find(|t| t.name == team_slug) {
+            Some(t) => t.clone(),
+            None => {
+                self.refresh_team_list().await?;
+                let refreshed = self.list_my_teams().await?;
+                match refreshed.iter().find(|t| t.name == team_slug) {
+                    Some(t) => t.clone(),
+                    None => {
+                        return Err(CoreError::NotAMemberOfTeam {
+                            team: team_slug.to_string(),
+                            teams: refreshed.into_iter().map(|t| t.name).collect(),
+                        });
+                    }
+                }
+            }
+        };
+        match self
+            .try_channel_in_team_by_id(channel_name, &team.id, &team.name, source)
+            .await?
+        {
+            Some(resolved) => Ok(resolved),
+            None => Err(CoreError::ChannelNotFoundInAnyTeam {
+                channel: channel_name.to_string(),
+                teams: vec![team.name],
+            }),
+        }
+    }
+
+    /// Try the by-name lookup against a specific team. Returns
+    /// `Some(resolved)` on a 200, `None` on a 404 (caller continues the
+    /// chain or decides to fail), bubbles other errors.
+    async fn try_channel_in_team(
+        &self,
+        channel_name: &str,
+        team_slug: &str,
+        source: ResolutionSource,
+    ) -> Result<Option<ResolvedChannel>, CoreError> {
+        let team_id = self.team_id_for_slug(team_slug).await?;
+        self.try_channel_in_team_by_id(channel_name, &team_id, team_slug, source)
+            .await
+    }
+
+    async fn try_channel_in_team_by_id(
+        &self,
+        channel_name: &str,
+        team_id: &str,
+        team_slug: &str,
+        source: ResolutionSource,
+    ) -> Result<Option<ResolvedChannel>, CoreError> {
+        #[derive(Deserialize)]
+        struct ChannelResponse {
+            id: String,
+            name: String,
+        }
+        let result: Result<ChannelResponse, CoreError> = self
+            .request(
+                "GET",
+                &format!("/teams/{team_id}/channels/name/{channel_name}"),
+                None::<Value>,
+            )
+            .await;
+        match result {
+            Ok(channel) => Ok(Some(ResolvedChannel {
+                channel_id: channel.id,
+                channel_name: channel.name,
+                team_id: team_id.to_string(),
+                team_name: team_slug.to_string(),
+                resolution_source: source,
+            })),
+            Err(CoreError::Api { status, .. }) if status == reqwest::StatusCode::NOT_FOUND => {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Compatibility wrapper preserving the pre-PER-019 public API that
+    /// returns just the channel-id. Internal callers should prefer
+    /// `resolve_channel` directly so they get the team metadata too.
     pub async fn channel_id_for_name(&self, channel_name: &str) -> Result<String, CoreError> {
         self.channel_id(channel_name).await
     }
@@ -1842,12 +2425,19 @@ impl MattermostClient {
         Ok(posts)
     }
 
+    /// PER-019 (secrev pin, PR #40 review): the post-search endpoint is
+    /// team-scoped via `/teams/{team_id}/posts/search`. Pre-PER-019 this
+    /// resolved `team_id` from the profile's primary team only, so a
+    /// caller asking for `read --since-last-mine` against a non-primary-
+    /// team channel would search the wrong team and miss the prior post.
+    /// Now routes through `resolve_channel` so the search uses the
+    /// channel's actual team-id.
     async fn latest_authored_post_id(
         &self,
         channel_name: &str,
         username: &str,
     ) -> Result<Option<String>, CoreError> {
-        let team_id = self.team_id().await?;
+        let resolved = self.resolve_channel(channel_name, None).await?;
 
         #[derive(Serialize)]
         struct SearchPayload {
@@ -1871,9 +2461,9 @@ impl MattermostClient {
         let response: SearchResponse = self
             .request(
                 "POST",
-                &format!("/teams/{team_id}/posts/search"),
+                &format!("/teams/{}/posts/search", resolved.team_id),
                 Some(SearchPayload {
-                    terms: format!("from:{username} in:{channel_name}"),
+                    terms: format!("from:{username} in:{}", resolved.channel_name),
                     is_or_search: false,
                     page: 0,
                     per_page: 1,
@@ -1888,20 +2478,15 @@ impl MattermostClient {
             .map(|post| post.id))
     }
 
+    /// PER-019: now routes through the γ hybrid resolver so internal
+    /// callers automatically inherit cross-team behavior. Public name
+    /// preserved; behavior changed from "single primary-team lookup" to
+    /// "primary first, fallback across member teams". The compatibility
+    /// wrapper `channel_id_for_name` keeps the bare-id return shape for
+    /// any external consumer.
     async fn channel_id(&self, channel_name: &str) -> Result<String, CoreError> {
-        let team_id = self.team_id().await?;
-        #[derive(Deserialize)]
-        struct ChannelResponse {
-            id: String,
-        }
-        let channel: ChannelResponse = self
-            .request(
-                "GET",
-                &format!("/teams/{team_id}/channels/name/{channel_name}"),
-                None::<Value>,
-            )
-            .await?;
-        Ok(channel.id)
+        let resolved = self.resolve_channel(channel_name, None).await?;
+        Ok(resolved.channel_id)
     }
 
     async fn user_id(&self, username: &str) -> Result<String, CoreError> {
@@ -2756,18 +3341,23 @@ mod tests {
 
         let state = AttentionState {
             channels: BTreeMap::from([(
-                "per-008".to_string(),
+                "org-lanytehq/per-008".to_string(),
                 ChannelCursorState {
                     last_seen_post_id: Some("post-123".to_string()),
                     updated_at: Some(1_776_000_000_000),
                     last_known_stale: false,
                     last_checked_at: None,
+                    channel_id: "ch-008".to_string(),
+                    team_id: "team-lanytehq".to_string(),
+                    team_name: "org-lanytehq".to_string(),
+                    channel_name: "per-008".to_string(),
                 },
             )]),
             mentions: MentionCursorState {
                 last_seen_post_id: Some("mention-456".to_string()),
                 updated_at: Some(1_776_000_000_001),
             },
+            quarantined: Vec::new(),
         };
 
         let path = store_attention_state("bravo-devlead", &state).unwrap();
@@ -4198,6 +4788,359 @@ monitored_channels = ["per-003", "per-004"]
             let resolved =
                 resolve_profile_name(None, FallbackPolicy::ExplicitOnly, &inputs).unwrap();
             assert_eq!(resolved, "bravo-devlead-lanytehq");
+        }
+    }
+
+    /// PER-019 cross-team channel resolution tests. Wiremock-based —
+    /// covers the γ hybrid resolver's primary-first / fallback /
+    /// ambiguity / no-match / explicit-override branches plus the
+    /// SOP-MM-015 regression case dispatch flagged 2026-04-28.
+    mod per_019_resolver {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn test_profile(server_url: &str) -> Profile {
+            Profile {
+                name: "bravo-devlead-lanytehq".to_string(),
+                role: "bravo-devlead".to_string(),
+                scope: "lanytehq".to_string(),
+                provider: Provider::Mattermost,
+                bot_username: "agent-bravo-devlead".to_string(),
+                team_name: "org-lanytehq".to_string(),
+                server_url: server_url.to_string(),
+                env_name: "LANYTE_MM_TOKEN".to_string(),
+                env_file: None,
+                credential_mode: CredentialMode::EnvName,
+                capability_class: CapabilityClass::Standard,
+                monitored_channels: Vec::new(),
+                ipc: None,
+            }
+        }
+
+        async fn mock_my_teams(server: &MockServer, teams: Vec<(&str, &str)>) {
+            let body: Vec<_> = teams
+                .into_iter()
+                .map(|(id, name)| {
+                    serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "display_name": name,
+                    })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me/teams"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+
+        async fn mock_team_by_slug(server: &MockServer, slug: &str, id: &str) {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v4/teams/name/{slug}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": id,
+                    "name": slug,
+                })))
+                .mount(server)
+                .await;
+        }
+
+        async fn mock_channel_in_team(
+            server: &MockServer,
+            team_id: &str,
+            channel_name: &str,
+            channel_id: &str,
+        ) {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/api/v4/teams/{team_id}/channels/name/{channel_name}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": channel_id,
+                    "name": channel_name,
+                })))
+                .mount(server)
+                .await;
+        }
+
+        async fn mock_channel_404_in_team(server: &MockServer, team_id: &str, channel_name: &str) {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/api/v4/teams/{team_id}/channels/name/{channel_name}"
+                )))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "id": "app.channel.get_by_name.missing.app_error",
+                    "message": "Channel does not exist.",
+                    "status_code": 404,
+                })))
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn ac1_primary_team_channel_resolves_primary_source() {
+            // AC #1: primary-team channels resolve unchanged from
+            // pre-PER-019 behavior — single API call, no fallback.
+            let server = MockServer::start().await;
+            mock_my_teams(&server, vec![("team-lanytehq", "org-lanytehq")]).await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            mock_channel_in_team(&server, "team-lanytehq", "general", "ch-general").await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let resolved = client.resolve_channel("general", None).await.unwrap();
+            assert_eq!(resolved.channel_id, "ch-general");
+            assert_eq!(resolved.team_name, "org-lanytehq");
+            assert_eq!(resolved.resolution_source, ResolutionSource::Primary);
+        }
+
+        #[tokio::test]
+        async fn ac2_cross_team_fallback_finds_unique_match() {
+            // AC #2: bot in two teams, channel only on non-primary →
+            // γ hybrid step 2 fallback succeeds and tags as Fallback.
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                ],
+            )
+            .await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            mock_channel_404_in_team(&server, "team-lanytehq", "leadership").await;
+            mock_channel_in_team(&server, "team-ops", "leadership", "ch-leadership").await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let resolved = client.resolve_channel("leadership", None).await.unwrap();
+            assert_eq!(resolved.channel_id, "ch-leadership");
+            assert_eq!(resolved.team_name, "3-leaps-operations");
+            assert_eq!(resolved.resolution_source, ResolutionSource::Fallback);
+        }
+
+        #[tokio::test]
+        async fn ac3_ambiguous_channel_refuses_with_team_list() {
+            // AC #3: same channel name on multiple non-primary teams →
+            // refuse with AmbiguousChannel listing the matching teams.
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                    ("team-fulmen", "org-fulmenhq"),
+                ],
+            )
+            .await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            mock_channel_404_in_team(&server, "team-lanytehq", "general").await;
+            mock_channel_in_team(&server, "team-ops", "general", "ch-ops-general").await;
+            mock_channel_in_team(&server, "team-fulmen", "general", "ch-fulmen-general").await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let err = client
+                .resolve_channel("general", None)
+                .await
+                .expect_err("ambiguous resolution must refuse");
+            match err {
+                CoreError::AmbiguousChannel { channel, teams } => {
+                    assert_eq!(channel, "general");
+                    assert_eq!(teams.len(), 2);
+                }
+                other => panic!("expected AmbiguousChannel, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn ac4_no_match_refuses_with_searched_teams_after_refresh() {
+            // AC #4 + AC #14 self-healing: channel not in any member
+            // team → force refresh, then refuse with searched-teams list.
+            let server = MockServer::start().await;
+            mock_my_teams(&server, vec![("team-lanytehq", "org-lanytehq")]).await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            mock_channel_404_in_team(&server, "team-lanytehq", "phantom").await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let err = client
+                .resolve_channel("phantom", None)
+                .await
+                .expect_err("no-match must refuse");
+            match err {
+                CoreError::ChannelNotFoundInAnyTeam { channel, teams } => {
+                    assert_eq!(channel, "phantom");
+                    assert!(teams.contains(&"org-lanytehq".to_string()));
+                }
+                other => panic!("expected ChannelNotFoundInAnyTeam, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn ac5_explicit_team_channel_syntax_overrides() {
+            // AC #5: <team>/<channel> takes precedence over the chain.
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                ],
+            )
+            .await;
+            // Both teams have a #general; explicit syntax forces ops.
+            mock_channel_in_team(&server, "team-ops", "general", "ch-ops-general").await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let resolved = client
+                .resolve_channel("3-leaps-operations/general", None)
+                .await
+                .unwrap();
+            assert_eq!(resolved.channel_id, "ch-ops-general");
+            assert_eq!(resolved.team_name, "3-leaps-operations");
+            assert_eq!(resolved.resolution_source, ResolutionSource::Explicit);
+        }
+
+        #[tokio::test]
+        async fn explicit_team_not_a_member_refuses_distinctly() {
+            // Per secrev's pin: distinguish "team you are not a member
+            // of" from "channel not found".
+            let server = MockServer::start().await;
+            mock_my_teams(&server, vec![("team-lanytehq", "org-lanytehq")]).await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let err = client
+                .resolve_channel("not-my-team/anything", None)
+                .await
+                .expect_err("not-a-member must refuse");
+            match err {
+                CoreError::NotAMemberOfTeam { team, .. } => {
+                    assert_eq!(team, "not-my-team");
+                }
+                other => panic!("expected NotAMemberOfTeam, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn ac8_sop_mm_015_regression_3_leaps_operations_leadership() {
+            // AC #8 SOP-MM-015 regression pin: post to
+            // 3-leaps-operations/#leadership from a profile bound to
+            // org-lanytehq (the exact case dispatch hit 2026-04-28).
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                ],
+            )
+            .await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            mock_channel_404_in_team(&server, "team-lanytehq", "leadership").await;
+            mock_channel_in_team(&server, "team-ops", "leadership", "ch-leadership").await;
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let resolved = client.resolve_channel("leadership", None).await.unwrap();
+            assert_eq!(resolved.team_name, "3-leaps-operations");
+            assert_eq!(resolved.channel_id, "ch-leadership");
+            assert_eq!(resolved.resolution_source, ResolutionSource::Fallback);
+        }
+
+        #[tokio::test]
+        async fn ac15_migration_quarantines_ambiguous_legacy_record() {
+            // AC #15: a legacy `(profile, channel-name)` cursor that now
+            // resolves ambiguously must be quarantined, not silently
+            // bound to one team.
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                ],
+            )
+            .await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            // Primary AND fallback both have the channel — devrev's pin
+            // says primary wins on migration even when fallbacks also match.
+            mock_channel_in_team(&server, "team-lanytehq", "general", "ch-lh-general").await;
+            mock_channel_in_team(&server, "team-ops", "general", "ch-ops-general").await;
+
+            // Build state with a legacy bare-name entry.
+            let mut state = AttentionState {
+                channels: BTreeMap::from([(
+                    "general".to_string(),
+                    ChannelCursorState {
+                        last_seen_post_id: Some("pre-merge-post".to_string()),
+                        updated_at: Some(1_776_000_000_000),
+                        last_known_stale: false,
+                        last_checked_at: None,
+                        channel_id: String::new(),
+                        team_id: String::new(),
+                        team_name: String::new(),
+                        channel_name: String::new(),
+                    },
+                )]),
+                mentions: MentionCursorState::default(),
+                quarantined: Vec::new(),
+            };
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            // Primary lookup matches → migrates clean to the qualified
+            // key for the primary team. (devrev's "primary-team-first"
+            // pin: even when fallback teams also have the name, primary
+            // wins on migration.)
+            let outcome = migrate_attention_state(&mut state, &client).await.unwrap();
+            assert_eq!(outcome.migrated, 1);
+            assert_eq!(outcome.quarantined, 0);
+            assert!(state.channels.contains_key("org-lanytehq/general"));
+            assert!(!state.channels.contains_key("general"));
+        }
+
+        #[tokio::test]
+        async fn migration_quarantines_when_only_fallbacks_are_ambiguous() {
+            // Variant of AC #15: primary doesn't have it; multiple
+            // fallback teams do → quarantine.
+            let server = MockServer::start().await;
+            mock_my_teams(
+                &server,
+                vec![
+                    ("team-lanytehq", "org-lanytehq"),
+                    ("team-ops", "3-leaps-operations"),
+                    ("team-fulmen", "org-fulmenhq"),
+                ],
+            )
+            .await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            mock_channel_404_in_team(&server, "team-lanytehq", "general").await;
+            mock_channel_in_team(&server, "team-ops", "general", "ch-ops-general").await;
+            mock_channel_in_team(&server, "team-fulmen", "general", "ch-fulmen-general").await;
+
+            let mut state = AttentionState {
+                channels: BTreeMap::from([(
+                    "general".to_string(),
+                    ChannelCursorState {
+                        last_seen_post_id: Some("pre-merge-post".to_string()),
+                        updated_at: Some(1_776_000_000_000),
+                        last_known_stale: false,
+                        last_checked_at: None,
+                        channel_id: String::new(),
+                        team_id: String::new(),
+                        team_name: String::new(),
+                        channel_name: String::new(),
+                    },
+                )]),
+                mentions: MentionCursorState::default(),
+                quarantined: Vec::new(),
+            };
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let outcome = migrate_attention_state(&mut state, &client).await.unwrap();
+            assert_eq!(outcome.migrated, 0);
+            assert_eq!(outcome.quarantined, 1);
+            assert!(state.channels.is_empty());
+            assert_eq!(state.quarantined.len(), 1);
+            assert_eq!(state.quarantined[0].legacy_channel_name, "general");
+            assert_eq!(state.quarantined[0].ambiguous_teams.len(), 2);
         }
     }
 }
