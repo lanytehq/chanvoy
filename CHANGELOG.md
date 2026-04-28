@@ -9,20 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **PER-014 review fixes (devrev PR #16, 2026-04-27).** Drift gate now
-  refuses `subscribe` RPCs and suppresses event forwarding to existing
-  subscribers when the identity-drift bit is set — closes the gap where
-  network-sourced WebSocket events could continue flowing for the
-  wrong authenticated bot. `unsubscribe` / `daemon_status` /
-  `profile_status` / `attention` / `shutdown` remain answerable for
-  diagnostic and cleanup. Missing bootstrap-state file behavior split:
-  if `CHANVOY_BOOTSTRAP_NONCE` is set but the file is absent, daemon
-  refuses with `CoreError::BootstrapHandoffFailed` (failed auto-setup
-  handoff — likely runtime-dir drift, sandbox /tmp cleanup, or a
-  consume race); if the env nonce is absent, daemon falls back to
+- **PER-014 review fixes (devrev + entarch PR #16, 2026-04-27/28).**
+  Drift gate now refuses `subscribe` RPCs and suppresses event
+  forwarding to existing subscribers when the identity-drift bit is
+  set — closes the gap where network-sourced WebSocket events could
+  continue flowing for the wrong authenticated bot. `unsubscribe` /
+  `daemon_status` / `profile_status` / `attention` / `shutdown` remain
+  answerable for diagnostic and cleanup. **IPC peer surface honors the
+  same drift gate**: network-backed IPC requests (channel list / read /
+  post / channel get / subscribe) refuse with the new
+  `ChatErrorCode::IdentityDrift`, and IPC subscription event forwarding
+  is suppressed under drift. Missing bootstrap-state file behavior
+  split: if `CHANVOY_BOOTSTRAP_NONCE` is set but the file is absent,
+  daemon refuses with `CoreError::BootstrapHandoffFailed` (failed
+  auto-setup handoff — likely runtime-dir drift, sandbox /tmp cleanup,
+  or a consume race); if the env nonce is absent, daemon falls back to
   legacy `whoami()` (manual `daemon serve` path). Resolution logic
   factored into `chanvoy_core::resolve_startup_identity` for unit
-  testability; 4 new tests cover the three branches.
+  testability. **Post-spawn readiness now uses a local-only RPC
+  (`profile_status`) instead of `daemon_status`**: under sandbox
+  restrictions where REST is stalled rather than denied, the
+  Mattermost-probing `daemon_status` could exceed the post-spawn ping
+  timeout and cause `auto-setup` to report `Daemon(NotRunning)` even
+  though the socket was bound — exactly the failure mode PER-014 is
+  trying to eliminate. The operator-facing `chanvoy daemon status` keeps
+  the network probe.
 
 ## [0.1.2] - 2026-04-27
 

@@ -142,6 +142,12 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let event_bus: Arc<EventBus> = Arc::new(EventBus::new(256));
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
+    // Shared identity-drift bit, allocated before AppState so the IPC
+    // peer (constructed before AppState) can also observe it. PER-014
+    // (entarch finding #1, 2026-04-28): IPC must honor the same drift
+    // gate as the local UDS surface.
+    let identity_drift = Arc::new(AtomicBool::new(false));
+
     let ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>> = match &profile.ipc {
         Some(IpcConfig {
             enabled: true,
@@ -154,6 +160,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                 client_for_ipc,
                 Arc::clone(&event_bus),
                 gateway_socket.clone(),
+                Arc::clone(&identity_drift),
             ));
             let state = ipc_peer.state();
             let cancel = cancel_token.clone();
@@ -175,7 +182,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         ws_state_holder: ws_state_holder.clone(),
         ipc_state,
         attention_state: Arc::new(Mutex::new(load_attention_state(&profile.name)?)),
-        identity_drift: Arc::new(AtomicBool::new(false)),
+        identity_drift,
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -276,8 +283,24 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     })
 }
 
-pub async fn ping(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
-    daemon_client(profile_name).daemon_status().await
+/// Local-only readiness check for the daemon UDS socket. Used by the CLI's
+/// pre-spawn "is anything already running here?" probe and the post-spawn
+/// "did the daemon I just spawned come up?" loop in `ensure_daemon_running`.
+///
+/// PER-014 (entarch PR #16 finding #2): MUST use a local-only RPC, not
+/// `daemon_status`. `daemon_status` awaits `probe_whoami` against
+/// Mattermost; under sandbox restrictions where REST is stalled rather
+/// than denied, that probe can take longer than the post-spawn ping
+/// timeout, causing `auto-setup` to report `Daemon(NotRunning)` even
+/// though the daemon bound its socket successfully. Reintroducing exactly
+/// the operator-visible failure mode PER-014 was supposed to eliminate.
+///
+/// `profile_status` is in `LOCAL_ONLY_METHODS` and never makes a network
+/// call; if it answers, the daemon is bound and serving RPCs. Operator-
+/// facing health (`chanvoy daemon status` → `status()` → `daemon_status`)
+/// keeps the network probe — that's where operators want it.
+pub async fn ping(profile_name: &str) -> Result<ProfileStatus, DaemonError> {
+    daemon_client(profile_name).profile_status().await
 }
 
 pub async fn stop(profile_name: &str) -> Result<(), DaemonError> {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chanvoy_core::{
@@ -29,6 +30,14 @@ pub enum ChatErrorCode {
     SubscriptionNotFound,
     UnsupportedOperation,
     ChannelNotJoined,
+    /// PER-014: post-bind whoami probe (or any later daemon_status call)
+    /// caught the bot identity diverging from the configured bot_username.
+    /// Network-backed IPC requests refuse with this code while the drift
+    /// bit is set; subscription event forwarding is suppressed; local
+    /// socket and `daemon_status` remain queryable so operators can
+    /// re-run `chanvoy auto-setup` to re-validate identity. Per
+    /// @agent-entarch-lanytehq's PR #16 finding (2026-04-28).
+    IdentityDrift,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -379,6 +388,12 @@ pub struct IpcPeer {
     gateway_socket: String,
     state: Arc<tokio::sync::Mutex<IpcPeerState>>,
     subscriptions: Arc<tokio::sync::Mutex<HashMap<String, SubscriptionEntry>>>,
+    /// PER-014: shared drift signal from the daemon's `AppState`. When
+    /// set, network-backed IPC requests refuse with `IdentityDrift` and
+    /// event forwarding to subscribers is suppressed. Local control /
+    /// audit / subscription-management responses still flow. Per
+    /// @agent-entarch-lanytehq's PR #16 finding (2026-04-28).
+    identity_drift: Arc<AtomicBool>,
 }
 
 impl IpcPeer {
@@ -387,6 +402,7 @@ impl IpcPeer {
         client: MattermostClient,
         event_bus: Arc<EventBus>,
         gateway_socket: String,
+        identity_drift: Arc<AtomicBool>,
     ) -> Self {
         Self {
             client,
@@ -399,6 +415,23 @@ impl IpcPeer {
                 reconnect_count: 0,
             })),
             subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            identity_drift,
+        }
+    }
+
+    /// PER-014: build a drift-refused error frame for a given request_id.
+    /// Used by every network-backed IPC handler at the top of its body
+    /// to short-circuit when the drift bit is set.
+    fn drift_refusal(request_id: String) -> ChatFrame {
+        ChatFrame::Error {
+            request_id,
+            error_code: ChatErrorCode::IdentityDrift,
+            message: "identity drift detected: configured bot_username does not match the \
+                Mattermost-returned username for this token; network-backed IPC requests \
+                are refused. Inspect daemon_status.mattermost_identity_drift and re-run \
+                `chanvoy auto-setup` to re-validate identity."
+                .to_string(),
+            retryable: Some(true),
         }
     }
 
@@ -490,6 +523,7 @@ impl IpcPeer {
         let subscriptions = Arc::clone(&self.subscriptions);
         let cancel_fwd = cancel.clone();
         let audit_peer_id = peer_id.clone();
+        let drift_for_fwd = Arc::clone(&self.identity_drift);
 
         let forward_handle = tokio::spawn(async move {
             loop {
@@ -497,6 +531,17 @@ impl IpcPeer {
                     recv_result = event_rx.recv() => {
                         match recv_result {
                             Ok(event) => {
+                                // PER-014: drop Mattermost-sourced events
+                                // when identity drift is set. Same contract
+                                // as the local UDS subscription path —
+                                // operators query daemon_status to learn
+                                // why events stopped, then re-run
+                                // `chanvoy auto-setup`. Per
+                                // @agent-entarch-lanytehq's PR #16
+                                // finding (2026-04-28).
+                                if drift_for_fwd.load(Ordering::Relaxed) {
+                                    continue;
+                                }
                                 let subs = subscriptions.lock().await;
                                 for (sub_id, entry) in subs.iter() {
                                     if event_matches_ipc_filter(&event, &entry.filter) {
@@ -576,6 +621,12 @@ impl IpcPeer {
                 team_id: _,
                 include_archived,
             } => {
+                if self.identity_drift.load(Ordering::Relaxed) {
+                    let _ = self
+                        .send_response(tx, &Self::drift_refusal(request_id))
+                        .await;
+                    return;
+                }
                 let _ = &delegation_id;
                 let result = self.client.list_channels().await;
                 let response = match result {
@@ -603,6 +654,12 @@ impl IpcPeer {
                 thread_root_id,
                 limit,
             } => {
+                if self.identity_drift.load(Ordering::Relaxed) {
+                    let _ = self
+                        .send_response(tx, &Self::drift_refusal(request_id))
+                        .await;
+                    return;
+                }
                 let _ = &delegation_id;
                 let response = if let Some(root_id) = &thread_root_id {
                     let result = self.client.read_thread(root_id).await;
@@ -664,6 +721,12 @@ impl IpcPeer {
                 gate_token,
                 thread_root_id,
             } => {
+                if self.identity_drift.load(Ordering::Relaxed) {
+                    let _ = self
+                        .send_response(tx, &Self::drift_refusal(request_id))
+                        .await;
+                    return;
+                }
                 let _ = &delegation_id;
                 if gate_token.is_empty() {
                     let err = ChatFrame::Error {
@@ -721,6 +784,12 @@ impl IpcPeer {
                 delegation_id,
                 channel_id,
             } => {
+                if self.identity_drift.load(Ordering::Relaxed) {
+                    let _ = self
+                        .send_response(tx, &Self::drift_refusal(request_id))
+                        .await;
+                    return;
+                }
                 let _ = &delegation_id;
                 let result = self.client.list_channels().await;
                 let response = match result {
@@ -749,6 +818,12 @@ impl IpcPeer {
                 filter,
                 resume_after_seq,
             } => {
+                if self.identity_drift.load(Ordering::Relaxed) {
+                    let _ = self
+                        .send_response(tx, &Self::drift_refusal(request_id))
+                        .await;
+                    return;
+                }
                 let _ = &delegation_id;
                 let sub_id = uuid::Uuid::new_v4().to_string();
                 let start_seq = self.event_bus.current_seq();
@@ -1192,5 +1267,43 @@ mod tests {
         assert!(json.contains("history_unavailable"));
         let parsed: ChatFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(gap, parsed);
+    }
+
+    #[test]
+    fn drift_refusal_frame_carries_identity_drift_code() {
+        // PER-014 (entarch finding #1): IPC drift gate refuses
+        // network-backed requests with the new IdentityDrift code.
+        // Verify the frame shape, retryable hint, and roundtrip.
+        let frame = IpcPeer::drift_refusal("req-123".to_string());
+        match &frame {
+            ChatFrame::Error {
+                request_id,
+                error_code,
+                message,
+                retryable,
+            } => {
+                assert_eq!(request_id, "req-123");
+                assert_eq!(*error_code, ChatErrorCode::IdentityDrift);
+                assert!(
+                    message.contains("identity drift"),
+                    "diagnostic should name the failure mode"
+                );
+                assert!(
+                    message.contains("auto-setup"),
+                    "diagnostic should point at the recovery action"
+                );
+                // retryable=Some(true) because re-running auto-setup
+                // can clear the drift bit; this is not a permanent
+                // permission denial.
+                assert_eq!(*retryable, Some(true));
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+        // Roundtrip the new error code through serde so wire-format
+        // consumers see "identity_drift" snake_case.
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("identity_drift"), "json={json}");
+        let parsed: ChatFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(frame, parsed);
     }
 }
