@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::{fs, io};
+use std::{env, fs, io};
 
 use chanvoy_core::{
     daemon_event_to_notification, load_attention_state, load_profile, load_token, now_unix_millis,
@@ -23,7 +24,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::{sleep, timeout, Duration};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -52,6 +53,13 @@ struct AppState {
     ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>>,
     ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>>,
     attention_state: Arc<Mutex<AttentionState>>,
+    /// PER-014 drift floor. Set by the post-bind probe (and refreshed by
+    /// every `daemon_status` call) when `whoami()` returns a username that
+    /// does not match the configured `bot_username`. Network-backed RPCs
+    /// inspect this and refuse with a clear diagnostic; the local socket
+    /// stays bound so operators can query `daemon_status` to learn what's
+    /// wrong.
+    identity_drift: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -80,15 +88,51 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     }
     let token = load_token(&profile)?;
     let client = MattermostClient::new(&profile, token)?;
-    let identity = client.whoami().await?;
-    if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
-        return Err(CoreError::ProfileIdentityMismatch {
-            expected: profile.bot_username.clone(),
-            actual: identity.username,
+
+    // PER-014: three startup paths, distinguished by whether the parent
+    // advertised a handoff via `CHANVOY_BOOTSTRAP_NONCE` and whether the
+    // bootstrap-state file is present:
+    //
+    // 1. **File present**: validated bootstrap path. Validate
+    //    freshness + profile_fingerprint + nonce-env match + username
+    //    match, consume-and-delete, bind without a network call. This is
+    //    the auto-setup → sandboxed-daemon-spawn happy path.
+    // 2. **File missing, nonce env set**: failed auto-setup handoff.
+    //    The parent advertised a handoff (env var set) but the daemon
+    //    child could not find the file. Likely runtime-dir drift between
+    //    parent and child, sandbox temp cleanup, or a consume race.
+    //    Refuse with `BootstrapHandoffFailed` so the operator can
+    //    distinguish from a legacy manual invocation. Per
+    //    @agent-bravo-devrev's PR #16 finding (2026-04-27).
+    // 3. **File missing, nonce env absent**: legacy / non-auto-setup
+    //    path. Manual `chanvoy daemon serve`. Fall through to the
+    //    original network whoami() — works in unsandboxed shells and
+    //    is the right thing for developer-mode invocations.
+    let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
+    let resolution =
+        chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())?;
+    let my_user_id = match resolution {
+        chanvoy_core::BootstrapResolution::Validated { user_id } => {
+            info!(
+                profile = profile_name,
+                "chanvoy daemon trusted pre-validated identity from bootstrap state"
+            );
+            user_id
         }
-        .into());
-    }
-    let my_user_id = identity.id;
+        chanvoy_core::BootstrapResolution::Legacy => {
+            // Manual `chanvoy daemon serve` (not via auto-setup): no
+            // handoff in flight. Network whoami() runs as before.
+            let identity = client.whoami().await?;
+            if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
+                return Err(CoreError::ProfileIdentityMismatch {
+                    expected: profile.bot_username.clone(),
+                    actual: identity.username,
+                }
+                .into());
+            }
+            identity.id
+        }
+    };
     let listener = UnixListener::bind(&socket_path)?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     fs::write(&pid_path, std::process::id().to_string())?;
@@ -97,6 +141,12 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>> = Arc::new(Mutex::new(None));
     let event_bus: Arc<EventBus> = Arc::new(EventBus::new(256));
     let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // Shared identity-drift bit, allocated before AppState so the IPC
+    // peer (constructed before AppState) can also observe it. PER-014
+    // (entarch finding #1, 2026-04-28): IPC must honor the same drift
+    // gate as the local UDS surface.
+    let identity_drift = Arc::new(AtomicBool::new(false));
 
     let ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>> = match &profile.ipc {
         Some(IpcConfig {
@@ -110,6 +160,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                 client_for_ipc,
                 Arc::clone(&event_bus),
                 gateway_socket.clone(),
+                Arc::clone(&identity_drift),
             ));
             let state = ipc_peer.state();
             let cancel = cancel_token.clone();
@@ -131,6 +182,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         ws_state_holder: ws_state_holder.clone(),
         ipc_state,
         attention_state: Arc::new(Mutex::new(load_attention_state(&profile.name)?)),
+        identity_drift,
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -153,6 +205,49 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             ws_ref.run(ws_shutdown_rx).await;
         });
         *ws_state_holder.lock().await = Some(ws_state);
+    }
+
+    // PER-014 post-bind drift probe. Bind-first: the local UDS is already
+    // listening. Probe-after: this runs asynchronously so the bind result
+    // is not gated on Mattermost reachability — sandbox-blocked or
+    // unreachable network surfaces as `mattermost_ok=false` via
+    // `daemon_status`, never a startup failure. On identity mismatch
+    // (whoami returns a different username than the configured
+    // `bot_username`), we set the `identity_drift` bit; network-backed
+    // RPCs surface this with a clear diagnostic. The local socket stays
+    // bound regardless so operators can query `daemon_status` to learn
+    // what's wrong. Per @agent-bravo-devrev's drift-floor framing
+    // (#per-014, 2026-04-27).
+    {
+        let probe_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let probe = chanvoy_core::probe_whoami(
+                &probe_state.client,
+                chanvoy_core::STATUS_PROBE_TIMEOUT_MS,
+            )
+            .await;
+            match probe {
+                Ok(username) => {
+                    if !probe_state.profile.bot_username.is_empty()
+                        && username != probe_state.profile.bot_username
+                    {
+                        probe_state.identity_drift.store(true, Ordering::Relaxed);
+                        warn!(
+                            expected = %probe_state.profile.bot_username,
+                            actual = %username,
+                            "post-bind whoami probe surfaced identity drift; daemon stays bound, network RPCs will refuse"
+                        );
+                    }
+                }
+                Err(err) => {
+                    info!(
+                        profile = %probe_state.profile.name,
+                        error = %err,
+                        "post-bind whoami probe failed (sandbox-blocked or transient); daemon_status will retry on each call"
+                    );
+                }
+            }
+        });
     }
 
     info!(
@@ -188,7 +283,36 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     })
 }
 
-pub async fn ping(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
+/// Local-only readiness check for the daemon UDS socket. Use this when
+/// the question is "is the daemon bound and answering RPCs?" — not
+/// "does the daemon's Mattermost token still work?". Calls
+/// `profile_status`, which is in `LOCAL_ONLY_METHODS` and never touches
+/// the network.
+///
+/// PER-014 (entarch PR #16 finding #2): used by `ensure_daemon_running`'s
+/// post-spawn "did the child I just spawned come up?" loop. Under sandbox
+/// restrictions where REST is stalled rather than denied, a daemon_status-
+/// based readiness check could exceed the post-spawn ping timeout and
+/// cause `auto-setup` to report `Daemon(NotRunning)` even though the
+/// daemon bound its socket — exactly the failure mode PER-014 is trying
+/// to eliminate.
+pub async fn ping(profile_name: &str) -> Result<ProfileStatus, DaemonError> {
+    daemon_client(profile_name).profile_status().await
+}
+
+/// Network-aware health check for the daemon. Use this when the question
+/// is "is the existing daemon usable?" — i.e., bound AND with a working
+/// Mattermost token AND no identity drift. Calls `daemon_status`, which
+/// runs `probe_whoami` against Mattermost.
+///
+/// PER-014 (entarch PR #16 residual finding, 2026-04-28): used by
+/// `ensure_daemon_running`'s pre-spawn check to decide whether the
+/// existing daemon should be reused or torn down and respawned. A
+/// daemon with a revoked/rotated token or drifted identity must be
+/// replaced rather than reused — the previous semantics relied on
+/// the network probe to surface that, and PER-014's local-only ping()
+/// retarget would otherwise mask it.
+pub async fn ping_full(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
     daemon_client(profile_name).daemon_status().await
 }
 
@@ -251,6 +375,22 @@ async fn handle_client(
             } => {
                 match recv_result {
                     Ok(event) => {
+                        // PER-014: if identity drift is set, suppress
+                        // forwarding network-sourced events to subscribed
+                        // clients. The post-bind probe (or a later
+                        // daemon_status call) caught the bot's identity
+                        // diverging from the configured bot_username; the
+                        // drift floor's contract is "no Mattermost-sourced
+                        // data flows while drift is true." Operators query
+                        // daemon_status.mattermost_identity_drift to learn
+                        // why the event stream paused; the local socket
+                        // and `unsubscribe` / `daemon_status` /
+                        // `profile_status` / attention RPCs stay
+                        // answerable. Per @agent-bravo-devrev's PR #16
+                        // finding, 2026-04-27.
+                        if state.identity_drift.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let subs = state.subscriptions.lock().await;
                         let matches_any = client_sub_ids.iter().any(|id| {
                             subs.get(id)
@@ -337,11 +477,49 @@ fn event_matches_filter(event: &DaemonEvent, filter: &SubscriptionFilter) -> boo
     }
 }
 
+/// PER-014: methods that NEVER serve Mattermost-sourced data. Even when
+/// the drift gate is tripped, these must remain answerable so operators
+/// can learn what's wrong via `daemon_status` and the daemon stays
+/// administrable (`shutdown`, `unsubscribe`, `profile_status`, attention).
+///
+/// `subscribe` is intentionally NOT on this list: subscriptions forward
+/// Mattermost WebSocket events from the daemon to clients, so accepting
+/// new subscriptions under drift would let network-sourced data flow
+/// for the wrong authenticated bot. Existing subscribers also have
+/// their event forwarding gated on the drift bit (see
+/// `handle_client`'s receive arm). `unsubscribe` stays local so
+/// operators can clean up state without first un-drifting.
+/// (Per @agent-bravo-devrev's PR #16 finding, 2026-04-27.)
+const LOCAL_ONLY_METHODS: &[&str] = &[
+    "daemon_status",
+    "profile_status",
+    "unsubscribe",
+    "attention_list",
+    "attention_show",
+    "shutdown",
+];
+
 async fn dispatch_request(
     request: JsonRpcRequest,
     state: &AppState,
     shutdown_tx: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
 ) -> JsonRpcResponse {
+    // PER-014 drift gate. If the post-bind probe (or any later
+    // `daemon_status` probe) caught the bot's Mattermost identity
+    // diverging from the configured `bot_username`, network-backed RPCs
+    // refuse with a clear diagnostic. Local-only RPCs stay answerable so
+    // operators can query `daemon_status` and shut down cleanly. The
+    // local socket stays bound regardless. Per @agent-bravo-devrev's
+    // drift-floor framing (#per-014, 2026-04-27).
+    let method = request.method.as_str();
+    if state.identity_drift.load(Ordering::Relaxed) && !LOCAL_ONLY_METHODS.contains(&method) {
+        return rpc_error(
+            request.id,
+            -32_000,
+            "identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.".to_string(),
+        );
+    }
+
     let response: Result<serde_json::Value, DaemonError> = match request.method.as_str() {
         "whoami" => state
             .client
@@ -577,6 +755,16 @@ async fn dispatch_request(
             let whoami_result =
                 chanvoy_core::probe_whoami(&state.client, chanvoy_core::STATUS_PROBE_TIMEOUT_MS)
                     .await;
+            // PER-014: keep the drift bit fresh — the post-bind one-shot
+            // probe seeds it, but `daemon_status` is the live signal that
+            // re-validates each call. A previously-tripped drift can also
+            // recover here (e.g., bot identity restored externally).
+            if let Ok(ref username) = whoami_result {
+                if !state.profile.bot_username.is_empty() {
+                    let drifted = *username != state.profile.bot_username;
+                    state.identity_drift.store(drifted, Ordering::Relaxed);
+                }
+            }
             Ok(to_value(chanvoy_core::build_daemon_status(
                 state.profile.name.clone(),
                 state.socket_path.clone(),

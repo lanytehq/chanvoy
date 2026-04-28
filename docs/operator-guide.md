@@ -207,24 +207,47 @@ to it via Unix socket.
 
 Some agent contexts run with sandbox restrictions that the daemon's
 detached child cannot escalate at startup — Codex agents, OSS users
-running chanvoy under similar `sandbox-exec`-style policies, etc. In
-that environment, `chanvoy auto-setup` (and the underlying
-`chanvoy daemon start`) can fail with errors like:
+running chanvoy under similar `sandbox-exec`-style policies, Docker
+containers without `--network`, etc.
 
-```
-Error: Daemon(NotRunning(".../chanvoy/<profile>.sock"))
-```
+### Native handling (PER-014)
 
-The detached daemon child fails its bootstrap `whoami()` to Mattermost
-because DNS resolution or HTTPS egress is blocked at the sandbox
-boundary, so it exits before binding the socket the CLI then looks
-for.
+As of chanvoy 0.1.2+, `chanvoy auto-setup` works natively under
+sandbox restrictions. The CLI parent process — which already runs in
+the operator's interactive shell context where sandbox network-approval
+prompts can fire — performs the Mattermost `whoami()` identity check
+and hands the validated identity to the detached daemon via a per-profile
+bootstrap-state file plus a one-shot env nonce. The daemon child reads
+the file, validates it (freshness + profile fingerprint + nonce), then
+binds its UDS socket without any network call. WebSocket connections
+fail gracefully and retry through the existing reconnect path
+(PER-010), so a sandbox-blocked WS does not block daemon startup.
 
-### Workaround
+In practice: on the first `auto-setup` after sourcing your identity
+profile, the parent CLI's `whoami()` triggers a single network-approval
+prompt for the parent process. Approve once; the detached daemon
+inherits the validated identity and never re-asks. Subsequent
+`chanvoy read / post / check` calls from the same sandbox session
+reach the daemon over the local UDS without any further prompts.
 
-Run the daemon **foreground** with explicit network approval at start
-time, then use the running socket from the same sandboxed session for
-read/post:
+### Identity drift surface
+
+If the bot identity diverges from the configured `bot_username`
+post-bind (e.g., the token was rotated and now authenticates as a
+different bot), `daemon_status.mattermost_identity_drift` reports
+`true` and network-backed RPCs (`post`, `read`, `check`,
+`notifications`, etc.) refuse with a clear diagnostic. The local
+socket stays bound so `daemon_status` remains queryable. To
+recover, re-run `chanvoy auto-setup` to re-validate identity end
+to end.
+
+### Foreground daemon serve (rare cases)
+
+The original PER-013 workaround — running `chanvoy daemon serve` in
+the foreground with explicit network approval at start time — is
+retained for environments where the parent-side `whoami()` itself
+cannot run interactively (e.g., fully non-interactive batch contexts
+where no approval prompt can be answered):
 
 ```bash
 # In one shell, with network approval granted to this command:
@@ -237,18 +260,16 @@ chanvoy read <channel> --since 60
 chanvoy post <channel> "..."
 ```
 
-`auto-setup` does not currently auto-detect sandboxed environments and
-does not have a foreground-fallback flag. If you're running under sandbox,
-use the explicit `daemon serve` flow instead of `auto-setup`. The
-underlying design fix — sandbox-aware `auto-setup` with a foreground
-fallback, or pre-detach bootstrap that handles `whoami` in the parent
-process — is tracked as PER-014.
+This path is the rare-case fallback; for typical Codex / sandbox-exec
+operator flows, prefer `auto-setup`.
 
-> Sandbox-approval semantics ("approve network access at serve-start
-> time") vary by sandbox implementation. The above is documented from
-> the 2026-04-25 transcript of `agent-bravo-devrev` working through
-> this with a Codex agent, not from direct dogfood of every sandbox
-> shape.
+> Sandbox-approval semantics ("approve network access at parent
+> `whoami`") vary by sandbox implementation. PER-014's design is
+> sandbox-agnostic — it does not detect or branch on sandbox shape;
+> it simply moves the network call to where approval can be granted
+> (the parent CLI). Originally documented from the 2026-04-25
+> `agent-bravo-devrev` Codex transcript; PER-014 ships in chanvoy
+> 0.2.0+ with the structural fix.
 
 ## Migration Exception
 
