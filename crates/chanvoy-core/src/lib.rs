@@ -573,6 +573,15 @@ pub struct AttentionListResult {
     pub profile: String,
     pub channels: Vec<AttentionChannelEntry>,
     pub mentions: AttentionMentionEntry,
+    /// PER-019 (secrev PR #17 finding #2): legacy cursor records that
+    /// the qualified-key migration could not bind cleanly because the
+    /// channel name resolved on multiple member teams. Surfaced here
+    /// so operators can see them and disambiguate; the next read/post
+    /// on the channel via `--team` or `<team>/<channel>` syntax
+    /// re-establishes a fresh cursor under the correct qualified key.
+    /// `#[serde(default)]` keeps wire-format back-compat.
+    #[serde(default)]
+    pub quarantined: Vec<QuarantinedCursor>,
 }
 
 /// `attention show <channel>` wire shape. Includes the channel entry
@@ -596,17 +605,28 @@ pub struct AttentionShowResult {
 ///   abort the pass; degrades overall readiness when aggregated.
 /// - Skips DM (`D`) and group-DM (`G`) pseudo-channels; those are addressed via the
 ///   mentions cursor.
+///
+/// PER-019 (entarch PR #17 finding + secrev residual): seed pre-filter
+/// must understand the qualified-key cursor format. Pre-PER-019 the
+/// `existing_cursors` set was bare names; post-migration the daemon
+/// passes qualified `<team>/<channel>` keys. The helper enumerates
+/// only primary-team channels, so qualify each enumerated name with
+/// the primary team before checking the existing-cursors set.
+/// Bare-name fallback is retained for any callers that haven't migrated
+/// yet (or pre-migration state).
 pub async fn compute_seed_outcomes(
     client: &MattermostClient,
     existing_cursors: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<SeededChannelOutcome>, CoreError> {
     let channels = client.list_channels().await?;
+    let primary_team = client.primary_team_name();
     let mut outcomes = Vec::new();
     for channel in channels {
         if channel.channel_type != "O" && channel.channel_type != "P" {
             continue;
         }
-        if existing_cursors.contains(&channel.name) {
+        let qualified = attention_key_for(primary_team, &channel.name);
+        if existing_cursors.contains(&qualified) || existing_cursors.contains(&channel.name) {
             continue;
         }
         let head = match client.latest_channel_messages_by_id(&channel.id, 1).await {
@@ -3913,6 +3933,78 @@ monitored_channels = ["per-003", "per-004"]
                 })
                 .collect();
             assert_eq!(channels, vec!["per-009"]);
+        }
+
+        #[tokio::test]
+        async fn compute_seed_outcomes_skips_qualified_key_after_per019_migration() {
+            // entarch PR #17 P2: post-PER-019 the daemon passes
+            // qualified `<team>/<channel>` cursor keys into
+            // compute_seed_outcomes. Pre-fix the helper compared bare
+            // names against the qualified set, so already-cursored
+            // primary-team channels were no longer skipped at
+            // enumeration. With the fix, qualifying the enumerated
+            // name with the primary team before checking matches.
+            let server = MockServer::start().await;
+            mock_whoami(&server, 200).await;
+            mock_team(&server, "org-lanytehq", 200).await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me/teams/team-id-456/channels"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "ch-existing", "name": "bravo-team", "display_name": "Bravo", "type": "O"},
+                    {"id": "ch-new", "name": "per-019", "display_name": "PER-019", "type": "O"},
+                ])))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch-new/posts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "posts": {
+                        "post-new": {
+                            "id": "post-new",
+                            "user_id": "u",
+                            "message": "x",
+                            "create_at": 1_776_000_000_000_i64,
+                            "username": "u",
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+            // No mock for ch-existing/posts — if the helper fetched
+            // it, wiremock returns 404 → outcomes contain Failed.
+            // The fix ensures it skips at enumeration instead.
+
+            let client =
+                MattermostClient::new(&test_profile(&server.uri()), "token".into()).unwrap();
+            // Daemon now passes qualified keys (post-migration shape).
+            let mut existing = std::collections::BTreeSet::new();
+            existing.insert("org-lanytehq/bravo-team".to_string());
+            let outcomes = compute_seed_outcomes(&client, &existing).await.unwrap();
+
+            let channels: Vec<_> = outcomes
+                .iter()
+                .map(|o| match o {
+                    SeededChannelOutcome::Seeded { channel, .. }
+                    | SeededChannelOutcome::UnseededEmptyChannel { channel }
+                    | SeededChannelOutcome::Failed { channel, .. } => channel.as_str(),
+                })
+                .collect();
+            assert_eq!(
+                channels,
+                vec!["per-019"],
+                "qualified-key cursor must skip the seed enumeration; bare-name match would falsely emit Failed"
+            );
+            // Belt-and-suspenders: verify nothing emitted for the
+            // existing channel (no Failed, no Seeded, no Empty).
+            assert!(
+                !outcomes.iter().any(|o| match o {
+                    SeededChannelOutcome::Seeded { channel, .. }
+                    | SeededChannelOutcome::UnseededEmptyChannel { channel }
+                    | SeededChannelOutcome::Failed { channel, .. } => channel == "bravo-team",
+                }),
+                "already-cursored channel must not appear in outcomes"
+            );
         }
     }
 

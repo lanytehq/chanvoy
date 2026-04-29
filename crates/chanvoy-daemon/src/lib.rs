@@ -1341,21 +1341,40 @@ async fn record_staleness_verdict(
 /// across runs.
 async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
     let attention = state.attention_state.lock().await;
-    let mut channel_names: std::collections::BTreeSet<String> =
-        state.profile.monitored_channels.iter().cloned().collect();
-    channel_names.extend(attention.channels.keys().cloned());
-    let channels = channel_names
+    // PER-019 (secrev PR #17 finding #1): qualify monitored_channels
+    // entries against the primary team before unioning with the
+    // already-qualified attention.channels keys. Pre-fix, a tracked
+    // channel that also had a persisted cursor under the qualified
+    // key would emit two rows (a bare `bravo-team` no_anchor + a
+    // qualified `org-lanytehq/bravo-team` cursor). The bare form
+    // resolves against the primary team because that's the
+    // historical interpretation of `monitored_channels`.
+    let primary_team = state.client.primary_team_name();
+    let mut channel_keys: std::collections::BTreeSet<String> = state
+        .profile
+        .monitored_channels
+        .iter()
+        .map(|name| {
+            if name.contains('/') {
+                name.clone()
+            } else {
+                chanvoy_core::attention_key_for(primary_team, name)
+            }
+        })
+        .collect();
+    channel_keys.extend(attention.channels.keys().cloned());
+    let channels = channel_keys
         .into_iter()
-        .map(|name| match attention.channels.get(&name) {
+        .map(|key| match attention.channels.get(&key) {
             Some(cursor) => chanvoy_core::AttentionChannelEntry {
-                channel: name,
+                channel: key,
                 source: attention_source_for_channel(cursor),
                 newest_seen: cursor.last_seen_post_id.clone(),
                 updated_at: cursor.updated_at,
                 last_checked_at: cursor.last_checked_at,
             },
             None => chanvoy_core::AttentionChannelEntry {
-                channel: name,
+                channel: key,
                 source: chanvoy_core::AttentionSource::NoAnchor,
                 newest_seen: None,
                 updated_at: None,
@@ -1368,10 +1387,18 @@ async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
         newest_seen: attention.mentions.last_seen_post_id.clone(),
         updated_at: attention.mentions.updated_at,
     };
+    // PER-019 (secrev PR #17 finding #2): surface quarantined legacy
+    // records so operators can see them and disambiguate. Cloned out
+    // of the locked state for read-only display; the originals
+    // remain in attention.quarantined until an operator re-reads /
+    // re-posts via --team or <team>/<channel> to re-establish a
+    // qualified cursor.
+    let quarantined = attention.quarantined.clone();
     chanvoy_core::AttentionListResult {
         profile: state.profile.name.clone(),
         channels,
         mentions,
+        quarantined,
     }
 }
 

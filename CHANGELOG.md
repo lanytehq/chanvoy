@@ -34,6 +34,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`inbound_event_wakes_wait`) with a regression test that fires
     two events sharing the same name but different ids and verifies
     only the matching id wakes the wait.
+- **PER-019 review fixes (entarch + secrev PR #17, 2026-04-29).**
+  Three follow-on gaps from the qualified-key migration's
+  propagation:
+  - `compute_seed_outcomes` skip-check now honors qualified keys.
+    The helper enumerates primary-team channels; it qualifies each
+    enumerated name against the primary team before checking the
+    existing-cursors set. Pre-fix, post-migration cursor sets
+    contained qualified keys but the helper compared against bare
+    names — already-cursored primary-team channels were no longer
+    skipped at enumeration, risking spurious `Failed` outcomes on
+    transient HEAD fetches and degraded `auto-setup` readiness
+    (entarch P2 + secrev residual). Bare-name fallback is retained.
+  - `attention_list` qualifies `monitored_channels` entries against
+    the primary team before unioning with the qualified
+    `attention.channels` keys. Pre-fix, a tracked channel with a
+    persisted cursor under `org-lanytehq/bravo-team` could emit two
+    rows: a bare `bravo-team` no_anchor and the qualified cursor
+    row. Post-fix, the union deduplicates because both forms hash
+    to the same qualified key (secrev finding #1).
+  - `AttentionListResult` gains a `quarantined: Vec<QuarantinedCursor>`
+    field surfaced in `attention list` output. Quarantined records
+    were invisible to operators pre-fix; now they're listed with
+    their original bare name + the ambiguous teams they resolved
+    to + the preserved cursor state (secrev finding #2).
+  Plus one new regression test
+  (`compute_seed_outcomes_skips_qualified_key_after_per019_migration`)
+  that fails on the pre-fix bare-name comparison.
 
 ## [0.1.3] - 2026-04-28
 
