@@ -1174,6 +1174,12 @@ async fn check_channel(
 /// `<team_name>/<channel_name>` key used by `AttentionState.channels`.
 /// Centralized so every lookup site honors the same resolution chain
 /// the read/post/check verbs use.
+///
+/// **Network call**: invokes `resolve_channel` which hits Mattermost
+/// for `team_id`/`channel_id` lookup. Suitable only for handlers that
+/// are already in the network-call set (post/read/check/wait); for
+/// strict-read-only handlers (attention show/list per PER-008B), use
+/// [`local_attention_key`] instead.
 async fn qualified_attention_key(
     state: &AppState,
     channel: &str,
@@ -1184,6 +1190,42 @@ async fn qualified_attention_key(
         &resolved.team_name,
         &resolved.channel_name,
     ))
+}
+
+/// PER-019 (secrev PR #17 attention-surface finding, 2026-04-29): build
+/// an attention-state lookup key without making any network call,
+/// preserving the PER-008B strict-read-only contract on the
+/// `attention show` / `attention list` RPCs.
+///
+/// Heuristic mirrors `attention_list`'s `monitored_channels` qualifying
+/// pass:
+/// - Already-qualified input (`<team>/<channel>`) passes through
+///   verbatim, with `#` trimmed from the channel segment.
+/// - Explicit `--team <slug>` override qualifies with the requested
+///   team (no membership verification — that's the strict-read-only
+///   trade-off; an operator pointing at a non-member team simply gets
+///   `NoAnchor` rather than a refusal).
+/// - Bare name defaults to the profile's primary team.
+///
+/// Trade-off (consistent with PER-008B): a bare name typed against a
+/// channel whose cursor is qualified to a non-primary team will return
+/// `NoAnchor` from the lookup. That's the correct strict-read-only
+/// behavior — operators disambiguate with `--team` or
+/// `<team>/<channel>` when they need to inspect non-primary cursors.
+fn local_attention_key(state: &AppState, channel: &str, team: Option<&str>) -> String {
+    local_attention_key_for(state.client.primary_team_name(), channel, team)
+}
+
+/// Pure-string variant of [`local_attention_key`] for unit testability.
+/// Same heuristic, takes the primary-team slug directly instead of
+/// extracting it from `AppState`.
+fn local_attention_key_for(primary_team: &str, channel: &str, team: Option<&str>) -> String {
+    let trimmed = channel.trim_start_matches('#');
+    if let Some((team_slug, channel_name)) = trimmed.split_once('/') {
+        return chanvoy_core::attention_key_for(team_slug, channel_name.trim_start_matches('#'));
+    }
+    let resolved_team = team.unwrap_or(primary_team);
+    chanvoy_core::attention_key_for(resolved_team, trimmed)
 }
 
 async fn record_channel_cursor(
@@ -1411,15 +1453,20 @@ async fn attention_show(
     channel: &str,
     team: Option<&str>,
 ) -> chanvoy_core::AttentionShowResult {
-    // PER-019: resolve to qualified key first. Failure here surfaces as
-    // NoAnchor rather than an RPC error so the strict-read-only contract
-    // on the `attention` prefix is preserved.
-    let key_lookup = qualified_attention_key(state, channel, team).await;
+    // PER-019 (secrev PR #17 attention-surface finding, 2026-04-29):
+    // build the lookup key locally without resolving against
+    // Mattermost — `attention show` is on the strict-read-only
+    // attention prefix per PER-008B and must never make network
+    // calls. The earlier qualified_attention_key path violated that
+    // contract by going through `resolve_channel`. The local
+    // qualifier mirrors `attention_list`'s heuristic: explicit
+    // <team>/<channel> or --team wins; bare name defaults to the
+    // primary team. Bare name against a non-primary cursor returns
+    // NoAnchor — operators disambiguate via --team for cross-team
+    // inspection.
+    let key = local_attention_key(state, channel, team);
     let attention = state.attention_state.lock().await;
-    let entry = match key_lookup
-        .ok()
-        .and_then(|key| attention.channels.get(&key).map(|c| (key, c)))
-    {
+    let entry = match attention.channels.get(&key).map(|c| (key.clone(), c)) {
         Some((key, cursor)) => chanvoy_core::AttentionChannelEntry {
             channel: key,
             source: attention_source_for_channel(cursor),
@@ -1888,6 +1935,47 @@ mod tests {
                 mentioned,
             }),
         }
+    }
+
+    /// PER-019 (secrev PR #17 attention-surface finding, 2026-04-29):
+    /// the `local_attention_key_for` helper used by `attention show`
+    /// must build the lookup key purely from string manipulation —
+    /// no network call. This test exercises the heuristic across the
+    /// three input shapes (qualified, --team override, bare-name +
+    /// primary-team default) and asserts the expected key shape.
+    /// The fact that the helper is `fn` (not `async fn`) and takes no
+    /// network handle is itself the static guarantee; this test
+    /// pins the behavior so a future refactor can't silently
+    /// re-introduce a network call without breaking the test.
+    #[test]
+    fn secrev_pr17_attention_show_local_key_no_network() {
+        // Qualified `<team>/<channel>` passes through.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "3-leaps-operations/development", None),
+            "3-leaps-operations/development"
+        );
+        // Qualified with leading `#` on channel segment is normalized.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "3-leaps-operations/#development", None),
+            "3-leaps-operations/development"
+        );
+        // --team override wins over primary-team default.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "general", Some("3-leaps-operations")),
+            "3-leaps-operations/general"
+        );
+        // Bare name defaults to primary team (the strict-read-only
+        // trade-off: cross-team cursors require explicit
+        // disambiguation here, mirroring `attention_list`).
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "bravo-team", None),
+            "org-lanytehq/bravo-team"
+        );
+        // Leading `#` on bare name is also trimmed.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "#bravo-team", None),
+            "org-lanytehq/bravo-team"
+        );
     }
 
     #[test]

@@ -61,6 +61,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Plus one new regression test
   (`compute_seed_outcomes_skips_qualified_key_after_per019_migration`)
   that fails on the pre-fix bare-name comparison.
+- **PER-019 attention-surface contract restoration (secrev PR #17,
+  2026-04-29).** My earlier fix routed `attention show` through
+  `qualified_attention_key`, which calls `resolve_channel` and so
+  makes a Mattermost API call. That violated the PER-008B
+  strict-read-only contract on the `attention` prefix (no network
+  calls allowed; status surface stays available during outages).
+  Restored the contract: `attention show` now uses a new pure-string
+  helper `local_attention_key` whose heuristic mirrors
+  `attention_list` — explicit `<team>/<channel>` or `--team` wins;
+  bare name defaults to the primary team. Trade-off: a bare name
+  typed against a non-primary cursor returns `NoAnchor`; operators
+  disambiguate via `--team` or `<team>/<channel>` for cross-team
+  inspection. Regression test `secrev_pr17_attention_show_local_key_no_network`
+  pins the heuristic across all four input shapes.
 
 ## [0.1.3] - 2026-04-28
 
