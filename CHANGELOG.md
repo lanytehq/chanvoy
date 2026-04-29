@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     channel segment, matching the existing whole-arg `#` trim
     operators rely on when pasting channel names from the Mattermost
     UI.
+  - `wait_push_backed` matches inbound WS events by resolved
+    `channel_id`, not `channel_name`. Same-named channels on different
+    teams have distinct ids, so the previous name-based predicate
+    could let an event from the wrong team wake a wait. The matcher
+    is extracted into a small testable predicate
+    (`inbound_event_wakes_wait`) with a regression test that fires
+    two events sharing the same name but different ids and verifies
+    only the matching id wakes the wait.
 
 ## [0.1.3] - 2026-04-28
 

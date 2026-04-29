@@ -963,6 +963,24 @@ async fn wait_for_messages(
     }
 }
 
+/// PER-019 (devrev PR #17 second-pass finding): predicate for
+/// `wait_push_backed` event matching, extracted for unit testability.
+/// Returns true when the inbound event should wake the wait — same
+/// resolved `channel_id` (not name; same-named channels on different
+/// teams have distinct ids), past the cursor, not authored by us.
+fn inbound_event_wakes_wait(
+    payload: &chanvoy_core::InboundEventPayload,
+    channel_id: &str,
+    cursor_id: &str,
+    cursor_create_at: i64,
+    my_user_id: &str,
+) -> bool {
+    payload.channel_id == channel_id
+        && payload.post_id != cursor_id
+        && payload.create_at > cursor_create_at
+        && payload.sender_id != my_user_id
+}
+
 async fn wait_push_backed(
     state: &AppState,
     channel: &str,
@@ -978,23 +996,24 @@ async fn wait_push_backed(
             match rx.recv().await {
                 Ok(event) => match &event.payload {
                     DaemonEventPayloadInner::Inbound(p)
-                        if p.channel_name.eq_ignore_ascii_case(channel) =>
+                        if inbound_event_wakes_wait(
+                            p,
+                            channel_id,
+                            cursor_id,
+                            cursor_create_at,
+                            &state.my_user_id,
+                        ) =>
                     {
-                        if p.post_id != cursor_id
-                            && p.create_at > cursor_create_at
-                            && p.sender_id != state.my_user_id
-                        {
-                            return Ok(WaitResult {
-                                channel: channel.to_string(),
-                                messages: vec![chanvoy_core::Message {
-                                    id: p.post_id.clone(),
-                                    user_id: p.sender_id.clone(),
-                                    username: p.sender_username.clone(),
-                                    message: p.message.clone(),
-                                    create_at: p.create_at,
-                                }],
-                            });
-                        }
+                        return Ok(WaitResult {
+                            channel: channel.to_string(),
+                            messages: vec![chanvoy_core::Message {
+                                id: p.post_id.clone(),
+                                user_id: p.sender_id.clone(),
+                                username: p.sender_username.clone(),
+                                message: p.message.clone(),
+                                create_at: p.create_at,
+                            }],
+                        });
                     }
                     _ => {}
                 },
@@ -1851,6 +1870,80 @@ mod tests {
             &event,
             &SubscriptionFilter::AllMonitored
         ));
+    }
+
+    /// PER-019 (devrev PR #17 second-pass regression): when two
+    /// channels share a name across different teams (e.g.
+    /// `org-lanytehq/general` and `3-leaps-operations/general`),
+    /// the push-backed wait must wake only on events for the
+    /// resolved `channel_id`, never on a name-collision from the
+    /// other team. Pre-fix, the predicate compared by `channel_name`
+    /// and would wake on either; post-fix, only the matching id
+    /// wakes.
+    #[test]
+    fn devrev_pr17_finding5_wait_push_backed_filters_by_channel_id() {
+        fn payload(channel_id: &str, channel_name: &str, post_id: &str) -> InboundEventPayload {
+            InboundEventPayload {
+                profile: "test".to_string(),
+                provider: Provider::Mattermost,
+                channel_id: channel_id.to_string(),
+                channel_name: channel_name.to_string(),
+                post_id: post_id.to_string(),
+                sender_id: "u-other".to_string(),
+                sender_username: "alice".to_string(),
+                message: "hello".to_string(),
+                create_at: 2000,
+                received_at: 2001,
+                mentioned: false,
+            }
+        }
+
+        // Wait was set up for the Ops team's #general (id=ch-ops-general).
+        let wait_channel_id = "ch-ops-general";
+        let cursor_id = "p-cursor";
+        let cursor_create_at = 1000;
+        let my_user_id = "bot-bravo";
+
+        // Event from the SAME team (matching id) → wake.
+        let ops_event = payload("ch-ops-general", "general", "p-ops-1");
+        assert!(
+            inbound_event_wakes_wait(
+                &ops_event,
+                wait_channel_id,
+                cursor_id,
+                cursor_create_at,
+                my_user_id,
+            ),
+            "matching channel_id should wake the wait"
+        );
+
+        // Event from the OTHER team (same name, different id) → must NOT wake.
+        let lh_event = payload("ch-lanytehq-general", "general", "p-lh-1");
+        assert!(
+            !inbound_event_wakes_wait(
+                &lh_event,
+                wait_channel_id,
+                cursor_id,
+                cursor_create_at,
+                my_user_id,
+            ),
+            "same-named channel on a different team must not wake the wait"
+        );
+
+        // Self-authored event (matching id) → must NOT wake (existing
+        // contract; preserved by the fix).
+        let mut self_event = payload("ch-ops-general", "general", "p-self");
+        self_event.sender_id = my_user_id.to_string();
+        assert!(
+            !inbound_event_wakes_wait(
+                &self_event,
+                wait_channel_id,
+                cursor_id,
+                cursor_create_at,
+                my_user_id,
+            ),
+            "self-authored event must not wake the wait"
+        );
     }
 
     #[test]
