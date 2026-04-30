@@ -61,7 +61,7 @@ enum CommandSet {
     #[command(subcommand)]
     Profile(ProfileCommand),
     Whoami,
-    Channels,
+    Channels(ChannelsArgs),
     Dms,
     Read(ReadArgs),
     Check(CheckArgs),
@@ -91,9 +91,25 @@ enum AttentionCommand {
 }
 
 #[derive(Debug, Args)]
+struct ChannelsArgs {
+    /// PER-019 AC #11: filter to a single team. Without this, `chanvoy
+    /// channels` lists every team the bot is a member of, grouped.
+    #[arg(long, conflicts_with = "primary_team")]
+    team: Option<String>,
+    /// PER-019 AC #11: print only the profile's primary team in the
+    /// pre-PER-019 single-team format. Back-compat escape hatch for
+    /// tooling that depends on the old shape.
+    #[arg(long, conflicts_with = "team")]
+    primary_team: bool,
+}
+
+#[derive(Debug, Args)]
 struct AttentionShowArgs {
     /// Channel name.
     channel: String,
+    /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -145,6 +161,13 @@ struct ReadArgs {
     after: Option<String>,
     #[arg(long, conflicts_with_all = ["since", "after"])]
     since_last_mine: bool,
+    /// PER-019: explicit team override for cross-team channel resolution
+    /// (per-invocation only). Equivalent to the `<team>/<channel>`
+    /// positional syntax. When unset, the γ hybrid resolver tries the
+    /// profile's primary team first, then falls back across other teams
+    /// the bot is a member of.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -160,6 +183,9 @@ struct CheckArgs {
     channel: String,
     #[arg(long)]
     after: Option<String>,
+    /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -167,12 +193,18 @@ struct WaitArgs {
     channel: String,
     #[arg(long, default_value_t = 10)]
     timeout: u64,
+    /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct PostArgs {
     channel: String,
     message: String,
+    /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -318,9 +350,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
         }
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
         CommandSet::Whoami => print_identity(cli.json, &daemon_client(&profile).whoami().await?),
-        CommandSet::Channels => {
-            print_value(cli.json, &daemon_client(&profile).list_channels().await?)
-        }
+        CommandSet::Channels(args) => handle_channels_command(&profile, cli.json, args).await,
         CommandSet::Dms => print_value(cli.json, &daemon_client(&profile).list_dms().await?),
         CommandSet::Read(args) => print_value(
             cli.json,
@@ -330,11 +360,12 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                     args.since,
                     args.after.clone(),
                     args.since_last_mine,
+                    args.team.clone(),
                 )
                 .await?,
         ),
         CommandSet::Check(args) => match daemon_client(&profile)
-            .check_channel(&args.channel, args.after.clone())
+            .check_channel(&args.channel, args.after.clone(), args.team.clone())
             .await?
         {
             result if result.has_new_messages => print_value(cli.json, &result),
@@ -347,7 +378,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
             cli.json,
             "posted",
             &daemon_client(&profile)
-                .post_message(&args.channel, &args.message)
+                .post_message(&args.channel, &args.message, args.team.clone())
                 .await?,
         ),
         CommandSet::Dm(DmCommand::Send(args)) => print_dm_receipt(
@@ -398,7 +429,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 );
             }
             match daemon_client(&profile)
-                .wait_channel(&args.channel, args.timeout)
+                .wait_channel(&args.channel, args.timeout, args.team.clone())
                 .await
             {
                 Ok(result) => {
@@ -473,7 +504,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
         }
         CommandSet::Attention(AttentionCommand::Show(args)) => {
             let result = daemon_client(&profile)
-                .attention_show(&args.channel)
+                .attention_show(&args.channel, args.team.clone())
                 .await?;
             print_json_or_text(cli.json, &result, &render_attention_show_text(&result))
         }
@@ -1076,13 +1107,16 @@ fn detach_into_new_session(_cmd: &mut Command) {
 /// Stop the daemon if it is present, and wait until its socket is actually gone
 /// so the caller's subsequent spawn lands on a clean slate.
 ///
-/// **Daemon presence is detected via socket file existence, not via `ping()`.**
-/// `ping()` is the `daemon_status` RPC which internally calls `whoami()` against
-/// Mattermost (`chanvoy-daemon::dispatch_request`, "daemon_status" arm). A daemon
-/// running with a revoked credential fails ping while being very much alive.
-/// Falling back to socket existence ensures the stop path catches those zombies
-/// on both the Refresh path (explicit stop to force reload) and the Reuse path
-/// (invoked from ensure_daemon_running when ping fails).
+/// **Daemon presence is detected via socket file existence, not via a probe RPC.**
+/// The pre-spawn health check in `ensure_daemon_running` uses `ping_full()`
+/// (network-aware `daemon_status`, runs `probe_whoami` against Mattermost); a
+/// daemon running with a revoked credential or drifted identity fails that
+/// probe while being very much alive. Falling back to socket existence ensures
+/// the stop path catches those zombies on both the Refresh path (explicit stop
+/// to force reload) and the Reuse path (invoked from `ensure_daemon_running`
+/// when the network-aware probe fails or returns degraded). The local-only
+/// `ping()` (= `profile_status`) is reserved for post-spawn readiness, not
+/// stale-daemon detection.
 ///
 /// The daemon's `shutdown` RPC is handled locally (no Mattermost calls) so it
 /// works even when `whoami()` is failing. A stale socket (process already gone)
@@ -1393,6 +1427,41 @@ fn render_attention_list_text(result: &AttentionListResult) -> String {
         result.mentions.newest_seen.as_deref().unwrap_or("—"),
         format_ts(result.mentions.updated_at),
     ));
+    // PER-019 (devrev PR #17 follow-up, 2026-04-30): surface
+    // quarantined legacy cursor records in the default human output.
+    // The JSON-side fix at 3156a0a added the field to
+    // `AttentionListResult` but the renderer ignored it; quarantined
+    // records stayed invisible to operators using the default text
+    // output. Render a small section listing the original bare
+    // channel name + the ambiguous teams the migration found, so
+    // operators know which cursors need manual disambiguation via
+    // `--team` or `<team>/<channel>` on next access.
+    if !result.quarantined.is_empty() {
+        out.push_str(&format!(
+            "\nquarantined ({} record{}):\n",
+            result.quarantined.len(),
+            if result.quarantined.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ));
+        out.push_str(&format!(
+            "  {:<24} {:<40} {}\n",
+            "LEGACY_NAME", "AMBIGUOUS_TEAMS", "QUARANTINED_AT"
+        ));
+        for q in &result.quarantined {
+            out.push_str(&format!(
+                "  {:<24} {:<40} {}\n",
+                truncate(&q.legacy_channel_name, 24),
+                truncate(&q.ambiguous_teams.join(", "), 40),
+                format_ts(Some(q.quarantined_at)),
+            ));
+        }
+        out.push_str(
+            "  (re-establish per-team cursors via `--team <slug>` or `<team>/<channel>` syntax)\n",
+        );
+    }
     out
 }
 
@@ -1760,6 +1829,80 @@ impl HumanReadable for Vec<Channel> {
     }
 }
 
+/// PER-019 AC #11: render the cross-team channel listing as a grouped
+/// human view. Each team gets a `=== <team-slug> ===` header followed
+/// by `<team-slug>/<channel-name>` lines so operators can copy any
+/// line directly into `chanvoy read` / `post` / `check` if they need
+/// the explicit-team form.
+fn render_team_channels_human(groups: &[chanvoy_core::TeamChannels]) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for group in groups {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(&format!("=== {} ===\n", group.team_name));
+        if group.channels.is_empty() {
+            out.push_str("  (no channels)\n");
+            continue;
+        }
+        let name_width = group
+            .channels
+            .iter()
+            .map(|c| c.name.len() + group.team_name.len() + 1)
+            .max()
+            .unwrap_or(0);
+        let display_width = group
+            .channels
+            .iter()
+            .map(|c| c.display_name.len())
+            .max()
+            .unwrap_or(0);
+        for channel in &group.channels {
+            let qualified = format!("{}/{}", group.team_name, channel.name);
+            out.push_str(&format!(
+                "  {:<name_width$}  {:<display_width$}  {}\n",
+                qualified,
+                channel.display_name,
+                channel.channel_type,
+                name_width = name_width,
+                display_width = display_width,
+            ));
+        }
+    }
+    out
+}
+
+async fn handle_channels_command(
+    profile: &str,
+    json: bool,
+    args: ChannelsArgs,
+) -> Result<(), CliError> {
+    if args.primary_team {
+        // Back-compat single-team output; same shape as pre-PER-019.
+        return print_value(json, &daemon_client(profile).list_channels().await?);
+    }
+    let groups = daemon_client(profile).list_channels_across_teams().await?;
+    let filtered: Vec<chanvoy_core::TeamChannels> = if let Some(team_filter) = args.team {
+        groups
+            .into_iter()
+            .filter(|g| g.team_name == team_filter)
+            .collect()
+    } else {
+        groups
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "teams": filtered }))?
+        );
+    } else {
+        print!("{}", render_team_channels_human(&filtered));
+    }
+    Ok(())
+}
+
 impl HumanReadable for Vec<DmConversation> {
     fn to_human_string(&self) -> String {
         let mut lines = self
@@ -1965,6 +2108,81 @@ mod tests {
     /// `env::remove_var` calls would otherwise race with each other and
     /// with any test that reads the same vars.
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// PER-019 (devrev PR #17 follow-up, 2026-04-30): the human
+    /// `chanvoy attention list` output must surface
+    /// `AttentionListResult.quarantined` so operators using the
+    /// default text mode see legacy cursors that the migration
+    /// couldn't bind cleanly. Pre-fix, the JSON output exposed the
+    /// field but `render_attention_list_text` ignored it.
+    #[test]
+    fn devrev_pr17_attention_list_renderer_surfaces_quarantined() {
+        use chanvoy_core::{
+            AttentionListResult, AttentionMentionEntry, AttentionSource, QuarantinedCursor,
+        };
+
+        let result = AttentionListResult {
+            profile: "bravo-devlead-lanytehq".to_string(),
+            channels: Vec::new(),
+            mentions: AttentionMentionEntry {
+                source: AttentionSource::NoAnchor,
+                newest_seen: None,
+                updated_at: None,
+            },
+            quarantined: vec![QuarantinedCursor {
+                legacy_channel_name: "general".to_string(),
+                ambiguous_teams: vec!["org-lanytehq".to_string(), "3-leaps-operations".to_string()],
+                state: chanvoy_core::ChannelCursorState::default(),
+                quarantined_at: 1_777_500_000_000,
+            }],
+        };
+
+        let rendered = render_attention_list_text(&result);
+
+        assert!(
+            rendered.contains("quarantined (1 record):"),
+            "renderer must surface quarantined section header. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("LEGACY_NAME"),
+            "renderer must include the column header. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("general"),
+            "renderer must include the legacy channel name. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("org-lanytehq") && rendered.contains("3-leaps-operations"),
+            "renderer must list both ambiguous teams. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("--team") || rendered.contains("<team>/<channel>"),
+            "renderer must point operators at the disambiguation syntax. got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn devrev_pr17_attention_list_renderer_omits_quarantined_when_empty() {
+        // Symmetric: if there are no quarantined entries, the section
+        // is omitted entirely (no spurious empty header).
+        use chanvoy_core::{AttentionListResult, AttentionMentionEntry, AttentionSource};
+
+        let result = AttentionListResult {
+            profile: "bravo-devlead-lanytehq".to_string(),
+            channels: Vec::new(),
+            mentions: AttentionMentionEntry {
+                source: AttentionSource::NoAnchor,
+                newest_seen: None,
+                updated_at: None,
+            },
+            quarantined: Vec::new(),
+        };
+        let rendered = render_attention_list_text(&result);
+        assert!(
+            !rendered.contains("quarantined"),
+            "no quarantined section when the vec is empty. got:\n{rendered}"
+        );
+    }
 
     #[test]
     fn identity_uses_lanyte_chat_shape() {

@@ -102,7 +102,7 @@ async fn post_cursor_survives_clean_restart() {
     let state_before = read_attention_state(&env).expect("state file after post");
     let cursor_before = state_before
         .channels
-        .get("test-channel")
+        .get("org-lanytehq/test-channel")
         .expect("channel cursor present");
     assert_eq!(
         cursor_before.last_seen_post_id.as_deref(),
@@ -155,7 +155,7 @@ async fn post_cursor_survives_sigkill_restart() {
     let state_before = read_attention_state(&env).expect("state file after post");
     let cursor_before = state_before
         .channels
-        .get("test-channel")
+        .get("org-lanytehq/test-channel")
         .expect("channel cursor present");
     assert_eq!(
         cursor_before.last_seen_post_id.as_deref(),
@@ -262,7 +262,7 @@ async fn stale_cursor_path_preserved_across_restart() {
     assert_eq!(
         state_before
             .channels
-            .get("test-channel")
+            .get("org-lanytehq/test-channel")
             .and_then(|c| c.last_seen_post_id.as_deref()),
         Some("post-id-ac4-phase1"),
     );
@@ -772,8 +772,12 @@ async fn auto_setup_detached_daemon_state_survives_session_transition() {
     let bravo_team = parsed["channels"]
         .as_array()
         .and_then(|arr| {
-            arr.iter()
-                .find(|c| c["channel"].as_str() == Some("bravo-team"))
+            arr.iter().find(|c| {
+                // PER-019: attention list emits qualified
+                // `<team>/<channel>` keys for the channel field.
+                let label = c["channel"].as_str().unwrap_or("");
+                label == "org-lanytehq/bravo-team" || label == "bravo-team"
+            })
         })
         .expect("bravo-team entry present after Session A's post");
     assert_eq!(

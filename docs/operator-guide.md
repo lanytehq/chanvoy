@@ -141,6 +141,94 @@ Current inspectability gap worth tracking:
 - there is not yet a first-class `doctor` or `status` surface for showing the current stored attention state file and cursor values
 - operators can inspect the per-profile JSON state file directly under the config root for now
 
+## Cross-Team Channel Resolution
+
+As of chanvoy 0.1.3+, channel-name arguments resolve across every
+team the bot is a member of. Previously (≤ 0.1.2), every CLI verb
+that took a channel name searched only the profile's primary team
+and silently 404'd when the channel lived on a different team —
+exactly the failure SOP-MM-015 cross-org standing channels expose.
+
+### Resolution chain (γ hybrid)
+
+In order of precedence:
+
+1. **Explicit `<team>/<channel>` syntax** — wins over everything.
+   Useful when scripts/agents need to pin a specific team:
+   ```bash
+   chanvoy post 3-leaps-operations/leadership "..."
+   chanvoy read 3-leaps-operations/leadership --since 60
+   ```
+2. **Explicit `--team <slug>` flag** — same effect as the syntax
+   above, but as a flag for verbs that already take other flags:
+   ```bash
+   chanvoy read leadership --team 3-leaps-operations --since 60
+   ```
+3. **Profile's primary team** — the `team_name` your profile binds
+   to. Tried first; this is the common case and incurs no extra
+   API call when the channel lives on the primary team.
+4. **Fallback across other member teams** — if the primary team
+   doesn't have the channel, chanvoy searches every team the bot
+   is a member of (cached for 15 minutes; the cache force-refreshes
+   on a no-match before failing so newly-added memberships surface
+   without re-running `auto-setup`).
+
+### Diagnostics
+
+When the resolver can't pick a single team, the CLI refuses with one
+of three distinct error shapes — never a generic 404:
+
+- **No-match**: `channel "<name>" not found on any team you are a
+  member of. Teams searched: [...]`. Suggests either checking the
+  spelling or asking dispatch to add the bot to the team that
+  actually hosts the channel.
+- **Not-a-member** (only via explicit `<team>/<channel>` or
+  `--team`): `team "<slug>" requested via <team>/<channel> syntax,
+  but you are not a member of it. Teams you are a member of: [...]`.
+- **Ambiguous**: `channel "<name>" is ambiguous — found on multiple
+  teams: [...]. Use --team <slug> or <team>/<channel> syntax to
+  disambiguate.`
+
+### Cursor isolation
+
+Cursors (for `read --since-last-mine`, attention freshness, mention
+tracking) are tracked per qualified `<team>/<channel>` pair, so
+same-named channels on different teams maintain independent state —
+reading `org-lanytehq/general` does not advance cursors for
+`3-leaps-operations/general`.
+
+If you upgrade from a pre-0.1.3 daemon and a previously-tracked
+channel name now exists on multiple of your member teams, the
+migration **quarantines** that record rather than silently binding
+it to one team. The next read/post on the channel via `--team` or
+`<team>/<channel>` re-establishes a fresh cursor under the correct
+qualified key. Quarantined records are preserved verbatim under
+`AttentionState.quarantined` for inspection.
+
+### `chanvoy channels` cross-team output
+
+The default `chanvoy channels` listing now groups by team:
+
+```
+=== org-lanytehq ===
+  org-lanytehq/general
+  org-lanytehq/per-019
+
+=== 3-leaps-operations ===
+  3-leaps-operations/development
+  3-leaps-operations/leadership
+```
+
+The qualified `<team>/<channel>` form on each line is directly
+copy-pasteable into `chanvoy read` / `post` / `check`.
+
+Flags:
+- `--team <slug>` — list only that team's channels.
+- `--primary-team` — pre-0.1.3 single-team output for tooling that
+  depends on the old shape.
+- `--json` — structured per-team output with a `qualified` field
+  for each channel.
+
 ## Profile Resolution
 
 When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profile in order:

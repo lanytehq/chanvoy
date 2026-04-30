@@ -172,6 +172,40 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         _ => None,
     };
 
+    // PER-019 load-time migration: walk pre-PER-019 cursor entries
+    // (keyed by bare channel name) and rewrite them under qualified
+    // `<team_name>/<channel_name>` keys. Ambiguous names quarantine.
+    // Idempotent — already-qualified entries are skipped.
+    let mut attention = load_attention_state(&profile.name)?;
+    match chanvoy_core::migrate_attention_state(&mut attention, &client).await {
+        Ok(outcome) if outcome.migrated + outcome.quarantined > 0 => {
+            info!(
+                profile = profile_name,
+                migrated = outcome.migrated,
+                quarantined = outcome.quarantined,
+                skipped = outcome.skipped,
+                "PER-019 attention-state migration completed"
+            );
+            // Persist the rewritten state so write-time paths land in
+            // qualified-key territory.
+            store_attention_state(&profile.name, &attention)?;
+        }
+        Ok(_) => {
+            // Nothing to migrate — no-op.
+        }
+        Err(err) => {
+            // Migration is best-effort at startup; if the team-list
+            // endpoint is unreachable now, write paths will resolve
+            // lazily and the legacy entries will be rewritten on
+            // first cursor update. Don't block daemon startup.
+            tracing::warn!(
+                profile = profile_name,
+                %err,
+                "PER-019 attention-state migration deferred — write paths will retry"
+            );
+        }
+    }
+
     let state = Arc::new(AppState {
         profile: profile.clone(),
         client,
@@ -181,7 +215,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         subscriptions: Arc::new(Mutex::new(HashMap::new())),
         ws_state_holder: ws_state_holder.clone(),
         ipc_state,
-        attention_state: Arc::new(Mutex::new(load_attention_state(&profile.name)?)),
+        attention_state: Arc::new(Mutex::new(attention)),
         identity_drift,
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -533,6 +567,12 @@ async fn dispatch_request(
             .await
             .map(to_value)
             .map_err(DaemonError::from),
+        "list_channels_across_teams" => state
+            .client
+            .list_channels_across_teams()
+            .await
+            .map(to_value)
+            .map_err(DaemonError::from),
         "list_dms" => state
             .client
             .list_dms()
@@ -540,20 +580,21 @@ async fn dispatch_request(
             .map(to_value)
             .map_err(DaemonError::from),
         "read_channel" => parse_and_call(&request.params, |params: ReadChannelParams| async move {
+            let team = params.team.as_deref();
             if let Some(after_post_id) = params.after_post_id {
                 state
                     .client
-                    .read_channel_after(&params.channel, &after_post_id)
+                    .read_channel_after(&params.channel, &after_post_id, team)
                     .await
             } else if params.since_last_mine {
                 state
                     .client
-                    .read_channel_since_last_mine(&params.channel)
+                    .read_channel_since_last_mine(&params.channel, team)
                     .await
             } else {
                 state
                     .client
-                    .read_channel(&params.channel, params.since_minutes.unwrap_or(60))
+                    .read_channel(&params.channel, params.since_minutes.unwrap_or(60), team)
                     .await
             }
         })
@@ -561,7 +602,17 @@ async fn dispatch_request(
         .map(to_value),
         "check_channel" => {
             parse_and_call(&request.params, |params: CheckChannelParams| async move {
-                check_channel(state, &params.channel, params.after_post_id.as_deref()).await
+                // PER-019 (devrev PR #17 finding #1): thread --team
+                // through to the channel resolution so duplicate-name
+                // channels check on the requested team, not the
+                // primary-team default.
+                check_channel(
+                    state,
+                    &params.channel,
+                    params.after_post_id.as_deref(),
+                    params.team.as_deref(),
+                )
+                .await
             })
             .await
             .map(to_value)
@@ -569,9 +620,15 @@ async fn dispatch_request(
         "post_message" => parse_and_call(&request.params, |params: PostMessageParams| async move {
             let receipt = state
                 .client
-                .post_message(&params.channel, &params.message)
+                .post_message(&params.channel, &params.message, params.team.as_deref())
                 .await?;
-            record_channel_cursor(state, &params.channel, &receipt.id).await?;
+            // PER-019 (devrev PR #17 finding #2): cursor recording must
+            // bind to the same team the post landed on. Pass the
+            // operator's --team override through; otherwise a
+            // duplicate-name channel could record under the
+            // primary-team key while the post went to Ops.
+            record_channel_cursor(state, &params.channel, &receipt.id, params.team.as_deref())
+                .await?;
             Ok(receipt)
         })
         .await
@@ -624,7 +681,16 @@ async fn dispatch_request(
         .await
         .map(to_value),
         "wait_channel" => parse_and_call(&request.params, |params: WaitChannelParams| async move {
-            wait_for_messages(state, &params.channel, params.timeout_minutes).await
+            // PER-019 (devrev PR #17 finding #1): thread --team into
+            // the wait helper so duplicate-name channels wait on the
+            // requested team's cursor.
+            wait_for_messages(
+                state,
+                &params.channel,
+                params.timeout_minutes,
+                params.team.as_deref(),
+            )
+            .await
         })
         .await
         .map(to_value),
@@ -782,7 +848,9 @@ async fn dispatch_request(
         "attention_list" => Ok(to_value(attention_list(state).await)),
         "attention_show" => {
             parse_and_call(&request.params, |params: AttentionShowParams| async move {
-                Ok::<_, CoreError>(attention_show(state, &params.channel).await)
+                Ok::<_, CoreError>(
+                    attention_show(state, &params.channel, params.team.as_deref()).await,
+                )
             })
             .await
             .map(to_value)
@@ -842,8 +910,19 @@ async fn wait_for_messages(
     state: &AppState,
     channel: &str,
     timeout_minutes: u64,
+    team: Option<&str>,
 ) -> Result<WaitResult, CoreError> {
-    let channel_id = state.client.channel_id_for_name(channel).await?;
+    // PER-019 (devrev PR #17 finding #1): resolve via the cross-team
+    // resolver so duplicate-name channels wait on the requested team.
+    // The previous `channel_id_for_name` path went through the legacy
+    // `channel_id` helper, which now uses the resolver default chain
+    // (primary-first/fallback) but did not honor the operator's
+    // explicit `--team` override.
+    let channel_id = state
+        .client
+        .resolve_channel(channel, team)
+        .await?
+        .channel_id;
 
     let initial = state
         .client
@@ -884,6 +963,24 @@ async fn wait_for_messages(
     }
 }
 
+/// PER-019 (devrev PR #17 second-pass finding): predicate for
+/// `wait_push_backed` event matching, extracted for unit testability.
+/// Returns true when the inbound event should wake the wait — same
+/// resolved `channel_id` (not name; same-named channels on different
+/// teams have distinct ids), past the cursor, not authored by us.
+fn inbound_event_wakes_wait(
+    payload: &chanvoy_core::InboundEventPayload,
+    channel_id: &str,
+    cursor_id: &str,
+    cursor_create_at: i64,
+    my_user_id: &str,
+) -> bool {
+    payload.channel_id == channel_id
+        && payload.post_id != cursor_id
+        && payload.create_at > cursor_create_at
+        && payload.sender_id != my_user_id
+}
+
 async fn wait_push_backed(
     state: &AppState,
     channel: &str,
@@ -899,23 +996,24 @@ async fn wait_push_backed(
             match rx.recv().await {
                 Ok(event) => match &event.payload {
                     DaemonEventPayloadInner::Inbound(p)
-                        if p.channel_name.eq_ignore_ascii_case(channel) =>
+                        if inbound_event_wakes_wait(
+                            p,
+                            channel_id,
+                            cursor_id,
+                            cursor_create_at,
+                            &state.my_user_id,
+                        ) =>
                     {
-                        if p.post_id != cursor_id
-                            && p.create_at > cursor_create_at
-                            && p.sender_id != state.my_user_id
-                        {
-                            return Ok(WaitResult {
-                                channel: channel.to_string(),
-                                messages: vec![chanvoy_core::Message {
-                                    id: p.post_id.clone(),
-                                    user_id: p.sender_id.clone(),
-                                    username: p.sender_username.clone(),
-                                    message: p.message.clone(),
-                                    create_at: p.create_at,
-                                }],
-                            });
-                        }
+                        return Ok(WaitResult {
+                            channel: channel.to_string(),
+                            messages: vec![chanvoy_core::Message {
+                                id: p.post_id.clone(),
+                                user_id: p.sender_id.clone(),
+                                username: p.sender_username.clone(),
+                                message: p.message.clone(),
+                                create_at: p.create_at,
+                            }],
+                        });
                     }
                     _ => {}
                 },
@@ -991,12 +1089,17 @@ async fn check_channel(
     state: &AppState,
     channel: &str,
     explicit_after: Option<&str>,
+    team: Option<&str>,
 ) -> Result<CheckResult, CoreError> {
     let (anchor, anchor_source) = if let Some(after) = explicit_after {
         (Some(after.to_string()), "explicit_after".to_string())
     } else {
+        // PER-019 (devrev PR #17 finding #1): lookup uses the operator's
+        // --team override so duplicate-name channels read the cursor
+        // for the requested team, not the primary-team default.
+        let key = qualified_attention_key(state, channel, team).await?;
         let attention = state.attention_state.lock().await;
-        let Some(cursor) = attention.channels.get(channel) else {
+        let Some(cursor) = attention.channels.get(&key) else {
             return Ok(CheckResult {
                 channel: channel.to_string(),
                 anchor: None,
@@ -1029,7 +1132,7 @@ async fn check_channel(
 
     let messages = match state
         .client
-        .read_channel_after(channel, &anchor_post_id)
+        .read_channel_after(channel, &anchor_post_id, team)
         .await
     {
         Ok(messages) => {
@@ -1039,14 +1142,14 @@ async fn check_channel(
             // its own probe (PER-008B D1: cached staleness, cxotech's
             // `last_checked_at` refinement).
             if anchor_source == "daemon_cursor" {
-                record_staleness_verdict(state, channel, false).await;
+                record_staleness_verdict(state, channel, false, team).await;
             }
             messages
         }
         Err(CoreError::AnchorNotFound(_)) | Err(CoreError::AnchorChannelMismatch { .. })
             if anchor_source == "daemon_cursor" =>
         {
-            record_staleness_verdict(state, channel, true).await;
+            record_staleness_verdict(state, channel, true, team).await;
             return Ok(stale_cursor_check_result(channel));
         }
         Err(error) => return Err(error),
@@ -1066,22 +1169,93 @@ async fn check_channel(
     })
 }
 
+/// PER-019: resolve a channel argument (possibly `<team>/<channel>` or
+/// bare name) plus an optional `--team` override into the qualified
+/// `<team_name>/<channel_name>` key used by `AttentionState.channels`.
+/// Centralized so every lookup site honors the same resolution chain
+/// the read/post/check verbs use.
+///
+/// **Network call**: invokes `resolve_channel` which hits Mattermost
+/// for `team_id`/`channel_id` lookup. Suitable only for handlers that
+/// are already in the network-call set (post/read/check/wait); for
+/// strict-read-only handlers (attention show/list per PER-008B), use
+/// [`local_attention_key`] instead.
+async fn qualified_attention_key(
+    state: &AppState,
+    channel: &str,
+    team: Option<&str>,
+) -> Result<String, CoreError> {
+    let resolved = state.client.resolve_channel(channel, team).await?;
+    Ok(chanvoy_core::attention_key_for(
+        &resolved.team_name,
+        &resolved.channel_name,
+    ))
+}
+
+/// PER-019 (secrev PR #17 attention-surface finding, 2026-04-29): build
+/// an attention-state lookup key without making any network call,
+/// preserving the PER-008B strict-read-only contract on the
+/// `attention show` / `attention list` RPCs.
+///
+/// Heuristic mirrors `attention_list`'s `monitored_channels` qualifying
+/// pass:
+/// - Already-qualified input (`<team>/<channel>`) passes through
+///   verbatim, with `#` trimmed from the channel segment.
+/// - Explicit `--team <slug>` override qualifies with the requested
+///   team (no membership verification — that's the strict-read-only
+///   trade-off; an operator pointing at a non-member team simply gets
+///   `NoAnchor` rather than a refusal).
+/// - Bare name defaults to the profile's primary team.
+///
+/// Trade-off (consistent with PER-008B): a bare name typed against a
+/// channel whose cursor is qualified to a non-primary team will return
+/// `NoAnchor` from the lookup. That's the correct strict-read-only
+/// behavior — operators disambiguate with `--team` or
+/// `<team>/<channel>` when they need to inspect non-primary cursors.
+fn local_attention_key(state: &AppState, channel: &str, team: Option<&str>) -> String {
+    local_attention_key_for(state.client.primary_team_name(), channel, team)
+}
+
+/// Pure-string variant of [`local_attention_key`] for unit testability.
+/// Same heuristic, takes the primary-team slug directly instead of
+/// extracting it from `AppState`.
+fn local_attention_key_for(primary_team: &str, channel: &str, team: Option<&str>) -> String {
+    let trimmed = channel.trim_start_matches('#');
+    if let Some((team_slug, channel_name)) = trimmed.split_once('/') {
+        return chanvoy_core::attention_key_for(team_slug, channel_name.trim_start_matches('#'));
+    }
+    let resolved_team = team.unwrap_or(primary_team);
+    chanvoy_core::attention_key_for(resolved_team, trimmed)
+}
+
 async fn record_channel_cursor(
     state: &AppState,
     channel: &str,
     post_id: &str,
+    team: Option<&str>,
 ) -> Result<(), CoreError> {
+    // PER-019 (devrev PR #17 finding #2): cursor recording must bind
+    // to the same team the side effect (post / read) landed on.
+    // Threading the operator's `--team` override here matches the
+    // resolver call the surrounding RPC made, so duplicate-name
+    // channels record under the right qualified key.
+    let resolved = state.client.resolve_channel(channel, team).await?;
+    let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
     let mut attention = state.attention_state.lock().await;
     // Every cursor-write path is a staleness-clearing event per the
     // PER-008B D1 guardrail: the new cursor value is fresh, by definition
     // not stale, and has not yet been checked.
     attention.channels.insert(
-        channel.to_string(),
+        key,
         chanvoy_core::ChannelCursorState {
             last_seen_post_id: Some(post_id.to_string()),
             updated_at: Some(chanvoy_core::now_unix_millis()),
             last_known_stale: false,
             last_checked_at: None,
+            channel_id: resolved.channel_id,
+            team_id: resolved.team_id,
+            team_name: resolved.team_name,
+            channel_name: resolved.channel_name,
         },
     );
     store_attention_state(&state.profile.name, &attention)?;
@@ -1113,18 +1287,28 @@ async fn record_channel_cursor_if_absent(
     channel: &str,
     post_id: &str,
 ) -> Result<bool, CoreError> {
+    // PER-019: resolve to qualified key first; only then check absence
+    // under the new key shape. Pre-PER-019 entries with a bare-name key
+    // are migrated at daemon `start()` so by the time we get here the
+    // map is qualified-keyed.
+    let resolved = state.client.resolve_channel(channel, None).await?;
+    let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
     let mut attention = state.attention_state.lock().await;
-    if attention.channels.contains_key(channel) {
+    if attention.channels.contains_key(&key) {
         return Ok(false);
     }
     // A freshly-seeded cursor is by definition non-stale and unchecked.
     attention.channels.insert(
-        channel.to_string(),
+        key,
         chanvoy_core::ChannelCursorState {
             last_seen_post_id: Some(post_id.to_string()),
             updated_at: Some(chanvoy_core::now_unix_millis()),
             last_known_stale: false,
             last_checked_at: None,
+            channel_id: resolved.channel_id,
+            team_id: resolved.team_id,
+            team_name: resolved.team_name,
+            channel_name: resolved.channel_name,
         },
     );
     store_attention_state(&state.profile.name, &attention)?;
@@ -1143,9 +1327,30 @@ async fn record_channel_cursor_if_absent(
 /// best-effort optimization for `attention list`'s fast path, and
 /// failing a `check_channel` call because we couldn't persist the
 /// verdict would be the wrong trade.
-async fn record_staleness_verdict(state: &AppState, channel: &str, stale: bool) {
+async fn record_staleness_verdict(
+    state: &AppState,
+    channel: &str,
+    stale: bool,
+    team: Option<&str>,
+) {
+    // PER-019 (devrev PR #17 finding #1): lookup uses qualified
+    // `<team>/<channel>` key, honoring the operator's --team override
+    // so duplicate-name channels persist the verdict on the right team's
+    // cursor entry.
+    let key = match qualified_attention_key(state, channel, team).await {
+        Ok(k) => k,
+        Err(err) => {
+            tracing::warn!(
+                profile = %state.profile.name,
+                channel = %channel,
+                %err,
+                "failed to resolve channel for staleness verdict; skipping persistence"
+            );
+            return;
+        }
+    };
     let mut attention = state.attention_state.lock().await;
-    let Some(cursor) = attention.channels.get_mut(channel) else {
+    let Some(cursor) = attention.channels.get_mut(&key) else {
         return;
     };
     cursor.last_known_stale = stale;
@@ -1178,21 +1383,40 @@ async fn record_staleness_verdict(state: &AppState, channel: &str, stale: bool) 
 /// across runs.
 async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
     let attention = state.attention_state.lock().await;
-    let mut channel_names: std::collections::BTreeSet<String> =
-        state.profile.monitored_channels.iter().cloned().collect();
-    channel_names.extend(attention.channels.keys().cloned());
-    let channels = channel_names
+    // PER-019 (secrev PR #17 finding #1): qualify monitored_channels
+    // entries against the primary team before unioning with the
+    // already-qualified attention.channels keys. Pre-fix, a tracked
+    // channel that also had a persisted cursor under the qualified
+    // key would emit two rows (a bare `bravo-team` no_anchor + a
+    // qualified `org-lanytehq/bravo-team` cursor). The bare form
+    // resolves against the primary team because that's the
+    // historical interpretation of `monitored_channels`.
+    let primary_team = state.client.primary_team_name();
+    let mut channel_keys: std::collections::BTreeSet<String> = state
+        .profile
+        .monitored_channels
+        .iter()
+        .map(|name| {
+            if name.contains('/') {
+                name.clone()
+            } else {
+                chanvoy_core::attention_key_for(primary_team, name)
+            }
+        })
+        .collect();
+    channel_keys.extend(attention.channels.keys().cloned());
+    let channels = channel_keys
         .into_iter()
-        .map(|name| match attention.channels.get(&name) {
+        .map(|key| match attention.channels.get(&key) {
             Some(cursor) => chanvoy_core::AttentionChannelEntry {
-                channel: name,
+                channel: key,
                 source: attention_source_for_channel(cursor),
                 newest_seen: cursor.last_seen_post_id.clone(),
                 updated_at: cursor.updated_at,
                 last_checked_at: cursor.last_checked_at,
             },
             None => chanvoy_core::AttentionChannelEntry {
-                channel: name,
+                channel: key,
                 source: chanvoy_core::AttentionSource::NoAnchor,
                 newest_seen: None,
                 updated_at: None,
@@ -1205,10 +1429,18 @@ async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
         newest_seen: attention.mentions.last_seen_post_id.clone(),
         updated_at: attention.mentions.updated_at,
     };
+    // PER-019 (secrev PR #17 finding #2): surface quarantined legacy
+    // records so operators can see them and disambiguate. Cloned out
+    // of the locked state for read-only display; the originals
+    // remain in attention.quarantined until an operator re-reads /
+    // re-posts via --team or <team>/<channel> to re-establish a
+    // qualified cursor.
+    let quarantined = attention.quarantined.clone();
     chanvoy_core::AttentionListResult {
         profile: state.profile.name.clone(),
         channels,
         mentions,
+        quarantined,
     }
 }
 
@@ -1216,11 +1448,27 @@ async fn attention_list(state: &AppState) -> chanvoy_core::AttentionListResult {
 /// with `source = NoAnchor` when the channel is not tracked, rather than
 /// erroring — operators asking about an untracked channel want that
 /// confirmed, not a bare error.
-async fn attention_show(state: &AppState, channel: &str) -> chanvoy_core::AttentionShowResult {
+async fn attention_show(
+    state: &AppState,
+    channel: &str,
+    team: Option<&str>,
+) -> chanvoy_core::AttentionShowResult {
+    // PER-019 (secrev PR #17 attention-surface finding, 2026-04-29):
+    // build the lookup key locally without resolving against
+    // Mattermost — `attention show` is on the strict-read-only
+    // attention prefix per PER-008B and must never make network
+    // calls. The earlier qualified_attention_key path violated that
+    // contract by going through `resolve_channel`. The local
+    // qualifier mirrors `attention_list`'s heuristic: explicit
+    // <team>/<channel> or --team wins; bare name defaults to the
+    // primary team. Bare name against a non-primary cursor returns
+    // NoAnchor — operators disambiguate via --team for cross-team
+    // inspection.
+    let key = local_attention_key(state, channel, team);
     let attention = state.attention_state.lock().await;
-    let entry = match attention.channels.get(channel) {
-        Some(cursor) => chanvoy_core::AttentionChannelEntry {
-            channel: channel.to_string(),
+    let entry = match attention.channels.get(&key).map(|c| (key.clone(), c)) {
+        Some((key, cursor)) => chanvoy_core::AttentionChannelEntry {
+            channel: key,
             source: attention_source_for_channel(cursor),
             newest_seen: cursor.last_seen_post_id.clone(),
             updated_at: cursor.updated_at,
@@ -1375,6 +1623,15 @@ impl DaemonClient {
         self.call("list_channels", serde_json::json!({})).await
     }
 
+    /// PER-019 AC #11: list channels across every team the bot is a
+    /// member of, grouped per team.
+    pub async fn list_channels_across_teams(
+        &self,
+    ) -> Result<Vec<chanvoy_core::TeamChannels>, DaemonError> {
+        self.call("list_channels_across_teams", serde_json::json!({}))
+            .await
+    }
+
     pub async fn list_dms(&self) -> Result<Vec<DmConversation>, DaemonError> {
         self.call("list_dms", serde_json::json!({})).await
     }
@@ -1385,6 +1642,7 @@ impl DaemonClient {
         since_minutes: Option<u64>,
         after_post_id: Option<String>,
         since_last_mine: bool,
+        team: Option<String>,
     ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
         self.call(
             "read_channel",
@@ -1393,6 +1651,7 @@ impl DaemonClient {
                 since_minutes,
                 after_post_id,
                 since_last_mine,
+                team,
             })?,
         )
         .await
@@ -1402,12 +1661,14 @@ impl DaemonClient {
         &self,
         channel: &str,
         after_post_id: Option<String>,
+        team: Option<String>,
     ) -> Result<CheckResult, DaemonError> {
         self.call(
             "check_channel",
             serde_json::to_value(CheckChannelParams {
                 channel: channel.to_string(),
                 after_post_id,
+                team,
             })?,
         )
         .await
@@ -1417,12 +1678,14 @@ impl DaemonClient {
         &self,
         channel: &str,
         message: &str,
+        team: Option<String>,
     ) -> Result<chanvoy_core::PostReceipt, DaemonError> {
         self.call(
             "post_message",
             serde_json::to_value(PostMessageParams {
                 channel: channel.to_string(),
                 message: message.to_string(),
+                team,
             })?,
         )
         .await
@@ -1492,12 +1755,14 @@ impl DaemonClient {
         &self,
         channel: &str,
         timeout_minutes: u64,
+        team: Option<String>,
     ) -> Result<WaitResult, DaemonError> {
         self.call(
             "wait_channel",
             serde_json::to_value(WaitChannelParams {
                 channel: channel.to_string(),
                 timeout_minutes,
+                team,
             })?,
         )
         .await
@@ -1566,11 +1831,13 @@ impl DaemonClient {
     pub async fn attention_show(
         &self,
         channel: &str,
+        team: Option<String>,
     ) -> Result<chanvoy_core::AttentionShowResult, DaemonError> {
         self.call(
             "attention_show",
             serde_json::to_value(AttentionShowParams {
                 channel: channel.to_string(),
+                team,
             })?,
         )
         .await
@@ -1670,6 +1937,47 @@ mod tests {
         }
     }
 
+    /// PER-019 (secrev PR #17 attention-surface finding, 2026-04-29):
+    /// the `local_attention_key_for` helper used by `attention show`
+    /// must build the lookup key purely from string manipulation —
+    /// no network call. This test exercises the heuristic across the
+    /// three input shapes (qualified, --team override, bare-name +
+    /// primary-team default) and asserts the expected key shape.
+    /// The fact that the helper is `fn` (not `async fn`) and takes no
+    /// network handle is itself the static guarantee; this test
+    /// pins the behavior so a future refactor can't silently
+    /// re-introduce a network call without breaking the test.
+    #[test]
+    fn secrev_pr17_attention_show_local_key_no_network() {
+        // Qualified `<team>/<channel>` passes through.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "3-leaps-operations/development", None),
+            "3-leaps-operations/development"
+        );
+        // Qualified with leading `#` on channel segment is normalized.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "3-leaps-operations/#development", None),
+            "3-leaps-operations/development"
+        );
+        // --team override wins over primary-team default.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "general", Some("3-leaps-operations")),
+            "3-leaps-operations/general"
+        );
+        // Bare name defaults to primary team (the strict-read-only
+        // trade-off: cross-team cursors require explicit
+        // disambiguation here, mirroring `attention_list`).
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "bravo-team", None),
+            "org-lanytehq/bravo-team"
+        );
+        // Leading `#` on bare name is also trimmed.
+        assert_eq!(
+            local_attention_key_for("org-lanytehq", "#bravo-team", None),
+            "org-lanytehq/bravo-team"
+        );
+    }
+
     #[test]
     fn filter_all_monitored_matches_inbound_message() {
         let event = inbound_event("per-004", false);
@@ -1677,6 +1985,80 @@ mod tests {
             &event,
             &SubscriptionFilter::AllMonitored
         ));
+    }
+
+    /// PER-019 (devrev PR #17 second-pass regression): when two
+    /// channels share a name across different teams (e.g.
+    /// `org-lanytehq/general` and `3-leaps-operations/general`),
+    /// the push-backed wait must wake only on events for the
+    /// resolved `channel_id`, never on a name-collision from the
+    /// other team. Pre-fix, the predicate compared by `channel_name`
+    /// and would wake on either; post-fix, only the matching id
+    /// wakes.
+    #[test]
+    fn devrev_pr17_finding5_wait_push_backed_filters_by_channel_id() {
+        fn payload(channel_id: &str, channel_name: &str, post_id: &str) -> InboundEventPayload {
+            InboundEventPayload {
+                profile: "test".to_string(),
+                provider: Provider::Mattermost,
+                channel_id: channel_id.to_string(),
+                channel_name: channel_name.to_string(),
+                post_id: post_id.to_string(),
+                sender_id: "u-other".to_string(),
+                sender_username: "alice".to_string(),
+                message: "hello".to_string(),
+                create_at: 2000,
+                received_at: 2001,
+                mentioned: false,
+            }
+        }
+
+        // Wait was set up for the Ops team's #general (id=ch-ops-general).
+        let wait_channel_id = "ch-ops-general";
+        let cursor_id = "p-cursor";
+        let cursor_create_at = 1000;
+        let my_user_id = "bot-bravo";
+
+        // Event from the SAME team (matching id) → wake.
+        let ops_event = payload("ch-ops-general", "general", "p-ops-1");
+        assert!(
+            inbound_event_wakes_wait(
+                &ops_event,
+                wait_channel_id,
+                cursor_id,
+                cursor_create_at,
+                my_user_id,
+            ),
+            "matching channel_id should wake the wait"
+        );
+
+        // Event from the OTHER team (same name, different id) → must NOT wake.
+        let lh_event = payload("ch-lanytehq-general", "general", "p-lh-1");
+        assert!(
+            !inbound_event_wakes_wait(
+                &lh_event,
+                wait_channel_id,
+                cursor_id,
+                cursor_create_at,
+                my_user_id,
+            ),
+            "same-named channel on a different team must not wake the wait"
+        );
+
+        // Self-authored event (matching id) → must NOT wake (existing
+        // contract; preserved by the fix).
+        let mut self_event = payload("ch-ops-general", "general", "p-self");
+        self_event.sender_id = my_user_id.to_string();
+        assert!(
+            !inbound_event_wakes_wait(
+                &self_event,
+                wait_channel_id,
+                cursor_id,
+                cursor_create_at,
+                my_user_id,
+            ),
+            "self-authored event must not wake the wait"
+        );
     }
 
     #[test]
