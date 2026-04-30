@@ -1427,6 +1427,41 @@ fn render_attention_list_text(result: &AttentionListResult) -> String {
         result.mentions.newest_seen.as_deref().unwrap_or("—"),
         format_ts(result.mentions.updated_at),
     ));
+    // PER-019 (devrev PR #17 follow-up, 2026-04-30): surface
+    // quarantined legacy cursor records in the default human output.
+    // The JSON-side fix at 3156a0a added the field to
+    // `AttentionListResult` but the renderer ignored it; quarantined
+    // records stayed invisible to operators using the default text
+    // output. Render a small section listing the original bare
+    // channel name + the ambiguous teams the migration found, so
+    // operators know which cursors need manual disambiguation via
+    // `--team` or `<team>/<channel>` on next access.
+    if !result.quarantined.is_empty() {
+        out.push_str(&format!(
+            "\nquarantined ({} record{}):\n",
+            result.quarantined.len(),
+            if result.quarantined.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ));
+        out.push_str(&format!(
+            "  {:<24} {:<40} {}\n",
+            "LEGACY_NAME", "AMBIGUOUS_TEAMS", "QUARANTINED_AT"
+        ));
+        for q in &result.quarantined {
+            out.push_str(&format!(
+                "  {:<24} {:<40} {}\n",
+                truncate(&q.legacy_channel_name, 24),
+                truncate(&q.ambiguous_teams.join(", "), 40),
+                format_ts(Some(q.quarantined_at)),
+            ));
+        }
+        out.push_str(
+            "  (re-establish per-team cursors via `--team <slug>` or `<team>/<channel>` syntax)\n",
+        );
+    }
     out
 }
 
@@ -2073,6 +2108,81 @@ mod tests {
     /// `env::remove_var` calls would otherwise race with each other and
     /// with any test that reads the same vars.
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// PER-019 (devrev PR #17 follow-up, 2026-04-30): the human
+    /// `chanvoy attention list` output must surface
+    /// `AttentionListResult.quarantined` so operators using the
+    /// default text mode see legacy cursors that the migration
+    /// couldn't bind cleanly. Pre-fix, the JSON output exposed the
+    /// field but `render_attention_list_text` ignored it.
+    #[test]
+    fn devrev_pr17_attention_list_renderer_surfaces_quarantined() {
+        use chanvoy_core::{
+            AttentionListResult, AttentionMentionEntry, AttentionSource, QuarantinedCursor,
+        };
+
+        let result = AttentionListResult {
+            profile: "bravo-devlead-lanytehq".to_string(),
+            channels: Vec::new(),
+            mentions: AttentionMentionEntry {
+                source: AttentionSource::NoAnchor,
+                newest_seen: None,
+                updated_at: None,
+            },
+            quarantined: vec![QuarantinedCursor {
+                legacy_channel_name: "general".to_string(),
+                ambiguous_teams: vec!["org-lanytehq".to_string(), "3-leaps-operations".to_string()],
+                state: chanvoy_core::ChannelCursorState::default(),
+                quarantined_at: 1_777_500_000_000,
+            }],
+        };
+
+        let rendered = render_attention_list_text(&result);
+
+        assert!(
+            rendered.contains("quarantined (1 record):"),
+            "renderer must surface quarantined section header. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("LEGACY_NAME"),
+            "renderer must include the column header. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("general"),
+            "renderer must include the legacy channel name. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("org-lanytehq") && rendered.contains("3-leaps-operations"),
+            "renderer must list both ambiguous teams. got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("--team") || rendered.contains("<team>/<channel>"),
+            "renderer must point operators at the disambiguation syntax. got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn devrev_pr17_attention_list_renderer_omits_quarantined_when_empty() {
+        // Symmetric: if there are no quarantined entries, the section
+        // is omitted entirely (no spurious empty header).
+        use chanvoy_core::{AttentionListResult, AttentionMentionEntry, AttentionSource};
+
+        let result = AttentionListResult {
+            profile: "bravo-devlead-lanytehq".to_string(),
+            channels: Vec::new(),
+            mentions: AttentionMentionEntry {
+                source: AttentionSource::NoAnchor,
+                newest_seen: None,
+                updated_at: None,
+            },
+            quarantined: Vec::new(),
+        };
+        let rendered = render_attention_list_text(&result);
+        assert!(
+            !rendered.contains("quarantined"),
+            "no quarantined section when the vec is empty. got:\n{rendered}"
+        );
+    }
 
     #[test]
     fn identity_uses_lanyte_chat_shape() {
