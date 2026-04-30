@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PER-019 attention list human renderer (devrev PR #17 follow-up,
+  2026-04-30).** The JSON-side fix at `3156a0a` added `quarantined`
+  to `AttentionListResult`, but `render_attention_list_text` ignored
+  it — operators using the default text mode for `chanvoy attention
+  list` couldn't see quarantined records without reaching for
+  `--json`. Renderer now emits a `quarantined (N record(s)):`
+  section with `LEGACY_NAME / AMBIGUOUS_TEAMS / QUARANTINED_AT`
+  columns plus a hint at the `--team` / `<team>/<channel>`
+  disambiguation syntax.
 - **PER-019 review fixes (devrev PR #17, 2026-04-28).** Four behavior-
   coverage gaps closed:
   - `chanvoy check --team` and `chanvoy wait --team` now thread the
