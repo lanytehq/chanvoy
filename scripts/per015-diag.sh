@@ -477,6 +477,15 @@ run_probes() {
 
 # -- run probes (once for observe; twice for fresh-spawn) ------------------
 
+# devrev PR #18 finding #5: track whether the fresh-spawn actually
+# completed so the verdict logic can distinguish "no daemon ever
+# expected" (observe mode) from "spawn just ran and should have
+# produced a live pid" (post-spawn). Without this, a missing pid
+# file post-spawn falls through to insufficient_visibility instead
+# of the pid_dead_or_missing_after_spawn lifecycle verdict — exactly
+# the failure shape the binding diagnostic needs to surface.
+FRESH_SPAWN_EXECUTED="false"
+
 if [[ "$MODE" == "fresh-spawn" && "$PHASE" == "A" ]]; then
 	# devrev PR #18 finding #1: capture pre-spawn state for diagnostic
 	# record only, then perform scoped teardown + auto-setup, then
@@ -501,6 +510,7 @@ if [[ "$MODE" == "fresh-spawn" && "$PHASE" == "A" ]]; then
 		emit_kv "fresh_spawn_target_binary" "$DAEMON_BIN_PATH"
 		probe "stop_daemon" "$CHANVOY" "${PROFILE_ARGS[@]}" daemon stop
 		probe "auto_setup" "$CHANVOY" "${PROFILE_ARGS[@]}" auto-setup
+		FRESH_SPAWN_EXECUTED="true"
 		emit_kv "fresh_spawn_executed" "true"
 
 		# devrev PR #18 finding #1: re-run the full probe block so
@@ -534,9 +544,23 @@ elif [[ "$PID_ALIVE" == "true" && "$SOCK_REACHABLE" == "true" ]]; then
 elif [[ "$PID_ALIVE" == "true" && "$SOCK_REACHABLE" == "false" ]]; then
 	VERDICT="same_namespace_pid_alive_socket_unreachable"
 	emit_kv "verdict_reason" "daemon process alive but UDS unreachable; investigate socket access/permissions, not lifetime"
+elif [[ "$FRESH_SPAWN_EXECUTED" == "true" && "$PID_ALIVE" != "true" ]]; then
+	# devrev PR #18 finding #5: post-fresh-spawn we expect a live pid
+	# (auto-setup just succeeded). Anything else — pid file missing,
+	# pid file present but process gone — is the lifecycle/detach
+	# failure verdict, not insufficient_visibility. The reason field
+	# distinguishes the two sub-cases for operator clarity.
+	VERDICT="pid_dead_or_missing_after_spawn"
+	if [[ -z "$PID_VALUE" ]]; then
+		emit_kv "verdict_reason" "fresh-spawn executed (auto-setup ran) but post-spawn pid file is missing; daemon did not establish a pid — actual lifecycle/detach failure candidate"
+	elif [[ "$PID_ALIVE" == "false" ]]; then
+		emit_kv "verdict_reason" "fresh-spawn executed but post-spawn pid is dead; daemon spawned and exited — actual lifecycle/detach failure candidate"
+	else
+		emit_kv "verdict_reason" "fresh-spawn executed but post-spawn pid liveness unknown (PS may be blocked); treating as lifecycle failure for binding diagnostic"
+	fi
 elif [[ "$PID_ALIVE" == "false" ]]; then
 	VERDICT="pid_dead_or_missing_after_spawn"
-	emit_kv "verdict_reason" "pid file present but process not alive (or pid file missing); actual lifecycle/detach failure candidate"
+	emit_kv "verdict_reason" "pid file present but process not alive; actual lifecycle/detach failure candidate"
 elif [[ "$PS_AVAILABLE" == "false" ]]; then
 	VERDICT="insufficient_visibility"
 	emit_kv "verdict_reason" "ps blocked by sandbox; cannot determine pid liveness"

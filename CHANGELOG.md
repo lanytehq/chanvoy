@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fresh-spawn teardown logs the target's full identity (profile +
     socket + pid + binary) before stop, scoped strictly to the
     resolved profile.
+  - **PR #18 second-pass (devrev re-review):** post-spawn missing pid
+    file now classifies as `pid_dead_or_missing_after_spawn`, not
+    `insufficient_visibility`. New `FRESH_SPAWN_EXECUTED` flag tracks
+    whether the spawn actually ran; verdict treats post-spawn
+    `PID_ALIVE != true` as the lifecycle verdict regardless of whether
+    the pid file is missing OR the pid is dead. Reason field
+    distinguishes the two sub-cases. Pre-fix, missing-pid-file post
+    auto-setup fell through to `insufficient_visibility` — exactly
+    the failure shape the binding diagnostic needs to surface
+    cleanly.
 - **PER-015 Phase 1: `scripts/per015-diag.sh` diagnostic harness.** Investigation
   tool for the "auto-setup succeeds but later `chanvoy read` fails with
   `Daemon(NotRunning)`" failure mode. Captures runtime-dir / profile /
