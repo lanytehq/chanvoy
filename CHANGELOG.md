@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **PER-015 Phase 1 review fixes (devrev PR #18, 2026-05-01).** Four
+  follow-on fixes from devrev's review of the harness:
+  - Fresh-spawn mode now re-runs every probe (status / paths / pid /
+    binary / ps) after `auto-setup` so the verdict reflects the
+    daemon the spawn actually created. Pre-fix, the verdict computed
+    from the pre-teardown snapshot — wrong direction for the binding
+    diagnostic. Probe block factored into a `run_probes` function
+    that takes a section label so the same code drives observe-mode
+    and both pre/post-spawn passes in fresh-spawn mode.
+  - Process-detail capture now includes `sess` (session id) so
+    reviewers can verify the PER-008D `setsid` contract held in the
+    observed environment (a daemon whose SESS == PID is its own
+    session leader; SESS != PID indicates the new-session step
+    didn't take effect).
+  - New `--compare A.log B.log` cross-phase mode emits
+    `runtime_or_profile_mismatch` (or `same_namespace_across_phases`)
+    by diffing the two logs' resolved_profile / runtime_dir /
+    socket_path / pid_path fields. Pre-fix, the per-phase verdict
+    taxonomy advertised that classification but no code path emitted
+    it — operators would have had to eyeball the diff manually.
+  - Fresh-spawn teardown logs the target's full identity (profile +
+    socket + pid + binary) before stop, scoped strictly to the
+    resolved profile.
 - **PER-015 Phase 1: `scripts/per015-diag.sh` diagnostic harness.** Investigation
   tool for the "auto-setup succeeds but later `chanvoy read` fails with
   `Daemon(NotRunning)`" failure mode. Captures runtime-dir / profile /
