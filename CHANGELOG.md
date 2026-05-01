@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
+
+- **PER-015 Phase 1: `scripts/per015-diag.sh` diagnostic harness.** Investigation
+  tool for the "auto-setup succeeds but later `chanvoy read` fails with
+  `Daemon(NotRunning)`" failure mode. Captures runtime-dir / profile /
+  socket / pid-liveness / process-table / binary-identity state at one
+  invocation; designed for two-shot use (`phase=A` after auto-setup,
+  `phase=B` at the failing call) so namespace drift is diff-able.
+  Two modes: `--mode observe` (default; no teardown — safe) and
+  `--mode fresh-spawn` (binding-verdict mode: scoped `daemon stop` →
+  `auto-setup` → re-probe). Emits a stable `VERDICT=` field per the
+  six-state taxonomy entarch + secrev pinned. Output written to
+  `~/.cache/chanvoy-per015-diag/<timestamp>/` mode 0700, file mode
+  0600. Env captures redact `TOKEN|SECRET|KEY|PASSWORD|AUTH|COOKIE|SESSION`
+  patterns to name + length only — no hashes (per secrev: avoid
+  reusable fingerprint). Investigation-tool only; no chanvoy CLI
+  surface change, no version bump, no rust code touched.
 
 - **PER-019 attention list human renderer (devrev PR #17 follow-up,
   2026-04-30).** The JSON-side fix at `3156a0a` added `quarantined`
