@@ -7,7 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
+
+- **PER-015 Phase 1 review fixes (devrev PR #18, 2026-05-01).** Four
+  follow-on fixes from devrev's review of the harness:
+  - Fresh-spawn mode now re-runs every probe (status / paths / pid /
+    binary / ps) after `auto-setup` so the verdict reflects the
+    daemon the spawn actually created. Pre-fix, the verdict computed
+    from the pre-teardown snapshot — wrong direction for the binding
+    diagnostic. Probe block factored into a `run_probes` function
+    that takes a section label so the same code drives observe-mode
+    and both pre/post-spawn passes in fresh-spawn mode.
+  - Process-detail capture now includes `sess` (session id) so
+    reviewers can verify the PER-008D `setsid` contract held in the
+    observed environment (a daemon whose SESS == PID is its own
+    session leader; SESS != PID indicates the new-session step
+    didn't take effect).
+  - New `--compare A.log B.log` cross-phase mode emits
+    `runtime_or_profile_mismatch` (or `same_namespace_across_phases`)
+    by diffing the two logs' resolved_profile / runtime_dir /
+    socket_path / pid_path fields. Pre-fix, the per-phase verdict
+    taxonomy advertised that classification but no code path emitted
+    it — operators would have had to eyeball the diff manually.
+  - Fresh-spawn teardown logs the target's full identity (profile +
+    socket + pid + binary) before stop, scoped strictly to the
+    resolved profile.
+  - **PR #18 second-pass (devrev re-review):** post-spawn missing pid
+    file now classifies as `pid_dead_or_missing_after_spawn`, not
+    `insufficient_visibility`. New `FRESH_SPAWN_EXECUTED` flag tracks
+    whether the spawn actually ran; verdict treats post-spawn
+    `PID_ALIVE != true` as the lifecycle verdict regardless of whether
+    the pid file is missing OR the pid is dead. Reason field
+    distinguishes the two sub-cases. Pre-fix, missing-pid-file post
+    auto-setup fell through to `insufficient_visibility` — exactly
+    the failure shape the binding diagnostic needs to surface
+    cleanly.
+- **PER-015 Phase 1: `scripts/per015-diag.sh` diagnostic harness.** Investigation
+  tool for the "auto-setup succeeds but later `chanvoy read` fails with
+  `Daemon(NotRunning)`" failure mode. Captures runtime-dir / profile /
+  socket / pid-liveness / process-table / binary-identity state at one
+  invocation; designed for two-shot use (`phase=A` after auto-setup,
+  `phase=B` at the failing call) so namespace drift is diff-able.
+  Two modes: `--mode observe` (default; no teardown — safe) and
+  `--mode fresh-spawn` (binding-verdict mode: scoped `daemon stop` →
+  `auto-setup` → re-probe). Emits a stable `VERDICT=` field per the
+  six-state taxonomy entarch + secrev pinned. Output written to
+  `~/.cache/chanvoy-per015-diag/<timestamp>/` mode 0700, file mode
+  0600. Env captures redact `TOKEN|SECRET|KEY|PASSWORD|AUTH|COOKIE|SESSION`
+  patterns to name + length only — no hashes (per secrev: avoid
+  reusable fingerprint). Investigation-tool only; no chanvoy CLI
+  surface change, no version bump, no rust code touched.
 
 - **PER-019 attention list human renderer (devrev PR #17 follow-up,
   2026-04-30).** The JSON-side fix at `3156a0a` added `quarantined`
