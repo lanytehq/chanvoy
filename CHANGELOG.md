@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-02
+
+### Release highlights
+
+The local-mode polish push is functionally complete. v0.2.0 bundles
+**PER-014** (sandbox-aware daemon startup), **PER-019** (cross-team
+channel resolution), and **PER-015 Phase 1** (diagnostic harness for
+the daemon-startup / namespace-drift failure family).
+
+Net operator impact:
+- `chanvoy auto-setup` now works end-to-end under sandbox restrictions
+  (Codex agents, macOS sandboxd, Docker without `--network`, OSS
+  sandbox setups). The detached daemon no longer needs network at
+  startup — identity validation moved into the parent CLI.
+- Channel-name resolution finds channels across every team the bot
+  is a member of, not just the profile's primary team. Closes the
+  silent-404 cross-team posting gap. Explicit `<team>/<channel>` and
+  `--team <slug>` overrides are available; ambiguity refuses with
+  clear disambiguation guidance.
+- Cursor isolation: same-named channels on different teams maintain
+  independent state. Pre-PER-019 records migrate automatically;
+  ambiguous historical names quarantine rather than silently bind.
+- Diagnostic harness `scripts/per015-diag.sh` ships as a forensic
+  tool for any future regression in the daemon-startup family.
+- PER-015 itself was investigated and **scope-collapsed to done** —
+  no Phase 2 implementation needed; the post-PER-014/PER-019
+  baseline resolves the originally-observed failure.
+
+No breaking CLI surface change vs 0.1.x. Profile/state files from
+0.1.x load forward via `#[serde(default)]` migration. New public
+chanvoy-core API: `ResolvedChannel`, `ResolutionSource`, `TeamInfo`,
+`TeamChannels`, `MigrationOutcome`, `QuarantinedCursor`,
+`attention_key_for`, `migrate_attention_state`, plus new error
+variants `ChannelNotFoundInAnyTeam`, `NotAMemberOfTeam`,
+`AmbiguousChannel`, `BootstrapHandoffFailed`.
+
+To upgrade: `make install`, then `chanvoy daemon stop` and
+`chanvoy auto-setup` to cycle any running daemon onto the new binary.
+
 ### Added
 
 - **PER-015 Phase 1 review fixes (devrev PR #18, 2026-05-01).** Four
@@ -219,10 +258,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the previous stale-daemon-respawn semantics that local-only ping
   alone would have masked.
 
-## [0.1.2] - 2026-04-27
-
-### Added
-
 - **PER-014: sandbox-aware daemon startup via pre-detach identity bootstrap.**
   `chanvoy auto-setup` now succeeds in sandboxed agent contexts (Codex,
   macOS sandboxd, Docker without `--network`, OSS sandbox setups) without
@@ -332,6 +367,7 @@ session-survival, hash-chained reconnect-health surface. Pre-this-changelog
 shipping history is captured in git log and the per-task briefs under
 `lanyte-productbook-internal/content/projmgmt/peers/`.
 
-[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lanytehq/chanvoy/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/lanytehq/chanvoy/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lanytehq/chanvoy/releases/tag/v0.1.0
