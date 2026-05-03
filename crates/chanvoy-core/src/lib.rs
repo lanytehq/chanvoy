@@ -437,10 +437,36 @@ pub struct JsonRpcResponse {
 pub struct ReadChannelParams {
     pub channel: String,
     pub since_minutes: Option<u64>,
+    /// PER-023: time window in seconds (resolution upgrade for `30s`/`5m`/
+    /// `4h`/`2d` suffix support). Daemon prefers `since_secs` over
+    /// `since_minutes` when both are present; the CLI emits seconds for
+    /// new invocations and `since_minutes` is retained only so a freshly
+    /// upgraded daemon can still decode requests from a not-yet-upgraded
+    /// CLI peer in flight on the same machine.
+    #[serde(default)]
+    pub since_secs: Option<u64>,
     #[serde(default)]
     pub after_post_id: Option<String>,
     #[serde(default)]
     pub since_last_mine: bool,
+    /// PER-023 Scope §2 (settled in productbook PR #47): bounded most-recent-N
+    /// posts (default N=50; `--limit` overrides). Mode-independent of the
+    /// `--since`/`--after`/`--since-last-mine` chain; mutually exclusive
+    /// with them at the CLI layer.
+    #[serde(default)]
+    pub since_bootstrap: bool,
+    /// PER-023 Scope §2 + AC #2a: hard cap on the existing read-mode
+    /// result set. Daemon truncates the post list returned by the chosen
+    /// read mode to at most `limit` entries; PER-023 explicitly does NOT
+    /// add full-window pagination semantics. CLI rejects bare
+    /// `read --limit N` (no read-mode flag) before reaching the daemon.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// PER-023 Scope §4 + AC #4: when set, daemon advances the channel
+    /// attention cursor to the latest post **returned** by this read
+    /// (mode-independent rule). No-op when zero posts are returned.
+    #[serde(default)]
+    pub advance: bool,
     /// PER-019: optional `--team <slug>` override for cross-team
     /// disambiguation. Per-invocation only (no profile-level toggle).
     #[serde(default)]
@@ -471,6 +497,10 @@ pub struct ReadDirectMessageParams {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotificationsParams {
     pub since_minutes: Option<u64>,
+    /// PER-023: time window in seconds. Daemon prefers `since_secs` over
+    /// `since_minutes` when both are present.
+    #[serde(default)]
+    pub since_secs: Option<u64>,
     #[serde(default)]
     pub unread_only: bool,
 }
@@ -491,6 +521,36 @@ pub struct AttentionShowParams {
     /// PER-019: optional `--team <slug>` override.
     #[serde(default)]
     pub team: Option<String>,
+}
+
+/// PER-023 primitive 1: parameters for `chanvoy pinned <channel>`. Pure
+/// read; daemon does not advance any cursor regardless of result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinnedChannelParams {
+    pub channel: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-023 primitive 4: parameters for `chanvoy ack <channel>`. Daemon
+/// fetches the channel's current latest post id (without surfacing
+/// content) and advances the attention cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AckChannelParams {
+    pub channel: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-023 primitive 4: outcome of an `ack` call. Carries the resolved
+/// channel + the cursor target so JSON consumers can confirm what was
+/// ack'd. `cursor_post_id == None` means the channel had no posts —
+/// cursor is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AckResult {
+    pub channel: String,
+    pub team: String,
+    pub cursor_post_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -761,6 +821,10 @@ pub struct NotifyParams {
 pub struct WaitChannelParams {
     pub channel: String,
     pub timeout_minutes: u64,
+    /// PER-023: timeout in seconds. Daemon prefers `timeout_secs` over
+    /// `timeout_minutes` when set.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// PER-019: optional `--team <slug>` override.
     #[serde(default)]
     pub team: Option<String>,
@@ -1441,6 +1505,246 @@ pub fn minutes_ago_millis(minutes: u64) -> i64 {
     now_unix_millis() - Duration::from_secs(minutes * 60).as_millis() as i64
 }
 
+pub fn seconds_ago_millis(seconds: u64) -> i64 {
+    now_unix_millis() - Duration::from_secs(seconds).as_millis() as i64
+}
+
+/// PER-023: which unit applies when an operator passes a bare integer
+/// (no suffix) to a time-window flag. Matches the per-flag semantics
+/// shipped before PER-023 — bare integer preserves today's behavior so
+/// existing `--since 30` / `--timeout 10` invocations continue to work
+/// unchanged. `30m` / `10m` is the preferred new shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeWindowDefaultUnit {
+    /// Bare integer = minutes. Used by `read --since`,
+    /// `notifications --since`, `wait --timeout`.
+    Minutes,
+    /// Bare integer = seconds. Reserved for future flags where
+    /// sub-minute resolution is the natural default.
+    Seconds,
+}
+
+/// Help-text disclosure for any flag that takes a time-window value.
+/// Per PER-023 Scope §3 + AC #3 the help text MUST disclose both the
+/// accepted-suffix list and the rejected-suffix list explicitly so
+/// operators don't hit silent unit-confusion footguns. Embed via clap's
+/// `#[arg(long_help = ...)]` on the flag definition.
+pub const TIME_WINDOW_SUFFIX_HELP: &str = "\
+Accepted suffixes: s (seconds), m (minutes), h (hours), d (days). \
+Bare integer (no suffix) preserves today's per-flag default unit. \
+Rejected with diagnostic: uppercase 'M' and 'mo' (months/minutes ambiguity \
+given chanvoy's existing minutes-default).";
+
+/// PER-023 Scope §3 (settled in productbook PR #47): parse a time-window
+/// string into seconds, applying the per-flag default unit to bare
+/// integers.
+///
+/// Accepted suffixes: `s` / `m` / `h` / `d`. Bare integer (no suffix)
+/// preserves today's per-flag semantics. Uppercase `M` and `mo` are
+/// rejected with diagnostics naming the ambiguity — loud failure on
+/// ambiguous-intent input is consistent with the brief's other contract
+/// edges (e.g., bare `read --limit N` rejection); reject-then-relax
+/// preserves optionality if a future brief introduces months as a
+/// distinct unit.
+pub fn parse_time_window(input: &str, default_unit: TimeWindowDefaultUnit) -> Result<u64, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "empty time-window value; {TIME_WINDOW_SUFFIX_HELP}"
+        ));
+    }
+    // `mo` (months) — rejected upfront so a typo doesn't silently parse
+    // as minutes. Lowercase comparison so `MO`, `Mo`, `mO` all hit.
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with("mo") {
+        return Err(format!(
+            "time-window value {trimmed:?} uses 'mo' suffix; rejected to avoid \
+             month/minute ambiguity given chanvoy's existing minutes-default. \
+             Months are not supported today; use s/m/h/d for sub-month windows."
+        ));
+    }
+    let last = trimmed
+        .chars()
+        .last()
+        .expect("trimmed is non-empty per check above");
+    let (num_str, multiplier_secs): (&str, u64) = if last.is_ascii_digit() {
+        let multiplier = match default_unit {
+            TimeWindowDefaultUnit::Minutes => 60,
+            TimeWindowDefaultUnit::Seconds => 1,
+        };
+        (trimmed, multiplier)
+    } else if last == 'M' {
+        return Err(format!(
+            "time-window value {trimmed:?} uses uppercase 'M' suffix; rejected \
+             to avoid month/minute ambiguity. Use lowercase 'm' for minutes."
+        ));
+    } else {
+        let suffix_start = trimmed.len() - last.len_utf8();
+        let suffix = &trimmed[suffix_start..];
+        let multiplier = match suffix {
+            "s" => 1u64,
+            "m" => 60,
+            "h" => 3600,
+            "d" => 86400,
+            other => {
+                return Err(format!(
+                    "time-window value {trimmed:?} has unknown suffix {other:?}; \
+                     {TIME_WINDOW_SUFFIX_HELP}"
+                ));
+            }
+        };
+        (&trimmed[..suffix_start], multiplier)
+    };
+    let n: u64 = num_str.parse().map_err(|err| {
+        format!("time-window value {trimmed:?} contains invalid integer {num_str:?}: {err}")
+    })?;
+    n.checked_mul(multiplier_secs).ok_or_else(|| {
+        format!(
+            "time-window value {trimmed:?} overflows u64 seconds (max ≈ \
+             5.84e11 years; pick a saner window)"
+        )
+    })
+}
+
+#[cfg(test)]
+mod time_window_tests {
+    use super::*;
+
+    #[test]
+    fn bare_integer_minutes_default() {
+        assert_eq!(
+            parse_time_window("30", TimeWindowDefaultUnit::Minutes).unwrap(),
+            30 * 60
+        );
+        assert_eq!(
+            parse_time_window("0", TimeWindowDefaultUnit::Minutes).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bare_integer_seconds_default() {
+        assert_eq!(
+            parse_time_window("30", TimeWindowDefaultUnit::Seconds).unwrap(),
+            30
+        );
+    }
+
+    #[test]
+    fn suffix_seconds() {
+        assert_eq!(
+            parse_time_window("30s", TimeWindowDefaultUnit::Minutes).unwrap(),
+            30
+        );
+    }
+
+    #[test]
+    fn suffix_minutes_lowercase() {
+        assert_eq!(
+            parse_time_window("5m", TimeWindowDefaultUnit::Minutes).unwrap(),
+            5 * 60
+        );
+    }
+
+    #[test]
+    fn suffix_hours() {
+        assert_eq!(
+            parse_time_window("4h", TimeWindowDefaultUnit::Minutes).unwrap(),
+            4 * 3600
+        );
+    }
+
+    #[test]
+    fn suffix_days() {
+        assert_eq!(
+            parse_time_window("2d", TimeWindowDefaultUnit::Minutes).unwrap(),
+            2 * 86400
+        );
+    }
+
+    #[test]
+    fn uppercase_m_rejected() {
+        let err = parse_time_window("30M", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(
+            err.contains("uppercase 'M'"),
+            "diagnostic should name the ambiguity, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mo_lowercase_rejected() {
+        let err = parse_time_window("3mo", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(
+            err.contains("'mo'"),
+            "diagnostic should name 'mo' suffix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mo_uppercase_rejected() {
+        let err = parse_time_window("3MO", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("'mo'"));
+    }
+
+    #[test]
+    fn mo_mixed_case_rejected() {
+        for variant in ["3Mo", "3mO"] {
+            let err = parse_time_window(variant, TimeWindowDefaultUnit::Minutes).unwrap_err();
+            assert!(
+                err.to_ascii_lowercase().contains("'mo'"),
+                "variant {variant} should reject as months suffix; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_rejected() {
+        let err = parse_time_window("", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn unknown_suffix_rejected() {
+        let err = parse_time_window("5w", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(err.contains("unknown suffix"), "got: {err}");
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(
+            parse_time_window("  5m  ", TimeWindowDefaultUnit::Minutes).unwrap(),
+            5 * 60
+        );
+    }
+
+    #[test]
+    fn invalid_integer_with_known_suffix_rejected() {
+        let err = parse_time_window("foo5m", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(
+            err.contains("invalid integer"),
+            "diagnostic should name invalid integer; got: {err}"
+        );
+    }
+
+    #[test]
+    fn purely_alphabetic_rejected() {
+        // "foo" has no digits and 'o' is an unknown suffix; either
+        // diagnostic is acceptable so long as we loud-fail.
+        let err = parse_time_window("foo", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(
+            err.contains("unknown suffix") || err.contains("invalid integer"),
+            "diagnostic should loud-fail on non-numeric input; got: {err}"
+        );
+    }
+
+    #[test]
+    fn overflow_rejected() {
+        let err =
+            parse_time_window("99999999999999999999d", TimeWindowDefaultUnit::Minutes).unwrap_err();
+        assert!(err.contains("invalid integer") || err.contains("overflow"));
+    }
+}
+
 /// PER-019: cross-team channel resolution outcome.
 ///
 /// Internal callers that need the team-id (e.g., for cursor metadata,
@@ -2034,6 +2338,131 @@ impl MattermostClient {
             .collect();
         posts.sort_by_key(|message| message.create_at);
         Ok(posts)
+    }
+
+    /// PER-023 primitive 3: read with second-resolution time window.
+    /// Resolves the channel via the γ hybrid resolver (PER-019), then hits
+    /// MM `/channels/{id}/posts?since={millis}` directly so suffixes like
+    /// `30s` aren't lossily rounded up to a full minute.
+    pub async fn read_channel_since_secs(
+        &self,
+        channel_name: &str,
+        since_secs: u64,
+        team: Option<&str>,
+    ) -> Result<Vec<Message>, CoreError> {
+        let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
+        let since = seconds_ago_millis(since_secs);
+        self.read_channel_by_id_since_millis(&channel_id, since)
+            .await
+    }
+
+    /// PER-023 primitive 1: fetch the channel's pinned posts via MM
+    /// `GET /api/v4/channels/{id}/pinned_posts`. Pure read, no cursor side
+    /// effects (mirrors the operator-facing pinned-as-context contract).
+    /// Resolves via the γ hybrid resolver (PER-019); accepts
+    /// `<team>/<channel>` syntax and the `--team` override.
+    pub async fn read_channel_pinned(
+        &self,
+        channel_name: &str,
+        team: Option<&str>,
+    ) -> Result<Vec<Message>, CoreError> {
+        let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
+        #[derive(Deserialize)]
+        struct RawPost {
+            id: String,
+            user_id: String,
+            message: String,
+            create_at: i64,
+            username: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PostsResponse {
+            #[serde(default)]
+            posts: BTreeMap<String, RawPost>,
+        }
+        let response: PostsResponse = self
+            .request(
+                "GET",
+                &format!("/channels/{channel_id}/pinned_posts"),
+                None::<Value>,
+            )
+            .await?;
+        let mut posts: Vec<Message> = response
+            .posts
+            .into_values()
+            .map(|post| Message {
+                id: post.id,
+                user_id: post.user_id,
+                username: post.username.unwrap_or_else(|| "unknown".to_string()),
+                message: post.message,
+                create_at: post.create_at,
+            })
+            .collect();
+        posts.sort_by_key(|message| message.create_at);
+        Ok(posts)
+    }
+
+    /// PER-023 primitive 2: bounded most-recent-N posts. Maps the
+    /// `--since-bootstrap` operator surface onto MM
+    /// `GET /channels/{id}/posts?per_page=N` (descending order). Resolves
+    /// via γ hybrid; no cursor side effects unless the daemon RPC layer
+    /// applies `--advance` after.
+    pub async fn read_channel_most_recent(
+        &self,
+        channel_name: &str,
+        limit: u32,
+        team: Option<&str>,
+    ) -> Result<Vec<Message>, CoreError> {
+        let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
+        #[derive(Deserialize)]
+        struct RawPost {
+            id: String,
+            user_id: String,
+            message: String,
+            create_at: i64,
+            username: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PostsResponse {
+            posts: BTreeMap<String, RawPost>,
+        }
+        let response: PostsResponse = self
+            .request(
+                "GET",
+                &format!("/channels/{channel_id}/posts?per_page={limit}"),
+                None::<Value>,
+            )
+            .await?;
+        let mut posts: Vec<Message> = response
+            .posts
+            .into_values()
+            .map(|post| Message {
+                id: post.id,
+                user_id: post.user_id,
+                username: post.username.unwrap_or_else(|| "unknown".to_string()),
+                message: post.message,
+                create_at: post.create_at,
+            })
+            .collect();
+        posts.sort_by_key(|message| message.create_at);
+        Ok(posts)
+    }
+
+    /// PER-023 primitive 4: fetch the channel's current latest post id
+    /// without surfacing the content. Used by `chanvoy ack <channel>` to
+    /// advance the attention cursor to the channel's current latest.
+    /// Returns `None` for empty channels (channel exists, no posts yet).
+    /// Delegates to `read_channel_most_recent` with `per_page=1` — MM's
+    /// channel-meta endpoint returns `last_post_at` but not the post id,
+    /// so the most-recent-post fetch is the single round-trip that gives
+    /// us the id directly.
+    pub async fn channel_last_post_id(
+        &self,
+        channel_name: &str,
+        team: Option<&str>,
+    ) -> Result<Option<String>, CoreError> {
+        let recent = self.read_channel_most_recent(channel_name, 1, team).await?;
+        Ok(recent.into_iter().next_back().map(|m| m.id))
     }
 
     pub async fn post_message_by_id(
