@@ -150,10 +150,13 @@ Run these in order when joining a long-running channel:
    30 seconds); `chanvoy read --since 30s` is precise. Use `read` when
    sub-minute precision matters.
 
-   **`notifications --unread` ignores `--since` entirely.** It counts
-   unread mentions since the stored anchor cursor, not since a time
-   window. The `--since` flag is silently unused on this branch
-   (pre-PER-023 behavior; documented here for clarity).
+   **`notifications --unread` does not use `--since` for counting.**
+   The unread branch counts mentions since the stored anchor cursor,
+   not since a time window. The supplied `--since` value is still
+   parsed and validated for shape (so a malformed suffix on either
+   path still rejects loudly with the same diagnostic), but the parsed
+   window is not consumed on the unread path. Pre-PER-023 behavior;
+   documented here for clarity.
 
 Worked example, walking into a fresh channel:
 

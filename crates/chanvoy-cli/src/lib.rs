@@ -216,16 +216,22 @@ struct ReadWindowArgs {
     /// `30s`) round up to the next whole minute because the underlying
     /// MM notifications surface is minute-keyed. For second-precise
     /// time windows, use `chanvoy read --since` (millisecond precision
-    /// against MM `posts?since=`). `--unread` ignores this flag
-    /// entirely.
+    /// against MM `posts?since=`).
+    ///
+    /// `--unread` interaction: this value is still parsed and
+    /// validated (a malformed suffix on either path still rejects
+    /// loudly), but the parsed window is not used for `--unread`
+    /// counts — those count since the stored anchor cursor instead.
     #[arg(
         long,
         default_value = "1440",
-        long_help = "Time window for notifications. Bare integer = minutes (today's default; default 1440 = 24h). Accepted suffixes: s/m/h/d. Rejected: uppercase 'M', 'mo'. Resolution: minute-rounded (sub-minute suffixes round up to the next whole minute; the underlying MM notifications surface is minute-keyed). --unread ignores --since entirely (counts since stored anchor cursor)."
+        long_help = "Time window for notifications. Bare integer = minutes (today's default; default 1440 = 24h). Accepted suffixes: s/m/h/d. Rejected: uppercase 'M', 'mo'. Resolution: minute-rounded (sub-minute suffixes round up to the next whole minute; the underlying MM notifications surface is minute-keyed). --unread interaction: the value is still parsed/validated (malformed suffix rejects loudly on either path), but the parsed window is not used for --unread counts (those count since the stored anchor cursor)."
     )]
     since: String,
-    /// Filter to unread mentions only. **Ignores `--since`** — counts
-    /// since the stored anchor cursor, not since a time window.
+    /// Filter to unread mentions only. The parsed `--since` value is
+    /// unused on this branch — unread counts run from the stored
+    /// anchor cursor, not from a time window. (`--since` is still
+    /// parsed/validated for shape, so malformed suffixes reject.)
     #[arg(long)]
     unread: bool,
 }
