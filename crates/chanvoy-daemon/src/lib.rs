@@ -8,14 +8,15 @@ use std::{env, fs, io};
 use chanvoy_core::{
     daemon_event_to_notification, load_attention_state, load_profile, load_token, now_unix_millis,
     pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile, store_attention_state,
-    AddMemberParams, ArchiveChannelParams, AttentionShowParams, AttentionState, CapabilityClass,
-    Channel, CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent,
-    DaemonEventKind, DaemonEventPayloadInner, DaemonHealth, DaemonStatus, DirectMessageParams,
-    DmConversation, EventBus, IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    MattermostClient, MattermostWs, NotificationsParams, NotifyParams, PostMessageParams, Profile,
-    ProfileStatus, Provider, ReadChannelParams, ReadDirectMessageParams, ShutdownResult,
-    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnreadNotifications, UnsubscribeParams,
-    WaitChannelParams, WaitResult, WsState,
+    AckChannelParams, AckResult, AddMemberParams, ArchiveChannelParams, AttentionShowParams,
+    AttentionState, CapabilityClass, Channel, CheckChannelParams, CheckResult, CoreError,
+    CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, DaemonHealth,
+    DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
+    NotifyParams, PinnedChannelParams, PostMessageParams, Profile, ProfileStatus, Provider,
+    ReadChannelParams, ReadDirectMessageParams, ShutdownResult, SubscribeParams, SubscriptionAck,
+    SubscriptionFilter, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult,
+    WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -581,22 +582,92 @@ async fn dispatch_request(
             .map_err(DaemonError::from),
         "read_channel" => parse_and_call(&request.params, |params: ReadChannelParams| async move {
             let team = params.team.as_deref();
-            if let Some(after_post_id) = params.after_post_id {
+            // PER-023 Scope §2 + AC #2a: bootstrap mode hits MM directly
+            // for bounded-most-recent-N posts (default N=50, --limit
+            // override). Mode-independent of --since/--after/etc.; CLI
+            // enforces mutual exclusion.
+            let mut messages = if params.since_bootstrap {
+                let limit = params.limit.unwrap_or(50);
+                state
+                    .client
+                    .read_channel_most_recent(&params.channel, limit, team)
+                    .await?
+            } else if let Some(after_post_id) = params.after_post_id {
                 state
                     .client
                     .read_channel_after(&params.channel, &after_post_id, team)
-                    .await
+                    .await?
             } else if params.since_last_mine {
                 state
                     .client
                     .read_channel_since_last_mine(&params.channel, team)
-                    .await
+                    .await?
+            } else if let Some(secs) = params.since_secs {
+                state
+                    .client
+                    .read_channel_since_secs(&params.channel, secs, team)
+                    .await?
             } else {
                 state
                     .client
                     .read_channel(&params.channel, params.since_minutes.unwrap_or(60), team)
-                    .await
+                    .await?
+            };
+            // PER-023 Scope §2 + AC #2a: general --limit truncates the
+            // existing read-mode result set (hard cap; no full-window
+            // pagination semantics added by PER-023). Bootstrap already
+            // applied the limit at the API layer, so this no-ops there.
+            if let Some(limit) = params.limit {
+                if !params.since_bootstrap {
+                    let limit = limit as usize;
+                    if messages.len() > limit {
+                        // Keep the most-recent N — sort is ascending by
+                        // create_at, so truncate from the front.
+                        let drop = messages.len() - limit;
+                        messages.drain(..drop);
+                    }
+                }
             }
+            // PER-023 Scope §4 + AC #4: --advance advances the cursor
+            // to the latest post **returned** (mode-independent rule).
+            // No-op when zero posts returned.
+            if params.advance {
+                if let Some(latest) = messages.last() {
+                    record_channel_cursor(state, &params.channel, &latest.id, team).await?;
+                }
+            }
+            Ok::<_, CoreError>(messages)
+        })
+        .await
+        .map(to_value),
+        "pinned_channel" => {
+            parse_and_call(&request.params, |params: PinnedChannelParams| async move {
+                state
+                    .client
+                    .read_channel_pinned(&params.channel, params.team.as_deref())
+                    .await
+            })
+            .await
+            .map(to_value)
+        }
+        "ack_channel" => parse_and_call(&request.params, |params: AckChannelParams| async move {
+            let team = params.team.as_deref();
+            // Resolve up-front so the result carries the operator-visible
+            // qualified-channel info even when the channel turns out to
+            // be empty.
+            let resolved = state.client.resolve_channel(&params.channel, team).await?;
+            let cursor_post_id = state
+                .client
+                .channel_last_post_id(&params.channel, team)
+                .await?;
+            if let Some(ref post_id) = cursor_post_id {
+                record_channel_cursor(state, &params.channel, post_id, team).await?;
+            }
+            Ok::<_, CoreError>(AckResult {
+                channel: resolved.channel_name,
+                team: resolved.team_name,
+                cursor_post_id,
+            })
         })
         .await
         .map(to_value),
@@ -661,10 +732,16 @@ async fn dispatch_request(
                         .await
                         .map(NotificationsResponse::Unread)
                 } else {
-                    let notifications = state
-                        .client
-                        .notifications(params.since_minutes.unwrap_or(1440))
-                        .await?;
+                    // PER-023: prefer second-resolution `since_secs` over
+                    // the legacy minute-resolution field. Round up to the
+                    // next minute so the underlying minutes-API client
+                    // doesn't truncate sub-minute windows to zero.
+                    let since_minutes = if let Some(secs) = params.since_secs {
+                        secs.div_ceil(60).max(1)
+                    } else {
+                        params.since_minutes.unwrap_or(1440)
+                    };
+                    let notifications = state.client.notifications(since_minutes).await?;
                     record_notifications_cursor(state, &notifications).await?;
                     Ok(NotificationsResponse::Messages(notifications))
                 }
@@ -684,13 +761,12 @@ async fn dispatch_request(
             // PER-019 (devrev PR #17 finding #1): thread --team into
             // the wait helper so duplicate-name channels wait on the
             // requested team's cursor.
-            wait_for_messages(
-                state,
-                &params.channel,
-                params.timeout_minutes,
-                params.team.as_deref(),
-            )
-            .await
+            // PER-023: prefer second-resolution `timeout_secs` so
+            // suffixes like `30s` aren't lossily rounded.
+            let timeout_secs = params
+                .timeout_secs
+                .unwrap_or(params.timeout_minutes.saturating_mul(60));
+            wait_for_messages(state, &params.channel, timeout_secs, params.team.as_deref()).await
         })
         .await
         .map(to_value),
@@ -909,7 +985,7 @@ fn require_elevated_profile(profile: &Profile) -> Result<(), CoreError> {
 async fn wait_for_messages(
     state: &AppState,
     channel: &str,
-    timeout_minutes: u64,
+    timeout_secs: u64,
     team: Option<&str>,
 ) -> Result<WaitResult, CoreError> {
     // PER-019 (devrev PR #17 finding #1): resolve via the cross-team
@@ -938,7 +1014,7 @@ async fn wait_for_messages(
         .iter()
         .any(|m| m.eq_ignore_ascii_case(channel));
 
-    let limit = Duration::from_secs(timeout_minutes * 60);
+    let limit = Duration::from_secs(timeout_secs);
 
     if is_monitored {
         wait_push_backed(
@@ -1636,21 +1712,81 @@ impl DaemonClient {
         self.call("list_dms", serde_json::json!({})).await
     }
 
+    /// PER-023: full read-channel surface. The CLI populates `since_secs`
+    /// (parsed via `parse_time_window`) for `--since` and the bootstrap /
+    /// limit / advance flags for the new primitives. `since_minutes` is
+    /// retained on the param wire only as a back-compat field a daemon
+    /// can still decode from a not-yet-upgraded CLI peer.
+    ///
+    /// Bidirectional version safety (devrev PR #20 P1): when `since_secs`
+    /// is set, the legacy `since_minutes` field is also populated with
+    /// the same value rounded up to a minute. A new-CLI → old-daemon
+    /// path then falls back to approximate-but-not-silent semantics
+    /// (a v0.2.0 daemon reading a `30s` request reads ~1 minute; the
+    /// new daemon prefers `since_secs` over `since_minutes` and gets
+    /// the precise value). PER-023's new flags (`since_bootstrap`,
+    /// `limit`, `advance`) are silently ignored by old daemons — this
+    /// is acceptable because the only operator-visible regression is
+    /// "behaves like pre-PER-023 read", not "silent zero-result";
+    /// `--advance` failing to advance a cursor against an old daemon
+    /// is recoverable on the next CLI invocation post-cycle.
+    #[allow(clippy::too_many_arguments)]
     pub async fn read_channel(
         &self,
         channel: &str,
-        since_minutes: Option<u64>,
+        since_secs: Option<u64>,
         after_post_id: Option<String>,
         since_last_mine: bool,
+        since_bootstrap: bool,
+        limit: Option<u32>,
+        advance: bool,
         team: Option<String>,
     ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
+        let since_minutes = since_secs.map(secs_to_minutes_compat);
         self.call(
             "read_channel",
             serde_json::to_value(ReadChannelParams {
                 channel: channel.to_string(),
                 since_minutes,
+                since_secs,
                 after_post_id,
                 since_last_mine,
+                since_bootstrap,
+                limit,
+                advance,
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-023 primitive 1: fetch pinned posts for a channel.
+    pub async fn pinned_channel(
+        &self,
+        channel: &str,
+        team: Option<String>,
+    ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
+        self.call(
+            "pinned_channel",
+            serde_json::to_value(PinnedChannelParams {
+                channel: channel.to_string(),
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-023 primitive 4: advance attention cursor to channel's
+    /// current latest post id without surfacing content.
+    pub async fn ack_channel(
+        &self,
+        channel: &str,
+        team: Option<String>,
+    ) -> Result<AckResult, DaemonError> {
+        self.call(
+            "ack_channel",
+            serde_json::to_value(AckChannelParams {
+                channel: channel.to_string(),
                 team,
             })?,
         )
@@ -1738,13 +1874,17 @@ impl DaemonClient {
 
     pub async fn notifications(
         &self,
-        since_minutes: u64,
+        since_secs: u64,
         unread_only: bool,
     ) -> Result<serde_json::Value, DaemonError> {
+        // Devrev PR #20 P1 fix: populate legacy minutes field with a
+        // rounded-up compatibility value so a new-CLI → old-daemon path
+        // doesn't silently fall back to the 1440m default.
         self.call(
             "notifications",
             serde_json::to_value(NotificationsParams {
-                since_minutes: Some(since_minutes),
+                since_minutes: Some(secs_to_minutes_compat(since_secs)),
+                since_secs: Some(since_secs),
                 unread_only,
             })?,
         )
@@ -1754,14 +1894,21 @@ impl DaemonClient {
     pub async fn wait_channel(
         &self,
         channel: &str,
-        timeout_minutes: u64,
+        timeout_secs: u64,
         team: Option<String>,
     ) -> Result<WaitResult, DaemonError> {
+        // Devrev PR #20 P1 fix: legacy `timeout_minutes` field is
+        // populated with a rounded-up compatibility value so an old
+        // daemon waits for an approximate (not zero) window. Without
+        // this, `wait --timeout 5m` against a v0.2.0 daemon would
+        // immediately return `WaitTimeout` because the legacy field
+        // came across as 0. New daemon prefers `timeout_secs`.
         self.call(
             "wait_channel",
             serde_json::to_value(WaitChannelParams {
                 channel: channel.to_string(),
-                timeout_minutes,
+                timeout_minutes: secs_to_minutes_compat(timeout_secs),
+                timeout_secs: Some(timeout_secs),
                 team,
             })?,
         )
@@ -1887,6 +2034,43 @@ impl DaemonClient {
 
 pub fn daemon_client(profile_name: &str) -> DaemonClient {
     DaemonClient::new(profile_name)
+}
+
+/// Devrev PR #20 P1 helper: round seconds up to the next whole minute,
+/// minimum 1 minute. Used when populating legacy `since_minutes` /
+/// `timeout_minutes` fields alongside the new `since_secs` /
+/// `timeout_secs` fields so a new-CLI → old-daemon path falls back to
+/// approximate (rather than silently broken) semantics. Does not
+/// affect new-daemon behavior because the daemon prefers the seconds
+/// field when present.
+fn secs_to_minutes_compat(secs: u64) -> u64 {
+    secs.div_ceil(60).max(1)
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    #[test]
+    fn secs_to_minutes_rounds_up() {
+        assert_eq!(secs_to_minutes_compat(30), 1, "30s rounds up to 1m");
+        assert_eq!(secs_to_minutes_compat(59), 1, "59s rounds up to 1m");
+        assert_eq!(secs_to_minutes_compat(60), 1, "60s = 1m exactly");
+        assert_eq!(secs_to_minutes_compat(61), 2, "61s rounds up to 2m");
+        assert_eq!(secs_to_minutes_compat(300), 5, "5m exactly");
+        assert_eq!(secs_to_minutes_compat(301), 6, "5m+1s rounds to 6m");
+    }
+
+    #[test]
+    fn secs_to_minutes_zero_floors_to_one() {
+        // Edge case: an operator who somehow ends up with 0 seconds
+        // shouldn't trip the old-daemon WaitTimeout-on-0-minutes path.
+        // Floor to 1m so a `wait --timeout 0s` pathological invocation
+        // at least lasts a minute against an old daemon — pathological
+        // either way, but the failure mode is "waited a minute" rather
+        // than "instantly timed out".
+        assert_eq!(secs_to_minutes_compat(0), 1);
+    }
 }
 
 #[cfg(test)]

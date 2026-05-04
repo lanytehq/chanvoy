@@ -4,12 +4,13 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    list_profiles, load_active_profile, load_token, pid_path_for_profile, socket_path_for_profile,
-    store_active_profile, store_profile, AttentionListResult, AttentionShowResult, AttentionSource,
-    CapabilityClass, Channel, CheckResult, CredentialMode, DaemonHealthState, DaemonStatus,
-    DmConversation, Identity, MattermostClient, Message, Notification, PostReceipt, Profile,
-    ProfileStatus, Provider, SeedCursorsResult, SeededChannelOutcome, UnreadNotifications,
-    WaitResult, WsConnectionState,
+    list_profiles, load_active_profile, load_token, parse_time_window, pid_path_for_profile,
+    socket_path_for_profile, store_active_profile, store_profile, AckResult, AttentionListResult,
+    AttentionShowResult, AttentionSource, CapabilityClass, Channel, CheckResult, CredentialMode,
+    DaemonHealthState, DaemonStatus, DmConversation, Identity, MattermostClient, Message,
+    Notification, PostReceipt, Profile, ProfileStatus, Provider, SeedCursorsResult,
+    SeededChannelOutcome, TimeWindowDefaultUnit, UnreadNotifications, WaitResult,
+    WsConnectionState,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -71,6 +72,14 @@ enum CommandSet {
     Notify(NotifyArgs),
     Notifications(ReadWindowArgs),
     Wait(WaitArgs),
+    /// PER-023 primitive 1: fetch a channel's pinned posts. Pure read,
+    /// no cursor side effects. Uses the PER-019 γ hybrid resolver;
+    /// accepts <team>/<channel> syntax and the --team flag.
+    Pinned(PinnedArgs),
+    /// PER-023 primitive 4: advance attention cursor to channel's
+    /// current latest post without fetching content. Uses the PER-019 γ
+    /// hybrid resolver; accepts <team>/<channel> syntax.
+    Ack(AckArgs),
     #[command(subcommand)]
     Channel(ChannelCommand),
     /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
@@ -155,12 +164,40 @@ enum ChannelCommand {
 #[derive(Debug, Args)]
 struct ReadArgs {
     channel: String,
-    #[arg(long, conflicts_with_all = ["after", "since_last_mine"])]
-    since: Option<u64>,
-    #[arg(long, conflicts_with_all = ["since", "since_last_mine"])]
+    /// Time window for the read (PER-023: accepts s/m/h/d suffixes;
+    /// bare integer = minutes, today's semantics). Mutually exclusive
+    /// with --after / --since-last-mine / --since-bootstrap.
+    #[arg(
+        long,
+        conflicts_with_all = ["after", "since_last_mine", "since_bootstrap"],
+        long_help = "Time window for the read. Bare integer = minutes (today's default). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo' (months/minutes ambiguity). Mutually exclusive with --after / --since-last-mine / --since-bootstrap.",
+    )]
+    since: Option<String>,
+    #[arg(long, conflicts_with_all = ["since", "since_last_mine", "since_bootstrap"])]
     after: Option<String>,
-    #[arg(long, conflicts_with_all = ["since", "after"])]
+    #[arg(long, conflicts_with_all = ["since", "after", "since_bootstrap"])]
     since_last_mine: bool,
+    /// PER-023 primitive 2: bounded most-recent-N posts (default N=50;
+    /// override with --limit). Replaces the `--since 999999` hack with
+    /// a documented, bounded "give me recent context" anchor.
+    #[arg(
+        long,
+        conflicts_with_all = ["since", "after", "since_last_mine"],
+        long_help = "Bounded most-recent-N posts (default 50; override with --limit). Use this to bootstrap into a long channel without scanning history. Replaces the --since 999999 hack."
+    )]
+    since_bootstrap: bool,
+    /// PER-023 primitive 2: hard cap on the result set. Composes with
+    /// any read-mode flag; PER-023 does NOT add full-window pagination
+    /// semantics — `--limit` truncates the existing read-mode result.
+    /// Bare `--limit N` (no read-mode flag) is rejected — use
+    /// `--since-bootstrap --limit N` for "give me the latest N".
+    #[arg(long)]
+    limit: Option<u32>,
+    /// PER-023 primitive 4: advance attention cursor to the latest post
+    /// **returned** by this read (mode-independent rule). No-op when
+    /// zero posts are returned.
+    #[arg(long)]
+    advance: bool,
     /// PER-019: explicit team override for cross-team channel resolution
     /// (per-invocation only). Equivalent to the `<team>/<channel>`
     /// positional syntax. When unset, the γ hybrid resolver tries the
@@ -172,10 +209,47 @@ struct ReadArgs {
 
 #[derive(Debug, Args)]
 struct ReadWindowArgs {
-    #[arg(long, default_value_t = 1440)]
-    since: u64,
+    /// Time window for notifications (PER-023: accepts s/m/h/d
+    /// suffixes; bare integer = minutes, today's semantics).
+    ///
+    /// Resolution note: minute-rounded — sub-minute suffixes (e.g.
+    /// `30s`) round up to the next whole minute because the underlying
+    /// MM notifications surface is minute-keyed. For second-precise
+    /// time windows, use `chanvoy read --since` (millisecond precision
+    /// against MM `posts?since=`).
+    ///
+    /// `--unread` interaction: this value is still parsed and
+    /// validated (a malformed suffix on either path still rejects
+    /// loudly), but the parsed window is not used for `--unread`
+    /// counts — those count since the stored anchor cursor instead.
+    #[arg(
+        long,
+        default_value = "1440",
+        long_help = "Time window for notifications. Bare integer = minutes (today's default; default 1440 = 24h). Accepted suffixes: s/m/h/d. Rejected: uppercase 'M', 'mo'. Resolution: minute-rounded (sub-minute suffixes round up to the next whole minute; the underlying MM notifications surface is minute-keyed). --unread interaction: the value is still parsed/validated (malformed suffix rejects loudly on either path), but the parsed window is not used for --unread counts (those count since the stored anchor cursor)."
+    )]
+    since: String,
+    /// Filter to unread mentions only. The parsed `--since` value is
+    /// unused on this branch — unread counts run from the stored
+    /// anchor cursor, not from a time window. (`--since` is still
+    /// parsed/validated for shape, so malformed suffixes reject.)
     #[arg(long)]
     unread: bool,
+}
+
+#[derive(Debug, Args)]
+struct PinnedArgs {
+    channel: String,
+    /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AckArgs {
+    channel: String,
+    /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -191,8 +265,14 @@ struct CheckArgs {
 #[derive(Debug, Args)]
 struct WaitArgs {
     channel: String,
-    #[arg(long, default_value_t = 10)]
-    timeout: u64,
+    /// PER-023: timeout window for the wait. Bare integer = minutes
+    /// (today's default; default 10m). Accepts s/m/h/d suffixes.
+    #[arg(
+        long,
+        default_value = "10",
+        long_help = "Wait timeout. Bare integer = minutes (today's default; default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'."
+    )]
+    timeout: String,
     /// PER-019: explicit team override.
     #[arg(long)]
     team: Option<String>,
@@ -352,18 +432,49 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
         CommandSet::Whoami => print_identity(cli.json, &daemon_client(&profile).whoami().await?),
         CommandSet::Channels(args) => handle_channels_command(&profile, cli.json, args).await,
         CommandSet::Dms => print_value(cli.json, &daemon_client(&profile).list_dms().await?),
-        CommandSet::Read(args) => print_value(
-            cli.json,
-            &daemon_client(&profile)
-                .read_channel(
-                    &args.channel,
-                    args.since,
-                    args.after.clone(),
-                    args.since_last_mine,
-                    args.team.clone(),
-                )
-                .await?,
-        ),
+        CommandSet::Read(args) => {
+            // PER-023 §Resolved Decisions (PR #47): bare `read --limit N`
+            // (no read-mode flag) is rejected with diagnostic suggesting
+            // `--since-bootstrap --limit N`. Loud failure on
+            // ambiguous-intent input; reject-then-relax preserves
+            // optionality for a future shorthand.
+            if args.limit.is_some()
+                && args.since.is_none()
+                && args.after.is_none()
+                && !args.since_last_mine
+                && !args.since_bootstrap
+            {
+                return Err(CliError::Bootstrap(
+                    "`--limit` requires an explicit read-mode flag — use \
+                     `--since-bootstrap --limit N` for 'give me the latest N posts', \
+                     or `--since <window> --limit N` to cap a time-window read. \
+                     Bare `read --limit N` is rejected (PER-023)."
+                        .to_string(),
+                ));
+            }
+            let since_secs = match args.since.as_deref() {
+                Some(raw) => Some(
+                    parse_time_window(raw, TimeWindowDefaultUnit::Minutes)
+                        .map_err(CliError::Bootstrap)?,
+                ),
+                None => None,
+            };
+            print_value(
+                cli.json,
+                &daemon_client(&profile)
+                    .read_channel(
+                        &args.channel,
+                        since_secs,
+                        args.after.clone(),
+                        args.since_last_mine,
+                        args.since_bootstrap,
+                        args.limit,
+                        args.advance,
+                        args.team.clone(),
+                    )
+                    .await?,
+            )
+        }
         CommandSet::Check(args) => match daemon_client(&profile)
             .check_channel(&args.channel, args.after.clone(), args.team.clone())
             .await?
@@ -402,34 +513,40 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 .notify(&args.bot_username, &args.message)
                 .await?,
         ),
-        CommandSet::Notifications(args) => print_value(
-            cli.json,
-            &if args.unread {
-                serde_json::from_value::<UnreadNotifications>(
-                    daemon_client(&profile)
-                        .notifications(args.since, true)
-                        .await?,
-                )?
-            } else {
-                return print_value(
-                    cli.json,
-                    &serde_json::from_value::<Vec<Notification>>(
+        CommandSet::Notifications(args) => {
+            let since_secs = parse_time_window(&args.since, TimeWindowDefaultUnit::Minutes)
+                .map_err(CliError::Bootstrap)?;
+            print_value(
+                cli.json,
+                &if args.unread {
+                    serde_json::from_value::<UnreadNotifications>(
                         daemon_client(&profile)
-                            .notifications(args.since, false)
+                            .notifications(since_secs, true)
                             .await?,
-                    )?,
-                );
-            },
-        ),
+                    )?
+                } else {
+                    return print_value(
+                        cli.json,
+                        &serde_json::from_value::<Vec<Notification>>(
+                            daemon_client(&profile)
+                                .notifications(since_secs, false)
+                                .await?,
+                        )?,
+                    );
+                },
+            )
+        }
         CommandSet::Wait(args) => {
+            let timeout_secs = parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes)
+                .map_err(CliError::Bootstrap)?;
             if !cli.json {
                 eprintln!(
-                    "waiting for new message in #{} (timeout: {}m)...",
-                    args.channel, args.timeout
+                    "waiting for new message in #{} (timeout: {}s)...",
+                    args.channel, timeout_secs
                 );
             }
             match daemon_client(&profile)
-                .wait_channel(&args.channel, args.timeout, args.team.clone())
+                .wait_channel(&args.channel, timeout_secs, args.team.clone())
                 .await
             {
                 Ok(result) => {
@@ -453,8 +570,8 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                         );
                     } else {
                         eprintln!(
-                            "timeout: no new messages in #{} after {} minutes",
-                            args.channel, args.timeout
+                            "timeout: no new messages in #{} after {} seconds",
+                            args.channel, timeout_secs
                         );
                     }
                     process::exit(1);
@@ -462,6 +579,18 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 Err(error) => Err(error.into()),
             }
         }
+        CommandSet::Pinned(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .pinned_channel(&args.channel, args.team.clone())
+                .await?,
+        ),
+        CommandSet::Ack(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .ack_channel(&args.channel, args.team.clone())
+                .await?,
+        ),
         CommandSet::Channel(ChannelCommand::Create(args)) => print_value(
             cli.json,
             &daemon_client(&profile)
@@ -1977,6 +2106,21 @@ impl HumanReadable for WaitResult {
             .map(format_message)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+impl HumanReadable for AckResult {
+    fn to_human_string(&self) -> String {
+        match &self.cursor_post_id {
+            Some(post_id) => format!(
+                "ack: {}/{} cursor advanced to {}",
+                self.team, self.channel, post_id
+            ),
+            None => format!(
+                "ack: {}/{} channel has no posts; cursor unchanged",
+                self.team, self.channel
+            ),
+        }
     }
 }
 

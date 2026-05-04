@@ -111,20 +111,97 @@ Chanvoy is org-portable. Operators in any org adopt it the same way:
 
 The `lanytehq` segment in the default config path (`~/.config/lanytehq/chanvoy/`) is the chanvoy product namespace, not an org binding — see "Product namespace (not org restriction)" above. If your environment requires it, override with `CHANVOY_CONFIG_DIR`.
 
+## Session-Start Orientation
+
+PER-023 (chanvoy v0.2.1) bundles four primitives that close the
+"operator just opened a channel" first-30-seconds workflow gap.
+Run these in order when joining a long-running channel:
+
+1. **Pin context first.** `chanvoy pinned <channel>` returns just the
+   channel's pinned posts. Pure read — no cursor side effects. Pins
+   are the canonical "important context" surface.
+2. **Recent context, bounded.** `chanvoy read <channel> --since-bootstrap`
+   returns the most recent 50 posts (override with `--limit N`). Use
+   this instead of the legacy `--since 999999` hack — bounded,
+   documented, predictable on long channels.
+3. **Read and acknowledge in one shot.** Add `--advance` to any read
+   to advance the attention cursor to the latest post returned (no-op
+   when zero posts come back). Or use `chanvoy ack <channel>` to mark
+   the channel current-latest read without surfacing content (useful
+   when an operator wants a clean baseline before tomorrow's session).
+4. **Time windows in human units.** Every time-window flag accepts
+   `30s` / `5m` / `4h` / `2d`. Bare integer preserves today's per-flag
+   default (minutes for `read --since`, `notifications --since`,
+   `wait --timeout`). Uppercase `M` and `mo` are loud-failed with a
+   diagnostic to avoid month/minute confusion.
+
+   **Resolution is per-flag, not uniform.** Suffix parsing is uniform
+   (every affected flag accepts the same suffix grammar), but the
+   precision delivered by each flag depends on the underlying API
+   surface:
+
+   | Flag | Resolution | Why |
+   |---|---|---|
+   | `read --since` | second-precise | hits MM `posts?since={millis}` directly |
+   | `wait --timeout` | second-precise | local timer, no API constraint |
+   | `notifications --since` | minute-rounded (rounds up) | underlying MM notifications surface is minute-keyed |
+
+   So `chanvoy notifications --since 30s` behaves like ~1 minute (not
+   30 seconds); `chanvoy read --since 30s` is precise. Use `read` when
+   sub-minute precision matters.
+
+   **`notifications --unread` does not use `--since` for counting.**
+   The unread branch counts mentions since the stored anchor cursor,
+   not since a time window. The supplied `--since` value is still
+   parsed and validated for shape (so a malformed suffix on either
+   path still rejects loudly with the same diagnostic), but the parsed
+   window is not consumed on the unread path. Pre-PER-023 behavior;
+   documented here for clarity.
+
+Worked example, walking into a fresh channel:
+
+```bash
+chanvoy pinned bravo-team                  # canonical context (pure read)
+chanvoy read bravo-team --since-bootstrap  # 50 most-recent posts
+chanvoy ack bravo-team                     # mark current-latest read
+# next session:
+chanvoy check bravo-team                   # any new posts since ack?
+```
+
+`--limit` is general across read modes:
+
+```bash
+chanvoy read bravo-team --since 30m --limit 20    # cap a time-window read
+chanvoy read bravo-team --after <post> --limit 50 # cap a post-anchored read
+chanvoy read bravo-team --limit 20                # REJECTED — bare --limit needs a read-mode flag
+```
+
+The bare-`--limit` rejection is intentional (loud failure on
+ambiguous-intent commands); use `--since-bootstrap --limit N` for
+"give me the latest N posts."
+
 ## Resume And Attention
 
 PER-008 adds cursor-based local-mode workflow primitives:
 
 - `chanvoy read <channel> --after <post-id>`
 - `chanvoy read <channel> --since-last-mine`
+- `chanvoy read <channel> --since-bootstrap [--limit N]` (PER-023)
+- `chanvoy read <channel> --advance` (PER-023; mode-independent cursor-advance)
 - `chanvoy check <channel> [--after <post-id>]`
+- `chanvoy ack <channel>` (PER-023; advance cursor without fetching content)
+- `chanvoy pinned <channel>` (PER-023; pure read of pinned posts)
 - `chanvoy notifications --unread`
 
 Current semantics:
 
 - `read --after` is a pure read and does not advance stored channel state
 - `read --since-last-mine` is a pure read and does not advance stored channel state
+- `read --since-bootstrap` is a pure read; default 50, `--limit` overrides
+- `read --advance` advances the cursor to the latest post **returned** by this read (mode-independent rule); no-op when zero posts returned
 - `check` is a pure probe and does not advance stored channel state
+- `pinned` is a pure read; never advances any cursor
+- `ack <channel>` advances the cursor to the channel's **current** latest post id without surfacing content; no-op success when channel has no posts
 - `notifications --unread` is a pure probe and does not advance mention state
 - `check <channel>` without `--after` uses the stored daemon cursor when available
 - if no stored cursor exists yet, `check` returns `new: 0 anchor=none source=no_anchor` with exit code `1`
@@ -134,6 +211,8 @@ Current durable cursor behavior:
 
 - successful `post` stores the latest post id for that profile+channel
 - full `notifications` reads store the latest mention cursor
+- `read --advance` stores the latest post id from the result set (latest post returned, not channel absolute latest, when the read mode applies a bounded window)
+- `ack <channel>` stores the channel's current latest post id at the time of the call
 - probes do not clear attention
 
 Current inspectability gap worth tracking:
