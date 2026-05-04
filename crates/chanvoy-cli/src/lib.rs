@@ -211,12 +211,21 @@ struct ReadArgs {
 struct ReadWindowArgs {
     /// Time window for notifications (PER-023: accepts s/m/h/d
     /// suffixes; bare integer = minutes, today's semantics).
+    ///
+    /// Resolution note: minute-rounded — sub-minute suffixes (e.g.
+    /// `30s`) round up to the next whole minute because the underlying
+    /// MM notifications surface is minute-keyed. For second-precise
+    /// time windows, use `chanvoy read --since` (millisecond precision
+    /// against MM `posts?since=`). `--unread` ignores this flag
+    /// entirely.
     #[arg(
         long,
         default_value = "1440",
-        long_help = "Time window for notifications. Bare integer = minutes (today's default; default 1440 = 24h). Accepted suffixes: s/m/h/d. Rejected: uppercase 'M', 'mo'."
+        long_help = "Time window for notifications. Bare integer = minutes (today's default; default 1440 = 24h). Accepted suffixes: s/m/h/d. Rejected: uppercase 'M', 'mo'. Resolution: minute-rounded (sub-minute suffixes round up to the next whole minute; the underlying MM notifications surface is minute-keyed). --unread ignores --since entirely (counts since stored anchor cursor)."
     )]
     since: String,
+    /// Filter to unread mentions only. **Ignores `--since`** — counts
+    /// since the stored anchor cursor, not since a time window.
     #[arg(long)]
     unread: bool,
 }

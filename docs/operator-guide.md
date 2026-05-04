@@ -135,6 +135,26 @@ Run these in order when joining a long-running channel:
    `wait --timeout`). Uppercase `M` and `mo` are loud-failed with a
    diagnostic to avoid month/minute confusion.
 
+   **Resolution is per-flag, not uniform.** Suffix parsing is uniform
+   (every affected flag accepts the same suffix grammar), but the
+   precision delivered by each flag depends on the underlying API
+   surface:
+
+   | Flag | Resolution | Why |
+   |---|---|---|
+   | `read --since` | second-precise | hits MM `posts?since={millis}` directly |
+   | `wait --timeout` | second-precise | local timer, no API constraint |
+   | `notifications --since` | minute-rounded (rounds up) | underlying MM notifications surface is minute-keyed |
+
+   So `chanvoy notifications --since 30s` behaves like ~1 minute (not
+   30 seconds); `chanvoy read --since 30s` is precise. Use `read` when
+   sub-minute precision matters.
+
+   **`notifications --unread` ignores `--since` entirely.** It counts
+   unread mentions since the stored anchor cursor, not since a time
+   window. The `--since` flag is silently unused on this branch
+   (pre-PER-023 behavior; documented here for clarity).
+
 Worked example, walking into a fresh channel:
 
 ```bash
