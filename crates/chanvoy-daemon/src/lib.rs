@@ -1717,6 +1717,19 @@ impl DaemonClient {
     /// limit / advance flags for the new primitives. `since_minutes` is
     /// retained on the param wire only as a back-compat field a daemon
     /// can still decode from a not-yet-upgraded CLI peer.
+    ///
+    /// Bidirectional version safety (devrev PR #20 P1): when `since_secs`
+    /// is set, the legacy `since_minutes` field is also populated with
+    /// the same value rounded up to a minute. A new-CLI → old-daemon
+    /// path then falls back to approximate-but-not-silent semantics
+    /// (a v0.2.0 daemon reading a `30s` request reads ~1 minute; the
+    /// new daemon prefers `since_secs` over `since_minutes` and gets
+    /// the precise value). PER-023's new flags (`since_bootstrap`,
+    /// `limit`, `advance`) are silently ignored by old daemons — this
+    /// is acceptable because the only operator-visible regression is
+    /// "behaves like pre-PER-023 read", not "silent zero-result";
+    /// `--advance` failing to advance a cursor against an old daemon
+    /// is recoverable on the next CLI invocation post-cycle.
     #[allow(clippy::too_many_arguments)]
     pub async fn read_channel(
         &self,
@@ -1729,11 +1742,12 @@ impl DaemonClient {
         advance: bool,
         team: Option<String>,
     ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
+        let since_minutes = since_secs.map(secs_to_minutes_compat);
         self.call(
             "read_channel",
             serde_json::to_value(ReadChannelParams {
                 channel: channel.to_string(),
-                since_minutes: None,
+                since_minutes,
                 since_secs,
                 after_post_id,
                 since_last_mine,
@@ -1863,10 +1877,13 @@ impl DaemonClient {
         since_secs: u64,
         unread_only: bool,
     ) -> Result<serde_json::Value, DaemonError> {
+        // Devrev PR #20 P1 fix: populate legacy minutes field with a
+        // rounded-up compatibility value so a new-CLI → old-daemon path
+        // doesn't silently fall back to the 1440m default.
         self.call(
             "notifications",
             serde_json::to_value(NotificationsParams {
-                since_minutes: None,
+                since_minutes: Some(secs_to_minutes_compat(since_secs)),
                 since_secs: Some(since_secs),
                 unread_only,
             })?,
@@ -1880,11 +1897,17 @@ impl DaemonClient {
         timeout_secs: u64,
         team: Option<String>,
     ) -> Result<WaitResult, DaemonError> {
+        // Devrev PR #20 P1 fix: legacy `timeout_minutes` field is
+        // populated with a rounded-up compatibility value so an old
+        // daemon waits for an approximate (not zero) window. Without
+        // this, `wait --timeout 5m` against a v0.2.0 daemon would
+        // immediately return `WaitTimeout` because the legacy field
+        // came across as 0. New daemon prefers `timeout_secs`.
         self.call(
             "wait_channel",
             serde_json::to_value(WaitChannelParams {
                 channel: channel.to_string(),
-                timeout_minutes: 0,
+                timeout_minutes: secs_to_minutes_compat(timeout_secs),
                 timeout_secs: Some(timeout_secs),
                 team,
             })?,
@@ -2011,6 +2034,43 @@ impl DaemonClient {
 
 pub fn daemon_client(profile_name: &str) -> DaemonClient {
     DaemonClient::new(profile_name)
+}
+
+/// Devrev PR #20 P1 helper: round seconds up to the next whole minute,
+/// minimum 1 minute. Used when populating legacy `since_minutes` /
+/// `timeout_minutes` fields alongside the new `since_secs` /
+/// `timeout_secs` fields so a new-CLI → old-daemon path falls back to
+/// approximate (rather than silently broken) semantics. Does not
+/// affect new-daemon behavior because the daemon prefers the seconds
+/// field when present.
+fn secs_to_minutes_compat(secs: u64) -> u64 {
+    secs.div_ceil(60).max(1)
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    #[test]
+    fn secs_to_minutes_rounds_up() {
+        assert_eq!(secs_to_minutes_compat(30), 1, "30s rounds up to 1m");
+        assert_eq!(secs_to_minutes_compat(59), 1, "59s rounds up to 1m");
+        assert_eq!(secs_to_minutes_compat(60), 1, "60s = 1m exactly");
+        assert_eq!(secs_to_minutes_compat(61), 2, "61s rounds up to 2m");
+        assert_eq!(secs_to_minutes_compat(300), 5, "5m exactly");
+        assert_eq!(secs_to_minutes_compat(301), 6, "5m+1s rounds to 6m");
+    }
+
+    #[test]
+    fn secs_to_minutes_zero_floors_to_one() {
+        // Edge case: an operator who somehow ends up with 0 seconds
+        // shouldn't trip the old-daemon WaitTimeout-on-0-minutes path.
+        // Floor to 1m so a `wait --timeout 0s` pathological invocation
+        // at least lasts a minute against an old daemon — pathological
+        // either way, but the failure mode is "waited a minute" rather
+        // than "instantly timed out".
+        assert_eq!(secs_to_minutes_compat(0), 1);
+    }
 }
 
 #[cfg(test)]
