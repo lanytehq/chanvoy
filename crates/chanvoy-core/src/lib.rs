@@ -114,6 +114,46 @@ pub struct Channel {
     pub display_name: String,
     #[serde(rename = "type")]
     pub channel_type: String,
+    /// PER-025 AC #6: MM `last_post_at` (Unix epoch ms). `None` is
+    /// rendered as `null` in `--json` (deterministic-null shape per
+    /// productbook PR #49 cleanup); the field is **not**
+    /// `skip_serializing_if`'d on purpose so consumers see a
+    /// deterministic shape rather than absent-field. The
+    /// `--primary-team --json` legacy path uses a separate
+    /// `LegacyChannel` serialization shape that omits this field
+    /// entirely (see `Channel::to_legacy`).
+    #[serde(default)]
+    pub last_post_at: Option<i64>,
+}
+
+impl Channel {
+    /// PER-025 AC #6a: render the legacy `--primary-team --json` shape
+    /// — the pre-PER-019 / pre-PER-025 single-team JSON field set, no
+    /// `last_post_at` field at all. Per @agent-entarch-lanytehq's
+    /// 2026-05-03 #brief-per-025 pin #5: the same in-memory `Channel`
+    /// struct cannot serialize into both the activity-bearing default
+    /// shape AND the legacy shape; the explicit projection avoids
+    /// accidental field leakage into the legacy contract.
+    pub fn to_legacy(&self) -> LegacyChannel {
+        LegacyChannel {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            display_name: self.display_name.clone(),
+            channel_type: self.channel_type.clone(),
+        }
+    }
+}
+
+/// PER-025 AC #6a: legacy `--primary-team --json` channel shape (no
+/// `last_post_at`). Constructed via `Channel::to_legacy` at the CLI
+/// rendering layer when `--primary-team` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyChannel {
+    pub id: String,
+    pub name: String,
+    pub display_name: String,
+    #[serde(rename = "type")]
+    pub channel_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -589,6 +629,42 @@ pub struct ReactionResult {
     pub ok: bool,
 }
 
+/// PER-025 primitive 1: parameters for `chanvoy search <channel>
+/// <query>`. Cross-channel / team-wide search is explicitly deferred
+/// from v1 per cross-reviewer alignment (see brief §Out of scope) —
+/// channel arg is always required.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchParams {
+    pub channel: String,
+    pub query: String,
+    /// Default 20 if omitted; CLI populates via `--limit N`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// MM `from:<author>` operator narrowing; CLI flag value.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// PER-023 time-window suffix-parsed seconds; CLI flag value.
+    /// Daemon converts to MM `after:<computed-iso-date>` operator.
+    #[serde(default)]
+    pub since_secs: Option<u64>,
+    /// PER-019 explicit team override.
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-025 primitive 1: outcome of a `chanvoy search` call. The
+/// resolved `team` and `channel` are surfaced so JSON consumers can
+/// disambiguate cross-team channel duplicates (mirrors PER-024's
+/// `ReactionResult` pattern). `posts` are the matching messages
+/// in MM's returned order (newest-first per MM's search ranking,
+/// preserved verbatim — chanvoy doesn't re-sort).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchResult {
+    pub team: String,
+    pub channel: String,
+    pub posts: Vec<Message>,
+}
+
 /// PER-024: strip surrounding ASCII colons from an emoji name if the
 /// operator typed the MM-UI form `:emoji:`. Pass-through when bare.
 /// Unmatched single colons are preserved verbatim (the chanvoy CLI
@@ -645,6 +721,307 @@ mod emoji_tests {
         // to empty string. MM will reject empty; that's the right
         // place for the error.
         assert_eq!(normalize_emoji_name("::"), "");
+    }
+}
+
+/// PER-025 primitive 1: chanvoy-owned scopes that can conflict with
+/// inline MM search operators. Caller passes flags into
+/// `check_search_operator_conflicts` so the scan knows which
+/// chanvoy-owned scope is active and which inline operators would
+/// therefore conflict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChanvoyScopes {
+    /// `<channel>` positional arg is set on `chanvoy search` —
+    /// chanvoy auto-scopes via `in:<resolved-channel>` so an inline
+    /// `in:` from the operator's query conflicts.
+    pub channel_arg: bool,
+    /// `--from <author>` flag is set — inline `from:<user>` conflicts.
+    pub from_flag: bool,
+    /// `--since <time>` flag is set — inline `before:`/`after:`
+    /// conflicts (both are date-window operators that overlap with
+    /// `--since`'s computed window).
+    pub since_flag: bool,
+}
+
+/// PER-025 AC #4a (cleared via productbook PR #49): scan an MM search
+/// query for inline operators that conflict with chanvoy-owned scopes.
+/// Returns `Ok(())` if no conflict; `Err(diagnostic)` on the first
+/// conflict found.
+///
+/// Per @agent-entarch-lanytehq's 2026-05-03 #brief-per-025 pin #3:
+/// chanvoy refuses with a clear diagnostic naming the conflicting
+/// flag/arg explicitly so operators can fix. Non-conflicting MM
+/// operators (anything chanvoy doesn't claim ownership of, plus
+/// `before:`/`after:` when `--since` is unset, etc.) pass through
+/// verbatim — chanvoy doesn't parse them; MM handles.
+///
+/// Quoted-region handling per @agent-bravo-devlead's 2026-05-05
+/// preread implementor-call disposition #2: tokens inside balanced
+/// double-quoted regions are treated as literal search text, NOT
+/// operators. So `chanvoy search per-019 "in: the brief"` does NOT
+/// conflict with the channel arg even though the literal substring
+/// `in:` appears, because it's quoted-as-text.
+pub fn check_search_operator_conflicts(query: &str, scopes: &ChanvoyScopes) -> Result<(), String> {
+    for token in iter_unquoted_tokens(query) {
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("in:") && scopes.channel_arg {
+            return Err(format!(
+                "inline `in:` operator in search query conflicts with the \
+                 channel argument; channel argument defines search scope; \
+                 remove inline `in:` or run a future team-wide search mode \
+                 (offending token: {token:?})"
+            ));
+        }
+        if lower.starts_with("from:") && scopes.from_flag {
+            return Err(format!(
+                "inline `from:` operator in search query conflicts with the \
+                 `--from` flag; pick one (offending token: {token:?})"
+            ));
+        }
+        if (lower.starts_with("before:") || lower.starts_with("after:")) && scopes.since_flag {
+            return Err(format!(
+                "inline `{op}` operator in search query conflicts with the \
+                 `--since` flag (both define the search time window); pick \
+                 one (offending token: {token:?})",
+                op = if lower.starts_with("before:") {
+                    "before:"
+                } else {
+                    "after:"
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Yield successive whitespace-delimited tokens of `input` that lie
+/// **outside** balanced double-quoted regions. Quoted regions are
+/// skipped entirely (their contents are search literals, not
+/// operators). Unmatched closing quotes are tolerated — the rest of
+/// the string is treated as quoted text up to end-of-input.
+fn iter_unquoted_tokens(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut in_quote = false;
+    let mut token_start: Option<usize> = None;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '"' {
+            // Flush any pending unquoted token before flipping the
+            // quote state.
+            if let Some(start) = token_start.take() {
+                if start < i {
+                    out.push(&input[start..i]);
+                }
+            }
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if in_quote {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            if let Some(start) = token_start.take() {
+                if start < i {
+                    out.push(&input[start..i]);
+                }
+            }
+        } else if token_start.is_none() {
+            token_start = Some(i);
+        }
+        i += 1;
+    }
+    if let Some(start) = token_start {
+        if start < bytes.len() {
+            out.push(&input[start..]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod search_operator_tests {
+    use super::*;
+
+    fn all_scopes() -> ChanvoyScopes {
+        ChanvoyScopes {
+            channel_arg: true,
+            from_flag: true,
+            since_flag: true,
+        }
+    }
+
+    #[test]
+    fn no_inline_operators_passes() {
+        let r = check_search_operator_conflicts("parent_pid validation", &all_scopes());
+        assert!(r.is_ok(), "plain text query should pass: {r:?}");
+    }
+
+    #[test]
+    fn inline_in_conflicts_with_channel_arg() {
+        let r = check_search_operator_conflicts(
+            "parent_pid in:other-channel",
+            &ChanvoyScopes {
+                channel_arg: true,
+                ..Default::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("`in:`"),
+            "diagnostic should name `in:`; got: {err}"
+        );
+        assert!(
+            err.contains("channel argument"),
+            "diagnostic should name the conflict; got: {err}"
+        );
+        assert!(
+            !err.contains("--team-wide"),
+            "diagnostic must NOT name nonexistent --team-wide flag; got: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_from_conflicts_with_from_flag() {
+        let r = check_search_operator_conflicts(
+            "validation from:entarch",
+            &ChanvoyScopes {
+                from_flag: true,
+                ..Default::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("`from:`"), "got: {err}");
+        assert!(err.contains("--from"), "got: {err}");
+    }
+
+    #[test]
+    fn inline_before_conflicts_with_since_flag() {
+        let r = check_search_operator_conflicts(
+            "x before:2026-05-01",
+            &ChanvoyScopes {
+                since_flag: true,
+                ..Default::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("`before:`"), "got: {err}");
+        assert!(err.contains("--since"), "got: {err}");
+    }
+
+    #[test]
+    fn inline_after_conflicts_with_since_flag() {
+        let r = check_search_operator_conflicts(
+            "x after:2026-05-01",
+            &ChanvoyScopes {
+                since_flag: true,
+                ..Default::default()
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("`after:`"), "got: {err}");
+    }
+
+    #[test]
+    fn non_conflicting_inline_passes() {
+        // `from:` without --from flag set should pass through.
+        let r =
+            check_search_operator_conflicts("validation from:entarch", &ChanvoyScopes::default());
+        assert!(r.is_ok(), "from: without flag should pass: {r:?}");
+        // Same for before: when --since unset.
+        let r = check_search_operator_conflicts("x before:2026-05-01", &ChanvoyScopes::default());
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn unknown_inline_operator_passes_through() {
+        // chanvoy doesn't claim ownership of arbitrary MM operators;
+        // they pass through to MM regardless of which flags are set.
+        let r = check_search_operator_conflicts("validation has:link", &all_scopes());
+        assert!(r.is_ok(), "unknown operator should pass: {r:?}");
+    }
+
+    #[test]
+    fn quoted_in_is_search_text_not_operator() {
+        // `"in: the brief"` is searchable text — operator-conflict
+        // scanner must NOT flag it.
+        let r = check_search_operator_conflicts(
+            "\"in: the brief\" parent_pid",
+            &ChanvoyScopes {
+                channel_arg: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            r.is_ok(),
+            "quoted in: should be search text, not operator: {r:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_from_is_search_text() {
+        let r = check_search_operator_conflicts(
+            "\"from: anywhere\" validation",
+            &ChanvoyScopes {
+                from_flag: true,
+                ..Default::default()
+            },
+        );
+        assert!(r.is_ok(), "quoted from: should pass: {r:?}");
+    }
+
+    #[test]
+    fn case_insensitive_operator_match() {
+        // MM accepts `In:`, `IN:` etc. The scan should catch all
+        // case variants so a typo doesn't sneak past.
+        for variant in ["IN:other", "In:other", "iN:other"] {
+            let r = check_search_operator_conflicts(
+                variant,
+                &ChanvoyScopes {
+                    channel_arg: true,
+                    ..Default::default()
+                },
+            );
+            assert!(r.is_err(), "variant {variant} should conflict");
+        }
+    }
+
+    #[test]
+    fn empty_query_passes() {
+        let r = check_search_operator_conflicts("", &all_scopes());
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn quoted_region_with_unclosed_trailing_quote_treated_as_quoted() {
+        // Unclosed trailing quote: rest of string is quoted-text up
+        // to end-of-input. So `parent_pid "in: stuff` has only
+        // "parent_pid" as an unquoted token — the rest is text.
+        let r = check_search_operator_conflicts(
+            "parent_pid \"in: stuff",
+            &ChanvoyScopes {
+                channel_arg: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            r.is_ok(),
+            "unclosed quote: rest is text, not operator: {r:?}"
+        );
+    }
+
+    #[test]
+    fn first_conflict_wins_diagnostic_is_specific() {
+        // Multiple inline conflicts: first-found is reported. This
+        // matches PER-025 brief intent — operator fixes one issue,
+        // re-runs, sees the next.
+        let r = check_search_operator_conflicts("in:chan from:user", &all_scopes());
+        let err = r.unwrap_err();
+        // `in:` comes first in the query, so it's the diagnostic.
+        assert!(err.contains("`in:`"), "got: {err}");
     }
 }
 
@@ -1994,6 +2371,13 @@ impl MattermostClient {
             display_name: String,
             #[serde(rename = "type")]
             channel_type: String,
+            // PER-025: MM returns `last_post_at` per channel. 0 = no
+            // posts yet (or never); we map that to `None` so the
+            // operator surface (`null` in JSON, `—` in human) is the
+            // single source of truth for "no activity," distinct from
+            // a real epoch timestamp.
+            #[serde(default)]
+            last_post_at: i64,
         }
         let channels: Vec<RawChannel> = self
             .request(
@@ -2009,6 +2393,11 @@ impl MattermostClient {
                 name: channel.name,
                 display_name: channel.display_name,
                 channel_type: channel.channel_type,
+                last_post_at: if channel.last_post_at > 0 {
+                    Some(channel.last_post_at)
+                } else {
+                    None
+                },
             })
             .collect())
     }
@@ -2370,6 +2759,9 @@ impl MattermostClient {
             name: channel.name,
             display_name: channel.display_name,
             channel_type: channel.channel_type,
+            // Freshly-created channels have no posts yet — last_post_at
+            // surfaces as `None` (renders `null` / `—`).
+            last_post_at: None,
         })
     }
 
@@ -2582,6 +2974,107 @@ impl MattermostClient {
     ) -> Result<Option<String>, CoreError> {
         let recent = self.read_channel_most_recent(channel_name, 1, team).await?;
         Ok(recent.into_iter().next_back().map(|m| m.id))
+    }
+
+    /// PER-025 primitive 1: search posts in a channel via MM
+    /// `POST /api/v4/teams/{team_id}/posts/search`. Composes the
+    /// chanvoy-owned scopes (`<channel>` → `in:<channel-name>`,
+    /// `--from <author>` → `from:<author>`, `--since <secs>` →
+    /// `after:<computed-date>`) into MM's native operator syntax.
+    /// Operator-conflict detection happens **before** this call —
+    /// chanvoy-cli runs `check_search_operator_conflicts` against the
+    /// raw query and refuses with a diagnostic before issuing the
+    /// daemon RPC, so by the time we get here the query is conflict-
+    /// free relative to the chanvoy-owned scopes.
+    pub async fn search_channel(
+        &self,
+        channel_name: &str,
+        query: &str,
+        limit: u32,
+        from: Option<&str>,
+        since_secs: Option<u64>,
+        team: Option<&str>,
+    ) -> Result<SearchResult, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        // Compose chanvoy-owned scopes onto the operator's query.
+        // chanvoy uses MM's native operator syntax (`in:`, `from:`,
+        // `after:`) so MM does the actual search-side work; chanvoy
+        // contributes the resolved-channel scope plus any flag
+        // narrowing.
+        let mut terms = format!("{query} in:{}", resolved.channel_name);
+        if let Some(author) = from {
+            terms.push_str(&format!(" from:{author}"));
+        }
+        if let Some(secs) = since_secs {
+            // MM accepts `after:YYYY-MM-DD` (date-only granularity is
+            // the documented surface; finer-grained windows aren't
+            // supported by this MM operator). Compute the date by
+            // subtracting `secs` from now and formatting in UTC.
+            let cutoff_millis = seconds_ago_millis(secs);
+            let date = chrono::DateTime::from_timestamp_millis(cutoff_millis)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "1970-01-01".to_string());
+            terms.push_str(&format!(" after:{date}"));
+        }
+
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            terms: &'a str,
+            is_or_search: bool,
+        }
+        #[derive(Deserialize)]
+        struct RawPost {
+            id: String,
+            user_id: String,
+            message: String,
+            create_at: i64,
+            #[serde(default)]
+            username: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct SearchResponse {
+            #[serde(default)]
+            order: Vec<String>,
+            #[serde(default)]
+            posts: BTreeMap<String, RawPost>,
+        }
+
+        let response: SearchResponse = self
+            .request(
+                "POST",
+                &format!("/teams/{}/posts/search", resolved.team_id),
+                Some(Payload {
+                    terms: &terms,
+                    is_or_search: false,
+                }),
+            )
+            .await?;
+
+        // MM returns `order` (post ids in ranked order) plus a `posts`
+        // map keyed by id. Walk `order` to preserve MM's ranking,
+        // then truncate to the operator's `--limit`.
+        let limit = limit as usize;
+        let mut posts = Vec::with_capacity(response.order.len().min(limit));
+        for id in response.order.iter().take(limit) {
+            if let Some(raw) = response.posts.get(id) {
+                posts.push(Message {
+                    id: raw.id.clone(),
+                    user_id: raw.user_id.clone(),
+                    username: raw
+                        .username
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    message: raw.message.clone(),
+                    create_at: raw.create_at,
+                });
+            }
+        }
+
+        Ok(SearchResult {
+            team: resolved.team_name,
+            channel: resolved.channel_name,
+            posts,
+        })
     }
 
     pub async fn post_message_by_id(

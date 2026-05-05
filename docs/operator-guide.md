@@ -304,6 +304,103 @@ reactions instead of acks (the bot identity is preserved since
 reactions are auth-bound) and threaded replies for actual fix-commit
 follow-ups.
 
+## Discovery
+
+PER-025 (chanvoy v0.2.1) adds two discovery primitives — keyword search
+within a channel, and a traffic-aware `chanvoy channels` listing.
+
+### Search (`chanvoy search`)
+
+```bash
+# Find posts mentioning "parent_pid" in a specific channel
+chanvoy search per-019 "parent_pid"
+
+# Cap results, filter by author, narrow by time window
+chanvoy search per-019 "parent_pid" --from entarch --since 7d --limit 5
+```
+
+Channel positional is **required** in v1 — cross-channel / team-wide
+search is deferred to a follow-on brief. Use `<team>/<channel>` for
+cross-team scope:
+
+```bash
+chanvoy search org-3leaps/leadership "deadline" --since 24h
+```
+
+`<query>` is passed verbatim to MM's search endpoint after chanvoy
+composes its owned scopes (`in:<resolved-channel>` always; plus
+`from:<author>` and `after:<computed-date>` if the matching flags are
+set). Inline MM operators that **conflict** with chanvoy-owned scopes
+refuse with a clear diagnostic naming the conflict:
+
+| Conflict | Diagnostic |
+|---|---|
+| Inline `in:` + channel arg | "channel argument defines search scope; remove inline `in:`..." |
+| Inline `from:` + `--from` | "inline `from:` operator conflicts with the `--from` flag; pick one" |
+| Inline `before:`/`after:` + `--since` | "inline operator conflicts with the `--since` flag (both define the search time window); pick one" |
+
+Non-conflicting inline operators pass through verbatim — chanvoy
+doesn't claim ownership of arbitrary MM search syntax. A double-quoted
+substring is treated as literal search text, not an operator: `chanvoy
+search per-019 "in: the brief"` searches for the literal phrase
+without conflicting against the channel arg.
+
+`--json` shape: `{ team, channel, posts: [...] }`. Each post carries
+the standard `Message` fields including `create_at` (i64 Unix epoch
+ms, matching chanvoy-core's existing post-timestamp convention).
+
+### Channel listing with activity (`chanvoy channels`)
+
+The default `chanvoy channels` output now includes a `last_active`
+column showing relative time per channel — `2h ago` / `3d ago` / `2w
+ago`, or `—` for channels with no posts.
+
+```bash
+chanvoy channels
+# === org-lanytehq ===
+#   org-lanytehq/bravo-team   Bravo Team   O  2h ago
+#   org-lanytehq/per-019      PER-019      O  3d ago
+#   org-lanytehq/quiet        Quiet        O  —
+```
+
+Sort by recency with `--sort active`:
+
+```bash
+chanvoy channels --sort active
+# Most-recent channels first within each team group;
+# never-active channels sort last within their group.
+```
+
+**`--sort active` preserves PER-019 team grouping** — channels are
+sorted within each team's group, but the group order itself stays
+primary-first / fallback-alphabetical. A flattened global-active view
+is explicitly out of scope (deferred to a future `--flatten` /
+`--global` decision if friction surfaces).
+
+`--json` shape on default `channels`: each channel object includes
+`last_post_at` as i64 Unix epoch ms; **missing-activity is required
+to be `last_post_at: null`** (deterministic shape — never absent,
+never `0`):
+
+```json
+{
+  "teams": [
+    {
+      "team_name": "org-lanytehq",
+      "channels": [
+        { "id": "...", "name": "active", "last_post_at": 1700000000000, ... },
+        { "id": "...", "name": "quiet", "last_post_at": null, ... }
+      ]
+    }
+  ]
+}
+```
+
+`chanvoy channels --primary-team --json` preserves the **legacy**
+single-team JSON shape exactly — no `last_post_at` field added. Use
+the legacy path when downstream tooling depends on the
+pre-PER-025 shape.
+
 ## Cross-Team Channel Resolution
 
 As of chanvoy 0.1.3+, channel-name arguments resolve across every

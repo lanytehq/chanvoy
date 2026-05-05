@@ -14,9 +14,9 @@ use chanvoy_core::{
     DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
     NotifyParams, PinnedChannelParams, PostMessageParams, Profile, ProfileStatus, Provider,
-    ReactParams, ReactionResult, ReadChannelParams, ReadDirectMessageParams, ShutdownResult,
-    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnreactParams, UnreadNotifications,
-    UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
+    ReactParams, ReactionResult, ReadChannelParams, ReadDirectMessageParams, SearchParams,
+    SearchResult, ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter,
+    UnreactParams, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -747,6 +747,25 @@ async fn dispatch_request(
                     &params.channel,
                     &params.post_id,
                     &params.emoji,
+                    params.team.as_deref(),
+                )
+                .await
+        })
+        .await
+        .map(to_value),
+        "search_channel" => parse_and_call(&request.params, |params: SearchParams| async move {
+            // PER-025 primitive 1: pure read, no cursor side effects.
+            // Operator-conflict detection ran at the CLI layer; by
+            // this point the query is conflict-free relative to
+            // chanvoy-owned scopes.
+            state
+                .client
+                .search_channel(
+                    &params.channel,
+                    &params.query,
+                    params.limit.unwrap_or(20),
+                    params.from.as_deref(),
+                    params.since_secs,
                     params.team.as_deref(),
                 )
                 .await
@@ -1918,6 +1937,33 @@ impl DaemonClient {
                 channel: channel.to_string(),
                 post_id: post_id.to_string(),
                 emoji: emoji.to_string(),
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-025 primitive 1: search posts within a channel.
+    /// Operator-conflict detection runs at the CLI layer; this client
+    /// expects the query to be already-vetted by
+    /// `check_search_operator_conflicts`.
+    pub async fn search_channel(
+        &self,
+        channel: &str,
+        query: &str,
+        limit: Option<u32>,
+        from: Option<String>,
+        since_secs: Option<u64>,
+        team: Option<String>,
+    ) -> Result<SearchResult, DaemonError> {
+        self.call(
+            "search_channel",
+            serde_json::to_value(SearchParams {
+                channel: channel.to_string(),
+                query: query.to_string(),
+                limit,
+                from,
+                since_secs,
                 team,
             })?,
         )
