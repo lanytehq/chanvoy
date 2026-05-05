@@ -554,3 +554,216 @@ async fn channels_sort_active_preserves_grouping() {
 
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
+
+// ----------------------------------------------------------------------
+// Devrev PR #22 round-1 P2 follow-ups
+// ----------------------------------------------------------------------
+
+/// Same cross-team helper as PER-023/024 test files. Locally redefined
+/// rather than extracted to common — small enough that local
+/// definition keeps tests self-contained per chanvoy's existing test
+/// discipline.
+async fn mount_alternate_team(
+    env: &TestEnv,
+    primary_team_id: &str,
+    alt_team: &str,
+    alt_team_id: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me/teams"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": primary_team_id,
+                "name": "org-lanytehq",
+                "display_name": "lanytehq",
+            },
+            {
+                "id": alt_team_id,
+                "name": alt_team,
+                "display_name": alt_team,
+            },
+        ])))
+        .mount(&env.mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/teams/name/{alt_team}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": alt_team_id,
+            "name": alt_team,
+        })))
+        .mount(&env.mock)
+        .await;
+}
+
+/// AC #4: positive `search --since <window>` composes the
+/// `after:<computed-date>` operator into the MM `terms` body. Per
+/// @agent-bravo-devrev's PR #22 round-1 P2 finding #1 (2026-05-05):
+/// pin the positive behavior explicitly rather than relying on the
+/// negative conflict-rejection test to imply it.
+///
+/// The implementation pins MM date-granularity (YYYY-MM-DD UTC) for
+/// the operator composition — this matches the documented MM search
+/// surface (`after:` accepts date-only). This test asserts that
+/// shape; finer-grained windows aren't supported by MM's
+/// after-operator.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn search_since_composes_after_date_into_terms() {
+    let env = TestEnv::new("per-025-search-since-positive").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-ssp", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("bravo-team", "chan-id-ssp").await;
+    mock_search_response(&env, "team-id-456", &[], &[]).await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(
+        &env,
+        &["search", "bravo-team", "validation", "--since", "7d"],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "search --since must exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let requests = env.mock.received_requests().await.unwrap_or_default();
+    let search_post = requests
+        .iter()
+        .find(|r| {
+            r.method == Method::POST && r.url.path() == "/api/v4/teams/team-id-456/posts/search"
+        })
+        .expect("search request was made");
+    let body: serde_json::Value =
+        serde_json::from_slice(&search_post.body).expect("search body parses");
+    let terms = body["terms"].as_str().expect("terms field");
+
+    // chanvoy must compose `after:<YYYY-MM-DD>` into terms when
+    // `--since` is set. Date is computed from "now - 7d"; we don't
+    // pin the exact date (test runs on different days) but assert
+    // the operator + format shape.
+    assert!(
+        terms.contains("after:"),
+        "search --since must compose after: operator into terms; got: {terms}"
+    );
+    // Find the after: token and verify it has the YYYY-MM-DD shape.
+    let after_token = terms
+        .split_whitespace()
+        .find(|t| t.starts_with("after:"))
+        .expect("after: token");
+    let date_part = after_token.trim_start_matches("after:");
+    assert_eq!(
+        date_part.len(),
+        10,
+        "after: date must be YYYY-MM-DD (10 chars); got: {date_part}"
+    );
+    assert_eq!(
+        date_part.chars().filter(|&c| c == '-').count(),
+        2,
+        "after: date must have two `-` separators (YYYY-MM-DD); got: {date_part}"
+    );
+    // Sanity: the chanvoy-owned channel scope is also there.
+    assert!(
+        terms.contains("in:bravo-team"),
+        "channel auto-scope still composed alongside --since; got: {terms}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// AC #1: `<team>/<channel>` syntax for `chanvoy search`. Per
+/// @agent-bravo-devrev's PR #22 round-1 P2 finding #2 (2026-05-05):
+/// confirms the alt-team channel resolves correctly, the search
+/// request hits the alt-team's `/teams/<alt-team-id>/posts/search`
+/// endpoint, and the JSON result reports the resolved alt-team
+/// `team` + `channel` (cross-team disambiguation pattern).
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn search_cross_team_syntax() {
+    let env = TestEnv::new("per-025-search-cross-team").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-sct", "agent-bravo-devlead", "team-id-456")
+        .await;
+    mount_alternate_team(&env, "team-id-456", "org-3leaps", "team-id-3leaps").await;
+    // Channel exists on the alternate team only — confirms the
+    // resolver is routing on the explicit team slug.
+    env.mock_channel_lookup_for_team("team-id-3leaps", "ops-tech", "chan-id-3l-search")
+        .await;
+    // Search response on the alt team's endpoint.
+    mock_search_response(
+        &env,
+        "team-id-3leaps",
+        &["alt-match"],
+        &[(
+            "alt-match",
+            "user-1",
+            "alice",
+            "alt-team validation here",
+            1_700_000_000_000,
+        )],
+    )
+    .await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(
+        &env,
+        &["--json", "search", "org-3leaps/ops-tech", "validation"],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "cross-team search must exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Result fields reflect the resolved alternate team — confirms
+    // γ resolver routed via Explicit and the cross-team
+    // disambiguation pattern surfaces correctly to JSON consumers.
+    let result: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("search --json parses");
+    assert_eq!(
+        result["team"].as_str(),
+        Some("org-3leaps"),
+        "SearchResult.team reflects the alt-team slug"
+    );
+    assert_eq!(result["channel"].as_str(), Some("ops-tech"));
+    assert_eq!(result["posts"].as_array().map(|a| a.len()), Some(1));
+
+    // The search request hit the **alt-team's** endpoint, not the
+    // primary team's — verifies the resolver routed the request
+    // path correctly.
+    let requests = env.mock.received_requests().await.unwrap_or_default();
+    let alt_search = requests.iter().find(|r| {
+        r.method == Method::POST && r.url.path() == "/api/v4/teams/team-id-3leaps/posts/search"
+    });
+    assert!(
+        alt_search.is_some(),
+        "search request must hit the alt-team's /posts/search endpoint; \
+         observed paths: {:?}",
+        requests
+            .iter()
+            .filter(|r| r.method == Method::POST)
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
+    );
+    let no_primary_search = requests.iter().any(|r| {
+        r.method == Method::POST && r.url.path() == "/api/v4/teams/team-id-456/posts/search"
+    });
+    assert!(
+        !no_primary_search,
+        "cross-team search must NOT hit the primary team's /posts/search endpoint"
+    );
+
+    // The terms body for the alt-team search composes `in:ops-tech`
+    // (the alt-team's resolved channel name).
+    let body: serde_json::Value =
+        serde_json::from_slice(&alt_search.unwrap().body).expect("body parses");
+    let terms = body["terms"].as_str().expect("terms field");
+    assert!(
+        terms.contains("in:ops-tech"),
+        "auto-scope uses the resolved alt-team channel name; got: {terms}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
