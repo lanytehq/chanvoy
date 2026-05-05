@@ -128,6 +128,13 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PostReceipt {
     pub id: String,
+    /// PER-024: thread root post id when the post was created as a
+    /// thread reply via `chanvoy post --reply-to`. **Additive** field
+    /// per AC #3a — non-threaded posts omit this entirely (not `null`)
+    /// so the existing `{ "id": "<post_id>" }` JSON shape is preserved
+    /// byte-for-byte for callers who don't opt into threading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -480,6 +487,13 @@ pub struct PostMessageParams {
     /// PER-019: optional `--team <slug>` override.
     #[serde(default)]
     pub team: Option<String>,
+    /// PER-024 primitive 1: when set, the post is created as a
+    /// thread reply under the named parent (MM `root_id`). Validation
+    /// order: resolve channel → verify parent exists on resolved
+    /// channel → write. Refuse wrong-channel parents with a clear
+    /// diagnostic before the write is attempted.
+    #[serde(default)]
+    pub thread_root_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,6 +544,108 @@ pub struct PinnedChannelParams {
     pub channel: String,
     #[serde(default)]
     pub team: Option<String>,
+}
+
+/// PER-024 primitive 2: parameters for `chanvoy react <channel>
+/// <post_id> <emoji>`. Channel context is positional (required) for
+/// multi-provider portability — Slack's reactions API needs the
+/// channel-id tuple even though Mattermost can key by post-id alone.
+/// See PER-024 Multi-Provider Portability Note for the rationale.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReactParams {
+    pub channel: String,
+    pub post_id: String,
+    pub emoji: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-024 primitive 2: parameters for `chanvoy unreact <channel>
+/// <post_id> <emoji>`. Same shape as `ReactParams`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnreactParams {
+    pub channel: String,
+    pub post_id: String,
+    pub emoji: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-024 primitive 2: outcome of a `react` / `unreact` call. The
+/// resolved `team` and `channel` are surfaced so JSON consumers can
+/// disambiguate cross-team channel duplicates (PER-019). The `emoji`
+/// field reflects the **normalized** value sent to the MM API
+/// (colon-stripped if the input was `:emoji:` form). `ok` is always
+/// `true` when this struct surfaces — failures bubble as
+/// `CoreError`s. Per @agent-bravo-devrev's PER-024 pre-impl pin #2
+/// (2026-05-04): includes both `team` and `channel` mirroring
+/// `AckResult`'s pattern.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReactionResult {
+    pub team: String,
+    pub channel: String,
+    pub post_id: String,
+    pub emoji: String,
+    pub ok: bool,
+}
+
+/// PER-024: strip surrounding ASCII colons from an emoji name if the
+/// operator typed the MM-UI form `:emoji:`. Pass-through when bare.
+/// Unmatched single colons are preserved verbatim (the chanvoy CLI
+/// is not an emoji validator — MM rejects unknown names with a
+/// clear error if needed). Per @agent-bravo-devrev's PER-024
+/// pre-impl pin #4 (2026-05-04): the **stripped** value is what
+/// gets sent to the MM API and surfaces in `--json`.
+pub fn normalize_emoji_name(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with(':') && trimmed.ends_with(':') {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod emoji_tests {
+    use super::*;
+
+    #[test]
+    fn bare_emoji_unchanged() {
+        assert_eq!(normalize_emoji_name("+1"), "+1");
+        assert_eq!(normalize_emoji_name("thumbsup"), "thumbsup");
+        assert_eq!(normalize_emoji_name("heavy_check_mark"), "heavy_check_mark");
+    }
+
+    #[test]
+    fn colon_wrapped_stripped() {
+        assert_eq!(normalize_emoji_name(":+1:"), "+1");
+        assert_eq!(normalize_emoji_name(":eyes:"), "eyes");
+    }
+
+    #[test]
+    fn unmatched_colon_preserved() {
+        // Single trailing or leading colon isn't the MM-UI form;
+        // pass through verbatim so MM can reject it cleanly.
+        assert_eq!(normalize_emoji_name(":+1"), ":+1");
+        assert_eq!(normalize_emoji_name("+1:"), "+1:");
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(normalize_emoji_name("  +1  "), "+1");
+        assert_eq!(normalize_emoji_name("  :+1:  "), "+1");
+    }
+
+    #[test]
+    fn empty_or_only_colons() {
+        // ":" by itself is one char so the colon-pair check fails
+        // (len >= 2 required); pass through.
+        assert_eq!(normalize_emoji_name(":"), ":");
+        // "::" is two colons — passes the colon-pair check, strips
+        // to empty string. MM will reject empty; that's the right
+        // place for the error.
+        assert_eq!(normalize_emoji_name("::"), "");
+    }
 }
 
 /// PER-023 primitive 4: parameters for `chanvoy ack <channel>`. Daemon
@@ -2084,7 +2200,10 @@ impl MattermostClient {
                 }),
             )
             .await?;
-        Ok(PostReceipt { id: receipt.id })
+        Ok(PostReceipt {
+            id: receipt.id,
+            parent_id: None,
+        })
     }
 
     pub async fn direct_message(
@@ -2489,7 +2608,10 @@ impl MattermostClient {
                 }),
             )
             .await?;
-        Ok(PostReceipt { id: receipt.id })
+        Ok(PostReceipt {
+            id: receipt.id,
+            parent_id: None,
+        })
     }
 
     pub async fn post_threaded_reply(
@@ -2519,7 +2641,117 @@ impl MattermostClient {
                 }),
             )
             .await?;
-        Ok(PostReceipt { id: receipt.id })
+        // PER-024 AC #3a: threaded receipts surface `parent_id`
+        // additively. Non-threaded paths (`post_message_by_id` /
+        // `post_message`) leave it `None` so the JSON shape
+        // collapses to `{ id }`.
+        Ok(PostReceipt {
+            id: receipt.id,
+            parent_id: Some(root_id.to_string()),
+        })
+    }
+
+    /// PER-024 primitive 1: high-level wrapper that resolves the
+    /// channel via PER-019 γ hybrid, verifies the parent post exists
+    /// on the **resolved** channel, then issues the threaded write.
+    /// Validation order is provider-portable per AC #3.
+    pub async fn post_threaded_reply_in_channel(
+        &self,
+        channel_name: &str,
+        root_post_id: &str,
+        message: &str,
+        team: Option<&str>,
+    ) -> Result<PostReceipt, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        self.assert_post_in_channel(&resolved.channel_id, &resolved.channel_name, root_post_id)
+            .await?;
+        self.post_threaded_reply(&resolved.channel_id, root_post_id, message)
+            .await
+    }
+
+    /// PER-024 primitive 2: add an emoji reaction under the bot's
+    /// identity. Validation order per AC #5a: resolve channel →
+    /// verify post exists on resolved channel → write. Idempotent on
+    /// duplicate-react per AC #5b: MM returns 200/201 with the
+    /// existing reaction object on duplicates, so we accept any 2xx
+    /// as success. Per @agent-bravo-devrev's PR #20 pre-impl pin #3
+    /// (2026-05-04) — idempotency is deliberate at the chanvoy-core
+    /// layer, not assumed from generic MM error behavior.
+    pub async fn add_reaction(
+        &self,
+        channel_name: &str,
+        post_id: &str,
+        emoji: &str,
+        team: Option<&str>,
+    ) -> Result<ReactionResult, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        self.assert_post_in_channel(&resolved.channel_id, &resolved.channel_name, post_id)
+            .await?;
+        let user_id = self.whoami().await?.id;
+        let normalized = normalize_emoji_name(emoji);
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            user_id: &'a str,
+            post_id: &'a str,
+            emoji_name: &'a str,
+        }
+        // MM returns the reaction object on success; we discard the
+        // body via `Value`. The 2xx vs error distinction is the
+        // operator-facing contract.
+        let _: Value = self
+            .request(
+                "POST",
+                "/reactions",
+                Some(Payload {
+                    user_id: &user_id,
+                    post_id,
+                    emoji_name: &normalized,
+                }),
+            )
+            .await?;
+        Ok(ReactionResult {
+            team: resolved.team_name,
+            channel: resolved.channel_name,
+            post_id: post_id.to_string(),
+            emoji: normalized,
+            ok: true,
+        })
+    }
+
+    /// PER-024 primitive 2: remove the bot's reaction. Validation
+    /// order per AC #5a; idempotent on missing-reaction per AC #5b
+    /// (404 normalized to success at this layer per devrev pre-impl
+    /// pin #3 — the operator contract is "this reaction does not
+    /// exist after this call returns," and a 404 from MM means it
+    /// already didn't exist).
+    pub async fn remove_reaction(
+        &self,
+        channel_name: &str,
+        post_id: &str,
+        emoji: &str,
+        team: Option<&str>,
+    ) -> Result<ReactionResult, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        self.assert_post_in_channel(&resolved.channel_id, &resolved.channel_name, post_id)
+            .await?;
+        let user_id = self.whoami().await?.id;
+        let normalized = normalize_emoji_name(emoji);
+        let path = format!("/users/{user_id}/posts/{post_id}/reactions/{normalized}");
+        match self.request::<Value, Value>("DELETE", &path, None).await {
+            Ok(_) => {}
+            Err(CoreError::Api {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }) => {}
+            Err(other) => return Err(other),
+        }
+        Ok(ReactionResult {
+            team: resolved.team_name,
+            channel: resolved.channel_name,
+            post_id: post_id.to_string(),
+            emoji: normalized,
+            ok: true,
+        })
     }
 
     pub async fn read_thread(&self, root_post_id: &str) -> Result<Vec<Message>, CoreError> {

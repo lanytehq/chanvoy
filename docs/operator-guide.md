@@ -220,6 +220,90 @@ Current inspectability gap worth tracking:
 - there is not yet a first-class `doctor` or `status` surface for showing the current stored attention state file and cursor values
 - operators can inspect the per-profile JSON state file directly under the config root for now
 
+## Conversation Primitives
+
+PER-024 (chanvoy v0.2.1) adds two primitives for cleaner multi-reviewer
+review cycles — threaded replies and emoji reactions. Both are
+noise-reduction surfaces: a high-traffic review channel with 11
+findings + acks no longer needs all of those as top-level posts.
+
+### Threaded replies (`post --reply-to`)
+
+```bash
+# Post a top-level finding (existing surface)
+chanvoy post brief-per-024 "finding #2: bare --limit shape ambiguous"
+# → posted: <reply-id>
+
+# Reply within the thread (PER-024)
+chanvoy post brief-per-024 "fixed in 54661a7" --reply-to <parent-id>
+# → posted: <reply-id>
+```
+
+`--reply-to` accepts the post id returned by a prior `chanvoy post` or
+`chanvoy read --json`. Channel resolution is unchanged (γ hybrid;
+`<team>/<channel>` works on `--reply-to` calls too). The validation
+order is **resolve channel → verify parent on resolved channel →
+write**, so a parent post id from a different channel is refused
+before any write is attempted.
+
+`--json` output is **additive**: non-threaded posts return the
+existing `{ "id": "<post_id>" }` shape unchanged; threaded posts add
+`parent_id` (`{ "id": "<new>", "parent_id": "<root>" }`). Human output
+stays `posted: <new_reply_id>` regardless.
+
+### Emoji reactions (`react` / `unreact`)
+
+```bash
+# Ack a finding without adding a "lgtm" text post
+chanvoy react brief-per-024 <post-id> +1
+# → ok: org-lanytehq/brief-per-024 +1 on post <post-id>
+
+# Remove your reaction
+chanvoy unreact brief-per-024 <post-id> +1
+```
+
+**Channel is positional and required** even though Mattermost can key
+reactions by post-id alone — Slack's reactions API needs the channel
+context, so chanvoy's CLI is shaped portable from day one. Use
+`<team>/<channel>` syntax for cross-team posts:
+
+```bash
+chanvoy react 3-leaps-operations/leadership <post-id> heavy_check_mark
+```
+
+Reactions are **idempotent**: re-reacting with the same emoji is a
+no-op success (matches MM's API behavior); unreacting when you didn't
+react is also success (chanvoy normalizes MM's 404 path so the
+operator contract is "this reaction does not exist after the call
+returns"). Reactions are **cursor-neutral** — they don't advance the
+attention cursor, so an `ack <channel>` after a `react` still treats
+the channel as having unread content if any new posts arrived.
+
+### Emoji name format
+
+Bare names preferred (`+1`, `eyes`, `heavy_check_mark`, `seen`). The
+MM-UI colon-wrapped form (`:+1:`) is also accepted — chanvoy strips
+the surrounding colons before the API call, so what reaches MM is the
+canonical bare form. Synonyms (e.g., `+1` vs `thumbsup`) are
+pass-through; chanvoy isn't an emoji resolver. If MM rejects an
+unknown name, the error surfaces with the typed value preserved.
+
+### When to use threading vs reactions
+
+| Use | Choose |
+|---|---|
+| Acking a finding ("noted", "lgtm", "seen") | reaction (`+1` / `eyes`) |
+| Following up on a finding with new info or a fix commit | threaded reply (`--reply-to`) |
+| Quick agreement / disagreement | reaction (`+1` / `-1`) |
+| Adding context that needs attribution + history | threaded reply |
+
+Pattern observed during PER-019's review cycle: 11 reviewer findings
++ ~30% acks-as-text-posts in a 30-post channel made the signal-to-noise
+ratio poor. PER-024's primitives let the same review cycle ship with
+reactions instead of acks (the bot identity is preserved since
+reactions are auth-bound) and threaded replies for actual fix-commit
+follow-ups.
+
 ## Cross-Team Channel Resolution
 
 As of chanvoy 0.1.3+, channel-name arguments resolve across every

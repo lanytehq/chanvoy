@@ -8,7 +8,7 @@ use chanvoy_core::{
     socket_path_for_profile, store_active_profile, store_profile, AckResult, AttentionListResult,
     AttentionShowResult, AttentionSource, CapabilityClass, Channel, CheckResult, CredentialMode,
     DaemonHealthState, DaemonStatus, DmConversation, Identity, MattermostClient, Message,
-    Notification, PostReceipt, Profile, ProfileStatus, Provider, SeedCursorsResult,
+    Notification, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SeedCursorsResult,
     SeededChannelOutcome, TimeWindowDefaultUnit, UnreadNotifications, WaitResult,
     WsConnectionState,
 };
@@ -80,6 +80,14 @@ enum CommandSet {
     /// current latest post without fetching content. Uses the PER-019 γ
     /// hybrid resolver; accepts <team>/<channel> syntax.
     Ack(AckArgs),
+    /// PER-024 primitive 2: add an emoji reaction to a post under the
+    /// bot's identity. Channel positional for multi-provider portability
+    /// (Slack reactions API requires channel+message_ts even though MM
+    /// keys by post-id alone). Idempotent on duplicate-react.
+    React(ReactArgs),
+    /// PER-024 primitive 2: remove the bot's emoji reaction. Idempotent
+    /// on missing-reaction (success exit).
+    Unreact(ReactArgs),
     #[command(subcommand)]
     Channel(ChannelCommand),
     /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
@@ -282,6 +290,31 @@ struct WaitArgs {
 struct PostArgs {
     channel: String,
     message: String,
+    /// PER-024 primitive 1: when set, the post is created as a
+    /// thread reply under the named parent post (MM `root_id` /
+    /// Slack `thread_ts` semantic). Channel resolution unchanged
+    /// (γ hybrid). Validation: refuse with clear diagnostic if
+    /// the parent doesn't exist on the resolved channel.
+    #[arg(long)]
+    reply_to: Option<String>,
+    /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ReactArgs {
+    /// Channel context (positional, required for multi-provider
+    /// portability). Accepts `<team>/<channel>` syntax for cross-team
+    /// resolution per PER-019 γ hybrid.
+    channel: String,
+    /// Post ID to react/unreact on. Format matches `chanvoy post`'s
+    /// returned ID and `chanvoy read --json`'s `id` field.
+    post_id: String,
+    /// Emoji name. Bare names (`+1`, `eyes`) preferred; colon-wrapped
+    /// MM-UI form (`:+1:`) is accepted with the colons stripped before
+    /// the API call.
+    emoji: String,
     /// PER-019: explicit team override.
     #[arg(long)]
     team: Option<String>,
@@ -489,7 +522,12 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
             cli.json,
             "posted",
             &daemon_client(&profile)
-                .post_message(&args.channel, &args.message, args.team.clone())
+                .post_message(
+                    &args.channel,
+                    &args.message,
+                    args.team.clone(),
+                    args.reply_to.clone(),
+                )
                 .await?,
         ),
         CommandSet::Dm(DmCommand::Send(args)) => print_dm_receipt(
@@ -589,6 +627,18 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
             cli.json,
             &daemon_client(&profile)
                 .ack_channel(&args.channel, args.team.clone())
+                .await?,
+        ),
+        CommandSet::React(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .react_post(&args.channel, &args.post_id, &args.emoji, args.team.clone())
+                .await?,
+        ),
+        CommandSet::Unreact(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .unreact_post(&args.channel, &args.post_id, &args.emoji, args.team.clone())
                 .await?,
         ),
         CommandSet::Channel(ChannelCommand::Create(args)) => print_value(
@@ -2121,6 +2171,19 @@ impl HumanReadable for AckResult {
                 self.team, self.channel
             ),
         }
+    }
+}
+
+impl HumanReadable for ReactionResult {
+    fn to_human_string(&self) -> String {
+        // PER-024 verb-shape note: the same human format works for
+        // both `react` and `unreact` because the result struct
+        // doesn't carry a verb discriminator — `ok: true` is the
+        // operator-facing contract on either path.
+        format!(
+            "ok: {}/{} {} on post {}",
+            self.team, self.channel, self.emoji, self.post_id
+        )
     }
 }
 

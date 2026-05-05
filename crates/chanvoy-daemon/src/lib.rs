@@ -14,9 +14,9 @@ use chanvoy_core::{
     DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
     NotifyParams, PinnedChannelParams, PostMessageParams, Profile, ProfileStatus, Provider,
-    ReadChannelParams, ReadDirectMessageParams, ShutdownResult, SubscribeParams, SubscriptionAck,
-    SubscriptionFilter, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult,
-    WsState,
+    ReactParams, ReactionResult, ReadChannelParams, ReadDirectMessageParams, ShutdownResult,
+    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnreactParams, UnreadNotifications,
+    UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -689,10 +689,28 @@ async fn dispatch_request(
             .map(to_value)
         }
         "post_message" => parse_and_call(&request.params, |params: PostMessageParams| async move {
-            let receipt = state
-                .client
-                .post_message(&params.channel, &params.message, params.team.as_deref())
-                .await?;
+            // PER-024 primitive 1: when thread_root_id is set, route to
+            // the threaded path which performs resolve→verify→write
+            // (validation order per AC #3). Cursor recording semantics
+            // are unchanged — both top-level and threaded posts advance
+            // the channel cursor, since both result in a write the
+            // operator wants reflected in attention state.
+            let receipt = if let Some(root_id) = &params.thread_root_id {
+                state
+                    .client
+                    .post_threaded_reply_in_channel(
+                        &params.channel,
+                        root_id,
+                        &params.message,
+                        params.team.as_deref(),
+                    )
+                    .await?
+            } else {
+                state
+                    .client
+                    .post_message(&params.channel, &params.message, params.team.as_deref())
+                    .await?
+            };
             // PER-019 (devrev PR #17 finding #2): cursor recording must
             // bind to the same team the post landed on. Pass the
             // operator's --team override through; otherwise a
@@ -701,6 +719,37 @@ async fn dispatch_request(
             record_channel_cursor(state, &params.channel, &receipt.id, params.team.as_deref())
                 .await?;
             Ok(receipt)
+        })
+        .await
+        .map(to_value),
+        "react_post" => parse_and_call(&request.params, |params: ReactParams| async move {
+            // PER-024 AC #5b: reactions are auth-bound metadata writes
+            // with NO cursor side effects. The chanvoy-core method
+            // performs resolve→verify→write per AC #5a; this dispatch
+            // does NOT call record_channel_cursor.
+            state
+                .client
+                .add_reaction(
+                    &params.channel,
+                    &params.post_id,
+                    &params.emoji,
+                    params.team.as_deref(),
+                )
+                .await
+        })
+        .await
+        .map(to_value),
+        "unreact_post" => parse_and_call(&request.params, |params: UnreactParams| async move {
+            // PER-024 AC #5b: same cursor-neutral contract as react.
+            state
+                .client
+                .remove_reaction(
+                    &params.channel,
+                    &params.post_id,
+                    &params.emoji,
+                    params.team.as_deref(),
+                )
+                .await
         })
         .await
         .map(to_value),
@@ -1810,17 +1859,65 @@ impl DaemonClient {
         .await
     }
 
+    /// PER-024: when `thread_root_id` is `Some`, the post is created as
+    /// a threaded reply via `post_threaded_reply_in_channel` and the
+    /// returned `PostReceipt` carries an additive `parent_id` field.
+    /// Otherwise the existing `post_message` path runs unchanged.
     pub async fn post_message(
         &self,
         channel: &str,
         message: &str,
         team: Option<String>,
+        thread_root_id: Option<String>,
     ) -> Result<chanvoy_core::PostReceipt, DaemonError> {
         self.call(
             "post_message",
             serde_json::to_value(PostMessageParams {
                 channel: channel.to_string(),
                 message: message.to_string(),
+                team,
+                thread_root_id,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-024 primitive 2: add an emoji reaction under the bot's
+    /// identity. Channel positional for multi-provider portability.
+    pub async fn react_post(
+        &self,
+        channel: &str,
+        post_id: &str,
+        emoji: &str,
+        team: Option<String>,
+    ) -> Result<ReactionResult, DaemonError> {
+        self.call(
+            "react_post",
+            serde_json::to_value(ReactParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
+                emoji: emoji.to_string(),
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-024 primitive 2: remove the bot's reaction. Idempotent on
+    /// missing-reaction (success exit).
+    pub async fn unreact_post(
+        &self,
+        channel: &str,
+        post_id: &str,
+        emoji: &str,
+        team: Option<String>,
+    ) -> Result<ReactionResult, DaemonError> {
+        self.call(
+            "unreact_post",
+            serde_json::to_value(UnreactParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
+                emoji: emoji.to_string(),
                 team,
             })?,
         )
