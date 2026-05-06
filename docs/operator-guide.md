@@ -489,6 +489,26 @@ Flags:
 - `--json` — structured per-team output with a `qualified` field
   for each channel.
 
+### Cross-team channel creation (v0.2.1)
+
+`chanvoy channel create <name> <display>` creates a public channel
+on the profile's primary team by default. To create a channel on an
+alternate team the bot is a member of, use `--team`:
+
+```bash
+# Default — lands on the profile's primary team
+chanvoy channel create ops-discussions "Ops Discussions"
+
+# Alt-team override — lands on org-3leaps
+chanvoy channel create ops-discussions "Ops Discussions" --team org-3leaps
+```
+
+The team must be one the bot is already a member of (the resolver
+looks it up via the same `/users/me/teams` membership cache that
+powers cross-team `read` / `post` / `search` etc.). v0.2.1 closes
+this gap — every chanvoy verb that touches a channel is now
+cross-team aware.
+
 ## Profile Resolution
 
 When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profile in order:

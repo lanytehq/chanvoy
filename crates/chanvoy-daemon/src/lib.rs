@@ -842,7 +842,12 @@ async fn dispatch_request(
             parse_and_call(&request.params, |params: CreateChannelParams| async move {
                 state
                     .client
-                    .create_channel(&params.name, &params.display_name, params.purpose)
+                    .create_channel(
+                        &params.name,
+                        &params.display_name,
+                        params.purpose,
+                        params.team.as_deref(),
+                    )
                     .await
             })
             .await
@@ -2063,6 +2068,7 @@ impl DaemonClient {
         name: &str,
         display_name: &str,
         purpose: Option<String>,
+        team: Option<String>,
     ) -> Result<Channel, DaemonError> {
         self.call(
             "create_channel",
@@ -2070,6 +2076,7 @@ impl DaemonClient {
                 name: name.to_string(),
                 display_name: display_name.to_string(),
                 purpose,
+                team,
             })?,
         )
         .await
