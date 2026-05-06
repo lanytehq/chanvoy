@@ -4,11 +4,12 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    list_profiles, load_active_profile, load_token, parse_time_window, pid_path_for_profile,
-    socket_path_for_profile, store_active_profile, store_profile, AckResult, AttentionListResult,
-    AttentionShowResult, AttentionSource, CapabilityClass, Channel, CheckResult, CredentialMode,
-    DaemonHealthState, DaemonStatus, DmConversation, Identity, MattermostClient, Message,
-    Notification, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SeedCursorsResult,
+    check_search_operator_conflicts, list_profiles, load_active_profile, load_token,
+    parse_time_window, pid_path_for_profile, socket_path_for_profile, store_active_profile,
+    store_profile, AckResult, AttentionListResult, AttentionShowResult, AttentionSource,
+    CapabilityClass, Channel, ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState,
+    DaemonStatus, DmConversation, Identity, LegacyChannel, MattermostClient, Message, Notification,
+    PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
     SeededChannelOutcome, TimeWindowDefaultUnit, UnreadNotifications, WaitResult,
     WsConnectionState,
 };
@@ -88,6 +89,12 @@ enum CommandSet {
     /// PER-024 primitive 2: remove the bot's emoji reaction. Idempotent
     /// on missing-reaction (success exit).
     Unreact(ReactArgs),
+    /// PER-025 primitive 1: search posts within a channel via MM
+    /// `/teams/{id}/posts/search`. Channel positional + required
+    /// (cross-channel search deferred from v1). Refuses with a
+    /// diagnostic on inline operator conflicts (`in:`, `from:`,
+    /// `before:`/`after:`) per AC #4a.
+    Search(SearchArgs),
     #[command(subcommand)]
     Channel(ChannelCommand),
     /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
@@ -115,9 +122,17 @@ struct ChannelsArgs {
     team: Option<String>,
     /// PER-019 AC #11: print only the profile's primary team in the
     /// pre-PER-019 single-team format. Back-compat escape hatch for
-    /// tooling that depends on the old shape.
+    /// tooling that depends on the old shape. PER-025 preserves this
+    /// JSON shape exactly (no `last_post_at` field added) per AC #6a.
     #[arg(long, conflicts_with = "team")]
     primary_team: bool,
+    /// PER-025 primitive 2: sort channels by recency. `active` =
+    /// most-recent-first within each PER-019 team group; missing /
+    /// zero-activity channels sort last within the group. Per AC #5
+    /// (entarch pin #4): preserves PER-019 grouping, does NOT
+    /// flatten globally.
+    #[arg(long, conflicts_with = "primary_team", value_parser = ["active"])]
+    sort: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -298,6 +313,39 @@ struct PostArgs {
     #[arg(long)]
     reply_to: Option<String>,
     /// PER-019: explicit team override.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SearchArgs {
+    /// Channel positional + required (cross-channel search deferred
+    /// from v1 per PER-025 §Out of scope). Accepts `<team>/<channel>`
+    /// for cross-team via PER-019 γ hybrid resolver.
+    channel: String,
+    /// Search query — passed through to MM's search endpoint as the
+    /// `terms` field after chanvoy composes its owned scopes
+    /// (`in:<resolved-channel>` always; `from:<author>` and
+    /// `after:<date>` if `--from` / `--since` are set). Inline MM
+    /// operators that conflict with chanvoy-owned scopes refuse with
+    /// a clear diagnostic per AC #4a; non-conflicting operators
+    /// pass through verbatim.
+    query: String,
+    /// Cap result count (default 20).
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
+    /// Narrow to a specific author (folded into the MM `terms` field
+    /// as `from:<author>`). Conflicts with inline `from:` in the
+    /// query — refuses with a diagnostic.
+    #[arg(long)]
+    from: Option<String>,
+    /// PER-023 time-window suffix (s/m/h/d). Folded into MM `terms`
+    /// as `after:<computed-date>` (date-granularity is the MM-native
+    /// surface). Conflicts with inline `before:`/`after:` in the
+    /// query.
+    #[arg(long)]
+    since: Option<String>,
+    /// PER-019 explicit team override.
     #[arg(long)]
     team: Option<String>,
 }
@@ -641,6 +689,41 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 .unreact_post(&args.channel, &args.post_id, &args.emoji, args.team.clone())
                 .await?,
         ),
+        CommandSet::Search(args) => {
+            // PER-025 AC #4a: scan the query for inline operators that
+            // conflict with chanvoy-owned scopes BEFORE issuing the
+            // daemon RPC. Refuses with a diagnostic naming the
+            // conflicting flag/arg explicitly per the broadened pin
+            // from entarch's #brief-per-025 review.
+            let scopes = ChanvoyScopes {
+                channel_arg: true, // channel positional is always set
+                from_flag: args.from.is_some(),
+                since_flag: args.since.is_some(),
+            };
+            check_search_operator_conflicts(&args.query, &scopes).map_err(CliError::Bootstrap)?;
+            // PER-023 time-window suffix parsing on `--since` (the
+            // PER-025 brief soft-deps on PER-023 for this exact path).
+            let since_secs = match args.since.as_deref() {
+                Some(raw) => Some(
+                    parse_time_window(raw, TimeWindowDefaultUnit::Minutes)
+                        .map_err(CliError::Bootstrap)?,
+                ),
+                None => None,
+            };
+            print_value(
+                cli.json,
+                &daemon_client(&profile)
+                    .search_channel(
+                        &args.channel,
+                        &args.query,
+                        Some(args.limit),
+                        args.from.clone(),
+                        since_secs,
+                        args.team.clone(),
+                    )
+                    .await?,
+            )
+        }
         CommandSet::Channel(ChannelCommand::Create(args)) => print_value(
             cli.json,
             &daemon_client(&profile)
@@ -2008,12 +2091,54 @@ impl HumanReadable for Vec<Channel> {
     }
 }
 
+/// PER-025 primitive 2: format a `last_post_at` (Unix epoch ms) as a
+/// relative-time string for the human-mode `last_active` column.
+/// Missing or zero activity renders as `—` per AC #5. Buckets:
+/// seconds / minutes / hours / days / weeks / years. Caches "now"
+/// at the call site so all rows in one render pass have a
+/// consistent reference (caller passes `now_millis`).
+fn format_last_active(last_post_at: Option<i64>, now_millis: i64) -> String {
+    let Some(ts) = last_post_at else {
+        return "—".to_string();
+    };
+    if ts <= 0 {
+        return "—".to_string();
+    }
+    let delta_ms = now_millis.saturating_sub(ts);
+    if delta_ms < 0 {
+        // Future timestamp (clock skew or test harness). Render as
+        // "just now" rather than a negative duration.
+        return "just now".to_string();
+    }
+    let delta_s = delta_ms / 1000;
+    if delta_s < 60 {
+        format!("{delta_s}s ago")
+    } else if delta_s < 3600 {
+        format!("{}m ago", delta_s / 60)
+    } else if delta_s < 86400 {
+        format!("{}h ago", delta_s / 3600)
+    } else if delta_s < 7 * 86400 {
+        format!("{}d ago", delta_s / 86400)
+    } else if delta_s < 365 * 86400 {
+        format!("{}w ago", delta_s / (7 * 86400))
+    } else {
+        format!("{}y ago", delta_s / (365 * 86400))
+    }
+}
+
 /// PER-019 AC #11: render the cross-team channel listing as a grouped
 /// human view. Each team gets a `=== <team-slug> ===` header followed
 /// by `<team-slug>/<channel-name>` lines so operators can copy any
 /// line directly into `chanvoy read` / `post` / `check` if they need
 /// the explicit-team form.
+///
+/// PER-025 primitive 2: each row gains a trailing `last_active` column
+/// (relative time, `—` for missing-activity). When `--sort active` is
+/// in effect, the channel order within each group is most-recent-first
+/// (the caller pre-sorts before calling this function); the column
+/// renders the same way regardless.
 fn render_team_channels_human(groups: &[chanvoy_core::TeamChannels]) -> String {
+    let now_millis = chanvoy_core::now_unix_millis();
     let mut out = String::new();
     let mut first = true;
     for group in groups {
@@ -2040,11 +2165,13 @@ fn render_team_channels_human(groups: &[chanvoy_core::TeamChannels]) -> String {
             .unwrap_or(0);
         for channel in &group.channels {
             let qualified = format!("{}/{}", group.team_name, channel.name);
+            let last_active = format_last_active(channel.last_post_at, now_millis);
             out.push_str(&format!(
-                "  {:<name_width$}  {:<display_width$}  {}\n",
+                "  {:<name_width$}  {:<display_width$}  {}  {}\n",
                 qualified,
                 channel.display_name,
                 channel.channel_type,
+                last_active,
                 name_width = name_width,
                 display_width = display_width,
             ));
@@ -2053,31 +2180,66 @@ fn render_team_channels_human(groups: &[chanvoy_core::TeamChannels]) -> String {
     out
 }
 
+/// PER-025 primitive 2 + AC #5 (entarch pin #4): sort channels within
+/// each team group by `last_post_at` descending. Missing /
+/// zero-activity channels sort last within their group. Group order
+/// itself is NOT modified — the PER-019 primary-first / fallback
+/// alphabetical ordering is preserved per the brief's flatten-only-
+/// in-future-brief disposition.
+fn sort_groups_by_active(groups: &mut [chanvoy_core::TeamChannels]) {
+    for group in groups {
+        group.channels.sort_by(|a, b| {
+            // None sorts last within group: map None → i64::MIN so
+            // it loses the descending compare against any real
+            // timestamp.
+            let a_key = a.last_post_at.unwrap_or(i64::MIN);
+            let b_key = b.last_post_at.unwrap_or(i64::MIN);
+            b_key.cmp(&a_key)
+        });
+    }
+}
+
 async fn handle_channels_command(
     profile: &str,
     json: bool,
     args: ChannelsArgs,
 ) -> Result<(), CliError> {
     if args.primary_team {
-        // Back-compat single-team output; same shape as pre-PER-019.
-        return print_value(json, &daemon_client(profile).list_channels().await?);
+        let channels = daemon_client(profile).list_channels().await?;
+        if json {
+            // PER-025 AC #6a: legacy `--primary-team --json` path
+            // preserves the pre-PER-025 JSON field set exactly — no
+            // `last_post_at` field. Project full `Channel` to
+            // `LegacyChannel` so the activity-bearing default shape
+            // doesn't leak into the legacy contract. Serialize
+            // directly (bypass `print_value`'s HumanReadable bound —
+            // the legacy human path stays on the existing
+            // `Vec<Channel>` rendering, which already omits the
+            // `last_active` column).
+            let legacy: Vec<LegacyChannel> = channels.iter().map(Channel::to_legacy).collect();
+            println!("{}", serde_json::to_string_pretty(&legacy)?);
+            return Ok(());
+        }
+        return print_value(false, &channels);
     }
-    let groups = daemon_client(profile).list_channels_across_teams().await?;
-    let filtered: Vec<chanvoy_core::TeamChannels> = if let Some(team_filter) = args.team {
-        groups
-            .into_iter()
-            .filter(|g| g.team_name == team_filter)
-            .collect()
-    } else {
-        groups
-    };
+    let mut groups = daemon_client(profile).list_channels_across_teams().await?;
+    if let Some(team_filter) = args.team {
+        groups.retain(|g| g.team_name == team_filter);
+    }
+    if matches!(args.sort.as_deref(), Some("active")) {
+        sort_groups_by_active(&mut groups);
+    }
     if json {
+        // PER-025 AC #6: default `channels --json` adds `last_post_at`
+        // to the grouped multi-team shape via Channel's serde
+        // (`Option<i64>` → `null` on None, deterministic shape). This
+        // path serializes the grouped TeamChannels structure as-is.
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "teams": filtered }))?
+            serde_json::to_string_pretty(&serde_json::json!({ "teams": groups }))?
         );
     } else {
-        print!("{}", render_team_channels_human(&filtered));
+        print!("{}", render_team_channels_human(&groups));
     }
     Ok(())
 }
@@ -2184,6 +2346,24 @@ impl HumanReadable for ReactionResult {
             "ok: {}/{} {} on post {}",
             self.team, self.channel, self.emoji, self.post_id
         )
+    }
+}
+
+impl HumanReadable for SearchResult {
+    fn to_human_string(&self) -> String {
+        if self.posts.is_empty() {
+            return format!("no matches in {}/{}", self.team, self.channel);
+        }
+        let header = format!(
+            "{} match(es) in {}/{}:",
+            self.posts.len(),
+            self.team,
+            self.channel
+        );
+        let lines: Vec<String> = std::iter::once(header)
+            .chain(self.posts.iter().map(format_message))
+            .collect();
+        lines.join("\n")
     }
 }
 
@@ -2316,6 +2496,94 @@ mod tests {
     /// with any test that reads the same vars.
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn format_last_active_buckets() {
+        let now = 1_700_000_000_000i64;
+        // Missing / zero — `—` per AC #5.
+        assert_eq!(format_last_active(None, now), "—");
+        assert_eq!(format_last_active(Some(0), now), "—");
+        // Sub-minute, minute, hour, day, week, year buckets.
+        assert_eq!(format_last_active(Some(now - 30_000), now), "30s ago");
+        assert_eq!(format_last_active(Some(now - 5 * 60_000), now), "5m ago");
+        assert_eq!(format_last_active(Some(now - 4 * 3_600_000), now), "4h ago");
+        assert_eq!(
+            format_last_active(Some(now - 2 * 86_400_000), now),
+            "2d ago"
+        );
+        assert_eq!(
+            format_last_active(Some(now - 14 * 86_400_000), now),
+            "2w ago"
+        );
+        assert_eq!(
+            format_last_active(Some(now - 730 * 86_400_000), now),
+            "2y ago"
+        );
+    }
+
+    #[test]
+    fn format_last_active_clock_skew_renders_just_now() {
+        // Future timestamp (clock skew) should not render as a
+        // negative duration.
+        let now = 1_700_000_000_000i64;
+        assert_eq!(format_last_active(Some(now + 5_000), now), "just now");
+    }
+
+    #[test]
+    fn sort_groups_by_active_within_group_only() {
+        use chanvoy_core::TeamChannels;
+        let mut groups = vec![
+            TeamChannels {
+                team_id: "t1".to_string(),
+                team_name: "team-a".to_string(),
+                team_display_name: "Team A".to_string(),
+                channels: vec![
+                    Channel {
+                        id: "c1".to_string(),
+                        name: "old".to_string(),
+                        display_name: "old".to_string(),
+                        channel_type: "O".to_string(),
+                        last_post_at: Some(100),
+                    },
+                    Channel {
+                        id: "c2".to_string(),
+                        name: "newer".to_string(),
+                        display_name: "newer".to_string(),
+                        channel_type: "O".to_string(),
+                        last_post_at: Some(500),
+                    },
+                    Channel {
+                        id: "c3".to_string(),
+                        name: "never".to_string(),
+                        display_name: "never".to_string(),
+                        channel_type: "O".to_string(),
+                        last_post_at: None,
+                    },
+                ],
+            },
+            TeamChannels {
+                team_id: "t2".to_string(),
+                team_name: "team-b".to_string(),
+                team_display_name: "Team B".to_string(),
+                channels: vec![Channel {
+                    id: "c4".to_string(),
+                    name: "only".to_string(),
+                    display_name: "only".to_string(),
+                    channel_type: "O".to_string(),
+                    last_post_at: Some(300),
+                }],
+            },
+        ];
+
+        sort_groups_by_active(&mut groups);
+
+        // Group order itself preserved (NOT flattened) per AC #5.
+        assert_eq!(groups[0].team_name, "team-a");
+        assert_eq!(groups[1].team_name, "team-b");
+        // Within team-a: most-recent first, never-active last.
+        let names: Vec<&str> = groups[0].channels.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["newer", "old", "never"]);
+    }
+
     /// PER-019 (devrev PR #17 follow-up, 2026-04-30): the human
     /// `chanvoy attention list` output must surface
     /// `AttentionListResult.quarantined` so operators using the
@@ -2432,12 +2700,14 @@ mod tests {
                 name: "dm-channel".to_string(),
                 display_name: String::new(),
                 channel_type: "D".to_string(),
+                last_post_at: None,
             },
             Channel {
                 id: "chan-id".to_string(),
                 name: "per-007".to_string(),
                 display_name: "PER-007".to_string(),
                 channel_type: "O".to_string(),
+                last_post_at: None,
             },
         ];
 
