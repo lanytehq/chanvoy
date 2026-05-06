@@ -392,6 +392,13 @@ struct ChannelCreateArgs {
     name: String,
     display_name: String,
     purpose: Option<String>,
+    /// PER-019 + v0.2.1: explicit team override. When unset, the
+    /// channel lands on the profile's primary team (legacy default).
+    /// When set, the channel is created on the named alternate team
+    /// (must be a team the bot is a member of). Closes the cross-team
+    /// admin-verb gap that the γ resolver left on `channel create`.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -727,7 +734,12 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
         CommandSet::Channel(ChannelCommand::Create(args)) => print_value(
             cli.json,
             &daemon_client(&profile)
-                .create_channel(&args.name, &args.display_name, args.purpose)
+                .create_channel(
+                    &args.name,
+                    &args.display_name,
+                    args.purpose,
+                    args.team.clone(),
+                )
                 .await?,
         ),
         CommandSet::Channel(ChannelCommand::Archive(args)) => {

@@ -1329,6 +1329,17 @@ pub struct CreateChannelParams {
     pub display_name: String,
     #[serde(default)]
     pub purpose: Option<String>,
+    /// Optional team override. When `None`, the channel is created on
+    /// the profile's primary team (pre-PER-019 / pre-v0.2.1 default).
+    /// When `Some(slug)`, the channel is created on the named team
+    /// (must be a team the bot is a member of). Closes the cross-team
+    /// admin-verb gap that the PER-019 γ resolver left on
+    /// `channel create` — every other PER-025-era verb routes
+    /// cross-team correctly via the resolver chain, but
+    /// `create_channel` historically went straight through
+    /// `team_id()` (primary). v0.2.1 release-prep addition.
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2716,13 +2727,24 @@ impl MattermostClient {
         Ok(channels)
     }
 
+    /// Create a public channel. The channel lands on the profile's
+    /// primary team unless `team` is `Some(<slug>)`, in which case the
+    /// resolver looks the team up via the bot's membership cache and
+    /// uses that team's id. Closes the v0.2.1 cross-team admin-verb
+    /// gap — `chanvoy channel create some-name --team org-3leaps` now
+    /// creates the channel on the alternate team rather than silently
+    /// landing it on the primary.
     pub async fn create_channel(
         &self,
         name: &str,
         display_name: &str,
         purpose: Option<String>,
+        team: Option<&str>,
     ) -> Result<Channel, CoreError> {
-        let team_id = self.team_id().await?;
+        let team_id = match team {
+            Some(slug) => self.team_id_for_slug(slug).await?,
+            None => self.team_id().await?,
+        };
         #[derive(Serialize)]
         struct Payload<'a> {
             team_id: &'a str,
