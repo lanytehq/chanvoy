@@ -2728,12 +2728,16 @@ impl MattermostClient {
     }
 
     /// Create a public channel. The channel lands on the profile's
-    /// primary team unless `team` is `Some(<slug>)`, in which case the
-    /// resolver looks the team up via the bot's membership cache and
-    /// uses that team's id. Closes the v0.2.1 cross-team admin-verb
-    /// gap — `chanvoy channel create some-name --team org-3leaps` now
-    /// creates the channel on the alternate team rather than silently
-    /// landing it on the primary.
+    /// primary team unless `team` is `Some(<slug>)`, in which case
+    /// the team slug is resolved through the bot's
+    /// `/users/me/teams` membership cache (with one force-refresh on
+    /// no-match for self-healing on newly-added memberships) before
+    /// the channel is created. Refuses with
+    /// `CoreError::NotAMemberOfTeam { team, teams }` if the bot is
+    /// not a member of the requested team — matching the PER-019 γ
+    /// resolver's enforcement posture rather than letting MM's
+    /// authorization layer reject the downstream call. Closes the
+    /// v0.2.1 cross-team admin-verb gap.
     pub async fn create_channel(
         &self,
         name: &str,
@@ -2742,7 +2746,11 @@ impl MattermostClient {
         team: Option<&str>,
     ) -> Result<Channel, CoreError> {
         let team_id = match team {
-            Some(slug) => self.team_id_for_slug(slug).await?,
+            // Devrev PR #23 finding #1: team override must enforce
+            // membership before posting, mirroring the PER-019
+            // resolver's `NotAMemberOfTeam` semantics that operators
+            // expect from the rest of the cross-team verbs.
+            Some(slug) => self.team_id_for_member_slug(slug).await?,
             None => self.team_id().await?,
         };
         #[derive(Serialize)]
@@ -3321,6 +3329,35 @@ impl MattermostClient {
             .request("GET", &format!("/teams/name/{slug}"), None::<Value>)
             .await?;
         Ok(team.id)
+    }
+
+    /// Resolve a team slug through the bot's `/users/me/teams`
+    /// membership cache (with one force-refresh on no-match for
+    /// self-healing on newly-added memberships) before returning
+    /// its id. Mirrors the membership check the PER-019 γ resolver
+    /// runs in `resolve_in_team` — refuses with
+    /// `CoreError::NotAMemberOfTeam { team, teams }` rather than
+    /// silently letting MM's authorization layer reject the
+    /// downstream call. Used by `create_channel`'s `--team` override
+    /// so chanvoy enforces the "must be a team the bot is a member
+    /// of" contract operator-side per devrev PR #23 finding #1.
+    async fn team_id_for_member_slug(&self, slug: &str) -> Result<String, CoreError> {
+        let teams = self.list_my_teams().await?;
+        if let Some(team) = teams.iter().find(|t| t.name == slug) {
+            return Ok(team.id.clone());
+        }
+        // No-match → force-refresh once before failing, matching
+        // resolve_in_team's self-healing posture for newly-added
+        // memberships (devrev's PR #40 pin on the resolver path).
+        self.refresh_team_list().await?;
+        let refreshed = self.list_my_teams().await?;
+        match refreshed.iter().find(|t| t.name == slug) {
+            Some(team) => Ok(team.id.clone()),
+            None => Err(CoreError::NotAMemberOfTeam {
+                team: slug.to_string(),
+                teams: refreshed.into_iter().map(|t| t.name).collect(),
+            }),
+        }
     }
 
     /// PER-019: list the teams the bot is a member of. Identity-bounded —

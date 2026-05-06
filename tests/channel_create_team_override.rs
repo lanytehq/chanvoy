@@ -116,6 +116,76 @@ async fn channel_create_with_team_override_uses_alt_team_id() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
+/// Devrev PR #23 finding #1: `--team <slug>` must refuse with
+/// `NotAMemberOfTeam` semantics when the bot is not a member of the
+/// requested team — matching the PER-019 γ resolver's enforcement
+/// posture for the rest of the cross-team verbs. Critically, the
+/// refusal must happen BEFORE `POST /channels` is hit (no
+/// silently-letting-MM-reject path).
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn channel_create_team_not_member_refuses_before_post() {
+    let env = TestEnv::new("chan-create-not-member").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-ccnm", "agent-bravo-devlead", "team-id-456")
+        .await;
+    // Bot is a member of org-lanytehq ONLY. The operator's --team
+    // value (`org-not-a-member`) is not in this list. The membership
+    // helper must refuse before POST /channels is attempted.
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me/teams"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id": "team-id-456", "name": "org-lanytehq", "display_name": "lanytehq"},
+        ])))
+        .mount(&env.mock)
+        .await;
+    // POST /channels intentionally NOT mounted — if create_channel
+    // attempted to call it despite the membership refusal, wiremock
+    // would 404 by default and the assertion below would still
+    // catch the wrongful call via received_requests.
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(
+        &env,
+        &[
+            "channel",
+            "create",
+            "ops-discussions",
+            "Ops Discussions",
+            "--team",
+            "org-not-a-member",
+        ],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "channel create --team <not-a-member> must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Diagnostic should name the unfamiliar team. The exact
+    // available-teams list shape is `CoreError::NotAMemberOfTeam`'s
+    // surface; chanvoy's CLI error renderer shows it.
+    assert!(
+        stderr.contains("org-not-a-member") || stderr.to_lowercase().contains("not a member"),
+        "diagnostic should name the bot-isn't-a-member condition; got: {stderr}"
+    );
+
+    // Critical: verify `POST /channels` was NOT called. Membership
+    // refusal must short-circuit before any write attempt — devrev
+    // pin's load-bearing assertion.
+    let requests = env.mock.received_requests().await.unwrap_or_default();
+    let create_writes = requests
+        .iter()
+        .filter(|r| r.method == Method::POST && r.url.path() == "/api/v4/channels")
+        .count();
+    assert_eq!(
+        create_writes, 0,
+        "membership refusal must short-circuit before POST /channels; observed {create_writes} write attempts"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
 /// Legacy default preserved: `chanvoy channel create <name> <display>`
 /// (no `--team`) still lands on the profile's primary team. Confirms
 /// the v0.2.1 addition is fully additive and doesn't accidentally
