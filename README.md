@@ -1,95 +1,199 @@
 # Chanvoy
 
-Chanvoy is the Mattermost/chat bridge peer for the Lanyte platform.
+A Mattermost (and eventually Slack) bridge for AI agents and the
+operators who run them. Chanvoy gives agents a seat at the table in
+the chat tools where teams already coordinate — joining channels,
+reading context, posting status, replying in threads, reacting,
+all under explicit delegation and autonomy gating.
 
-`chanvoy` is the local daemon-backed replacement for `lanyte-chat` in agent workflows.
+Where mlvoy bridges the inbox, chanvoy bridges the war room.
 
-This repository currently contains the M1 control-plane scaffold:
+> **Agents start here:** [`docs/getting-started.md`](./docs/getting-started.md).
+> A 30-minute walkthrough from zero to a working session, with a
+> sandboxed-agent path tree if you can't reach the local socket.
+> The "Agents start here" pointer at the top of that doc is a
+> three-line escape hatch if you only need the bootstrap.
 
-- `chanvoy-core`: shared domain types, profile model, JSON-RPC envelopes, and Mattermost client
-- `chanvoy-daemon`: local unix-socket daemon and profile-bound control plane
-- `chanvoy-cli`: CLI client surface
-- `chanvoy-mcp`: MCP bridge scaffold
+---
 
-## Current Scope
+## Status
 
-- local per-profile daemon over a Unix socket
-- Mattermost operator flows for agent sessions
-- local-daemon dogfooding readiness validated in PER-007
+Chanvoy v0.2.x. Local-mode (CLI ↔ per-profile daemon ↔ Mattermost)
+is the validated operating mode; the remote control plane and
+attested transport remain on the roadmap (deferred).
 
-Current validated local-daemon support is Unix-only:
+What's shipped:
 
-- Linux
-- macOS
+- **Local daemon model** — per-profile, detached, survives shell
+  exit; idempotent restart and stale-socket recovery.
+- **Cross-team channel resolution** — channel names resolve across
+  every team the bot is a member of. `<team>/<channel>` syntax and
+  `--team <slug>` flag for explicit pinning. Cursor isolation per
+  qualified channel.
+- **Sandbox-aware bootstrap** — `auto-setup` works under sandbox
+  restrictions (Codex agents, macOS sandbox-exec, Docker without
+  `--network`, OSS sandboxes of similar shape). Identity validation
+  runs in the parent CLI; the detached daemon needs no network at
+  startup.
+- **Session-start ergonomics** — `pinned`, `read --since-bootstrap`,
+  `ack`, time-unit suffixes (`30s` / `5m` / `4h` / `2d`) on every
+  time-window flag.
+- **Conversation primitives** — threaded replies via `post --reply-to`,
+  emoji reactions via `react` / `unreact`.
+- **Discovery primitives** — `search <channel> <query>` over MM's
+  search endpoint, `channels --sort active` traffic-aware listing.
+- **Cross-team channel admin** — `channel create --team <slug>`
+  for bots authorized on multiple teams.
 
-Remote proxy/control-plane serving is not the validated operating mode yet.
+Validated platforms: Linux, macOS. Windows is not currently a
+supported local-daemon platform.
+
+---
 
 ## Quick Start
 
-After sourcing the normal Lanyte identity env (so `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and `LANYTE_MM_TOKEN` are set):
+After installing chanvoy and sourcing your identity profile (so
+`LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a
+token reachable via `LANYTE_MM_TOKEN` are set):
+
+```bash
+chanvoy auto-setup
+chanvoy whoami
+chanvoy channels
+chanvoy read <channel> --since 1h
+```
+
+`chanvoy auto-setup` materializes the canonical `<role>-<scope>`
+profile from your sourced env, starts the daemon, and seeds channel
+cursors in one step. Subsequent commands work without `--profile` —
+the resolver picks the canonical profile automatically.
+
+If you're inside a sandbox (Codex agent, `sandbox-exec`, Docker
+without `--network`, or similar), read
+[`docs/getting-started.md` §Sandboxed agents](./docs/getting-started.md#sandboxed-agents)
+before running `auto-setup`. Most sandboxes work with no extra
+configuration; some need `CHANVOY_RUNTIME_DIR` set to a writable
+path inside the sandbox.
+
+For the full walkthrough — install, prerequisites, first read, first
+post, cross-team example, daily flow — see
+[`docs/getting-started.md`](./docs/getting-started.md).
+
+For development against the working copy without installing, replace
+`chanvoy` with `cargo run -p chanvoy --` in any of the commands
+above.
+
+---
+
+## Install
+
+Build from source:
 
 ```bash
 make install
-chanvoy auto-setup
-chanvoy whoami
-chanvoy read per-007 --since 60
 ```
 
-`chanvoy auto-setup` materializes the canonical `<role>-<scope>` profile, starts the daemon, and seeds channel cursors in one step. Subsequent commands work without `--profile` — the resolver picks the canonical profile from your sourced env.
+Default install location is `~/.cargo/bin/chanvoy`. MSRV is
+Rust 1.89.0; older toolchains will fail to build. If you don't have
+a Rust toolchain, [install rustup](https://rustup.rs) first.
 
-For development against the working copy without installing, replace `chanvoy` with `cargo run -p chanvoy --` in any of the above. See `docs/operator-guide.md` for the full bootstrap flow, including the manual `profile create-from-env` + `daemon start` path for debugging or custom scenarios.
+Verify:
+
+```bash
+chanvoy --version
+```
+
+---
+
+## Commands at a glance
+
+A categorized index — see [`docs/operator-guide.md`](./docs/operator-guide.md)
+for per-command reference, flags, and worked examples.
+
+| Category | Commands | Notes |
+|---|---|---|
+| **Bootstrap & lifecycle** | `auto-setup`, `daemon {start,serve,stop,status}`, `profile {list,active,create,create-from-env}`, `whoami` | `auto-setup` is the canonical bootstrap. `daemon serve` is the foreground variant for debug or sandbox parent-shell use. |
+| **Reading (cursor-neutral)** | `channels`, `pinned <ch>`, `read <ch>` (with `--since` / `--after` / `--since-bootstrap` / `--since-last-mine` / `--limit`), `check <ch>`, `dms`, `notifications` (with `--since` / `--unread`), `search <ch> <query>` | Pure reads; do not advance cursors unless `--advance` is passed on `read`. |
+| **Cursor-advancing reads** | `read --advance`, `ack <ch>` | Mark current-latest as seen with or without surfacing content. |
+| **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Successful writes establish or advance cursors. |
+| **Channel admin** | `channel {create,archive,restore,add-member}` (with `--team` for cross-team where authorized) | `restore` requires an elevated-capability profile. |
+| **Wait / probe** | `wait <ch> --timeout` | Block until new posts arrive or timeout. |
+| **Inspect (state, not chat)** | `attention {list,show}` | Strictly read-only on daemon state; never issues Mattermost API calls. |
+
+Time-window flags (`read --since`, `notifications --since`, `wait
+--timeout`, `search --since`) accept `s` / `m` / `h` / `d` suffixes.
+Bare integer = minutes (today's default). Uppercase `M` and `mo` are
+loud-failed to avoid month/minute confusion.
+
+---
 
 ## Paths
 
-Config root is platform-native under the `lanytehq` namespace:
+Config root (default, platform-native under the chanvoy product
+namespace):
 
 - Linux: `~/.config/lanytehq/chanvoy/`
 - macOS: `~/Library/Application Support/lanytehq/chanvoy/`
 
-Windows is not yet a supported local-daemon platform for the current `chanvoy` implementation. If/when Windows support is added under the agreed config-root convention, the expected config root will be `%APPDATA%\\lanytehq\\chanvoy\\`.
+Runtime sockets and pid files live separately, under
+`$XDG_RUNTIME_DIR/chanvoy/` when available, otherwise the OS temp
+dir.
 
-Runtime sockets and pid files are stored under `XDG_RUNTIME_DIR` when available, otherwise the OS temp dir.
+Two env overrides for non-default deployments (sandboxed agents,
+parallel test sessions, custom layouts):
 
-## Commands
+- `CHANVOY_CONFIG_DIR` — overrides the config root.
+- `CHANVOY_RUNTIME_DIR` — overrides the runtime directory.
 
-Common commands:
+Note on the namespace: the `lanytehq` segment in the default config
+root is the **product namespace** (chanvoy is a lanytehq-developed
+tool), not an org restriction. Operators in any org — lanytehq,
+enacthq, fulmenhq, third-party adopters — use the same default
+path. Profile data is partitioned per-profile, and profile names
+encode the org via the `<role>-<scope>` convention.
 
-```bash
-target/debug/chanvoy whoami
-target/debug/chanvoy channels
-target/debug/chanvoy read <channel> --since 60
-target/debug/chanvoy read <channel> --after <post-id>
-target/debug/chanvoy read <channel> --since-last-mine
-target/debug/chanvoy check <channel>
-target/debug/chanvoy post <channel> "message"
-target/debug/chanvoy dms
-target/debug/chanvoy dm <username> "message"
-target/debug/chanvoy notifications
-target/debug/chanvoy notifications --unread
-target/debug/chanvoy daemon status
-```
+---
 
-## Cursor Notes
+## Documentation
 
-- `read --after` and `read --since-last-mine` are observe-only
-- `check` is observe-only and returns exit `0` when new messages exist, exit `1` otherwise
-- `notifications --unread` is observe-only and returns a count only
-- if `check <channel>` has no stored cursor yet, it returns `new: 0 anchor=none source=no_anchor`
-- if a daemon-owned stored cursor no longer resolves, `check <channel>` degrades to `new: 0 anchor=none source=stale_cursor` instead of hard-failing
-- current durable cursor establishment comes from successful `post` in a channel and full `notifications` reads
+| Doc | When to read |
+|---|---|
+| [`docs/getting-started.md`](./docs/getting-started.md) | First time using chanvoy, or onboarding a new agent / operator. |
+| [`docs/operator-guide.md`](./docs/operator-guide.md) | Per-command reference; full flag and behavior detail. |
+| [`docs/troubleshooting.md`](./docs/troubleshooting.md) | Symptom-keyed recovery for common failure modes. |
+| [`docs/architecture.md`](./docs/architecture.md) | Runtime model — daemon, cursors, profiles, peer contract. For contributors and bootstrap-curious agents. |
+| [`docs/migration-runbook.md`](./docs/migration-runbook.md) | Replacing `lanyte-chat` with chanvoy across an existing deployment. |
+| [`docs/integration-tests.md`](./docs/integration-tests.md) | For contributors adding tests. |
+| [`BACKGROUNDER.md`](./BACKGROUNDER.md) | Why chanvoy exists and how it relates to mlvoy. |
+| [`AGENTS.md`](./AGENTS.md) | Agent-session conventions for working in this repo. |
+| [`REPOSITORY_SAFETY_PROTOCOLS.md`](./REPOSITORY_SAFETY_PROTOCOLS.md) | Repository-level safety + commit-content rules. |
 
-## Docs
+---
 
-- `docs/operator-guide.md`
-- `docs/migration-runbook.md`
-- `scripts/per007-smoke.sh`
+## Security note
 
-## Security Note
+Chanvoy assumes the local Unix account is the trust boundary.
 
-Chanvoy M1 assumes the local Unix account is the trust boundary.
+- Runtime and config files are permission-hardened (`0700`
+  directories, `0600` files) to reduce accidental cross-process
+  exposure.
+- Admin-only operations are gated by an explicit profile capability
+  class.
+- Chanvoy does not attempt to protect one process from another
+  process running as the same Unix user.
 
-- Runtime and config files are permission-hardened (`0700` directories, `0600` files) to reduce accidental cross-process exposure.
-- Admin-only operations are gated by explicit profile capability class.
-- Chanvoy M1 does not attempt to protect one process from another process running as the same Unix user.
+The same-user trust boundary is intentional and not a defect. Multi-
+user / multi-tenant deployments require the deferred remote control
+plane (with attested transport); no local-mode workaround changes
+this property.
 
-That same-user limitation is an acknowledged M1 boundary and should be revisited before adding richer daemon lifecycle ergonomics, auto-start behavior, or deployment models that span different Unix users or service accounts.
+See [`REPOSITORY_SAFETY_PROTOCOLS.md`](./REPOSITORY_SAFETY_PROTOCOLS.md)
+for repository-level safety rules (what never to commit, the
+permission contract, downstream contract surfaces).
+
+---
+
+## License
+
+Dual-licensed under MIT or Apache-2.0, at your option.
+See [LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE).

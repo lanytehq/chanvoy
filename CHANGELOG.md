@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Onboarding doc surface expansion (PER-026).** Major rewrite of
+  the user-facing docs: new `README.md` reflecting current state
+  (M1+M2+M3 shipped, cross-team resolution, sandbox-aware startup,
+  full v0.2.1 surface) with a categorized command index pointing at
+  the operator guide for reference detail. New
+  `docs/getting-started.md` — agent-first 30-minute onboarding with
+  an "Agents start here" pointer, a sandboxed-agent decision tree
+  covering network-side, socket-write, socket-read, and supervisor-
+  escalation paths. New `docs/troubleshooting.md` — symptom-keyed
+  recovery for the eight most common failure modes (Daemon
+  NotRunning after auto-setup, ActiveProfileNotFound, the
+  cross-team resolution refusal trio, identity drift, sandbox
+  network prompt, sandbox socket-permission denied, stale socket,
+  bare `--limit` rejection) with a forward link to
+  `scripts/per015-diag.sh` for unmatched cases. New
+  `docs/architecture.md` — runtime model (daemon lifecycle,
+  profile→bot binding, attention-state cursor isolation per
+  `<team>/<channel>`, cursor-advance taxonomy, peer contract
+  pointer) for contributors and bootstrap-curious agents. Includes
+  an "If you change X, also change Y" cross-reference table.
+- **`REPOSITORY_SAFETY_PROTOCOLS.md` rewritten chanvoy-specific.**
+  Previously contained content from a different repository.
+  Coverage: never-commit list (tokens, profile state, attention
+  snapshots, live MM URLs, diag dumps), permission contract (0700
+  dirs, 0600 files), trust-boundary framing (same-Unix-user is
+  intentional and not a defect), downstream contract surfaces
+  (public types in `chanvoy-core`, daemon RPC names, CLI argument
+  shape, profile capability classes, cursor-advance taxonomy,
+  bootstrap-state file format), sandbox-permission asks (chanvoy
+  doesn't negotiate; supervisor decides), required reviews, and
+  security reporting. Public-readable.
+- **`docs/operator-guide.md` reconciliation.** Dropped the "(chanvoy
+  v0.2.1)" parenthetical labels from four section headers
+  (Session-Start Orientation, Conversation Primitives, Discovery,
+  Cross-team channel creation) — by the time readers fetch the
+  merged docs, v0.2.1 is the released version and the doc-and-code-
+  ship-together convention applies.
+- **Internal brief-ID leakage scrubbed from user-facing prose.**
+  References to internal brief identifiers (PER-008B, PER-019 γ
+  hybrid, PER-023/024/025 primitive numbers, etc.) replaced with
+  feature-named anchors in `README.md`,
+  `docs/operator-guide.md`, and `docs/migration-runbook.md`.
+  Incidental brief mentions inside existing sections (e.g.,
+  context for an example) acceptable but not the primary anchor
+  for any user-visible concept.
+- **`AGENTS.md` pointer.** Added a new-to-chanvoy pointer to
+  `docs/getting-started.md` at the top of the agent guide.
+
+No behavior changes. No CLI surface changes. No code changes.
+
 ## [0.2.0] - 2026-05-02
 
 ### Release highlights
