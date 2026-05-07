@@ -112,7 +112,7 @@ async fn pinned_returns_pinned_posts() {
 
     // Pinned-posts endpoint mock.
     Mock::given(method("GET"))
-        .and(path("/api/v4/channels/chan-id-p1/pinned_posts"))
+        .and(path("/api/v4/channels/chan-id-p1/pinned"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "posts": {
                 "post-1": {
@@ -175,7 +175,7 @@ async fn pinned_empty_channel_returns_empty_list() {
     env.mock_channel_lookup("bravo-team", "chan-id-p2").await;
 
     Mock::given(method("GET"))
-        .and(path("/api/v4/channels/chan-id-p2/pinned_posts"))
+        .and(path("/api/v4/channels/chan-id-p2/pinned"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"posts": {}})))
         .mount(&env.mock)
         .await;
@@ -661,7 +661,7 @@ async fn pinned_cross_team_syntax_routes_via_explicit_resolver() {
     env.mock_channel_lookup_for_team("team-id-3leaps", "ops-tech", "chan-id-3l-ops")
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/v4/channels/chan-id-3l-ops/pinned_posts"))
+        .and(path("/api/v4/channels/chan-id-3l-ops/pinned"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "posts": {
                 "pin-1": {
