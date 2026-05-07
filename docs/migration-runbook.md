@@ -66,8 +66,9 @@ Important semantics:
 - `read --after`, `read --since-last-mine`, `check`, and `notifications --unread` are observe-only
 - `check` with no stored cursor returns `no_anchor` instead of silently falling back to a time window
 - `check` with a stale daemon-owned cursor degrades to `stale_cursor` instead of hard-failing
-- durable channel cursors are currently established by successful `post`
-- durable mention cursors are currently established by full `notifications` reads
+- durable channel cursors are advanced by successful `post`, `read --advance`, and `ack`
+- durable mention cursors are updated by full `notifications` reads (no `--since`)
+- `react` / `unreact`, `dm`, and `notify` are cursor-neutral
 
 ## Cutover Checklist
 

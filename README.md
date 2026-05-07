@@ -93,9 +93,16 @@ Build from source:
 make install
 ```
 
-Default install location is `~/.cargo/bin/chanvoy`. MSRV is
-Rust 1.89.0; older toolchains will fail to build. If you don't have
-a Rust toolchain, [install rustup](https://rustup.rs) first.
+Default install location:
+
+- Linux / macOS: `~/.local/bin/chanvoy`
+- Windows (when supported): `%USERPROFILE%\bin\chanvoy.exe`
+
+Override with `LOCAL_BIN=<path> make install`. Make sure the chosen
+directory is on your `PATH`.
+
+MSRV is Rust 1.89.0; older toolchains will fail to build. If you
+don't have a Rust toolchain, [install rustup](https://rustup.rs) first.
 
 Verify:
 
@@ -115,7 +122,7 @@ for per-command reference, flags, and worked examples.
 | **Bootstrap & lifecycle** | `auto-setup`, `daemon {start,serve,stop,status}`, `profile {list,active,create,create-from-env}`, `whoami` | `auto-setup` is the canonical bootstrap. `daemon serve` is the foreground variant for debug or sandbox parent-shell use. |
 | **Reading (cursor-neutral)** | `channels`, `pinned <ch>`, `read <ch>` (with `--since` / `--after` / `--since-bootstrap` / `--since-last-mine` / `--limit`), `check <ch>`, `dms`, `notifications` (with `--since` / `--unread`), `search <ch> <query>` | Pure reads; do not advance cursors unless `--advance` is passed on `read`. |
 | **Cursor-advancing reads** | `read --advance`, `ack <ch>` | Mark current-latest as seen with or without surfacing content. |
-| **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Successful writes establish or advance cursors. |
+| **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Only `post` advances the channel cursor; `dm`, `notify`, `react`, `unreact` are cursor-neutral. |
 | **Channel admin** | `channel {create,archive,restore,add-member}` (with `--team` for cross-team where authorized) | `restore` requires an elevated-capability profile. |
 | **Wait / probe** | `wait <ch> --timeout` | Block until new posts arrive or timeout. |
 | **Inspect (state, not chat)** | `attention {list,show}` | Strictly read-only on daemon state; never issues Mattermost API calls. |

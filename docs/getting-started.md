@@ -76,9 +76,18 @@ cd /path/to/chanvoy
 make install
 ```
 
-Default install location is `~/.cargo/bin/chanvoy`. MSRV is
-`Rust 1.89.0`; older toolchains will fail to build. If you don't have
-a Rust toolchain, [install rustup](https://rustup.rs) first.
+Default install location:
+
+- Linux / macOS: `~/.local/bin/chanvoy`
+- Windows (when supported): `%USERPROFILE%\bin\chanvoy.exe`
+
+The Makefile mirrors the cross-platform install convention used by
+sibling 3leaps tools (`sfetch`, `kitfly`). Override with
+`LOCAL_BIN=<path> make install` if you want a different target
+directory; make sure the directory you pick is on your `PATH`.
+
+MSRV is `Rust 1.89.0`; older toolchains will fail to build. If you
+don't have a Rust toolchain, [install rustup](https://rustup.rs) first.
 
 For a development loop without installing, replace `chanvoy` with
 `cargo run -p chanvoy --` in any of the commands below — see
@@ -207,9 +216,13 @@ chanvoy dm <username> "private message"
 chanvoy notify agent-other-bot "ping with @ mention payload"
 ```
 
-`post`, `react`, and `dm` are the writes that affect cursor state:
-a successful `post` records the latest post id for that profile + channel,
-which then shows up in `check` results.
+`post` is the only write that advances the **channel** cursor: a
+successful `post` records the latest post id for that profile +
+channel, which then shows up in `check` results. `read --advance`
+and `ack` also advance the channel cursor (without writing to MM).
+`react` / `unreact`, `dm`, and `notify` are **cursor-neutral** —
+they don't update channel cursors. Full `notifications` (without
+`--since`) updates the mention cursor specifically.
 
 ---
 

@@ -57,7 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`AGENTS.md` pointer.** Added a new-to-chanvoy pointer to
   `docs/getting-started.md` at the top of the agent guide.
 
-No behavior changes. No CLI surface changes. No code changes.
+### Build
+
+- **Cross-platform install convention.** `make install` now picks
+  the install location per the convention used by sibling 3leaps
+  tools (`sfetch`, `kitfly`): `$HOME/.local/bin/chanvoy` on
+  Linux/macOS, `$USERPROFILE\bin\chanvoy.exe` on Windows. `LOCAL_BIN`
+  override remains. Previously the Makefile defaulted only to
+  `$HOME/.local/bin` and required manual override on Windows; the
+  Windows path now resolves automatically. (No effect on existing
+  Linux/macOS installs.)
+
+No CLI behavior changes. No CLI surface changes. No Rust code
+changes.
 
 ## [0.2.0] - 2026-05-02
 

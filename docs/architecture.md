@@ -308,15 +308,23 @@ operator language it's just "the cross-team channel resolver."
 ```
 $CONFIG_ROOT/                          (default: ~/.config/lanytehq/chanvoy/
                                         on Linux, ~/Library/Application
-                                        Support/lanytehq/chanvoy/ on macOS)
+                                        Support/lanytehq/chanvoy/ on macOS;
+                                        override via CHANVOY_CONFIG_DIR — used
+                                        as-is, no lanytehq/chanvoy suffix added)
 ├── profiles/
-│   └── <profile-name>.json            Profile binding (bot identity, MM url, etc.)
-├── attention/
-│   └── <profile-name>.json            Per-profile cursor state, keyed by <team>/<channel>
-└── active_profile                     Single-line marker file (legacy convenience)
+│   └── <profile-name>.toml            Profile binding (bot identity, MM url,
+│                                       team binding) as TOML
+├── state-<profile-name>.json          Per-profile attention state (cursors
+│                                       keyed by <team>/<channel>) as JSON,
+│                                       one file per profile, at config root
+└── active_profile                     Single-line marker file (legacy
+                                       convenience pointer)
 
-$RUNTIME_ROOT/chanvoy/                 (default: $XDG_RUNTIME_DIR/chanvoy/
-                                        or OS temp)
+$RUNTIME_ROOT/                         (default: $XDG_RUNTIME_DIR/chanvoy/
+                                        or platform runtime dir / OS temp,
+                                        with /chanvoy/ suffix appended;
+                                        override via CHANVOY_RUNTIME_DIR — used
+                                        as-is, no chanvoy suffix added)
 ├── <profile-name>.sock                UDS socket — CLI ↔ daemon RPC
 ├── <profile-name>.pid                 Daemon pid file
 └── <profile-name>.bootstrap.json      One-shot bootstrap-state handoff
@@ -325,7 +333,7 @@ $RUNTIME_ROOT/chanvoy/                 (default: $XDG_RUNTIME_DIR/chanvoy/
 ### Permission contract
 
 - Config dirs: `0700`. Runtime dir: `0700`.
-- Profile + attention files: `0600`.
+- Profile TOML files + state JSON files + bootstrap handoff: `0600`.
 - Socket: `0700` parent dir; the socket itself inherits.
 
 This is a contract, not a hint. The `same-Unix-user` trust boundary

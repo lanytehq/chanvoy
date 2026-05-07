@@ -18,13 +18,15 @@ permission model, see [`docs/architecture.md`](./docs/architecture.md).
   whatever `CHANVOY_TOKEN_ENV_NAME` points at), sourced from a
   per-role identity script kept outside this repo. Test fixtures
   must use synthetic tokens (`test-token-...` literals) only.
-- **Profile state files.** Real profile JSON contains the bot
+- **Profile TOML files.** Real profile TOML
+  (`$CONFIG_ROOT/profiles/<profile>.toml`) contains the bot
   username, server URL, and team binding for a live deployment.
   Test fixtures use synthetic profile names and synthetic server
   URLs (`http://localhost:<port>` against `wiremock`).
-- **Attention-state snapshots from real deployments.** They contain
-  the bot's complete read history (channel ids, post ids,
-  timestamps). Synthetic-only in commits.
+- **Attention-state JSON snapshots from real deployments.**
+  `$CONFIG_ROOT/state-<profile>.json` contains the bot's complete
+  read history (channel ids, post ids, timestamps) keyed by
+  `<team>/<channel>`. Synthetic-only in commits.
 - **Live Mattermost server URLs or workspace identifiers.** Use
   obvious-placeholder hostnames (`mm.example.com`,
   `mattermost.test.invalid`) in docs and tests.
@@ -51,18 +53,27 @@ downstream contract changes and require explicit review.
 
 | Surface | Mode | Purpose |
 |---|---|---|
-| Config dirs (`$CONFIG_ROOT/`, `profiles/`, `attention/`) | `0700` | Reduce accidental cross-user exposure. |
-| Profile JSON files | `0600` | Same. |
-| Attention state JSON files | `0600` | Same. |
-| Runtime dir (`$RUNTIME_ROOT/chanvoy/`) | `0700` | Same. |
-| UDS socket (parent dir mode applies) | parent `0700` | Same. |
-| Pid files | `0600` | Same. |
-| Bootstrap-state handoff file | `0600` | Same; contains a one-shot validated identity nonce. |
+| Config dirs (`$CONFIG_ROOT/`, `profiles/`) | `0700` | Reduce accidental cross-user exposure. |
+| Profile TOML files (`$CONFIG_ROOT/profiles/<profile>.toml`) | `0600` | Same. |
+| Attention state JSON files (`$CONFIG_ROOT/state-<profile>.json`) | `0600` | Same. |
+| `active_profile` marker (`$CONFIG_ROOT/active_profile`) | `0600` | Same. |
+| Runtime dir (`$RUNTIME_ROOT/`) | `0700` | Same. |
+| UDS socket (`$RUNTIME_ROOT/<profile>.sock`) | parent `0700` | Same. |
+| Pid file (`$RUNTIME_ROOT/<profile>.pid`) | `0600` | Same. |
+| Bootstrap-state handoff (`$RUNTIME_ROOT/<profile>.bootstrap.json`) | `0600` | Same; contains a one-shot validated identity nonce. |
 
 If you change any of these masks, update
 [`docs/architecture.md` §Storage layout](./docs/architecture.md#storage-layout)
 in the same PR. Any code path that creates a new file under
 `$CONFIG_ROOT/` or `$RUNTIME_ROOT/` must use the matching mode.
+
+The default `$CONFIG_ROOT` resolves to `~/.config/lanytehq/chanvoy/`
+(Linux) or `~/Library/Application Support/lanytehq/chanvoy/` (macOS),
+overridable via `CHANVOY_CONFIG_DIR` (used as-is, no
+`lanytehq/chanvoy/` suffix). The default `$RUNTIME_ROOT` resolves to
+`$XDG_RUNTIME_DIR/chanvoy/` or the platform runtime / temp
+equivalent with a `chanvoy/` suffix; overridable via
+`CHANVOY_RUNTIME_DIR` (used as-is, no `chanvoy/` suffix).
 
 ---
 
