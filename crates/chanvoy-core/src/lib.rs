@@ -2898,10 +2898,18 @@ impl MattermostClient {
     }
 
     /// PER-023 primitive 1: fetch the channel's pinned posts via MM
-    /// `GET /api/v4/channels/{id}/pinned_posts`. Pure read, no cursor side
+    /// `GET /api/v4/channels/{id}/pinned`. Pure read, no cursor side
     /// effects (mirrors the operator-facing pinned-as-context contract).
     /// Resolves via the γ hybrid resolver (PER-019); accepts
     /// `<team>/<channel>` syntax and the `--team` override.
+    ///
+    /// Endpoint shape note (2026-05-07 fix): the canonical MM v4 path
+    /// is `/channels/{id}/pinned` — NOT `/pinned_posts`. The
+    /// `_posts` suffix returns 404 against real Mattermost.
+    /// Originally shipped in PER-023 with the wrong URL; the
+    /// wiremock test mocked the same wrong URL so it didn't catch
+    /// the live divergence. Prodmktg dogfooding flagged this
+    /// 2026-05-07 in #repo-chanvoy-ops.
     pub async fn read_channel_pinned(
         &self,
         channel_name: &str,
@@ -2924,7 +2932,7 @@ impl MattermostClient {
         let response: PostsResponse = self
             .request(
                 "GET",
-                &format!("/channels/{channel_id}/pinned_posts"),
+                &format!("/channels/{channel_id}/pinned"),
                 None::<Value>,
             )
             .await?;
