@@ -120,8 +120,8 @@ for per-command reference, flags, and worked examples.
 | Category | Commands | Notes |
 |---|---|---|
 | **Bootstrap & lifecycle** | `auto-setup`, `daemon {start,serve,stop,status}`, `profile {list,active,create,create-from-env}`, `whoami` | `auto-setup` is the canonical bootstrap. `daemon serve` is the foreground variant for debug or sandbox parent-shell use. |
-| **Reading (cursor-neutral)** | `channels`, `pinned <ch>`, `read <ch>` (with `--since` / `--after` / `--since-bootstrap` / `--since-last-mine` / `--limit`), `check <ch>`, `dms`, `notifications` (with `--since` / `--unread`), `search <ch> <query>` | Pure reads; do not advance cursors unless `--advance` is passed on `read`. |
-| **Cursor-advancing reads** | `read --advance`, `ack <ch>` | Mark current-latest as seen with or without surfacing content. |
+| **Reading (cursor-neutral)** | `channels`, `pinned <ch>`, `read <ch>` (with `--since` / `--after` / `--since-bootstrap` / `--since-last-mine` / `--limit`), `check <ch>`, `dms`, `notifications --unread`, `search <ch> <query>` | Pure reads; do not advance cursors unless `--advance` is passed on `read`. |
+| **Cursor-advancing reads** | `read --advance`, `ack <ch>`, full `notifications` (without `--unread`; with or without `--since`) | Channel-cursor advance for `read --advance` / `ack`; mention-cursor advance for full `notifications`. |
 | **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Only `post` advances the channel cursor; `dm`, `notify`, `react`, `unreact` are cursor-neutral. |
 | **Channel admin** | `channel {create,archive,restore,add-member}` (with `--team` for cross-team where authorized) | `restore` requires an elevated-capability profile. |
 | **Wait / probe** | `wait <ch> --timeout` | Block until new posts arrive or timeout. |

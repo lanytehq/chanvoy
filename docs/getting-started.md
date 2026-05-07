@@ -216,13 +216,15 @@ chanvoy dm <username> "private message"
 chanvoy notify agent-other-bot "ping with @ mention payload"
 ```
 
-`post` is the only write that advances the **channel** cursor: a
-successful `post` records the latest post id for that profile +
-channel, which then shows up in `check` results. `read --advance`
-and `ack` also advance the channel cursor (without writing to MM).
-`react` / `unreact`, `dm`, and `notify` are **cursor-neutral** —
-they don't update channel cursors. Full `notifications` (without
-`--since`) updates the mention cursor specifically.
+Three verbs advance the **channel** cursor: `post`, `read --advance`,
+and `ack`. Of those, only `post` writes to MM; the other two move
+the cursor without surfacing or producing chat content. A successful
+`post` records the latest post id for that profile + channel, which
+then shows up in `check` results. `react` / `unreact`, `dm`, and
+`notify` are **cursor-neutral** — they don't update channel
+cursors. Full `notifications` (without `--unread`) updates the
+**mention** cursor specifically; `notifications --unread` is a
+pure-read probe that doesn't.
 
 ---
 

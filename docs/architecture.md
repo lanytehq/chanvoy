@@ -255,9 +255,9 @@ Every read-shaped verb is one of three kinds:
 
 | Kind | Verbs | Cursor effect |
 |---|---|---|
-| Pure read | `read --after`, `read --since`, `read --since-bootstrap`, `read --since-last-mine`, `pinned`, `notifications --since`, `notifications --unread`, `search`, `attention list`, `attention show` | None |
+| Pure read | `read --after`, `read --since`, `read --since-bootstrap`, `read --since-last-mine`, `pinned`, `notifications --unread`, `search`, `attention list`, `attention show` | None |
 | Probe (pure-read with cursor consultation) | `check` | Reads cursor, never writes |
-| Cursor-advance | `read --advance`, `ack`, `post`, full `notifications` (no `--since`) | Writes cursor on success |
+| Cursor-advance | `read --advance`, `ack`, `post`, full `notifications` (without `--unread`; with or without `--since`) | Writes cursor on success |
 
 The taxonomy is load-bearing for agent loops: a script can `check` →
 `read --since-last-mine` → process → `ack` and trust that the cursor
