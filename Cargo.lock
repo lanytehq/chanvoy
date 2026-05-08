@@ -164,7 +164,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chanvoy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chanvoy-cli",
  "chanvoy-core",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chanvoy-core",
  "chanvoy-daemon",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "dirs",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-daemon"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chanvoy-core",
  "chanvoy-ipc",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-ipc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chanvoy-core",
  "chrono",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chanvoy-core",
  "serde",
@@ -1400,9 +1400,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.11"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20a6af516fea4b20eccceaf166e8aa666ac996208e8a644ce3ef5aa783bc7cd4"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "ring",
  "rustls-pki-types",

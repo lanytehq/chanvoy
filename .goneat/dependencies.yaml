@@ -1,0 +1,84 @@
+version: v1
+
+# License compliance policy for chanvoy v0.2.1+
+#
+# chanvoy is dual-licensed MIT OR Apache-2.0 (see LICENSE-MIT,
+# LICENSE-APACHE). Dependencies must be license-compatible with
+# both — i.e., permissive or compatible-permissive only. Strong
+# copyleft (GPL-3.0, AGPL-3.0) and weak copyleft (MPL-2.0) are
+# rejected because they would force chanvoy itself to take on
+# their license terms.
+#
+# The allow-list is explicit (not inferred) so a transitive dep
+# adopting an unfamiliar license trips a clear policy refusal
+# rather than silently propagating.
+
+licenses:
+  # Allow these permissive licenses on direct + transitive deps.
+  # All compatible with MIT OR Apache-2.0 dual-licensing.
+  # Symmetric with `deny.toml::licenses.allow`.
+  allowed:
+    - MIT
+    - Apache-2.0
+    - BSD-2-Clause
+    - BSD-3-Clause
+    - ISC
+    - Unicode-DFS-2016
+    - Unicode-3.0
+    - Zlib
+    - CC0-1.0
+    - 0BSD
+    - WTFPL
+    # CDLA-Permissive-2.0 — Linux Foundation permissive license
+    # for data; covers Mozilla's CA root certificates bundled in
+    # `webpki-roots`. Permissive (no copyleft); the CDLA license
+    # text is essentially MIT-for-data.
+    - CDLA-Permissive-2.0
+
+  # Per-crate exceptions where a transitive dep uses a license
+  # not in the global allow-list above. Each exception is a
+  # deliberate decision documented inline. Symmetric with
+  # `deny.toml::licenses.exceptions`.
+  exceptions:
+    # `option-ext` 0.2.0 is a small (single-file) MPL-2.0 utility
+    # used transitively via `dirs`. MPL-2.0 has filewise (not
+    # project-wide) copyleft — using `option-ext` as-is from
+    # crates.io without modifying its source does not impose
+    # MPL-2.0 on chanvoy's own code. Approved on 2026-05-08
+    # release-prep cycle; revisit if `dirs` switches to a
+    # non-MPL alternative.
+    - crate: option-ext
+      allow:
+        - MPL-2.0
+
+  # Hard-refuse copyleft (other than the option-ext MPL-2.0
+  # exception above). Adding a dep under one of these blocks
+  # the build until either the dep is replaced or the brief
+  # explicitly amends scope to relicense chanvoy itself.
+  forbidden:
+    - GPL-2.0
+    - GPL-2.0-only
+    - GPL-2.0-or-later
+    - GPL-3.0
+    - GPL-3.0-only
+    - GPL-3.0-or-later
+    - AGPL-3.0
+    - AGPL-3.0-only
+    - AGPL-3.0-or-later
+    - MPL-2.0
+    - LGPL-2.1
+    - LGPL-3.0
+    - SSPL-1.0
+
+# Cooling policy — packages under N days old are flagged. Catches
+# chain-jacking attempts where a recently-published version of
+# a familiar package introduces malicious code. 7d is the goneat
+# default; chanvoy follows the dogfood pattern.
+cooling:
+  enabled: true
+  min_age_days: 7
+  # Severity for cooling violations on the failure threshold.
+  # `medium` keeps cooling visible without blocking releases on
+  # legitimately-young deps; release-prep runs --fail-on=high so
+  # cooling is informational unless severity escalates.
+  severity: medium
