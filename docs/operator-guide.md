@@ -7,7 +7,7 @@
 - `chanvoy` uses a local per-profile daemon over a Unix socket.
 - Profiles and persisted config live under the platform-native config root for `lanytehq`.
 - Runtime sockets and pid files live outside the config root under the runtime temp area.
-- Current PER-007 readiness is for local-daemon replacement of `lanyte-chat`, not a remote proxy/control-plane deployment.
+- The validated operating mode is local-daemon as a replacement for `lanyte-chat`. A remote proxy / control-plane deployment is on the roadmap but deferred.
 
 Current validated local-daemon support is:
 
@@ -36,7 +36,7 @@ Runtime files are separate from config:
 - Socket: `XDG_RUNTIME_DIR/chanvoy/<profile>.sock` when available, otherwise the OS temp dir
 - Pid: same runtime directory as the socket
 
-Note: the broader `LANYTE_CONFIG_ROOT` override is a cross-app standardization follow-up and is not implemented in `chanvoy` as part of PER-007.
+Note: the broader `LANYTE_CONFIG_ROOT` override is a cross-app standardization follow-up and is not implemented in `chanvoy` today.
 
 ### Product namespace (not org restriction)
 
@@ -113,9 +113,9 @@ The `lanytehq` segment in the default config path (`~/.config/lanytehq/chanvoy/`
 
 ## Session-Start Orientation
 
-PER-023 (chanvoy v0.2.1) bundles four primitives that close the
-"operator just opened a channel" first-30-seconds workflow gap.
-Run these in order when joining a long-running channel:
+Four primitives close the "operator just opened a channel"
+first-30-seconds workflow gap. Run these in order when joining a
+long-running channel:
 
 1. **Pin context first.** `chanvoy pinned <channel>` returns just the
    channel's pinned posts. Pure read — no cursor side effects. Pins
@@ -155,8 +155,8 @@ Run these in order when joining a long-running channel:
    not since a time window. The supplied `--since` value is still
    parsed and validated for shape (so a malformed suffix on either
    path still rejects loudly with the same diagnostic), but the parsed
-   window is not consumed on the unread path. Pre-PER-023 behavior;
-   documented here for clarity.
+   window is not consumed on the unread path. This is the long-standing
+   semantic; documented here for clarity.
 
 Worked example, walking into a fresh channel:
 
@@ -182,15 +182,15 @@ ambiguous-intent commands); use `--since-bootstrap --limit N` for
 
 ## Resume And Attention
 
-PER-008 adds cursor-based local-mode workflow primitives:
+Cursor-based local-mode workflow primitives:
 
 - `chanvoy read <channel> --after <post-id>`
 - `chanvoy read <channel> --since-last-mine`
-- `chanvoy read <channel> --since-bootstrap [--limit N]` (PER-023)
-- `chanvoy read <channel> --advance` (PER-023; mode-independent cursor-advance)
+- `chanvoy read <channel> --since-bootstrap [--limit N]`
+- `chanvoy read <channel> --advance` (mode-independent cursor-advance)
 - `chanvoy check <channel> [--after <post-id>]`
-- `chanvoy ack <channel>` (PER-023; advance cursor without fetching content)
-- `chanvoy pinned <channel>` (PER-023; pure read of pinned posts)
+- `chanvoy ack <channel>` (advance cursor without fetching content)
+- `chanvoy pinned <channel>` (pure read of pinned posts)
 - `chanvoy notifications --unread`
 
 Current semantics:
@@ -222,29 +222,29 @@ Current inspectability gap worth tracking:
 
 ## Conversation Primitives
 
-PER-024 (chanvoy v0.2.1) adds two primitives for cleaner multi-reviewer
-review cycles — threaded replies and emoji reactions. Both are
-noise-reduction surfaces: a high-traffic review channel with 11
-findings + acks no longer needs all of those as top-level posts.
+Two primitives support cleaner multi-reviewer review cycles —
+threaded replies and emoji reactions. Both are noise-reduction
+surfaces: a high-traffic review channel with many findings + acks
+no longer needs all of those as top-level posts.
 
 ### Threaded replies (`post --reply-to`)
 
 ```bash
-# Post a top-level finding (existing surface)
-chanvoy post brief-per-024 "finding #2: bare --limit shape ambiguous"
+# Post a top-level finding
+chanvoy post review-channel "finding #2: bare --limit shape ambiguous"
 # → posted: <reply-id>
 
-# Reply within the thread (PER-024)
-chanvoy post brief-per-024 "fixed in 54661a7" --reply-to <parent-id>
+# Reply within the thread
+chanvoy post review-channel "fixed in 54661a7" --reply-to <parent-id>
 # → posted: <reply-id>
 ```
 
 `--reply-to` accepts the post id returned by a prior `chanvoy post` or
-`chanvoy read --json`. Channel resolution is unchanged (γ hybrid;
-`<team>/<channel>` works on `--reply-to` calls too). The validation
-order is **resolve channel → verify parent on resolved channel →
-write**, so a parent post id from a different channel is refused
-before any write is attempted.
+`chanvoy read --json`. Channel resolution is unchanged (the cross-team
+resolver applies; `<team>/<channel>` works on `--reply-to` calls too).
+The validation order is **resolve channel → verify parent on resolved
+channel → write**, so a parent post id from a different channel is
+refused before any write is attempted.
 
 `--json` output is **additive**: non-threaded posts return the
 existing `{ "id": "<post_id>" }` shape unchanged; threaded posts add
@@ -255,11 +255,11 @@ stays `posted: <new_reply_id>` regardless.
 
 ```bash
 # Ack a finding without adding a "lgtm" text post
-chanvoy react brief-per-024 <post-id> +1
-# → ok: org-lanytehq/brief-per-024 +1 on post <post-id>
+chanvoy react review-channel <post-id> +1
+# → ok: org-lanytehq/review-channel +1 on post <post-id>
 
 # Remove your reaction
-chanvoy unreact brief-per-024 <post-id> +1
+chanvoy unreact review-channel <post-id> +1
 ```
 
 **Channel is positional and required** even though Mattermost can key
@@ -297,17 +297,17 @@ unknown name, the error surfaces with the typed value preserved.
 | Quick agreement / disagreement | reaction (`+1` / `-1`) |
 | Adding context that needs attribution + history | threaded reply |
 
-Pattern observed during PER-019's review cycle: 11 reviewer findings
-+ ~30% acks-as-text-posts in a 30-post channel made the signal-to-noise
-ratio poor. PER-024's primitives let the same review cycle ship with
-reactions instead of acks (the bot identity is preserved since
-reactions are auth-bound) and threaded replies for actual fix-commit
-follow-ups.
+Pattern observed during a high-traffic review cycle: a dozen reviewer
+findings plus ~30% acks-as-text-posts made the signal-to-noise ratio
+poor. The reactions + threaded-reply primitives let the same review
+cycle ship with reactions instead of ack-posts (the bot identity is
+preserved since reactions are auth-bound) and threaded replies for
+actual fix-commit follow-ups.
 
 ## Discovery
 
-PER-025 (chanvoy v0.2.1) adds two discovery primitives — keyword search
-within a channel, and a traffic-aware `chanvoy channels` listing.
+Two discovery primitives — keyword search within a channel, and a
+traffic-aware `chanvoy channels` listing.
 
 ### Search (`chanvoy search`)
 
@@ -359,7 +359,7 @@ ago`, or `—` for channels with no posts.
 chanvoy channels
 # === org-lanytehq ===
 #   org-lanytehq/bravo-team   Bravo Team   O  2h ago
-#   org-lanytehq/per-019      PER-019      O  3d ago
+#   org-lanytehq/general      General      O  3d ago
 #   org-lanytehq/quiet        Quiet        O  —
 ```
 
@@ -371,7 +371,7 @@ chanvoy channels --sort active
 # never-active channels sort last within their group.
 ```
 
-**`--sort active` preserves PER-019 team grouping** — channels are
+**`--sort active` preserves cross-team grouping** — channels are
 sorted within each team's group, but the group order itself stays
 primary-first / fallback-alphabetical. A flattened global-active view
 is explicitly out of scope (deferred to a future `--flatten` /
@@ -399,17 +399,16 @@ never `0`):
 `chanvoy channels --primary-team --json` preserves the **legacy**
 single-team JSON shape exactly — no `last_post_at` field added. Use
 the legacy path when downstream tooling depends on the
-pre-PER-025 shape.
+pre-discovery-primitives shape.
 
 ## Cross-Team Channel Resolution
 
-As of chanvoy 0.1.3+, channel-name arguments resolve across every
-team the bot is a member of. Previously (≤ 0.1.2), every CLI verb
-that took a channel name searched only the profile's primary team
-and silently 404'd when the channel lived on a different team —
-exactly the failure SOP-MM-015 cross-org standing channels expose.
+Channel-name arguments resolve across every team the bot is a member
+of. (Earlier chanvoy versions searched only the profile's primary
+team and silently 404'd when the channel lived on a different team.
+The current resolver fixes that gap.)
 
-### Resolution chain (γ hybrid)
+### Resolution chain
 
 In order of precedence:
 
@@ -489,7 +488,7 @@ Flags:
 - `--json` — structured per-team output with a `qualified` field
   for each channel.
 
-### Cross-team channel creation (v0.2.1)
+### Cross-team channel creation
 
 `chanvoy channel create <name> <display>` creates a public channel
 on the profile's primary team by default. To create a channel on an
@@ -505,9 +504,8 @@ chanvoy channel create ops-discussions "Ops Discussions" --team org-3leaps
 
 The team must be one the bot is already a member of (the resolver
 looks it up via the same `/users/me/teams` membership cache that
-powers cross-team `read` / `post` / `search` etc.). v0.2.1 closes
-this gap — every chanvoy verb that touches a channel is now
-cross-team aware.
+powers cross-team `read` / `post` / `search` etc.). Every chanvoy
+verb that touches a channel is now cross-team aware.
 
 ## Profile Resolution
 
@@ -546,7 +544,7 @@ Reports the current marker contents directly. Output shape:
 | Set to `<name>` | `<name>` | `{"active_profile": "<name>"}` |
 | Empty | `(none)` | `{"active_profile": null}` |
 
-This replaces a pre-PER-012 fallback that synthesized a name from the resolver — scripts or agents parsing this output to gate behavior may need updating to handle the explicit-empty case (text `(none)` literal, or `.active_profile` field that may be JSON `null`).
+This replaces a fallback in earlier chanvoy versions that synthesized a name from the resolver — scripts or agents parsing this output to gate behavior may need updating to handle the explicit-empty case (text `(none)` literal, or `.active_profile` field that may be JSON `null`).
 
 ## Daemon Lifecycle
 
@@ -560,7 +558,7 @@ This replaces a pre-PER-012 fallback that synthesized a name from the resolver �
   - stops a running daemon
   - returns `NotRunning` if the daemon is already absent
 
-Observed PER-007 lifecycle behavior:
+Observed lifecycle behavior:
 
 - stale socket cleanup works on next `daemon start`
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior
@@ -578,18 +576,19 @@ detached child cannot escalate at startup — Codex agents, OSS users
 running chanvoy under similar `sandbox-exec`-style policies, Docker
 containers without `--network`, etc.
 
-### Native handling (PER-014)
+### Native sandbox handling
 
-As of chanvoy 0.1.2+, `chanvoy auto-setup` works natively under
-sandbox restrictions. The CLI parent process — which already runs in
-the operator's interactive shell context where sandbox network-approval
-prompts can fire — performs the Mattermost `whoami()` identity check
-and hands the validated identity to the detached daemon via a per-profile
-bootstrap-state file plus a one-shot env nonce. The daemon child reads
-the file, validates it (freshness + profile fingerprint + nonce), then
-binds its UDS socket without any network call. WebSocket connections
-fail gracefully and retry through the existing reconnect path
-(PER-010), so a sandbox-blocked WS does not block daemon startup.
+`chanvoy auto-setup` works natively under sandbox restrictions. The
+CLI parent process — which already runs in the operator's interactive
+shell context where sandbox network-approval prompts can fire —
+performs the Mattermost `whoami()` identity check and hands the
+validated identity to the detached daemon via a per-profile
+bootstrap-state file plus a one-shot env nonce. The daemon child
+reads the file, validates it (freshness + profile fingerprint +
+nonce), then binds its UDS socket without any network call.
+WebSocket connections fail gracefully and retry through the existing
+reconnect path, so a sandbox-blocked WS does not block daemon
+startup.
 
 In practice: on the first `auto-setup` after sourcing your identity
 profile, the parent CLI's `whoami()` triggers a single network-approval
@@ -611,11 +610,11 @@ to end.
 
 ### Foreground daemon serve (rare cases)
 
-The original PER-013 workaround — running `chanvoy daemon serve` in
-the foreground with explicit network approval at start time — is
-retained for environments where the parent-side `whoami()` itself
-cannot run interactively (e.g., fully non-interactive batch contexts
-where no approval prompt can be answered):
+Running `chanvoy daemon serve` in the foreground with explicit
+network approval at start time is the fallback for environments
+where the parent-side `whoami()` itself cannot run interactively
+(e.g., fully non-interactive batch contexts where no approval
+prompt can be answered):
 
 ```bash
 # In one shell, with network approval granted to this command:
@@ -632,12 +631,12 @@ This path is the rare-case fallback; for typical Codex / sandbox-exec
 operator flows, prefer `auto-setup`.
 
 > Sandbox-approval semantics ("approve network access at parent
-> `whoami`") vary by sandbox implementation. PER-014's design is
+> `whoami`") vary by sandbox implementation. The chanvoy design is
 > sandbox-agnostic — it does not detect or branch on sandbox shape;
 > it simply moves the network call to where approval can be granted
-> (the parent CLI). Originally documented from the 2026-04-25
-> `agent-bravo-devrev` Codex transcript; PER-014 ships in chanvoy
-> 0.2.0+ with the structural fix.
+> (the parent CLI). For the agent-facing decision tree
+> (network-only / socket-write / socket-read / escalate), see
+> [`getting-started.md` §Sandboxed agents](./getting-started.md#sandboxed-agents).
 
 ## Migration Exception
 

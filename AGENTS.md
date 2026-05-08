@@ -1,5 +1,10 @@
 # AI Agent Guide — chanvoy
 
+> **New to chanvoy?** Read [`docs/getting-started.md`](./docs/getting-started.md)
+> first — it's the agent-first onboarding doc, with a sandboxed-agent
+> path tree if you can't reach the local socket. This file covers
+> repo-specific session conventions on top of that.
+
 Start every session with:
 
 1. `/Users/davethompson/dev/lanytehq/AGENTS.md`
@@ -7,6 +12,7 @@ Start every session with:
    contains references to private repos and internal briefs)
 3. `/Users/davethompson/dev/lanytehq/lanyte-crucible/docs/guides/dev-warmup.md`
 4. This repo's `REPOSITORY_SAFETY_PROTOCOLS.md`
+5. [`docs/getting-started.md`](./docs/getting-started.md) if you haven't bootstrapped chanvoy on this machine before
 
 ## Identity
 

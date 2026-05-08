@@ -3,10 +3,18 @@ MSRV := $(shell awk -F\" '/^rust-version =/ {print $$2; exit}' Cargo.toml)
 GONEAT_FMT := @if command -v goneat >/dev/null 2>&1; then goneat format --types yaml,json,markdown --folders . --finalize-eof --quiet; else echo "goneat not found; skipping non-Rust formatting"; fi
 GONEAT_ASSESS := @if command -v goneat >/dev/null 2>&1; then goneat assess . --categories lint --check; else echo "goneat not found; skipping goneat assess"; fi
 
-# Userspace install location. Override per-OS if needed:
-#   Linux / macOS: $HOME/.local/bin (default)
-#   Windows / other: set LOCAL_BIN on the make invocation
+# Userspace install location. Mirrors the cross-platform convention used by
+# sibling 3leaps tools (sfetch, kitfly):
+#   Linux / macOS: $HOME/.local/bin/chanvoy
+#   Windows:       $USERPROFILE/bin/chanvoy.exe
+# Override either path with LOCAL_BIN= on the make invocation.
+ifeq ($(OS),Windows_NT)
+LOCAL_BIN ?= $(USERPROFILE)/bin
+EXT := .exe
+else
 LOCAL_BIN ?= $(HOME)/.local/bin
+EXT :=
+endif
 
 # Repo-root VERSION file is the source of truth for chanvoy's version.
 # Cargo.toml versions across workspace + crates are synced from it via
@@ -60,9 +68,9 @@ build-release:
 # lifecycle, while new execs resolve to the fresh file.
 install: build-release
 	@mkdir -p $(LOCAL_BIN)
-	@rm -f $(LOCAL_BIN)/chanvoy
-	@cp target/release/chanvoy $(LOCAL_BIN)/chanvoy
-	@echo "[ok] installed chanvoy to $(LOCAL_BIN)/chanvoy"
+	@rm -f $(LOCAL_BIN)/chanvoy$(EXT)
+	@cp target/release/chanvoy$(EXT) $(LOCAL_BIN)/chanvoy$(EXT)
+	@echo "[ok] installed chanvoy to $(LOCAL_BIN)/chanvoy$(EXT)"
 	@echo "     note: if a chanvoy daemon was already running, it"
 	@echo "     keeps the previous binary until you restart it via"
 	@echo "     'chanvoy daemon stop' + 'chanvoy auto-setup'"

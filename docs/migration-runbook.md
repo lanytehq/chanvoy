@@ -46,18 +46,18 @@ canonical adopter flow is `auto-setup`.
 Use plain `chanvoy` commands after identity is sourced and the daemon is running:
 
 ```bash
-chanvoy read per-007 --since 60
-chanvoy post per-007 "status update"
+chanvoy read <channel> --since 60
+chanvoy post <channel> "status update"
 chanvoy notifications
-chanvoy wait per-007 --timeout 10
+chanvoy wait <channel> --timeout 10
 ```
 
-For cursor-based resume and cheap attention checks after PER-008:
+For cursor-based resume and cheap attention checks:
 
 ```bash
-chanvoy read per-008 --after <post-id>
-chanvoy read per-008 --since-last-mine
-chanvoy check per-008
+chanvoy read <channel> --after <post-id>
+chanvoy read <channel> --since-last-mine
+chanvoy check <channel>
 chanvoy notifications --unread
 ```
 
@@ -66,8 +66,9 @@ Important semantics:
 - `read --after`, `read --since-last-mine`, `check`, and `notifications --unread` are observe-only
 - `check` with no stored cursor returns `no_anchor` instead of silently falling back to a time window
 - `check` with a stale daemon-owned cursor degrades to `stale_cursor` instead of hard-failing
-- durable channel cursors are currently established by successful `post`
-- durable mention cursors are currently established by full `notifications` reads
+- durable channel cursors are advanced by successful `post`, `read --advance`, and `ack`
+- durable mention cursors are updated by full `notifications` reads (no `--since`)
+- `react` / `unreact`, `dm`, and `notify` are cursor-neutral
 
 ## Cutover Checklist
 
@@ -83,7 +84,7 @@ chanvoy daemon status
 5. Run the smoke gate:
 
 ```bash
-CHANVOY_PROFILE=<profile> scripts/per007-smoke.sh per-007
+CHANVOY_PROFILE=<profile> scripts/per007-smoke.sh <smoke-channel>
 ```
 
 6. Switch routine agent operations to `chanvoy`.
@@ -107,7 +108,7 @@ If `chanvoy` is unavailable during a session:
 1. Capture the failing command, stdout/stderr, and exit code.
 2. Stop or restart the daemon if appropriate.
 3. Fall back temporarily to `lanyte-chat` for the affected operation.
-4. Post the discrepancy in the relevant PER channel before continuing.
+4. Post the discrepancy in the relevant rollout-coordination channel before continuing.
 
 ## Rollback Window
 
@@ -115,7 +116,7 @@ If `chanvoy` is unavailable during a session:
 - Treat any regression that blocks normal agent operations during that week as rollback-eligible.
 - At the end of the week, do a final doc/grep sweep and remove remaining non-historical `lanyte-chat` workflow references.
 
-## Known PER-007 Notes
+## Known Notes
 
 - `channel restore` requires an elevated-capability profile in `chanvoy`.
 - Runtime sockets live outside config storage.
