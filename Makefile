@@ -138,7 +138,7 @@ release-prep: pr-final license-check security-scan sbom ## Full release-cycle ga
 	@echo "     license-check ✓"
 	@echo "     security-scan ✓"
 	@echo "     SBOM generated under sbom/"
-	@echo "     ready to bump version + tag"
+	@echo "     ready to tag"
 
 precommit: check fmt quality
 
