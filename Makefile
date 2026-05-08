@@ -103,8 +103,10 @@ pr-final: ensure-msrv version-check
 # release-cycle gate, not the commit-cycle gate.
 #
 # Goneat install: `sfetch --repo fulmenhq/goneat --tag v0.5.10` (or a
-# later tag). The targets below check for goneat presence and skip
-# with a clear message if it isn't installed.
+# later tag). The targets below check for goneat presence and fail
+# with a clear install hint if it isn't on PATH. Defensible failure
+# mode for a release gate — letting a misconfigured environment ship
+# un-scanned releases would be the worse trade.
 
 sbom: ## Generate CycloneDX SBOM artifact for the current workspace
 	@if ! command -v goneat >/dev/null 2>&1; then \
