@@ -1,0 +1,61 @@
+version: v1
+
+# License compliance policy for chanvoy v0.2.1+
+#
+# chanvoy is dual-licensed MIT OR Apache-2.0 (see LICENSE-MIT,
+# LICENSE-APACHE). Dependencies must be license-compatible with
+# both — i.e., permissive or compatible-permissive only. Strong
+# copyleft (GPL-3.0, AGPL-3.0) and weak copyleft (MPL-2.0) are
+# rejected because they would force chanvoy itself to take on
+# their license terms.
+#
+# The allow-list is explicit (not inferred) so a transitive dep
+# adopting an unfamiliar license trips a clear policy refusal
+# rather than silently propagating.
+
+licenses:
+  # Allow these permissive licenses on direct + transitive deps.
+  # All compatible with MIT OR Apache-2.0 dual-licensing.
+  allowed:
+    - MIT
+    - Apache-2.0
+    - BSD-2-Clause
+    - BSD-3-Clause
+    - ISC
+    - Unicode-DFS-2016
+    - Unicode-3.0
+    - Zlib
+    - CC0-1.0
+    - 0BSD
+    - WTFPL
+
+  # Hard-refuse copyleft. Adding a dep under one of these blocks
+  # the build until either the dep is replaced or the brief
+  # explicitly amends scope to relicense chanvoy itself.
+  forbidden:
+    - GPL-2.0
+    - GPL-2.0-only
+    - GPL-2.0-or-later
+    - GPL-3.0
+    - GPL-3.0-only
+    - GPL-3.0-or-later
+    - AGPL-3.0
+    - AGPL-3.0-only
+    - AGPL-3.0-or-later
+    - MPL-2.0
+    - LGPL-2.1
+    - LGPL-3.0
+    - SSPL-1.0
+
+# Cooling policy — packages under N days old are flagged. Catches
+# chain-jacking attempts where a recently-published version of
+# a familiar package introduces malicious code. 7d is the goneat
+# default; chanvoy follows the dogfood pattern.
+cooling:
+  enabled: true
+  min_age_days: 7
+  # Severity for cooling violations on the failure threshold.
+  # `medium` keeps cooling visible without blocking releases on
+  # legitimately-young deps; release-prep runs --fail-on=high so
+  # cooling is informational unless severity escalates.
+  severity: medium

@@ -1,0 +1,103 @@
+# cargo-deny configuration for chanvoy
+#
+# Goal: permissive license posture (MIT / Apache-2.0 / BSD / ISC / Zlib /
+# Unicode) compatible with chanvoy's dual MIT-OR-Apache-2.0 licensing.
+# GPL-family and other strong copyleft deps fail fast — adding one
+# would force chanvoy itself to take on those terms.
+#
+# Pairs with .goneat/dependencies.yaml policy. Goneat invokes
+# cargo-deny under the hood for the actual scan; this file is the
+# allow-list cargo-deny consults.
+#
+# Run via:
+#   make license-check     — dedicated license scan
+#   make security-scan     — vulnerability + license + bans (full)
+#   make release-prep      — pr-final + license + security + sbom
+
+[graph]
+all-features = true
+
+[advisories]
+db-path = "target/advisory-dbs"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+
+# Per-advisory exceptions. Each is a deliberate decision documented
+# inline. Active CVE-shaped vulns are NEVER ignored here — only
+# `unmaintained` / `unsound` advisories with a documented mitigation
+# or scheduled-uplift plan.
+ignore = [
+  # rustls-pemfile is `unmaintained` per upstream — pulled in
+  # transitively via reqwest 0.12.x. Not an exploitable vuln; the
+  # crate still works. Resolution path is bumping reqwest to 0.13.x
+  # which dropped the dep. Out of scope for v0.2.1 release-prep
+  # (minor reqwest bump has API surface change risk we don't want
+  # to absorb pre-tag); v0.2.2 follow-up captured in CHANGELOG.
+  # Revisit when bumping reqwest.
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; resolved by reqwest 0.13.x bump (v0.2.2 follow-up)" },
+]
+
+[licenses]
+# Allow these permissive licenses on direct + transitive deps.
+# Symmetric with `.goneat/dependencies.yaml::licenses.allowed`.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "0BSD",
+  # CDLA-Permissive-2.0 is the Linux Foundation's permissive
+  # license for data — covers Mozilla's CA root certificates
+  # bundled in `webpki-roots`. Permissive (no copyleft); the
+  # CDLA license text is essentially MIT-for-data.
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# Per-crate license exceptions where transitive deps use a
+# license not in the global allow-list above. Each exception
+# is a deliberate decision documented inline.
+exceptions = [
+  # `option-ext` is a small (single-file) MPL-2.0 utility used
+  # transitively via `dirs`. MPL-2.0 has filewise (not project-
+  # wide) copyleft — using `option-ext` as-is from crates.io
+  # without modifying its source does not impose MPL-2.0 on
+  # chanvoy's own code. Approved on 2026-05-08 release-prep
+  # cycle; revisit if `dirs` switches to a non-MPL alternative.
+  { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+# Wildcard bans don't apply to workspace path deps and git deps
+# (which are intentionally version-loose by design — the path /
+# git ref is the version pin). cargo-deny treats those as
+# "wildcard" because no SemVer string is set; we tell it to
+# skip those by setting `wildcards = "allow"`. Strict wildcard
+# ban on regular crates.io deps remains via Cargo's own
+# resolver (it requires explicit versions there).
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+  "https://github.com/3leaps/ipcprims",
+  "https://github.com/3leaps/sysprims",
+]
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

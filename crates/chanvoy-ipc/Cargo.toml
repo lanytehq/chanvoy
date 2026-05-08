@@ -1,8 +1,9 @@
 [package]
 name = "chanvoy-ipc"
-version = "0.2.0"
-edition = "2021"
-rust-version = "1.89.0"
+version = "0.2.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 chanvoy-core = { path = "../chanvoy-core" }

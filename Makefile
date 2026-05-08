@@ -23,6 +23,7 @@ VERSION_FILE := VERSION
 
 .PHONY: all clean check fmt quality test test-integration build build-release install ensure-msrv msrv precommit prepush pr-final
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
+.PHONY: sbom security-scan license-check release-prep
 
 all: check
 
@@ -93,6 +94,51 @@ pr-final: ensure-msrv version-check
 	cargo test --package chanvoy --test restart_harness -- --ignored
 	cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] pr-final gate passed"
+
+# ---- v0.2.1+ release-prep tooling ---------------------------------------
+# Goneat (3leaps DX tool) handles SBOM, license compliance, and security
+# scanning for chanvoy. Run via individual targets during dev or via
+# `make release-prep` umbrella once before tagging a release. Not part of
+# `pr-final` to keep day-to-day CI fast — these scans are the
+# release-cycle gate, not the commit-cycle gate.
+#
+# Goneat install: `sfetch --repo fulmenhq/goneat --tag v0.5.10` (or a
+# later tag). The targets below check for goneat presence and skip
+# with a clear message if it isn't installed.
+
+sbom: ## Generate CycloneDX SBOM artifact for the current workspace
+	@if ! command -v goneat >/dev/null 2>&1; then \
+		echo "[!!] goneat not installed; skipping SBOM. Install via 'sfetch --repo fulmenhq/goneat'."; \
+		exit 1; \
+	fi
+	@mkdir -p sbom
+	@version=$$(awk -F'"' '/^version =/ {print $$2; exit}' crates/chanvoy-core/Cargo.toml); \
+		goneat dependencies --sbom \
+			--sbom-output "sbom/chanvoy-v$$version.cdx.json" \
+			--quiet
+	@echo "[ok] SBOM written under sbom/ (gitignored)"
+
+security-scan: ## Run goneat security (cargo-audit + cargo-deny on Rust)
+	@if ! command -v goneat >/dev/null 2>&1; then \
+		echo "[!!] goneat not installed; skipping security scan."; \
+		exit 1; \
+	fi
+	goneat security --fail-on high
+
+license-check: ## Run goneat license compliance per .goneat/dependencies.yaml
+	@if ! command -v goneat >/dev/null 2>&1; then \
+		echo "[!!] goneat not installed; skipping license check."; \
+		exit 1; \
+	fi
+	goneat dependencies --licenses --fail-on high
+
+release-prep: pr-final license-check security-scan sbom ## Full release-cycle gate (slower than pr-final; run before tagging)
+	@echo "[ok] release-prep gate passed"
+	@echo "     pr-final ✓"
+	@echo "     license-check ✓"
+	@echo "     security-scan ✓"
+	@echo "     SBOM generated under sbom/"
+	@echo "     ready to bump version + tag"
 
 precommit: check fmt quality
 
