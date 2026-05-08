@@ -30,7 +30,13 @@ Net operator impact:
   `wait --timeout`, `search --since`) accept `s`/`m`/`h`/`d`
   suffixes. Bare integer preserves today's per-flag default
   (minutes). Uppercase `M` and `mo` are loud-failed to avoid
-  month/minute confusion.
+  month/minute confusion. Resolution is per-flag and not uniform:
+  `read --since` and `wait --timeout` are second-precise;
+  `notifications --since` rounds up to the nearest minute (MM's
+  surface is minute-keyed); `search --since` narrows via the MM-
+  native `after:<YYYY-MM-DD>` operator (date granularity, not
+  sub-day precision). The suffix grammar is uniform; downstream
+  precision is what the underlying API supports.
 - Multi-reviewer review cycles get cleaner: `chanvoy post
   --reply-to <post>` for threaded follow-ups; `chanvoy react
   <ch> <post> +1` / `unreact` for ack-without-text-noise.
@@ -51,9 +57,11 @@ Net operator impact:
   `make release-prep` runs `pr-final` + license compliance +
   vulnerability scan + CycloneDX SBOM generation. Individual
   targets — `make sbom`, `make security-scan`, `make license-check`
-  — are available for dev-loop use. Goneat is detected at runtime;
-  targets skip cleanly with a clear install hint when goneat is
-  unavailable.
+  — are available for dev-loop use. Goneat presence is required;
+  the targets fail with a clear install hint
+  (`sfetch --repo fulmenhq/goneat`) when goneat isn't on `PATH`.
+  Defensible failure mode for a release gate — the alternative
+  would let a misconfigured environment ship un-scanned releases.
 - **`.goneat/dependencies.yaml`** policy file — explicit
   permissive-license allow-list (MIT / Apache-2.0 / BSD /
   ISC / Unicode-3.0 / Zlib / CC0-1.0 / CDLA-Permissive-2.0);
