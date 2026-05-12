@@ -1,0 +1,162 @@
+{
+  "$comment": [
+    "Canonical Mattermost v4 endpoints used by chanvoy. PER-032 AC #11 — single source of truth for URL contract.",
+    "Every chanvoy verb that issues an HTTP request to Mattermost has its method + path template recorded here.",
+    "Path placeholders use {name} syntax and expand to the stable test values defined in tests/url_shape_replay.rs.",
+    "All paths are relative to the Mattermost v4 API root (/api/v4). The chanvoy MattermostClient prepends /api/v4 to every request.",
+    "Adding a new MM-endpoint usage to chanvoy-core must land an entry here first (schemas-before-code invariant)."
+  ],
+  "api_root": "/api/v4",
+  "endpoints": {
+    "whoami": {
+      "method": "GET",
+      "path_template": "/users/me",
+      "verbs": ["whoami"],
+      "tier_b_live_smoke": true
+    },
+    "list_teams": {
+      "method": "GET",
+      "path_template": "/users/me/teams",
+      "verbs": ["channels", "read --since", "read --after", "read --since-last-mine", "read --since-bootstrap", "pinned", "ack", "check", "wait", "post", "post --reply-to", "react", "unreact", "search", "notifications", "channel create", "channel archive", "channel restore", "dm send", "dm read", "dms", "notify", "channel add-member"],
+      "tier_b_live_smoke": true,
+      "comment": "Bot team-membership enumeration. Hit by the PER-019 γ hybrid resolver on every team-bearing verb. Cached after first fetch."
+    },
+    "team_by_name": {
+      "method": "GET",
+      "path_template": "/teams/name/{slug}",
+      "verbs": ["channels", "read", "post", "search", "channel create", "channel archive", "channel restore", "channel add-member"],
+      "tier_b_live_smoke": true,
+      "comment": "Per-team lookup by slug. Hit by the γ hybrid resolver when an explicit --team override or <team>/<channel> syntax is used."
+    },
+    "list_team_channels": {
+      "method": "GET",
+      "path_template": "/users/me/teams/{team_id}/channels",
+      "verbs": ["channels", "auto-setup"],
+      "tier_b_live_smoke": true,
+      "comment": "Bot per-team channel membership listing. Hit by channels verb and the auto-setup cursor seeder."
+    },
+    "list_user_channels": {
+      "method": "GET",
+      "path_template": "/users/{user_id}/channels",
+      "verbs": ["channels"],
+      "tier_b_live_smoke": true,
+      "comment": "Cross-team channel enumeration for the bot user. `per_page` is a query filter, not part of the URL identity."
+    },
+    "channel_by_name": {
+      "method": "GET",
+      "path_template": "/teams/{team_id}/channels/name/{channel_name}",
+      "verbs": ["channels", "read", "post", "search", "pinned", "ack", "check", "wait", "react", "unreact", "channel archive", "channel restore", "channel add-member"],
+      "tier_b_live_smoke": true,
+      "comment": "Per-channel lookup by name within a resolved team. Hit by every channel-targeting verb."
+    },
+    "channel_posts": {
+      "method": "GET",
+      "path_template": "/channels/{channel_id}/posts",
+      "verbs": ["read --since", "read --after", "read --since-bootstrap", "read --since-last-mine", "ack", "check"],
+      "tier_b_live_smoke": true,
+      "comment": "Channel posts read. Query-string variants (?since=, ?after=, ?per_page=) are call-site filters; URL identity is the base path. PER-032 Item I's contract test asserts the daemon does not couple cursor state to this endpoint."
+    },
+    "channel_pinned": {
+      "method": "GET",
+      "path_template": "/channels/{channel_id}/pinned",
+      "verbs": ["pinned"],
+      "tier_b_live_smoke": true,
+      "comment": "Channel pinned posts. Originally shipped as /pinned_posts (404 in production); fixed to canonical /pinned in PR #25 / v0.2.1. PER-032 Item J / AC #11 — this endpoint is the load-bearing case for the URL-shape drift class. A regression here must fail Tier-A replay before reaching live MM."
+    },
+    "post_by_id": {
+      "method": "GET",
+      "path_template": "/posts/{post_id}",
+      "verbs": ["check", "read --after"],
+      "tier_b_live_smoke": true,
+      "comment": "Anchor-post existence probe. Hit by `assert_post_in_channel` / stale-cursor detection."
+    },
+    "post_thread": {
+      "method": "GET",
+      "path_template": "/posts/{root_post_id}/thread",
+      "verbs": ["post --reply-to"],
+      "tier_b_live_smoke": true,
+      "comment": "Thread enumeration. Used by `post --reply-to` to validate the parent post exists on the resolved channel before constructing the reply."
+    },
+    "user_by_username": {
+      "method": "GET",
+      "path_template": "/users/username/{username}",
+      "verbs": ["read --since-last-mine", "dm send", "dm read", "channel add-member"],
+      "tier_b_live_smoke": true,
+      "comment": "User lookup by username. Hit by since-last-mine (resolves the bot's own username for the search filter) and DM/add-member verbs (resolve target user)."
+    },
+    "user_by_id": {
+      "method": "GET",
+      "path_template": "/users/{user_id}",
+      "verbs": ["dm send", "dm read", "dms"],
+      "tier_b_live_smoke": false,
+      "tier_b_dropped_rationale": "peer-principal dependent — see brief §Scope J dropped-verb rationale. URL contract guarded here in Tier-A.",
+      "comment": "User lookup by id. Hit by DM-family verbs to resolve a counterparty."
+    },
+    "create_post": {
+      "method": "POST",
+      "path_template": "/posts",
+      "verbs": ["post", "post --reply-to", "dm send"],
+      "tier_b_live_smoke": true,
+      "comment": "Post creation. Same endpoint for channel posts, thread replies, and DM sends; differentiated by channel_id + optional root_id in body."
+    },
+    "create_channel": {
+      "method": "POST",
+      "path_template": "/channels",
+      "verbs": ["channel create"],
+      "tier_b_live_smoke": true,
+      "comment": "Channel creation. Smoke must clean up the created channel (archive) before declaring success."
+    },
+    "create_direct_channel": {
+      "method": "POST",
+      "path_template": "/channels/direct",
+      "verbs": ["dm send", "dm read", "dms"],
+      "tier_b_live_smoke": false,
+      "tier_b_dropped_rationale": "peer-principal dependent — see brief §Scope J dropped-verb rationale. URL contract guarded here in Tier-A.",
+      "comment": "DM channel resolution. POST body carries [my_user_id, other_user_id]; canonical DM channel returned."
+    },
+    "restore_channel": {
+      "method": "POST",
+      "path_template": "/channels/{channel_id}/restore",
+      "verbs": ["channel restore"],
+      "tier_b_live_smoke": false,
+      "tier_b_dropped_rationale": "elevated-capability admin verb — see brief §Scope J dropped-verb rationale. URL contract guarded here in Tier-A.",
+      "comment": "Channel restore (un-archive). Requires elevated-capability profile per chanvoy's PER-014 identity-drift gate / LOCAL_ONLY_METHODS posture."
+    },
+    "add_channel_member": {
+      "method": "POST",
+      "path_template": "/channels/{channel_id}/members",
+      "verbs": ["channel add-member"],
+      "tier_b_live_smoke": false,
+      "tier_b_dropped_rationale": "peer-principal dependent — see brief §Scope J dropped-verb rationale. URL contract guarded here in Tier-A.",
+      "comment": "Channel membership add. Body carries the target user_id."
+    },
+    "create_reaction": {
+      "method": "POST",
+      "path_template": "/reactions",
+      "verbs": ["react"],
+      "tier_b_live_smoke": true,
+      "comment": "Emoji reaction creation. Body carries {user_id, post_id, emoji_name}."
+    },
+    "delete_reaction": {
+      "method": "DELETE",
+      "path_template": "/users/{user_id}/posts/{post_id}/reactions/{emoji}",
+      "verbs": ["unreact"],
+      "tier_b_live_smoke": true,
+      "comment": "Emoji reaction removal. Idempotent on already-removed reactions (404 → success exit per the PER-024 contract)."
+    },
+    "delete_channel": {
+      "method": "DELETE",
+      "path_template": "/channels/{channel_id}",
+      "verbs": ["channel archive"],
+      "tier_b_live_smoke": true,
+      "comment": "Channel archive (soft delete). Reversible only via channel restore (which requires elevated capability)."
+    },
+    "search_posts": {
+      "method": "POST",
+      "path_template": "/teams/{team_id}/posts/search",
+      "verbs": ["search", "read --since-last-mine"],
+      "tier_b_live_smoke": true,
+      "comment": "Team-scoped post search. Hit by the search verb and by since-last-mine's authored-post lookup."
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "id": "new-channel-id-stable",
+  "name": "new-channel-name",
+  "display_name": "New Channel",
+  "team_id": "team-id-stable",
+  "type": "O",
+  "create_at": 1700000000000
+}

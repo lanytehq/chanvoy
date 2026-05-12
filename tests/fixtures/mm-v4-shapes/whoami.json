@@ -1,0 +1,7 @@
+{
+  "id": "user-id-stable",
+  "username": "bot-stable",
+  "is_bot": true,
+  "nickname": "Test Bot",
+  "email": "bot@example.com"
+}

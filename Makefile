@@ -23,7 +23,7 @@ VERSION_FILE := VERSION
 
 .PHONY: all clean check fmt quality test test-integration build build-release install ensure-msrv msrv precommit prepush pr-final
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
-.PHONY: sbom security-scan license-check release-prep
+.PHONY: sbom security-scan license-check release-prep release-smoke
 
 all: check
 
@@ -141,6 +141,26 @@ release-prep: pr-final license-check security-scan sbom ## Full release-cycle ga
 	@echo "     security-scan ✓"
 	@echo "     SBOM generated under sbom/"
 	@echo "     ready to tag"
+
+# PER-032 Item J Tier-B — live-MM URL-shape smoke harness.
+#
+# Pinned release-cycle ordering (PER-030 RELEASE_CHECKLIST.md is canonical):
+#   make release-prep      (commit-cycle gate — does NOT include this target)
+#   make release-smoke     (this target — live MM + ephemeral channel)
+#   make release-preflight (final pre-tag checks)
+#   git tag -a vX.Y.Z      (only if smoke passed)
+#   git push origin vX.Y.Z (only if smoke passed)
+#
+# Smoke FAILS the release cycle BEFORE any tag exists, draft release
+# is created, or signed artifact is produced. The failure surface is
+# "no release tag yet" — never "signed release that doesn't work."
+#
+# Deliberately NOT a dependency of release-prep (PR-032 AC #9):
+# release-prep is a commit-cycle gate that runs in CI without live
+# credentials; release-smoke is a release-cycle action that needs live
+# Mattermost access and is invoked only at RC time.
+release-smoke: ## PER-032 Tier-B — live-MM URL-shape smoke against a disposable test channel
+	@bash scripts/release-smoke.sh
 
 precommit: check fmt quality
 
