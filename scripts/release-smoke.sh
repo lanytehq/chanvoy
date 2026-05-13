@@ -41,13 +41,18 @@
 # this script. The script asserts the expected env vars are present
 # and exits with a clear diagnostic if not.
 #
-# Sanitization (PER-032 AC #10, devrev review pin #3):
+# Sanitization (PER-032 AC #10, devrev review pin #3, secrev review
+# of PR #27 on 2026-05-13):
 # All output is captured to `release-smoke.log` (gitignored). Before
 # the script exits — pass, fail, or interrupt — the log is filtered
-# through `scrub_log()` which replaces every 26-char Mattermost ID
-# with `<mm-id>` and substitutes the smoke channel/bot/team names
-# with placeholder tokens. The scrubbed log is what gets included in
-# release notes; the unscrubbed live log never leaves the smoke run.
+# through `scrub_log` → `scrub_stream` (defined in
+# `lib-release-smoke.sh`) which replaces every 26-char Mattermost ID
+# with `<mm-id>`, the live `${LANYTE_MM_URL}` with `<mm-url>`, and
+# the smoke channel/team/bot names with placeholder tokens. The
+# scrubbed log is what gets included in release notes; the
+# unscrubbed live log never leaves the smoke run.
+# `REPOSITORY_SAFETY_PROTOCOLS.md` is the canonical source for the
+# no-live-URL-in-committed-artifacts contract.
 #
 # Usage:
 #   ./scripts/release-smoke.sh [<test-team-slug>]
@@ -106,19 +111,13 @@ fi
 # ----------------------------------------------------------------------
 
 scrub_log() {
-  # Replace every 26-char lowercase-alphanumeric Mattermost ID
-  # (post/channel/team/user) with `<mm-id>`. Replace the smoke
-  # channel/team/bot names with placeholder tokens. Run in a
-  # temp file then overwrite so the operation is atomic.
+  # Filter the live log through `scrub_stream` (defined in
+  # `lib-release-smoke.sh`) so live MM URL + IDs + channel/team/bot
+  # names are replaced with placeholder tokens before the log is
+  # advertised as sanitized. Atomic via a temp file.
   local tmp
   tmp="$(mktemp -t release-smoke-scrub.XXXXXX)"
-  # POSIX-portable sed (mac + linux): use -E for extended regex.
-  sed -E \
-      -e 's/[a-z0-9]{26}/<mm-id>/g' \
-      -e "s|${SMOKE_CHANNEL}|<smoke-channel>|g" \
-      -e "s|${SMOKE_TEAM}|<smoke-team>|g" \
-      ${SMOKE_BOT_USERNAME:+ -e "s|${SMOKE_BOT_USERNAME}|<smoke-bot>|g"} \
-      "${SMOKE_LOG}" > "${tmp}"
+  scrub_stream < "${SMOKE_LOG}" > "${tmp}"
   mv "${tmp}" "${SMOKE_LOG}"
 }
 
