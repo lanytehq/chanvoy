@@ -59,6 +59,14 @@
 set -euo pipefail
 
 # ----------------------------------------------------------------------
+# Helper library (sourced with zero side effects — see lib for contract)
+# ----------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib-release-smoke.sh
+source "${SCRIPT_DIR}/lib-release-smoke.sh"
+
+# ----------------------------------------------------------------------
 # Configuration + pre-flight
 # ----------------------------------------------------------------------
 
@@ -168,13 +176,21 @@ SMOKE_CHANNEL_CREATED=1
 run "read --since-bootstrap (empty)" read "${SMOKE_CHANNEL}" --team "${SMOKE_TEAM}" --since-bootstrap --limit 5
 
 # ---- post a message (parent post id captured for threading + react) -
-echo "----- post (capture post_id)" >> "${SMOKE_LOG}"
+#
+# Extracts the post id via `extract_post_id` from lib-release-smoke.sh
+# (canonical PostReceipt shape is `{"id": "<post_id>"}`; the function
+# also accepts the legacy/forward-compat `post_id` key). The function
+# is unit-tested in `tests/release_smoke_post_id_parse.rs` so a
+# regression in chanvoy's PostReceipt JSON shape — or in this script's
+# extraction logic — fails CI before reaching live MM.
+echo "----- post (capture id from PostReceipt)" >> "${SMOKE_LOG}"
 POST_JSON="$(chanvoy --json post "${SMOKE_CHANNEL}" --team "${SMOKE_TEAM}" \
               "PER-032 smoke v${VERSION} — baseline post")"
 echo "${POST_JSON}" >> "${SMOKE_LOG}"
-POST_ID="$(printf '%s' "${POST_JSON}" | sed -n 's/.*"post_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+POST_ID="$(extract_post_id "${POST_JSON}")"
 if [[ -z "${POST_ID}" ]]; then
-  echo "[release-smoke] FAIL: could not extract post_id from \`post\` response" >&2
+  echo "[release-smoke] FAIL: could not extract post id from \`post\` response" >&2
+  echo "  expected \"id\" or \"post_id\" field in PostReceipt JSON; got: ${POST_JSON}" >&2
   exit 1
 fi
 

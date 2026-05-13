@@ -10,21 +10,43 @@
 //! is a **pure read** that returns posts within the time window,
 //! independent of the daemon's stored cursor state.
 //!
-//! ## Investigation outcome (2026-05-12)
+//! ## Investigation outcome (2026-05-12 / 13)
 //!
 //! End-to-end code trace (CLI → daemon dispatch → core
 //! `read_channel_since_secs` → MM `/channels/{id}/posts?since={millis}`)
 //! shows no client-side cursor coupling: the dispatch path does not
 //! reference `AttentionState` and the response is forwarded unaltered.
-//! Live probes from the current bravo-devlead bot identity against
-//! multiple channels with stale cursors could not reproduce the
-//! original symptom. The leading hypothesis is that the PR #26
-//! symptom traced to a Mattermost-side permission interaction
-//! (sandbox / lower-capability identity returning a filtered post set
-//! from `/posts?since=`), not a chanvoy code bug. Same pattern has
-//! been observed with codex agents running without escalated
-//! permissions — see `feedback_chanvoy_mm_symptoms_sandbox_permission_factor`
-//! in agent memory.
+//!
+//! Two cross-identity dogfood probes ran on 2026-05-12:
+//!
+//! - **`agent-bravo-devlead`** (Claude on this harness): probed
+//!   `repo-chanvoy-ops`, `ops-updates`, `bravo-team`, and
+//!   `release-chanvoy-v022` across `check`, `read --since N`, and
+//!   `read --since-bootstrap`. Behavior matched the documented
+//!   contract on every channel.
+//! - **`agent-bravo-devrev`** (GPT on opencode): same probe shape from
+//!   a different runtime, model, and effective sandbox. Could NOT
+//!   reproduce the exact original PR #26-clearance condition (`check
+//!   new>0` AND bootstrap-returns-posts AND `--since` empty), but
+//!   observed a broader anomaly: on `repo-chanvoy-ops`, `ops-updates`,
+//!   and `release-chanvoy-v022`, `check` reported `new > 0` while
+//!   `read --since N` AND `read --since-bootstrap --limit 5` both
+//!   returned empty for that identity. One exception:
+//!   `release-chanvoy-v022 read --since 1440` returned one recent
+//!   post. The anomaly cuts across both `?since=` and `?per_page=` MM
+//!   endpoints, so a chanvoy-side `--since`-specific bug is unlikely
+//!   to be the whole story.
+//!
+//! Leading hypothesis: a Mattermost-side identity / permission /
+//! caching factor affects multiple read endpoints under at least one
+//! agent identity. Same pattern shows up with codex agents running
+//! without escalated permissions — see
+//! `feedback_chanvoy_mm_symptoms_sandbox_permission_factor` in agent
+//! memory. Honest framing: the broader anomaly was not reproduced in
+//! the chanvoy code path; the daemon-side contract is structurally
+//! correct; the symptom surface is wider than the original brief
+//! captured and warrants a v0.2.3+ `chanvoy doctor`-style permission
+//! self-diagnostic verb to give operators a way to isolate it.
 //!
 //! ## What these tests guarantee (AC #1, #2, #4)
 //!
