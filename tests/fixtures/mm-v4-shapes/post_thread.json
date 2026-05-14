@@ -1,0 +1,12 @@
+{
+  "order": ["root-post-id-stable"],
+  "posts": {
+    "root-post-id-stable": {
+      "id": "root-post-id-stable",
+      "channel_id": "channel-id-stable",
+      "user_id": "user-id-stable",
+      "message": "fixture canonical body for /posts/{root_post_id}/thread",
+      "create_at": 1700000000000
+    }
+  }
+}

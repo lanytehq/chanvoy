@@ -7,3 +7,7 @@ AGENTS.local.md
 # Agent-scratch directories (lanyte-ctx checkpoint handoffs etc.)
 /.tmp/
 /tmp/
+
+# PER-032 Tier-B release-smoke output. The script scrubs live IDs
+# before exit, but the raw log lives only on the operator's machine.
+/release-smoke.log

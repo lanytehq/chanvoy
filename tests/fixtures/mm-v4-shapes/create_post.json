@@ -1,0 +1,8 @@
+{
+  "id": "new-post-id-stable",
+  "channel_id": "channel-id-stable",
+  "user_id": "user-id-stable",
+  "message": "fixture canonical body for POST /posts response",
+  "create_at": 1700000000000,
+  "root_id": ""
+}

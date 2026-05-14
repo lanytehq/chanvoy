@@ -1,0 +1,13 @@
+{
+  "order": ["post-id-stable"],
+  "posts": {
+    "post-id-stable": {
+      "id": "post-id-stable",
+      "user_id": "user-id-stable",
+      "username": "bot-stable",
+      "message": "fixture canonical body for /channels/{id}/posts",
+      "create_at": 1700000000000,
+      "channel_id": "channel-id-stable"
+    }
+  }
+}

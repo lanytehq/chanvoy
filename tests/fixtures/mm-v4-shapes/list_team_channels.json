@@ -1,0 +1,9 @@
+[
+  {
+    "id": "channel-id-stable",
+    "name": "channel-name-stable",
+    "display_name": "Test Channel",
+    "team_id": "team-id-stable",
+    "type": "O"
+  }
+]
