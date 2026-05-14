@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **CLI `--help` cleanup.** Stripped internal brief-ID references
+  (e.g., "PER-023 primitive 1," "PER-019 γ hybrid resolver,"
+  "PER-008B") from clap doc-comments and from the bare-`--limit`
+  rejection diagnostic. Public `chanvoy --help` and per-subcommand
+  `--help` now use feature-named terminology that maps directly to
+  the user-facing docs (e.g., "the pinned-posts read," "the
+  cross-team channel resolver," "the attention-state inspection
+  commands"). Source-only `//` comments retain brief references
+  where they help maintainers; only output-facing strings were in
+  scope. Closes the follow-on flagged in PER-026's out-of-scope
+  carve-out. No behavior change, no CLI surface change, no API
+  change.
+
 ## [0.2.1] - 2026-05-08
 
 ### Release highlights
