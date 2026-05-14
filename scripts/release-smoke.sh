@@ -4,9 +4,14 @@
 # Runs each verb in the Tier-B safe-subset (per PER-032 brief §Scope J)
 # against a disposable test channel on the operator-picked test team.
 # Asserts every verb returns a 2xx response and the chanvoy-core type
-# parses cleanly. Catches URL-shape drift that Tier-A fixture replay
-# can't (because fixtures match whatever URL the impl asks for) — the
-# structural fix for the `pinned_posts` vs `pinned` class.
+# parses cleanly. Tier-B is the real-MM round-trip proof on the safe
+# subset, once per release candidate — paired with the Tier-A
+# fixture-replay-against-canonical-manifest tests (see
+# `tests/url_shape_replay.rs` + `tests/fixtures/mm-v4-shapes/endpoints.json`)
+# which catch URL-shape drift in CI on every `make pr-final`. The
+# structural fix for the `pinned_posts` vs `pinned` class lives in
+# Tier-A's manifest assertion; Tier-B proves the safe subset works
+# end-to-end against real Mattermost before tag/sign.
 #
 # Verbs covered (Tier-B safe-subset):
 #   whoami, channels, channel create, post, post --reply-to,

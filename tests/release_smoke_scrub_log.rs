@@ -20,6 +20,14 @@
 //! that re-introduces a leak channel (e.g., logging another env var,
 //! or adding a new identifier class) fails this test before the
 //! release-smoke output is ever published.
+//!
+//! Test data: all MM URL literals in this file are RFC 2606 reserved
+//! `.invalid` placeholders (`https://mattermost.test.invalid`) — never
+//! the live host. Caught during secrev re-review of PR #27 on
+//! 2026-05-13: the original cut of this test committed the live MM
+//! host literal as test data, which is itself the exact leak channel
+//! we are guarding against. Test fixtures must not be a back door for
+//! the artifact-scrubbing contract — including doc comments.
 
 #![allow(dead_code)]
 
@@ -94,12 +102,17 @@ fn scrubs_mm_ids() {
 }
 
 /// AC #10 / secrev regression — `LANYTE_MM_URL` must be scrubbed.
+/// Uses an RFC 2606 reserved `.invalid` placeholder host so the test
+/// fixture itself does not commit a live MM URL.
 #[test]
 fn scrubs_live_mm_url() {
-    let input = "[release-smoke] team=org-3leaps-test channel=chanvoy-smoke-v0.2.2 url=https://mm.3leaps.dev\n";
-    let out = scrub_stream(input, &[("LANYTE_MM_URL", "https://mm.3leaps.dev")]);
+    let input = "[release-smoke] team=org-3leaps-test channel=chanvoy-smoke-v0.2.2 url=https://mattermost.test.invalid\n";
+    let out = scrub_stream(
+        input,
+        &[("LANYTE_MM_URL", "https://mattermost.test.invalid")],
+    );
     assert!(
-        !out.contains("https://mm.3leaps.dev"),
+        !out.contains("https://mattermost.test.invalid"),
         "LANYTE_MM_URL leaked through scrub_stream — secrev regression: {out:?}"
     );
     assert!(
@@ -155,14 +168,17 @@ fn scrubs_smoke_bot_username() {
 /// pipeline must still work.
 #[test]
 fn unset_bot_username_does_not_break_pipeline() {
-    let input = "post=abc123def456ghi789jkl012mn url=https://mm.3leaps.dev\n";
-    let out = scrub_stream(input, &[("LANYTE_MM_URL", "https://mm.3leaps.dev")]);
+    let input = "post=abc123def456ghi789jkl012mn url=https://mattermost.test.invalid\n";
+    let out = scrub_stream(
+        input,
+        &[("LANYTE_MM_URL", "https://mattermost.test.invalid")],
+    );
     assert!(
         !out.contains("abc123def456ghi789jkl012mn"),
         "id should scrub: {out:?}"
     );
     assert!(
-        !out.contains("https://mm.3leaps.dev"),
+        !out.contains("https://mattermost.test.invalid"),
         "url should scrub: {out:?}"
     );
 }
@@ -171,18 +187,18 @@ fn unset_bot_username_does_not_break_pipeline() {
 /// scrubbed line should contain no live identifiers at all.
 #[test]
 fn full_log_line_combo_scrubs_clean() {
-    let input = "[release-smoke] team=org-3leaps-test channel=chanvoy-smoke-v0.2.2 url=https://mm.3leaps.dev as=agent-bravo-devlead newest=abc123def456ghi789jkl012mn\n";
+    let input = "[release-smoke] team=org-3leaps-test channel=chanvoy-smoke-v0.2.2 url=https://mattermost.test.invalid as=agent-bravo-devlead newest=abc123def456ghi789jkl012mn\n";
     let out = scrub_stream(
         input,
         &[
-            ("LANYTE_MM_URL", "https://mm.3leaps.dev"),
+            ("LANYTE_MM_URL", "https://mattermost.test.invalid"),
             ("SMOKE_CHANNEL", "chanvoy-smoke-v0.2.2"),
             ("SMOKE_TEAM", "org-3leaps-test"),
             ("SMOKE_BOT_USERNAME", "agent-bravo-devlead"),
         ],
     );
     for leak in [
-        "https://mm.3leaps.dev",
+        "https://mattermost.test.invalid",
         "chanvoy-smoke-v0.2.2",
         "org-3leaps-test",
         "agent-bravo-devlead",
@@ -213,7 +229,7 @@ fn full_log_line_combo_scrubs_clean() {
 fn scrubs_across_multiple_lines() {
     let input = "\
 [release-smoke] starting chanvoy v0.2.2
-[release-smoke] url=https://mm.3leaps.dev
+[release-smoke] url=https://mattermost.test.invalid
 + chanvoy whoami
 {\"id\":\"abc123def456ghi789jkl012mn\"}
 [release-smoke] team=org-3leaps-test channel=chanvoy-smoke-v0.2.2
@@ -221,12 +237,12 @@ fn scrubs_across_multiple_lines() {
     let out = scrub_stream(
         input,
         &[
-            ("LANYTE_MM_URL", "https://mm.3leaps.dev"),
+            ("LANYTE_MM_URL", "https://mattermost.test.invalid"),
             ("SMOKE_CHANNEL", "chanvoy-smoke-v0.2.2"),
             ("SMOKE_TEAM", "org-3leaps-test"),
         ],
     );
-    assert_eq!(out.matches("https://mm.3leaps.dev").count(), 0);
+    assert_eq!(out.matches("https://mattermost.test.invalid").count(), 0);
     assert_eq!(out.matches("abc123def456ghi789jkl012mn").count(), 0);
     assert_eq!(out.matches("chanvoy-smoke-v0.2.2").count(), 0);
     assert_eq!(out.matches("org-3leaps-test").count(), 0);
