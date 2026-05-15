@@ -1,9 +1,16 @@
 [package]
 name = "chanvoy"
 version = "0.2.1"
-edition = "2021"
-rust-version = "1.89.0"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 publish = false
 
 [workspace]
@@ -21,6 +28,13 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.89.0"
 license = "MIT OR Apache-2.0"
+description = "Mattermost (and eventually Slack) bridge for AI agents and the operators who run them"
+repository = "https://github.com/lanytehq/chanvoy"
+homepage = "https://github.com/lanytehq/chanvoy"
+authors = ["lanytehq Contributors"]
+keywords = ["mattermost", "agent", "chat", "bridge", "lanyte"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "README.md"
 
 [workspace.dependencies]
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }

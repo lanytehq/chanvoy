@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Public-readiness pass.** README opens with a standard badge row
+  (CI / license / MSRV / version) above the lead paragraph. New
+  `SECURITY.md` at repo root documents the vulnerability-reporting
+  path, supported versions, signing-key verification posture
+  (cross-referencing `RELEASE_CHECKLIST.md`), the chanvoy-specific
+  security-issue class enumeration (token leaks; permission-mask
+  regressions; sandbox-bypass class; identity-attribution bugs;
+  bootstrap-handoff corruption), upstream-dependency posture, and
+  disclosure policy. New `CONTRIBUTING.md` at repo root covers the
+  toolchain, repo layout, branching, commit-attribution convention
+  (supervised-commit shape — human or agent), test discipline,
+  reviewer routing, code of conduct, and security-reporting pointer.
+  Content audit closed several Lanyte-internal-context leakage
+  sites in `AGENTS.md` and `docs/getting-started.md`;
+  `docs/migration-runbook.md` gained a top-of-file annotation
+  framing it as a Lanyte-internal artifact (the `lanyte-chat` →
+  `chanvoy` migration).
+- **Cargo metadata polish.** `[workspace.package]` populated with
+  `description`, `repository`, `homepage`, `keywords`,
+  `categories`, `authors`, `readme`. Root `chanvoy` package and
+  all five sub-crates inherit via `<key>.workspace = true`; each
+  sub-crate adds a per-crate `description` override. `publish =
+  false` preserved on the root package — chanvoy distributes via
+  signed-binary GitHub Releases, not crates.io. Every workspace
+  member now reports non-empty metadata under `cargo metadata
+  --no-deps`.
+
+No CLI behavior changes. No CLI surface changes. No Rust code
+changes outside `Cargo.toml` files.
+
 ## [0.2.1] - 2026-05-08
 
 ### Release highlights

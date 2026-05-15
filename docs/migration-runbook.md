@@ -1,5 +1,15 @@
 # Chanvoy Migration Runbook
 
+> **Audience note**: this runbook documents a Lanyte-internal
+> migration — replacing the legacy `lanyte-chat` script with
+> `chanvoy` for agent sessions inside the lanytehq deployment. It
+> references Lanyte-specific conventions (`ops-updates` as the
+> ops-broadcast channel, the `lanyte-chat` predecessor tool, and
+> the per-channel coordination shape used by lanytehq agents).
+> Operators in other orgs adopting chanvoy fresh should start at
+> [`getting-started.md`](./getting-started.md) instead — this
+> document carries no Lanyte-only requirements forward.
+
 This runbook covers local replacement of `lanyte-chat` with `chanvoy` for agent sessions.
 
 Current validated platform scope for this runbook:
