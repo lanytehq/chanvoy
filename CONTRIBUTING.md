@@ -115,11 +115,30 @@ real `chanvoy` binary against a `wiremock` Mattermost. They are
 gated behind `#[ignore]` so the fast loop stays fast; `make pr-final`
 runs them explicitly.
 
-The release-cycle endpoint-manifest smoke gate (`scripts/release-smoke.sh`)
-exercises each `chanvoy` CLI verb's MM URL contract against either a
-live Mattermost or a recorded fixture. See
-[`docs/integration-tests.md`](./docs/integration-tests.md) for the
-full test conventions.
+URL-shape drift between the chanvoy-core HTTP client and Mattermost's
+actual endpoints is guarded by a two-tier harness:
+
+- **Tier-A — canonical endpoint manifest + fixture replay** runs on
+  every `make pr-final` in CI. `tests/url_shape_replay.rs` walks the
+  canonical manifest at
+  [`tests/fixtures/mm-v4-shapes/endpoints.json`](./tests/fixtures/mm-v4-shapes/endpoints.json),
+  mounts an exact-path wiremock per entry, and asserts every
+  call-site issues the manifest's URL. Adding a new MM-endpoint
+  call from chanvoy-core requires landing an entry here first
+  (schemas-before-code).
+- **Tier-B — live-MM safe-subset smoke** runs once per release
+  candidate before tag/sign. [`scripts/release-smoke.sh`](./scripts/release-smoke.sh)
+  exercises the safe subset of verbs (read/post/pinned/ack/check/
+  react/unreact/search/notifications/channel-create/channel-archive,
+  plus `whoami` and `channels`) against a disposable test team on
+  a real Mattermost server. Daemon-state RPCs (`attention list/show`),
+  admin-only verbs (`channel restore`), and peer-principal-dependent
+  verbs (`dm`/`dms`) are intentionally excluded from Tier-B; their
+  contracts are exercised by Tier-A or other tests.
+
+Tier-A catches URL-shape drift broadly and fails in CI; Tier-B
+proves the safe-subset works end-to-end against real Mattermost
+before signing.
 
 When adding tests:
 
