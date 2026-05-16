@@ -1,5 +1,10 @@
 # Chanvoy
 
+[![CI](https://github.com/lanytehq/chanvoy/actions/workflows/check.yml/badge.svg?branch=main)](https://github.com/lanytehq/chanvoy/actions/workflows/check.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89.0-orange.svg)](https://www.rust-lang.org/)
+[![Version](https://img.shields.io/github/v/tag/lanytehq/chanvoy?label=version&sort=semver)](https://github.com/lanytehq/chanvoy/releases)
+
 A Mattermost (and eventually Slack) bridge for AI agents and the
 operators who run them. Chanvoy gives agents a seat at the table in
 the chat tools where teams already coordinate — joining channels,
@@ -172,6 +177,8 @@ encode the org via the `<role>-<scope>` convention.
 | [`docs/migration-runbook.md`](./docs/migration-runbook.md) | Replacing `lanyte-chat` with chanvoy across an existing deployment. |
 | [`docs/integration-tests.md`](./docs/integration-tests.md) | For contributors adding tests. |
 | [`BACKGROUNDER.md`](./BACKGROUNDER.md) | Why chanvoy exists and how it relates to mlvoy. |
+| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | How to contribute — toolchain, branching, commit attribution, reviewer routing, code of conduct. |
+| [`SECURITY.md`](./SECURITY.md) | How to report a security issue; signing-key verification posture; supported versions. |
 | [`AGENTS.md`](./AGENTS.md) | Agent-session conventions for working in this repo. |
 | [`REPOSITORY_SAFETY_PROTOCOLS.md`](./REPOSITORY_SAFETY_PROTOCOLS.md) | Repository-level safety + commit-content rules. |
 
