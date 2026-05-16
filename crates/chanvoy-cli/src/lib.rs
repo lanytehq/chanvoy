@@ -73,27 +73,27 @@ enum CommandSet {
     Notify(NotifyArgs),
     Notifications(ReadWindowArgs),
     Wait(WaitArgs),
-    /// PER-023 primitive 1: fetch a channel's pinned posts. Pure read,
-    /// no cursor side effects. Uses the PER-019 γ hybrid resolver;
-    /// accepts <team>/<channel> syntax and the --team flag.
+    /// Fetch a channel's pinned posts. Pure read, no cursor side
+    /// effects. Uses the cross-team channel resolver; accepts
+    /// <team>/<channel> syntax and the --team flag.
     Pinned(PinnedArgs),
-    /// PER-023 primitive 4: advance attention cursor to channel's
-    /// current latest post without fetching content. Uses the PER-019 γ
-    /// hybrid resolver; accepts <team>/<channel> syntax.
+    /// Advance the attention cursor to the channel's current latest
+    /// post without fetching content. Uses the cross-team channel
+    /// resolver; accepts <team>/<channel> syntax.
     Ack(AckArgs),
-    /// PER-024 primitive 2: add an emoji reaction to a post under the
-    /// bot's identity. Channel positional for multi-provider portability
-    /// (Slack reactions API requires channel+message_ts even though MM
-    /// keys by post-id alone). Idempotent on duplicate-react.
+    /// Add an emoji reaction to a post under the bot's identity.
+    /// Channel positional for multi-provider portability (Slack's
+    /// reactions API requires channel + message_ts even though
+    /// Mattermost keys by post-id alone). Idempotent on duplicate-react.
     React(ReactArgs),
-    /// PER-024 primitive 2: remove the bot's emoji reaction. Idempotent
-    /// on missing-reaction (success exit).
+    /// Remove the bot's emoji reaction. Idempotent on missing-reaction
+    /// (success exit).
     Unreact(ReactArgs),
-    /// PER-025 primitive 1: search posts within a channel via MM
-    /// `/teams/{id}/posts/search`. Channel positional + required
-    /// (cross-channel search deferred from v1). Refuses with a
-    /// diagnostic on inline operator conflicts (`in:`, `from:`,
-    /// `before:`/`after:`) per AC #4a.
+    /// Channel-scoped search via Mattermost's
+    /// `/teams/{id}/posts/search` endpoint. Channel positional and
+    /// required (cross-channel search not yet supported). Refuses
+    /// with a diagnostic on inline operator conflicts (`in:`,
+    /// `from:`, `before:` / `after:`).
     Search(SearchArgs),
     #[command(subcommand)]
     Channel(ChannelCommand),
@@ -101,7 +101,7 @@ enum CommandSet {
     AutoSetup(AutoSetupArgs),
     /// Inspect daemon-held attention state (cursors, staleness verdicts).
     /// Strictly read-only: never mutates daemon state, never issues
-    /// Mattermost API calls. See PER-008B.
+    /// Mattermost API calls.
     #[command(subcommand)]
     Attention(AttentionCommand),
 }
@@ -116,21 +116,20 @@ enum AttentionCommand {
 
 #[derive(Debug, Args)]
 struct ChannelsArgs {
-    /// PER-019 AC #11: filter to a single team. Without this, `chanvoy
-    /// channels` lists every team the bot is a member of, grouped.
+    /// Filter to a single team. Without this, `chanvoy channels`
+    /// lists every team the bot is a member of, grouped.
     #[arg(long, conflicts_with = "primary_team")]
     team: Option<String>,
-    /// PER-019 AC #11: print only the profile's primary team in the
-    /// pre-PER-019 single-team format. Back-compat escape hatch for
-    /// tooling that depends on the old shape. PER-025 preserves this
-    /// JSON shape exactly (no `last_post_at` field added) per AC #6a.
+    /// Print only the profile's primary team in the pre-cross-team
+    /// single-team format. Back-compat escape hatch for tooling that
+    /// depends on the old shape; the legacy JSON shape is preserved
+    /// exactly (no `last_post_at` field added).
     #[arg(long, conflicts_with = "team")]
     primary_team: bool,
-    /// PER-025 primitive 2: sort channels by recency. `active` =
-    /// most-recent-first within each PER-019 team group; missing /
-    /// zero-activity channels sort last within the group. Per AC #5
-    /// (entarch pin #4): preserves PER-019 grouping, does NOT
-    /// flatten globally.
+    /// Sort channels by recency. `active` = most-recent-first within
+    /// each team group; channels with missing or zero activity sort
+    /// last within their group. Preserves cross-team grouping; does
+    /// NOT flatten globally.
     #[arg(long, conflicts_with = "primary_team", value_parser = ["active"])]
     sort: Option<String>,
 }
@@ -139,7 +138,7 @@ struct ChannelsArgs {
 struct AttentionShowArgs {
     /// Channel name.
     channel: String,
-    /// PER-019: explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
@@ -187,8 +186,8 @@ enum ChannelCommand {
 #[derive(Debug, Args)]
 struct ReadArgs {
     channel: String,
-    /// Time window for the read (PER-023: accepts s/m/h/d suffixes;
-    /// bare integer = minutes, today's semantics). Mutually exclusive
+    /// Time window for the read. Accepts s/m/h/d suffixes; bare
+    /// integer = minutes (today's semantics). Mutually exclusive
     /// with --after / --since-last-mine / --since-bootstrap.
     #[arg(
         long,
@@ -200,40 +199,40 @@ struct ReadArgs {
     after: Option<String>,
     #[arg(long, conflicts_with_all = ["since", "after", "since_bootstrap"])]
     since_last_mine: bool,
-    /// PER-023 primitive 2: bounded most-recent-N posts (default N=50;
-    /// override with --limit). Replaces the `--since 999999` hack with
-    /// a documented, bounded "give me recent context" anchor.
+    /// Bounded most-recent-N posts (default N=50; override with
+    /// --limit). Use this to bootstrap into a long channel without
+    /// scanning history.
     #[arg(
         long,
         conflicts_with_all = ["since", "after", "since_last_mine"],
         long_help = "Bounded most-recent-N posts (default 50; override with --limit). Use this to bootstrap into a long channel without scanning history. Replaces the --since 999999 hack."
     )]
     since_bootstrap: bool,
-    /// PER-023 primitive 2: hard cap on the result set. Composes with
-    /// any read-mode flag; PER-023 does NOT add full-window pagination
-    /// semantics — `--limit` truncates the existing read-mode result.
-    /// Bare `--limit N` (no read-mode flag) is rejected — use
+    /// Hard cap on the result set. Composes with any read-mode flag
+    /// — `--limit` truncates the existing read-mode result; it does
+    /// NOT add full-window pagination semantics. Bare `--limit N`
+    /// (no read-mode flag) is rejected — use
     /// `--since-bootstrap --limit N` for "give me the latest N".
     #[arg(long)]
     limit: Option<u32>,
-    /// PER-023 primitive 4: advance attention cursor to the latest post
-    /// **returned** by this read (mode-independent rule). No-op when
-    /// zero posts are returned.
+    /// Advance the attention cursor to the latest post **returned**
+    /// by this read (mode-independent rule). No-op when zero posts
+    /// are returned.
     #[arg(long)]
     advance: bool,
-    /// PER-019: explicit team override for cross-team channel resolution
+    /// Explicit team override for cross-team channel resolution
     /// (per-invocation only). Equivalent to the `<team>/<channel>`
-    /// positional syntax. When unset, the γ hybrid resolver tries the
-    /// profile's primary team first, then falls back across other teams
-    /// the bot is a member of.
+    /// positional syntax. When unset, the cross-team resolver tries
+    /// the profile's primary team first, then falls back across
+    /// other teams the bot is a member of.
     #[arg(long)]
     team: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct ReadWindowArgs {
-    /// Time window for notifications (PER-023: accepts s/m/h/d
-    /// suffixes; bare integer = minutes, today's semantics).
+    /// Time window for notifications. Accepts s/m/h/d suffixes;
+    /// bare integer = minutes (today's semantics).
     ///
     /// Resolution note: minute-rounded — sub-minute suffixes (e.g.
     /// `30s`) round up to the next whole minute because the underlying
@@ -262,7 +261,7 @@ struct ReadWindowArgs {
 #[derive(Debug, Args)]
 struct PinnedArgs {
     channel: String,
-    /// PER-019: explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
@@ -270,7 +269,7 @@ struct PinnedArgs {
 #[derive(Debug, Args)]
 struct AckArgs {
     channel: String,
-    /// PER-019: explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
@@ -280,7 +279,7 @@ struct CheckArgs {
     channel: String,
     #[arg(long)]
     after: Option<String>,
-    /// PER-019: explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
@@ -288,15 +287,15 @@ struct CheckArgs {
 #[derive(Debug, Args)]
 struct WaitArgs {
     channel: String,
-    /// PER-023: timeout window for the wait. Bare integer = minutes
-    /// (today's default; default 10m). Accepts s/m/h/d suffixes.
+    /// Timeout window for the wait. Bare integer = minutes (today's
+    /// default; default 10m). Accepts s/m/h/d suffixes.
     #[arg(
         long,
         default_value = "10",
         long_help = "Wait timeout. Bare integer = minutes (today's default; default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'."
     )]
     timeout: String,
-    /// PER-019: explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
@@ -305,47 +304,47 @@ struct WaitArgs {
 struct PostArgs {
     channel: String,
     message: String,
-    /// PER-024 primitive 1: when set, the post is created as a
-    /// thread reply under the named parent post (MM `root_id` /
-    /// Slack `thread_ts` semantic). Channel resolution unchanged
-    /// (γ hybrid). Validation: refuse with clear diagnostic if
-    /// the parent doesn't exist on the resolved channel.
+    /// When set, the post is created as a thread reply under the
+    /// named parent post (Mattermost `root_id` / Slack `thread_ts`
+    /// semantic). Channel resolution unchanged from the top-level
+    /// post case. Validation: refuse with a clear diagnostic if the
+    /// parent doesn't exist on the resolved channel.
     #[arg(long)]
     reply_to: Option<String>,
-    /// PER-019: explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct SearchArgs {
-    /// Channel positional + required (cross-channel search deferred
-    /// from v1 per PER-025 §Out of scope). Accepts `<team>/<channel>`
-    /// for cross-team via PER-019 γ hybrid resolver.
+    /// Channel positional + required (cross-channel search not yet
+    /// supported). Accepts `<team>/<channel>` syntax for cross-team
+    /// resolution.
     channel: String,
-    /// Search query — passed through to MM's search endpoint as the
-    /// `terms` field after chanvoy composes its owned scopes
+    /// Search query — passed through to Mattermost's search endpoint
+    /// as the `terms` field after chanvoy composes its owned scopes
     /// (`in:<resolved-channel>` always; `from:<author>` and
-    /// `after:<date>` if `--from` / `--since` are set). Inline MM
-    /// operators that conflict with chanvoy-owned scopes refuse with
-    /// a clear diagnostic per AC #4a; non-conflicting operators
-    /// pass through verbatim.
+    /// `after:<date>` if `--from` / `--since` are set). Inline
+    /// operators that conflict with chanvoy-owned scopes refuse
+    /// with a clear diagnostic; non-conflicting operators pass
+    /// through verbatim.
     query: String,
     /// Cap result count (default 20).
     #[arg(long, default_value_t = 20)]
     limit: u32,
-    /// Narrow to a specific author (folded into the MM `terms` field
-    /// as `from:<author>`). Conflicts with inline `from:` in the
-    /// query — refuses with a diagnostic.
+    /// Narrow to a specific author (folded into the Mattermost
+    /// `terms` field as `from:<author>`). Conflicts with an inline
+    /// `from:` in the query — refuses with a diagnostic.
     #[arg(long)]
     from: Option<String>,
-    /// PER-023 time-window suffix (s/m/h/d). Folded into MM `terms`
-    /// as `after:<computed-date>` (date-granularity is the MM-native
-    /// surface). Conflicts with inline `before:`/`after:` in the
-    /// query.
+    /// Time-window suffix (s/m/h/d). Folded into the Mattermost
+    /// `terms` field as `after:<computed-date>` (date granularity is
+    /// the Mattermost-native surface). Conflicts with an inline
+    /// `before:` / `after:` in the query.
     #[arg(long)]
     since: Option<String>,
-    /// PER-019 explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
@@ -354,7 +353,7 @@ struct SearchArgs {
 struct ReactArgs {
     /// Channel context (positional, required for multi-provider
     /// portability). Accepts `<team>/<channel>` syntax for cross-team
-    /// resolution per PER-019 γ hybrid.
+    /// resolution.
     channel: String,
     /// Post ID to react/unreact on. Format matches `chanvoy post`'s
     /// returned ID and `chanvoy read --json`'s `id` field.
@@ -363,7 +362,7 @@ struct ReactArgs {
     /// MM-UI form (`:+1:`) is accepted with the colons stripped before
     /// the API call.
     emoji: String,
-    /// PER-019: explicit team override.
+    /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
 }
@@ -392,11 +391,12 @@ struct ChannelCreateArgs {
     name: String,
     display_name: String,
     purpose: Option<String>,
-    /// PER-019 + v0.2.1: explicit team override. When unset, the
-    /// channel lands on the profile's primary team (legacy default).
-    /// When set, the channel is created on the named alternate team
-    /// (must be a team the bot is a member of). Closes the cross-team
-    /// admin-verb gap that the γ resolver left on `channel create`.
+    /// Explicit team override. When unset, the channel lands on the
+    /// profile's primary team (legacy default). When set, the
+    /// channel is created on the named alternate team (which must
+    /// be a team the bot is a member of). Cross-team channel
+    /// creation parallels the cross-team channel resolver used for
+    /// reads and writes.
     #[arg(long)]
     team: Option<String>,
 }
@@ -422,10 +422,9 @@ struct ProfileCreateArgs {
     #[arg(long = "env-name")]
     env_name: String,
     /// Team name (e.g., `org-lanytehq`). Defaults to `org-${scope}`
-    /// derived from the positional `<scope>` argument; pass explicitly
-    /// only when the team name does not follow the convention. The old
-    /// hardcoded `org-lanytehq` default was a single-org bias removed
-    /// in PER-012.
+    /// derived from the positional `<scope>` argument; pass
+    /// explicitly only when the team name does not follow the
+    /// convention.
     #[arg(long)]
     team_name: Option<String>,
     #[arg(long)]
@@ -536,7 +535,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                     "`--limit` requires an explicit read-mode flag — use \
                      `--since-bootstrap --limit N` for 'give me the latest N posts', \
                      or `--since <window> --limit N` to cap a time-window read. \
-                     Bare `read --limit N` is rejected (PER-023)."
+                     Bare `read --limit N` is rejected."
                         .to_string(),
                 ));
             }
@@ -1338,8 +1337,8 @@ async fn ensure_daemon_running(
 /// the spawning shell's process group and session: when the shell exits
 /// (or its controlling terminal closes), the daemon receives `SIGHUP`
 /// and dies. Operators returning to a machine then find no running
-/// daemon despite an earlier successful `auto-setup` — the PER-008D
-/// motivating failure mode.
+/// daemon despite an earlier successful `auto-setup` — the
+/// motivating failure mode for the detachment design.
 ///
 /// `setsid(2)` makes the new process the leader of a new session and
 /// process group with no controlling terminal. `SIGHUP` from the
@@ -1660,10 +1659,11 @@ fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), C
     Ok(())
 }
 
-/// PER-008B text-format renderers. JSON shape is owned by the core
-/// result structs; these helpers only build a narrow-terminal-friendly
-/// human view. Both commands are strictly read-only — no daemon-state
-/// mutation, no Mattermost API calls.
+/// Text-format renderers for the attention-state inspection commands.
+/// JSON shape is owned by the core result structs; these helpers only
+/// build a narrow-terminal-friendly human view. Both commands are
+/// strictly read-only — no daemon-state mutation, no Mattermost API
+/// calls.
 fn render_attention_list_text(result: &AttentionListResult) -> String {
     let mut out = String::new();
     out.push_str(&format!("profile: {}\n", result.profile));
@@ -2103,12 +2103,12 @@ impl HumanReadable for Vec<Channel> {
     }
 }
 
-/// PER-025 primitive 2: format a `last_post_at` (Unix epoch ms) as a
-/// relative-time string for the human-mode `last_active` column.
-/// Missing or zero activity renders as `—` per AC #5. Buckets:
-/// seconds / minutes / hours / days / weeks / years. Caches "now"
-/// at the call site so all rows in one render pass have a
-/// consistent reference (caller passes `now_millis`).
+/// Format a `last_post_at` (Unix epoch ms) as a relative-time
+/// string for the human-mode `last_active` column. Missing or zero
+/// activity renders as `—`. Buckets: seconds / minutes / hours /
+/// days / weeks / years. Caches "now" at the call site so all rows
+/// in one render pass have a consistent reference (caller passes
+/// `now_millis`).
 fn format_last_active(last_post_at: Option<i64>, now_millis: i64) -> String {
     let Some(ts) = last_post_at else {
         return "—".to_string();
@@ -2138,15 +2138,15 @@ fn format_last_active(last_post_at: Option<i64>, now_millis: i64) -> String {
     }
 }
 
-/// PER-019 AC #11: render the cross-team channel listing as a grouped
-/// human view. Each team gets a `=== <team-slug> ===` header followed
-/// by `<team-slug>/<channel-name>` lines so operators can copy any
-/// line directly into `chanvoy read` / `post` / `check` if they need
-/// the explicit-team form.
+/// Render the cross-team channel listing as a grouped human view.
+/// Each team gets a `=== <team-slug> ===` header followed by
+/// `<team-slug>/<channel-name>` lines so operators can copy any
+/// line directly into `chanvoy read` / `post` / `check` if they
+/// need the explicit-team form.
 ///
-/// PER-025 primitive 2: each row gains a trailing `last_active` column
-/// (relative time, `—` for missing-activity). When `--sort active` is
-/// in effect, the channel order within each group is most-recent-first
+/// Each row also includes a trailing `last_active` column (relative
+/// time, `—` for missing activity). When `--sort active` is in
+/// effect, the channel order within each group is most-recent-first
 /// (the caller pre-sorts before calling this function); the column
 /// renders the same way regardless.
 fn render_team_channels_human(groups: &[chanvoy_core::TeamChannels]) -> String {
@@ -2192,12 +2192,11 @@ fn render_team_channels_human(groups: &[chanvoy_core::TeamChannels]) -> String {
     out
 }
 
-/// PER-025 primitive 2 + AC #5 (entarch pin #4): sort channels within
-/// each team group by `last_post_at` descending. Missing /
-/// zero-activity channels sort last within their group. Group order
-/// itself is NOT modified — the PER-019 primary-first / fallback
-/// alphabetical ordering is preserved per the brief's flatten-only-
-/// in-future-brief disposition.
+/// Sort channels within each team group by `last_post_at`
+/// descending. Missing / zero-activity channels sort last within
+/// their group. The group order itself is NOT modified — the
+/// primary-first / fallback-alphabetical team ordering is preserved.
+/// A flattened global view is intentionally not provided.
 fn sort_groups_by_active(groups: &mut [chanvoy_core::TeamChannels]) {
     for group in groups {
         group.channels.sort_by(|a, b| {
@@ -2596,12 +2595,12 @@ mod tests {
         assert_eq!(names, vec!["newer", "old", "never"]);
     }
 
-    /// PER-019 (devrev PR #17 follow-up, 2026-04-30): the human
-    /// `chanvoy attention list` output must surface
-    /// `AttentionListResult.quarantined` so operators using the
-    /// default text mode see legacy cursors that the migration
-    /// couldn't bind cleanly. Pre-fix, the JSON output exposed the
-    /// field but `render_attention_list_text` ignored it.
+    // Regression test: the human `chanvoy attention list` output
+    // must surface `AttentionListResult.quarantined` so operators
+    // using the default text mode see legacy cursors that the
+    // cross-team migration couldn't bind cleanly. Pre-fix, the JSON
+    // output exposed the field but `render_attention_list_text`
+    // ignored it.
     #[test]
     fn devrev_pr17_attention_list_renderer_surfaces_quarantined() {
         use chanvoy_core::{
@@ -2823,7 +2822,7 @@ mod tests {
     /// — including on panic-unwind paths. Combined with
     /// `CONFIG_ENV_LOCK` this prevents test-state leak across runs and
     /// keeps later tests from seeing the wrong failure if a current
-    /// test panics mid-execution. PER-012A devrev follow-up pin.
+    /// test panics mid-execution.
     struct EnvSnapshot {
         config_dir: Option<std::ffi::OsString>,
         role: Option<std::ffi::OsString>,
