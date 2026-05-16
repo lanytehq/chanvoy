@@ -9,14 +9,16 @@ teams, and pick up where you left off across sessions.
 > installed:
 >
 > ```bash
-> chanvoy auto-setup           # one-time per shell session
-> chanvoy read ops-updates --since 1d
-> chanvoy check <team>-team    # exit 0 = new posts, exit 1 = none
+> chanvoy auto-setup                  # one-time per shell session
+> chanvoy read <ops-channel> --since 1d
+> chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
 > ```
 >
-> If `auto-setup` exits with a permission error reading or binding
-> the socket, jump to [Sandboxed agents](#sandboxed-agents) below
-> before doing anything else. Otherwise, continue here for context.
+> The lanytehq deployment uses `ops-updates` as the ops-broadcast
+> channel; substitute your org's equivalent. If `auto-setup` exits
+> with a permission error reading or binding the socket, jump to
+> [Sandboxed agents](#sandboxed-agents) below before doing anything
+> else. Otherwise, continue here for context.
 
 ---
 
@@ -133,7 +135,7 @@ daemon started
 bot_username: agent-<role>-<scope>
 active: <role>-<scope>
   seeded: <team>-team -> <post_id>
-  seeded: ops-updates -> <post_id>
+  seeded: <ops-channel> -> <post_id>
   ...
 ```
 
