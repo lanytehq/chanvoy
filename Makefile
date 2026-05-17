@@ -23,7 +23,7 @@ VERSION_FILE := VERSION
 
 .PHONY: all clean check fmt quality test test-integration build build-release install ensure-msrv msrv precommit prepush pr-final
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
-.PHONY: sbom security-scan license-check release-prep release-smoke
+.PHONY: sbom security-scan license-check release-prep release-smoke workflow-lint
 
 all: check
 
@@ -52,8 +52,16 @@ test:
 build:
 	cargo build --workspace --all-targets
 
+# PER-031 AC 7a (entarch 2026-05-11 P2 + cxotech absorption pin):
+# release builds must use --locked so Cargo.lock is the trust anchor.
+# Without --locked, a release runner can refresh Cargo.lock mid-build
+# and ship binaries built against different transitive code than what
+# was tested at tag time — defeating the signing/verification trust
+# posture operators rely on. The contract lives here in the Makefile,
+# not as a workflow-only bypass, so local `make build-release` and CI
+# `make build-release` produce identical dependency resolution.
 build-release:
-	cargo build --release --package chanvoy
+	cargo build --release --locked --package chanvoy
 
 # Install the release binary into $(LOCAL_BIN).
 #
@@ -87,13 +95,27 @@ msrv: ensure-msrv
 	cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] MSRV $(MSRV) verified"
 
-pr-final: ensure-msrv version-check
+pr-final: ensure-msrv version-check workflow-lint
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace --all-targets
 	cargo test --package chanvoy --test restart_harness -- --ignored
 	cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] pr-final gate passed"
+
+# PER-031 AC #10: actionlint guards .github/workflows/ from drift on the
+# release surface. Skips with a hint when actionlint isn't installed so
+# day-to-day dev on machines without the tool isn't blocked; release-cycle
+# review and CI environments are expected to have it on PATH. Install:
+# `brew install actionlint` (macOS) or `go install
+# github.com/rhysd/actionlint/cmd/actionlint@latest`.
+workflow-lint:
+	@if command -v actionlint >/dev/null 2>&1; then \
+		actionlint; \
+		echo "[ok] actionlint clean"; \
+	else \
+		echo "[warn] actionlint not on PATH; skipping. Install via 'brew install actionlint'."; \
+	fi
 
 # ---- v0.2.1+ release-prep tooling ---------------------------------------
 # Goneat (3leaps DX tool) handles SBOM, license compliance, and security

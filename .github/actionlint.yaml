@@ -1,0 +1,22 @@
+# actionlint configuration.
+#
+# self-hosted-runner.labels: custom runner labels deployed for
+# lanytehq that actionlint doesn't recognize from its built-in
+# GitHub-hosted runner list. Naming convention follows the
+# Arm-Limited managed-runner-image naming applied to Arm-Limited-
+# managed images deployed across the galaxy:
+#
+#   ubuntu-latest-arm64-s    — Ubuntu, latest LTS, arm64, self-hosted
+#   windows-latest-arm64-s   — Windows, latest, arm64, self-hosted
+#                              (added when Windows enters a release
+#                              matrix; not used by chanvoy v0.2.2)
+#
+# Keep this list in sync with what lanytehq actually has deployed.
+# Adding a label here ONLY silences actionlint — it does not deploy
+# the runner. Removing a label that's still referenced by a
+# workflow will surface as an actionlint error on the next lint
+# pass, which is intentional drift detection.
+self-hosted-runner:
+  labels:
+    - ubuntu-latest-arm64-s
+    - windows-latest-arm64-s
