@@ -1,0 +1,248 @@
+name: release
+
+# PER-031: tag-triggered build/draft-only release workflow.
+#
+# Triggered ONLY on tag push matching v*. No pull_request,
+# pull_request_target, or workflow_dispatch (per secrev 2026-05-09 pin:
+# secrets and release material stay out of untrusted PR contexts; manual
+# dispatch is not needed for v0.2.2 baseline).
+#
+# Workflow's job is to compile and draft. Signing is local-only per the
+# manual-signing v0.2.2 baseline (PER-030 RELEASE_CHECKLIST.md flow).
+
+'on':
+  push:
+    tags:
+      - 'v*'
+
+# Workflow-default permissions are read-only. Each job either inherits
+# this or pins it explicitly. Only the final aggregate job overrides
+# to contents: write — it is the only step that mutates repository
+# state (creating the draft release + uploading assets).
+#
+# Per secrev 2026-05-11 PR #56 medium finding + cxotech absorption pin:
+# job-level least privilege. No id-token: write, no actions: write, no
+# packages: write anywhere.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MSRV: "1.89.0"
+
+jobs:
+  validate-version:
+    name: Validate VERSION matches tag
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate VERSION matches tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          file_version="$(cat VERSION)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$file_version" != "$tag_version" ]; then
+            echo "VERSION mismatch: file=$file_version tag=$tag_version"
+            exit 1
+          fi
+          echo "version=$file_version" >> "$GITHUB_OUTPUT"
+          echo "Validated VERSION=$file_version against tag=$GITHUB_REF_NAME"
+
+  build:
+    name: Build (${{ matrix.asset_name }})
+    needs: validate-version
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset_os: linux
+            asset_arch: x86_64
+            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-linux-x86_64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            asset_os: linux
+            asset_arch: aarch64
+            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-linux-aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_os: macos
+            asset_arch: x86_64
+            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-macos-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset_os: macos
+            asset_arch: aarch64
+            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-macos-aarch64
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Setup Rust ${{ env.MSRV }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: ${{ matrix.target }}
+      - name: Install Linux cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      # make build-release invokes `cargo build --release --locked` per
+      # AC 7a (entarch P2). The --locked contract lives in the Makefile,
+      # not as a workflow-only bypass, so local `make build-release` and
+      # CI `make build-release` resolve dependencies identically.
+      - name: Build release binary
+        shell: bash
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          make build-release
+      - name: Stage release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/chanvoy" "dist/${{ matrix.asset_name }}"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  draft-release:
+    name: Publish Draft Release
+    needs: [validate-version, build]
+    runs-on: ubuntu-22.04
+    # Only this job needs contents: write — it is the sole step that
+    # mutates repository state via `gh release create`. Build matrix
+    # jobs run with contents: read.
+    permissions:
+      contents: write
+    # Job-level GH_TOKEN: a single source-inspectable reference,
+    # set to the ephemeral workflow token, scoped by this job's
+    # `permissions: contents: write` (entarch 2026-05-11 P3 + cxotech
+    # absorption pin). Inherited by every step on this job — no
+    # PATs, no fine-grained tokens, no maintainer/org-level
+    # credentials, no long-lived secrets.
+    env:
+      GH_TOKEN: ${{ github.token }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: build-*
+          merge-multiple: true
+      - name: Stage release assets and generate checksums
+        id: stage
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mv artifacts/chanvoy-v"$VERSION"-* dist/
+          cd dist
+          ls -la
+          # SHA-256 over each binary in stable sort order.
+          find . -maxdepth 1 -name "chanvoy-v$VERSION-*" -printf '%f\n' \
+            | sort \
+            | xargs shasum -a 256 \
+            > checksums.txt
+          echo "--- checksums.txt ---"
+          cat checksums.txt
+      - name: Verify release notes exist
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="docs/releases/v${VERSION}.md"
+          if [ ! -f "$notes" ]; then
+            echo "ERROR: release notes missing at $notes"
+            echo "Create the release notes file before pushing the tag."
+            exit 1
+          fi
+          echo "Found release notes: $notes"
+      # GH_TOKEN is inherited from the job env block above (single
+      # source-inspectable reference; see job-level env comment).
+      - name: Create draft release
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          assets=(checksums.txt)
+          while IFS= read -r f; do
+            assets+=("$f")
+          done < <(find . -maxdepth 1 -name "chanvoy-v$VERSION-*" -printf '%f\n' | sort)
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "chanvoy v${VERSION}" \
+            --notes-file "../docs/releases/v${VERSION}.md" \
+            "${assets[@]}"
+          url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+          echo "Draft release created: $url"
+      - name: Job summary
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+          {
+            echo "## Draft release for $TAG"
+            echo ""
+            echo "URL: $url"
+            echo ""
+            echo "### Assets"
+            echo '```'
+            ls -1 dist/
+            echo '```'
+            echo ""
+            echo "### checksums.txt"
+            echo '```'
+            cat dist/checksums.txt
+            echo '```'
+            echo ""
+            echo "Next steps (Dave runs locally per PER-030 RELEASE_CHECKLIST.md):"
+            echo "1. \`make release-download\`"
+            echo "2. \`make release-sign\`"
+            echo "3. \`make release-verify\`"
+            echo "4. \`make release-upload\`"
+            echo "5. \`make release-undraft\`"
+          } >> "$GITHUB_STEP_SUMMARY"
