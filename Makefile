@@ -24,6 +24,9 @@ VERSION_FILE := VERSION
 .PHONY: all clean check fmt quality test test-integration build build-release install ensure-msrv msrv precommit prepush pr-final
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
 .PHONY: sbom security-scan license-check release-prep release-smoke workflow-lint
+.PHONY: release-preflight release-clean release-download release-checksums release-sign
+.PHONY: release-export-keys release-verify-signatures release-verify-keys release-verify
+.PHONY: release-notes release-upload release-undraft release-upload-all help
 
 all: check
 
@@ -183,6 +186,166 @@ release-prep: pr-final license-check security-scan sbom ## Full release-cycle ga
 # Mattermost access and is invoked only at RC time.
 release-smoke: ## PER-032 Tier-B — live-MM URL-shape smoke against a disposable test channel
 	@bash scripts/release-smoke.sh
+
+# ---- PER-030 signing rails ----------------------------------------------
+# Manual-signing v0.2.2 baseline: CI (PER-031 release.yml) produces a
+# draft release with binaries + checksums.txt + release notes; Dave
+# runs the targets below locally to sign / verify / upload / undraft.
+# Signing keys are NEVER in CI.
+#
+# Canonical release sequence (RELEASE_CHECKLIST.md is the source of
+# truth for ordering):
+#   make release-prep        — commit-cycle gate (license + security + SBOM)
+#   make release-smoke       — PER-032 live-MM URL-shape gate
+#   make release-preflight   — pre-tag readiness (this section, AC #4)
+#   git tag -a vX.Y.Z && git push
+#   (PER-031 GHA produces draft release)
+#   make release-download    — fetch draft artifacts
+#   make release-checksums   — regenerate checksums.txt locally
+#   make release-sign        — minisign per-binary + GPG over checksums.txt
+#   make release-verify      — verify signatures + key fingerprints
+#   make release-upload      — attach signed artifacts (atomic)
+#   make release-undraft     — flip draft → published (atomic)
+#   make release-upload-all  — composite of upload + undraft
+#
+# RELEASE_DIR is the local working directory for a given release
+# cycle. Derived from VERSION so the tag-mismatch foot-gun is
+# impossible: every target operates on the same directory.
+RELEASE_DIR ?= release/v$(shell cat $(VERSION_FILE))
+RELEASE_TAG ?= v$(shell cat $(VERSION_FILE))
+
+release-preflight: release-prep ## Pre-tag readiness gate — clean tree, version sync, no conflicting tag/release, tooling + signing keys present (AC #4)
+	@echo "[..] release-preflight: pre-tag readiness checks"
+	@if ! git diff --quiet HEAD; then \
+		echo "[!!] working tree has uncommitted changes"; \
+		git status --short; \
+		exit 1; \
+	fi
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "[!!] working tree has untracked files"; \
+		git status --short; \
+		exit 1; \
+	fi
+	@echo "[ok] working tree clean"
+	@file_version=$$(cat $(VERSION_FILE)); \
+	cargo_version=$$(awk -F'"' '/^version =/ {print $$2; exit}' Cargo.toml); \
+	if [ "$$file_version" != "$$cargo_version" ]; then \
+		echo "[!!] VERSION ($$file_version) != Cargo.toml ($$cargo_version)"; \
+		echo "     run 'make version-sync' to resolve"; \
+		exit 1; \
+	fi
+	@echo "[ok] VERSION + Cargo.toml in sync"
+	@tag="v$$(cat $(VERSION_FILE))"; \
+	if git rev-parse --verify "refs/tags/$$tag" >/dev/null 2>&1; then \
+		echo "[!!] tag $$tag already exists locally"; \
+		echo "     pick a fresh version, or delete the stale tag"; \
+		exit 1; \
+	fi; \
+	if git ls-remote --tags origin "$$tag" 2>/dev/null | grep -q "$$tag"; then \
+		echo "[!!] tag $$tag already exists on origin"; \
+		exit 1; \
+	fi
+	@echo "[ok] no conflicting tag for v$$(cat $(VERSION_FILE))"
+	@tag="v$$(cat $(VERSION_FILE))"; \
+	if command -v gh >/dev/null 2>&1 && \
+	   gh release view "$$tag" --repo lanytehq/chanvoy >/dev/null 2>&1; then \
+		echo "[!!] GitHub release $$tag already exists"; \
+		echo "     gh release view $$tag --repo lanytehq/chanvoy"; \
+		exit 1; \
+	fi
+	@echo "[ok] no conflicting GitHub release for v$$(cat $(VERSION_FILE))"
+	@for tool in gh minisign gpg; do \
+		if ! command -v $$tool >/dev/null 2>&1; then \
+			echo "[!!] $$tool not on PATH"; \
+			exit 1; \
+		fi; \
+	done
+	@echo "[ok] release tooling (gh + minisign + gpg) on PATH"
+	@if [ -z "$${CHANVOY_MINISIGN_KEY:-}" ]; then \
+		echo "[!!] CHANVOY_MINISIGN_KEY not set"; \
+		echo "     export CHANVOY_MINISIGN_KEY=/path/to/minisign-secret-key"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$$CHANVOY_MINISIGN_KEY" ]; then \
+		echo "[!!] CHANVOY_MINISIGN_KEY path not found: $$CHANVOY_MINISIGN_KEY"; \
+		exit 1; \
+	fi
+	@echo "[ok] minisign signing key present at $$CHANVOY_MINISIGN_KEY"
+	@notes="docs/releases/v$$(cat $(VERSION_FILE)).md"; \
+	if [ ! -f "$$notes" ]; then \
+		echo "[!!] release notes missing at $$notes"; \
+		echo "     create the file before pushing the tag"; \
+		exit 1; \
+	fi
+	@echo "[ok] release notes present at docs/releases/v$$(cat $(VERSION_FILE)).md"
+	@echo "[ok] release-preflight passed — ready to tag v$$(cat $(VERSION_FILE))"
+
+release-clean: ## Remove the local release working directory
+	@rm -rf release/
+	@echo "[ok] release working directory cleaned"
+
+release-download: ## Download draft-release artifacts from GitHub into $(RELEASE_DIR)
+	@bash scripts/download-release-assets.sh $(RELEASE_TAG) $(RELEASE_DIR)
+
+release-checksums: ## Regenerate checksums.txt locally over downloaded binaries
+	@bash scripts/generate-checksums.sh $(RELEASE_DIR)
+
+release-sign: ## Produce minisign per-binary + GPG over checksums.txt
+	@bash scripts/sign-release-assets.sh $(RELEASE_TAG) $(RELEASE_DIR)
+
+release-export-keys: ## Export public signing keys into $(RELEASE_DIR)
+	@bash scripts/export-release-keys.sh $(RELEASE_DIR)
+
+release-verify-signatures: ## Verify minisign + GPG signatures on signed artifacts
+	@bash scripts/verify-signatures.sh $(RELEASE_DIR)
+
+release-verify-keys: ## Verify public-key fingerprints match keys/expected-fingerprints.txt
+	@bash scripts/verify-public-keys.sh $(RELEASE_DIR)
+
+release-verify: release-verify-signatures release-verify-keys ## Composite — signatures + key fingerprints
+	@echo "[ok] release-verify passed (signatures + key fingerprints)"
+
+release-notes: ## Display the canonical release notes for the current VERSION
+	@notes="docs/releases/v$$(cat $(VERSION_FILE)).md"; \
+	if [ ! -f "$$notes" ]; then \
+		echo "[!!] release notes missing at $$notes"; \
+		exit 1; \
+	fi; \
+	cat "$$notes"
+
+release-upload: ## Attach signed artifacts + public keys to the draft release (atomic — does NOT flip draft state)
+	@bash scripts/upload-release-assets.sh $(RELEASE_TAG) $(RELEASE_DIR)
+
+release-undraft: ## Flip the GitHub release from draft → published (atomic — does NOT touch assets)
+	@if ! command -v gh >/dev/null 2>&1; then \
+		echo "[!!] gh CLI is required"; \
+		exit 1; \
+	fi
+	@if gh release view $(RELEASE_TAG) --repo lanytehq/chanvoy \
+		--json isDraft --jq .isDraft 2>/dev/null | grep -q true; then \
+		gh release edit $(RELEASE_TAG) --repo lanytehq/chanvoy --draft=false; \
+		echo "[ok] $(RELEASE_TAG) flipped draft → published"; \
+	else \
+		echo "[ok] $(RELEASE_TAG) already published (no-op; idempotent)"; \
+	fi
+
+release-upload-all: release-upload release-undraft ## Composite — upload signed artifacts then flip to published
+
+# ---- help -----------------------------------------------------------------
+# Auto-grouped from `##` annotations on target lines. Targets prefixed
+# with "release-" land under "Release operations" (per PER-030 AC #2).
+help: ## Print available targets grouped by category
+	@printf "\nchanvoy Makefile targets\n\n"
+	@printf "Release operations:\n"
+	@awk -F':.*## ' '/^release-[a-z][a-zA-Z0-9_-]*:.*## / {printf "  %-28s %s\n", $$1, $$2}' \
+		$(MAKEFILE_LIST) | sort
+	@printf "\nVersion management:\n"
+	@awk -F':.*## ' '/^version[a-zA-Z0-9_-]*:.*## / {printf "  %-28s %s\n", $$1, $$2}' \
+		$(MAKEFILE_LIST) | sort
+	@printf "\nQuality + build:\n"
+	@awk -F':.*## ' '/^[a-z][a-zA-Z0-9_-]*:.*## / && !/^release-/ && !/^version/ {printf "  %-28s %s\n", $$1, $$2}' \
+		$(MAKEFILE_LIST) | sort
+	@printf "\nFull procedure: RELEASE_CHECKLIST.md\n\n"
 
 precommit: check fmt quality
 
