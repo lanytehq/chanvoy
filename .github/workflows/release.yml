@@ -73,16 +73,17 @@ jobs:
             asset_os: linux
             asset_arch: x86_64
             asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-linux-x86_64
-          - os: ubuntu-22.04
+          # Native arm64 build on the Arm-Limited managed self-hosted
+          # runner deployed for lanytehq. Native > cross-compile here:
+          # the binary that ships is the binary that built+tested on
+          # actual aarch64 hardware (no wrong-glibc / wrong-symbol-
+          # version surprises). Scales naturally to Windows-arm64 when
+          # that lands in a v0.2.3+ brief.
+          - os: ubuntu-latest-arm64-s
             target: aarch64-unknown-linux-gnu
             asset_os: linux
             asset_arch: aarch64
             asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-linux-aarch64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            asset_os: macos
-            asset_arch: x86_64
-            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-macos-x86_64
           - os: macos-14
             target: aarch64-apple-darwin
             asset_os: macos
@@ -100,21 +101,15 @@ jobs:
         with:
           toolchain: ${{ env.MSRV }}
           targets: ${{ matrix.target }}
-      - name: Install Linux cross linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
       # make build-release invokes `cargo build --release --locked` per
       # AC 7a (entarch P2). The --locked contract lives in the Makefile,
       # not as a workflow-only bypass, so local `make build-release` and
-      # CI `make build-release` resolve dependencies identically.
+      # CI `make build-release` resolve dependencies identically. Every
+      # matrix row builds natively on its target architecture — no
+      # cross-compile gymnastics, no extra linker setup.
       - name: Build release binary
         shell: bash
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
