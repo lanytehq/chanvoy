@@ -25,16 +25,12 @@ db-urls = ["https://github.com/RustSec/advisory-db"]
 # inline. Active CVE-shaped vulns are NEVER ignored here — only
 # `unmaintained` / `unsound` advisories with a documented mitigation
 # or scheduled-uplift plan.
-ignore = [
-  # rustls-pemfile is `unmaintained` per upstream — pulled in
-  # transitively via reqwest 0.12.x. Not an exploitable vuln; the
-  # crate still works. Resolution path is bumping reqwest to 0.13.x
-  # which dropped the dep. Out of scope for v0.2.1 release-prep
-  # (minor reqwest bump has API surface change risk we don't want
-  # to absorb pre-tag); v0.2.2 follow-up captured in CHANGELOG.
-  # Revisit when bumping reqwest.
-  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; resolved by reqwest 0.13.x bump (v0.2.2 follow-up)" },
-]
+#
+# RUSTSEC-2025-0134 (rustls-pemfile unmaintained) resolved in v0.2.2
+# via PER-033: reqwest 0.12.15 → 0.13.3 bump dropped the transitive
+# dep entirely. Verified via `cargo tree -i rustls-pemfile` returning
+# no matches.
+ignore = []
 
 [licenses]
 # Allow these permissive licenses on direct + transitive deps.
