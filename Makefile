@@ -326,7 +326,7 @@ release-notes: ## Display the canonical release notes for the current VERSION
 	fi; \
 	cat "$$notes"
 
-release-upload: ## Attach signed artifacts + public keys to the draft release (atomic — does NOT flip draft state)
+release-upload: release-verify ## Attach signed artifacts + public keys to the draft release (gates on release-verify; does NOT flip draft state)
 	@bash scripts/upload-release-assets.sh $(RELEASE_TAG) $(RELEASE_DIR)
 
 release-undraft: ## Flip the GitHub release from draft → published (atomic — does NOT touch assets)
@@ -355,7 +355,7 @@ release-undraft: ## Flip the GitHub release from draft → published (atomic —
 		exit 1; \
 	fi
 
-release-upload-all: release-upload release-undraft ## Composite — upload signed artifacts then flip to published
+release-upload-all: release-upload release-undraft ## Composite — verify + upload signed artifacts then flip to published (release-verify chains transitively via release-upload)
 
 # ---- help -----------------------------------------------------------------
 # Auto-grouped from `##` annotations on target lines. Targets prefixed
