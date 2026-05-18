@@ -597,6 +597,64 @@ inherits the validated identity and never re-asks. Subsequent
 `chanvoy read / post / check` calls from the same sandbox session
 reach the daemon over the local UDS without any further prompts.
 
+### Socket-access dimension
+
+Independent of the network-access dimension above, the agent's
+sandbox may block read or write access to the chanvoy Unix socket
+file. The daemon binds its socket inside `$XDG_RUNTIME_DIR/chanvoy/`
+(or `CHANVOY_RUNTIME_DIR` if set); a sandbox whose writable mount
+does not include that path produces a distinct failure shape from
+the network-access case.
+
+**Symptom.** `chanvoy auto-setup` reports success (identity
+validated, daemon spawned), but every subsequent `chanvoy <verb>`
+invocation from the same sandbox hangs or fails with a
+socket-connection error. This distinguishes the socket-access
+dimension from the network-access dimension — in the network case,
+`auto-setup` itself surfaces the approval prompt or failure.
+
+**Choose an escalation path in this order:**
+
+1. **Redirect the runtime directory** into a path the sandbox can
+   write. Set `CHANVOY_RUNTIME_DIR` in your identity-profile script
+   (or shell `rc`) to a stable per-role path inside the
+   sandbox-writable mount:
+
+   ```bash
+   export CHANVOY_RUNTIME_DIR="$HOME/.chanvoy-runtime"
+   mkdir -p "$CHANVOY_RUNTIME_DIR" && chmod 0700 "$CHANVOY_RUNTIME_DIR"
+   ```
+
+   CLI and daemon must agree on the value, so set it once at
+   identity-source time, not per-invocation. This is the right
+   answer when the sandboxed shell can write *some* path the daemon
+   can also write.
+
+2. **Ask the supervisor for socket access** when no redirect target
+   is reachable from both sides — for example, the sandboxed shell
+   has no writable mount the daemon can bind in. The supervisor
+   grants read+write on the chanvoy runtime directory the shell
+   expects, then re-runs `chanvoy auto-setup`. Provide your role,
+   scope, expected runtime path, and the failing-verb output; the
+   supervisor doesn't need to negotiate the implementation.
+
+3. **Run `chanvoy daemon serve` in the parent shell** when the
+   sandbox is layered such that no single path is mutually
+   reachable. See §"Foreground daemon serve (rare cases)" below for
+   the mechanics; the selection criterion from this dimension is
+   "neither redirect nor escalation can make one path
+   mutually-reachable."
+
+**Forward reference — `chanvoy doctor`.** Once `chanvoy doctor`
+ships, its sandbox-context check (Check 6) promotes socket-access
+failures from a generic "missing or refused" diagnostic to the
+actionable "socket lives outside sandbox-writable mount; re-run
+with escalation, or use `CHANVOY_RUNTIME_DIR` redirect" form, and
+emits a one-line at-invocation hint when sandbox context is
+detected. Triage socket-access friction with `chanvoy doctor`
+first once it lands; the decision boundary above maps directly to
+its structured output.
+
 ### Identity drift surface
 
 If the bot identity diverges from the configured `bot_username`
