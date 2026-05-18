@@ -21,13 +21,14 @@ Usage: sign-release-assets.sh <release-tag> <release-dir>
 
 Environment:
   CHANVOY_MINISIGN_KEY   Path to minisign secret key (required)
-  CHANVOY_PGP_KEY_ID     GPG key ID for checksums.txt signature
-                         (optional; if unset, GPG step is skipped)
+  CHANVOY_PGP_KEY_ID     GPG key ID for checksums.txt signature (required;
+                         omitting it would produce a release that fails
+                         verify-signatures.sh — see PR #33 review)
   CHANVOY_GPG_HOMEDIR    Optional GPG homedir override
 
 Produces:
   <release-dir>/chanvoy-v*-*.minisig   one per binary (minisign)
-  <release-dir>/checksums.txt.asc      single (GPG, if PGP_KEY_ID set)
+  <release-dir>/checksums.txt.asc      single (GPG over the manifest)
 
 Example:
   CHANVOY_MINISIGN_KEY=~/.minisign/chanvoy.key \
@@ -57,8 +58,20 @@ if [ -z "$minisign_key" ]; then
     exit 1
 fi
 
+if [ -z "$pgp_key_id" ]; then
+    echo "error: CHANVOY_PGP_KEY_ID is required" >&2
+    echo "       GPG signature over checksums.txt is mandatory for v0.2.2" >&2
+    echo "       trust posture (devrev PR #33 review)" >&2
+    exit 1
+fi
+
 if ! command -v minisign >/dev/null 2>&1; then
     echo "error: minisign is required" >&2
+    exit 1
+fi
+
+if ! command -v gpg >/dev/null 2>&1; then
+    echo "error: gpg is required" >&2
     exit 1
 fi
 
@@ -84,19 +97,13 @@ for binary in "${binaries[@]}"; do
     minisign -S -s "$minisign_key" -m "$binary" -x "${binary}.minisig"
 done
 
-# GPG sign checksums.txt (manifest-level signature).
-if [ -n "$pgp_key_id" ]; then
-    if ! command -v gpg >/dev/null 2>&1; then
-        echo "error: gpg is required when CHANVOY_PGP_KEY_ID is set" >&2
-        exit 1
-    fi
-    gpg_args=(--batch --yes --armor --local-user "$pgp_key_id")
-    if [ -n "$gpg_homedir" ]; then
-        gpg_args+=(--homedir "$gpg_homedir")
-    fi
-    gpg "${gpg_args[@]}" \
-        --output "${release_dir}/checksums.txt.asc" \
-        --detach-sign "${release_dir}/checksums.txt"
+# GPG sign checksums.txt (manifest-level signature). Mandatory.
+gpg_args=(--batch --yes --armor --local-user "$pgp_key_id")
+if [ -n "$gpg_homedir" ]; then
+    gpg_args+=(--homedir "$gpg_homedir")
 fi
+gpg "${gpg_args[@]}" \
+    --output "${release_dir}/checksums.txt.asc" \
+    --detach-sign "${release_dir}/checksums.txt"
 
 echo "[ok] signed ${#binaries[@]} binaries + checksums.txt manifest for ${release_tag}"

@@ -271,6 +271,19 @@ release-preflight: release-prep ## Pre-tag readiness gate — clean tree, versio
 		exit 1; \
 	fi
 	@echo "[ok] minisign signing key present at $$CHANVOY_MINISIGN_KEY"
+	@if [ -z "$${CHANVOY_PGP_KEY_ID:-}" ]; then \
+		echo "[!!] CHANVOY_PGP_KEY_ID not set"; \
+		echo "     GPG signature over checksums.txt is mandatory for"; \
+		echo "     v0.2.2 trust posture (devrev PR #33 review)"; \
+		echo "     export CHANVOY_PGP_KEY_ID=<your-gpg-key-id>"; \
+		exit 1; \
+	fi
+	@if ! gpg --list-secret-keys "$$CHANVOY_PGP_KEY_ID" >/dev/null 2>&1; then \
+		echo "[!!] CHANVOY_PGP_KEY_ID not in gpg keyring: $$CHANVOY_PGP_KEY_ID"; \
+		echo "     gpg --list-secret-keys to inspect"; \
+		exit 1; \
+	fi
+	@echo "[ok] GPG signing key present in keyring ($$CHANVOY_PGP_KEY_ID)"
 	@notes="docs/releases/v$$(cat $(VERSION_FILE)).md"; \
 	if [ ! -f "$$notes" ]; then \
 		echo "[!!] release notes missing at $$notes"; \
@@ -321,12 +334,25 @@ release-undraft: ## Flip the GitHub release from draft → published (atomic —
 		echo "[!!] gh CLI is required"; \
 		exit 1; \
 	fi
-	@if gh release view $(RELEASE_TAG) --repo lanytehq/chanvoy \
-		--json isDraft --jq .isDraft 2>/dev/null | grep -q true; then \
+	@# Explicit existence check first — without this, the previous
+	@# implementation swallowed gh's "release not found" error and
+	@# reported "already published" for a missing release. Per devrev
+	@# PR #33 review, idempotency must distinguish "exists + already
+	@# published" from "does not exist."
+	@if ! gh release view $(RELEASE_TAG) --repo lanytehq/chanvoy >/dev/null 2>&1; then \
+		echo "[!!] release $(RELEASE_TAG) not found on lanytehq/chanvoy"; \
+		echo "     check the tag was pushed and the GHA workflow created the draft"; \
+		exit 1; \
+	fi
+	@is_draft=$$(gh release view $(RELEASE_TAG) --repo lanytehq/chanvoy --json isDraft --jq .isDraft); \
+	if [ "$$is_draft" = "true" ]; then \
 		gh release edit $(RELEASE_TAG) --repo lanytehq/chanvoy --draft=false; \
 		echo "[ok] $(RELEASE_TAG) flipped draft → published"; \
-	else \
+	elif [ "$$is_draft" = "false" ]; then \
 		echo "[ok] $(RELEASE_TAG) already published (no-op; idempotent)"; \
+	else \
+		echo "[!!] unexpected isDraft value for $(RELEASE_TAG): '$$is_draft'"; \
+		exit 1; \
 	fi
 
 release-upload-all: release-upload release-undraft ## Composite — upload signed artifacts then flip to published

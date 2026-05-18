@@ -72,17 +72,26 @@ for binary in "${binaries[@]}"; do
     minisign -V -p "$minisign_pub" -m "$binary" -x "$sig"
 done
 
+# GPG signature over checksums.txt is MANDATORY for v0.2.2 trust posture
+# (devrev review of PR #33, 2026-05-17). The brief's external-adopter
+# verification commands rely on both minisign-per-binary AND
+# gpg --verify checksums.txt.asc; an opt-out path would let a release
+# ship without manifest-level authenticity. To deliberately omit GPG,
+# that is a brief-level decision, not an impl-level silent skip.
 asc="${release_dir}/checksums.txt.asc"
-if [ -f "$asc" ]; then
-    if ! command -v gpg >/dev/null 2>&1; then
-        echo "error: GPG signature present but gpg not installed" >&2
-        exit 1
-    fi
-    gpg_args=(--verify "$asc" "${release_dir}/checksums.txt")
-    if [ -n "$gpg_homedir" ]; then
-        gpg_args=(--homedir "$gpg_homedir" "${gpg_args[@]}")
-    fi
-    gpg "${gpg_args[@]}"
+if [ ! -f "$asc" ]; then
+    echo "error: missing GPG signature over checksums.txt: ${asc}" >&2
+    echo "       run 'make release-sign' with CHANVOY_PGP_KEY_ID set" >&2
+    exit 1
 fi
+if ! command -v gpg >/dev/null 2>&1; then
+    echo "error: gpg is required to verify ${asc}" >&2
+    exit 1
+fi
+gpg_args=(--verify "$asc" "${release_dir}/checksums.txt")
+if [ -n "$gpg_homedir" ]; then
+    gpg_args=(--homedir "$gpg_homedir" "${gpg_args[@]}")
+fi
+gpg "${gpg_args[@]}"
 
-echo "[ok] signature verification passed (${#binaries[@]} binaries$([ -f "$asc" ] && echo ' + checksums.txt manifest'))"
+echo "[ok] signature verification passed (${#binaries[@]} binaries + checksums.txt manifest)"

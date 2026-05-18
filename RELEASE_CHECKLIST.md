@@ -72,7 +72,7 @@ no conflicting tag/release, tooling on PATH, signing keys present.
 
 ```bash
 export CHANVOY_MINISIGN_KEY=/path/to/minisign-secret-key
-export CHANVOY_PGP_KEY_ID=ABC123...          # optional
+export CHANVOY_PGP_KEY_ID=ABC123...
 make release-preflight
 ```
 
@@ -84,6 +84,9 @@ Checks (each fails fast with a clear hint):
 - No published GitHub release for this version
 - `gh`, `minisign`, `gpg` available on PATH
 - `CHANVOY_MINISIGN_KEY` set and points at an existing file
+- `CHANVOY_PGP_KEY_ID` set and present in the GPG keyring
+  (GPG signature over `checksums.txt` is mandatory for v0.2.2 trust
+  posture — devrev PR #33 review)
 - `docs/releases/vX.Y.Z.md` exists
 
 **This step does NOT inspect a draft release** — none exists yet.
@@ -224,11 +227,14 @@ The same values are checked into `keys/expected-fingerprints.txt` so
 Run `make version-sync` to bring `Cargo.toml` in line with `VERSION`,
 or `make version-set V=X.Y.Z` to set both atomically.
 
-### `release-preflight` fails on "CHANVOY_MINISIGN_KEY not set"
-Source the env file that exports your signing-key paths:
+### `release-preflight` fails on "CHANVOY_MINISIGN_KEY not set" or "CHANVOY_PGP_KEY_ID not set"
+Source the env file that exports your signing-key paths. Both are
+mandatory for v0.2.2 trust posture (devrev PR #33 review — silent
+skip of GPG would let a release ship without manifest-level
+authenticity):
 ```bash
 export CHANVOY_MINISIGN_KEY=$HOME/.minisign/chanvoy-secret.key
-export CHANVOY_PGP_KEY_ID=ABC123...        # optional
+export CHANVOY_PGP_KEY_ID=ABC123...
 ```
 
 ### `release-verify-keys` fails on "TBD placeholder"

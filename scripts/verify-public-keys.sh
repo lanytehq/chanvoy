@@ -30,10 +30,11 @@ Environment:
                                    relative to repo root)
   CHANVOY_GPG_HOMEDIR             Optional GPG homedir override
 
-Checks:
-  - Public key files contain no private-key markers
+Checks (all mandatory — per devrev PR #33 review, no silent skips):
+  - chanvoy.pub and chanvoy.gpg.asc are both present
+  - Neither key file contains private-key markers
   - minisign fingerprint matches expected
-  - GPG fingerprint matches expected (if chanvoy.gpg.asc present)
+  - GPG fingerprint matches expected
 
 Example:
   scripts/verify-public-keys.sh release/v0.2.2
@@ -61,6 +62,17 @@ if [ ! -f "$fingerprints_file" ]; then
     exit 1
 fi
 
+# Both public-key files are MANDATORY (devrev PR #33 review). Missing
+# either one is a release-blocker, not a silent skip.
+for key in "${release_dir}/chanvoy.pub" "${release_dir}/chanvoy.gpg.asc"; do
+    if [ ! -f "$key" ]; then
+        echo "error: missing public key file: ${key}" >&2
+        echo "       run 'make release-export-keys' with both" >&2
+        echo "       CHANVOY_MINISIGN_PUB and CHANVOY_PGP_KEY_ID set" >&2
+        exit 1
+    fi
+done
+
 # Defensive: catch "private key copied into release dir" footgun.
 scan_for_private_material() {
     local file="$1"
@@ -68,7 +80,6 @@ scan_for_private_material() {
 }
 
 for key in "${release_dir}/chanvoy.pub" "${release_dir}/chanvoy.gpg.asc"; do
-    [ -f "$key" ] || continue
     if scan_for_private_material "$key"; then
         echo "error: key file appears to contain private material: ${key}" >&2
         exit 1
@@ -86,73 +97,69 @@ while IFS= read -r line; do
     esac
 done < "$fingerprints_file"
 
-# minisign fingerprint check.
-if [ -f "${release_dir}/chanvoy.pub" ]; then
-    if [ -z "$expected_minisign" ]; then
-        echo "error: no 'minisign' line in ${fingerprints_file}" >&2
-        exit 1
-    fi
-    if [ "${expected_minisign#TBD-}" != "$expected_minisign" ]; then
-        echo "error: minisign fingerprint is a TBD placeholder in ${fingerprints_file}" >&2
-        echo "       fill in the real fingerprint after dispatch's keypair provisioning" >&2
-        exit 1
-    fi
-    # minisign public key file format:
-    #   untrusted comment: ...
-    #   <base64-blob>
-    # The second line contains a key identifier (10-hex-char prefix of
-    # the SHA-256 of the public key). We extract it for the comparison.
-    actual_minisign=$(awk 'NR==2 {print; exit}' "${release_dir}/chanvoy.pub" \
-        | base64 -d 2>/dev/null \
-        | xxd -p \
-        | tr -d '\n' \
-        | head -c 20 \
-        || true)
-    if [ -z "$actual_minisign" ]; then
-        echo "error: failed to extract minisign key id from ${release_dir}/chanvoy.pub" >&2
-        exit 1
-    fi
-    if [ "$actual_minisign" != "$expected_minisign" ]; then
-        echo "error: minisign fingerprint mismatch" >&2
-        echo "  expected: $expected_minisign" >&2
-        echo "  actual:   $actual_minisign" >&2
-        exit 1
-    fi
+# minisign fingerprint check (mandatory).
+if [ -z "$expected_minisign" ]; then
+    echo "error: no 'minisign' line in ${fingerprints_file}" >&2
+    exit 1
+fi
+if [ "${expected_minisign#TBD-}" != "$expected_minisign" ]; then
+    echo "error: minisign fingerprint is a TBD placeholder in ${fingerprints_file}" >&2
+    echo "       fill in the real fingerprint after dispatch's keypair provisioning" >&2
+    exit 1
+fi
+# minisign public key file format:
+#   untrusted comment: ...
+#   <base64-blob>
+# The second line contains a key identifier (10-hex-char prefix of
+# the SHA-256 of the public key). We extract it for the comparison.
+actual_minisign=$(awk 'NR==2 {print; exit}' "${release_dir}/chanvoy.pub" \
+    | base64 -d 2>/dev/null \
+    | xxd -p \
+    | tr -d '\n' \
+    | head -c 20 \
+    || true)
+if [ -z "$actual_minisign" ]; then
+    echo "error: failed to extract minisign key id from ${release_dir}/chanvoy.pub" >&2
+    exit 1
+fi
+if [ "$actual_minisign" != "$expected_minisign" ]; then
+    echo "error: minisign fingerprint mismatch" >&2
+    echo "  expected: $expected_minisign" >&2
+    echo "  actual:   $actual_minisign" >&2
+    exit 1
 fi
 
-# GPG fingerprint check.
-if [ -f "${release_dir}/chanvoy.gpg.asc" ]; then
-    if [ -z "$expected_gpg" ]; then
-        echo "error: no 'gpg' line in ${fingerprints_file}" >&2
-        exit 1
-    fi
-    if [ "${expected_gpg#TBD-}" != "$expected_gpg" ]; then
-        echo "error: GPG fingerprint is a TBD placeholder in ${fingerprints_file}" >&2
-        echo "       fill in the real fingerprint after dispatch's keypair provisioning" >&2
-        exit 1
-    fi
-    if ! command -v gpg >/dev/null 2>&1; then
-        echo "error: gpg is required to verify chanvoy.gpg.asc fingerprint" >&2
-        exit 1
-    fi
-    gpg_args=()
-    if [ -n "$gpg_homedir" ]; then
-        gpg_args+=(--homedir "$gpg_homedir")
-    fi
-    # `gpg --show-keys` parses a key file without importing.
-    actual_gpg=$(gpg "${gpg_args[@]}" --show-keys --with-colons \
-        "${release_dir}/chanvoy.gpg.asc" \
-        | awk -F: '$1 == "fpr" {print $10; exit}')
-    if [ -z "$actual_gpg" ]; then
-        echo "error: failed to extract GPG fingerprint from ${release_dir}/chanvoy.gpg.asc" >&2
-        exit 1
-    fi
-    if [ "$actual_gpg" != "$expected_gpg" ]; then
-        echo "error: GPG fingerprint mismatch" >&2
-        echo "  expected: $expected_gpg" >&2
-        echo "  actual:   $actual_gpg" >&2
-        exit 1
-    fi
+# GPG fingerprint check (mandatory).
+if [ -z "$expected_gpg" ]; then
+    echo "error: no 'gpg' line in ${fingerprints_file}" >&2
+    exit 1
+fi
+if [ "${expected_gpg#TBD-}" != "$expected_gpg" ]; then
+    echo "error: GPG fingerprint is a TBD placeholder in ${fingerprints_file}" >&2
+    echo "       fill in the real fingerprint after dispatch's keypair provisioning" >&2
+    exit 1
+fi
+if ! command -v gpg >/dev/null 2>&1; then
+    echo "error: gpg is required to verify chanvoy.gpg.asc fingerprint" >&2
+    exit 1
+fi
+gpg_args=()
+if [ -n "$gpg_homedir" ]; then
+    gpg_args+=(--homedir "$gpg_homedir")
+fi
+# `gpg --show-keys` parses a key file without importing.
+actual_gpg=$(gpg "${gpg_args[@]}" --show-keys --with-colons \
+    "${release_dir}/chanvoy.gpg.asc" \
+    | awk -F: '$1 == "fpr" {print $10; exit}')
+if [ -z "$actual_gpg" ]; then
+    echo "error: failed to extract GPG fingerprint from ${release_dir}/chanvoy.gpg.asc" >&2
+    exit 1
+fi
+if [ "$actual_gpg" != "$expected_gpg" ]; then
+    echo "error: GPG fingerprint mismatch" >&2
+    echo "  expected: $expected_gpg" >&2
+    echo "  actual:   $actual_gpg" >&2
+    exit 1
 fi
 
 echo "[ok] public-key fingerprints match expected values"
