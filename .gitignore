@@ -11,3 +11,8 @@ AGENTS.local.md
 # PER-032 Tier-B release-smoke output. The script scrubs live IDs
 # before exit, but the raw log lives only on the operator's machine.
 /release-smoke.log
+
+# PER-030 local release working directory. Holds downloaded draft-
+# release artifacts + locally-generated signatures + public keys
+# during the manual signing flow. Never committed.
+/release/

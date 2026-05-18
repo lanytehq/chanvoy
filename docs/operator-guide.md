@@ -646,3 +646,16 @@ operator flows, prefer `auto-setup`.
 - `chanvoy` enforces elevated capability locally and fails earlier with an elevated-capability error.
 
 This stricter behavior is intentional. Agents needing restore must use an elevated-capability profile.
+
+## Release operations
+
+`make help` lists the release surface under "Release operations". The
+**canonical step-by-step procedure** (with stable key fingerprints and
+external-adopter verification commands) lives at the repo root:
+
+→ [`/RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md)
+
+Per PER-030, signing is manual: CI produces a draft release on tag
+push (PER-031 `release.yml`), then `make release-download` →
+`release-sign` → `release-verify` → `release-upload` → `release-undraft`
+runs locally against that draft. Signing keys never touch CI.
