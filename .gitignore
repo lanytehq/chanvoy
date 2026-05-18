@@ -4,7 +4,7 @@
 .DS_Store
 AGENTS.local.md
 
-# Agent-scratch directories (lanyte-ctx checkpoint handoffs etc.)
+# Agent-scratch directories (stashvoy checkpoint handoffs etc.)
 /.tmp/
 /tmp/
 
