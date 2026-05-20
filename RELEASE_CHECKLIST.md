@@ -196,7 +196,7 @@ are attached to the release.
 
 ```bash
 # Verify a downloaded binary against its minisign signature
-minisign -Vm chanvoy-vX.Y.Z-linux-x86_64 -p chanvoy.pub
+minisign -Vm chanvoy-vX.Y.Z-linux-x86_64 -p chanvoy-minisign.pub
 
 # Verify the checksums manifest against the GPG signature
 gpg --verify checksums.txt.asc checksums.txt
@@ -216,8 +216,8 @@ only via a documented key-rotation announcement on `#ops-updates`.
 | GPG | `TBD — pinned at impl time from dispatch's keypair provisioning` |
 
 The same values are checked into `keys/expected-fingerprints.txt` so
-`make release-verify-keys` asserts an exported `chanvoy.pub` /
-`chanvoy.gpg.asc` matches them.
+`make release-verify-keys` asserts an exported `chanvoy-minisign.pub` /
+`chanvoy-release-signing-key.asc` matches them.
 
 ---
 

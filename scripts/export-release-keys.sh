@@ -12,17 +12,17 @@ usage() {
     cat <<'EOF'
 Usage: export-release-keys.sh <release-dir>
 
-  release-dir  Directory to write chanvoy.pub and chanvoy.gpg.asc into
+  release-dir  Directory to write chanvoy-minisign.pub and chanvoy-release-signing-key.asc into
 
 Environment:
   CHANVOY_MINISIGN_PUB  Path to minisign public key
-                        (copied verbatim to <release-dir>/chanvoy.pub)
+                        (copied verbatim to <release-dir>/chanvoy-minisign.pub)
   CHANVOY_PGP_KEY_ID    GPG key ID to export
-                        (written ASCII-armored to chanvoy.gpg.asc)
+                        (written ASCII-armored to chanvoy-release-signing-key.asc)
   CHANVOY_GPG_HOMEDIR   Optional GPG homedir override
 
 Example:
-  CHANVOY_MINISIGN_PUB=keys/chanvoy.pub \
+  CHANVOY_MINISIGN_PUB=keys/chanvoy-minisign.pub \
   CHANVOY_PGP_KEY_ID=ABC123... \
     scripts/export-release-keys.sh release/v0.2.2
 EOF
@@ -50,8 +50,8 @@ if [ -n "$minisign_pub" ]; then
         echo "error: minisign public key not found at ${minisign_pub}" >&2
         exit 1
     fi
-    cp "$minisign_pub" "${release_dir}/chanvoy.pub"
-    echo "[ok] exported chanvoy.pub"
+    cp "$minisign_pub" "${release_dir}/chanvoy-minisign.pub"
+    echo "[ok] exported chanvoy-minisign.pub"
 else
     echo "[--] CHANVOY_MINISIGN_PUB not set; skipping minisign public key export"
 fi
@@ -65,8 +65,8 @@ if [ -n "$pgp_key_id" ]; then
     if [ -n "$gpg_homedir" ]; then
         gpg_args=(--homedir "$gpg_homedir" "${gpg_args[@]}")
     fi
-    gpg "${gpg_args[@]}" >"${release_dir}/chanvoy.gpg.asc"
-    echo "[ok] exported chanvoy.gpg.asc"
+    gpg "${gpg_args[@]}" >"${release_dir}/chanvoy-release-signing-key.asc"
+    echo "[ok] exported chanvoy-release-signing-key.asc"
 else
     echo "[--] CHANVOY_PGP_KEY_ID not set; skipping GPG public key export"
 fi

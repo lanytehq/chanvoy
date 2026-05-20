@@ -8,13 +8,13 @@ operation flow lives in [`/RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md).
 
 | File | Purpose |
 |---|---|
-| `expected-fingerprints.txt` | Trust contract — expected fingerprints for `chanvoy.pub` (minisign) and `chanvoy.gpg.asc` (GPG). Falsifiable: a release-cycle whose exported public keys don't match these values fails `make release-verify-keys` |
+| `expected-fingerprints.txt` | Trust contract — expected fingerprints for `chanvoy-minisign.pub` (minisign) and `chanvoy-release-signing-key.asc` (GPG). Falsifiable: a release-cycle whose exported public keys don't match these values fails `make release-verify-keys` |
 | `README.md` | This file |
 
 ## What's NOT checked in
 
 - **Private signing keys** — these are in Dave's local environment only, never in this repo or in CI. See PER-030 for the manual-signing baseline.
-- **Public-key files** (`chanvoy.pub`, `chanvoy.gpg.asc`) — exported into the release working directory by `scripts/export-release-keys.sh` at release time. The fingerprint contract here lets external adopters re-verify the public-key files they pull from a release without needing to clone this repo.
+- **Public-key files** (`chanvoy-minisign.pub`, `chanvoy-release-signing-key.asc`) — exported into the release working directory by `scripts/export-release-keys.sh` at release time. The fingerprint contract here lets external adopters re-verify the public-key files they pull from a release without needing to clone this repo.
 
 ## Updating fingerprints
 

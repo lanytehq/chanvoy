@@ -5,7 +5,7 @@
 #
 # Verification model:
 #   - For each chanvoy-v*-* binary, expect a .minisig and verify
-#     against the bundled chanvoy.pub
+#     against the bundled chanvoy-minisign.pub
 #   - For checksums.txt, expect a .asc and verify against the GPG
 #     keyring (or CHANVOY_GPG_HOMEDIR override)
 #
@@ -16,11 +16,11 @@ usage() {
     cat <<'EOF'
 Usage: verify-signatures.sh <release-dir>
 
-  release-dir  Directory containing binaries + signatures + chanvoy.pub
+  release-dir  Directory containing binaries + signatures + chanvoy-minisign.pub
 
 Environment:
   CHANVOY_MINISIGN_PUB   Path to minisign public key
-                         (default: <release-dir>/chanvoy.pub)
+                         (default: <release-dir>/chanvoy-minisign.pub)
   CHANVOY_GPG_HOMEDIR    Optional GPG homedir override
 
 Example:
@@ -39,7 +39,7 @@ if [ "$#" -ne 1 ]; then
 fi
 
 release_dir="$1"
-minisign_pub="${CHANVOY_MINISIGN_PUB:-${release_dir}/chanvoy.pub}"
+minisign_pub="${CHANVOY_MINISIGN_PUB:-${release_dir}/chanvoy-minisign.pub}"
 gpg_homedir="${CHANVOY_GPG_HOMEDIR:-}"
 
 if [ ! -f "$minisign_pub" ]; then

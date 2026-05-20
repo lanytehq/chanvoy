@@ -21,8 +21,8 @@ usage() {
     cat <<'EOF'
 Usage: verify-public-keys.sh <release-dir>
 
-  release-dir  Directory containing chanvoy.pub and (optionally)
-               chanvoy.gpg.asc
+  release-dir  Directory containing chanvoy-minisign.pub and (optionally)
+               chanvoy-release-signing-key.asc
 
 Environment:
   CHANVOY_EXPECTED_FINGERPRINTS  Path to expected-fingerprints file
@@ -31,7 +31,7 @@ Environment:
   CHANVOY_GPG_HOMEDIR             Optional GPG homedir override
 
 Checks (all mandatory — per devrev PR #33 review, no silent skips):
-  - chanvoy.pub and chanvoy.gpg.asc are both present
+  - chanvoy-minisign.pub and chanvoy-release-signing-key.asc are both present
   - Neither key file contains private-key markers
   - minisign fingerprint matches expected
   - GPG fingerprint matches expected
@@ -64,7 +64,7 @@ fi
 
 # Both public-key files are MANDATORY (devrev PR #33 review). Missing
 # either one is a release-blocker, not a silent skip.
-for key in "${release_dir}/chanvoy.pub" "${release_dir}/chanvoy.gpg.asc"; do
+for key in "${release_dir}/chanvoy-minisign.pub" "${release_dir}/chanvoy-release-signing-key.asc"; do
     if [ ! -f "$key" ]; then
         echo "error: missing public key file: ${key}" >&2
         echo "       run 'make release-export-keys' with both" >&2
@@ -79,7 +79,7 @@ scan_for_private_material() {
     grep -E "PRIVATE|SECRET|BEGIN PGP PRIVATE KEY" "$file" >/dev/null 2>&1
 }
 
-for key in "${release_dir}/chanvoy.pub" "${release_dir}/chanvoy.gpg.asc"; do
+for key in "${release_dir}/chanvoy-minisign.pub" "${release_dir}/chanvoy-release-signing-key.asc"; do
     if scan_for_private_material "$key"; then
         echo "error: key file appears to contain private material: ${key}" >&2
         exit 1
@@ -112,14 +112,14 @@ fi
 #   <base64-blob>
 # The second line contains a key identifier (10-hex-char prefix of
 # the SHA-256 of the public key). We extract it for the comparison.
-actual_minisign=$(awk 'NR==2 {print; exit}' "${release_dir}/chanvoy.pub" \
+actual_minisign=$(awk 'NR==2 {print; exit}' "${release_dir}/chanvoy-minisign.pub" \
     | base64 -d 2>/dev/null \
     | xxd -p \
     | tr -d '\n' \
     | head -c 20 \
     || true)
 if [ -z "$actual_minisign" ]; then
-    echo "error: failed to extract minisign key id from ${release_dir}/chanvoy.pub" >&2
+    echo "error: failed to extract minisign key id from ${release_dir}/chanvoy-minisign.pub" >&2
     exit 1
 fi
 if [ "$actual_minisign" != "$expected_minisign" ]; then
@@ -140,7 +140,7 @@ if [ "${expected_gpg#TBD-}" != "$expected_gpg" ]; then
     exit 1
 fi
 if ! command -v gpg >/dev/null 2>&1; then
-    echo "error: gpg is required to verify chanvoy.gpg.asc fingerprint" >&2
+    echo "error: gpg is required to verify chanvoy-release-signing-key.asc fingerprint" >&2
     exit 1
 fi
 gpg_args=()
@@ -149,10 +149,10 @@ if [ -n "$gpg_homedir" ]; then
 fi
 # `gpg --show-keys` parses a key file without importing.
 actual_gpg=$(gpg "${gpg_args[@]}" --show-keys --with-colons \
-    "${release_dir}/chanvoy.gpg.asc" \
+    "${release_dir}/chanvoy-release-signing-key.asc" \
     | awk -F: '$1 == "fpr" {print $10; exit}')
 if [ -z "$actual_gpg" ]; then
-    echo "error: failed to extract GPG fingerprint from ${release_dir}/chanvoy.gpg.asc" >&2
+    echo "error: failed to extract GPG fingerprint from ${release_dir}/chanvoy-release-signing-key.asc" >&2
     exit 1
 fi
 if [ "$actual_gpg" != "$expected_gpg" ]; then

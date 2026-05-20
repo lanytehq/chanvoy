@@ -27,8 +27,8 @@ upload refuses to run if any is missing):
   - chanvoy-v*-*.minisig       per-binary minisign signature for EACH binary
   - checksums.txt              SHA-256 manifest
   - checksums.txt.asc          GPG signature over the manifest
-  - chanvoy.pub                minisign public key
-  - chanvoy.gpg.asc            GPG public key
+  - chanvoy-minisign.pub                minisign public key
+  - chanvoy-release-signing-key.asc            GPG public key
 
 Optionally refreshed if present:
   - docs/releases/<tag>.md     release notes (via gh release edit --notes-file)
@@ -82,8 +82,8 @@ for binary in "${binaries[@]}"; do
 done
 [ -f "${release_dir}/checksums.txt" ]      || missing+=("${release_dir}/checksums.txt")
 [ -f "${release_dir}/checksums.txt.asc" ]  || missing+=("${release_dir}/checksums.txt.asc")
-[ -f "${release_dir}/chanvoy.pub" ]        || missing+=("${release_dir}/chanvoy.pub")
-[ -f "${release_dir}/chanvoy.gpg.asc" ]    || missing+=("${release_dir}/chanvoy.gpg.asc")
+[ -f "${release_dir}/chanvoy-minisign.pub" ]        || missing+=("${release_dir}/chanvoy-minisign.pub")
+[ -f "${release_dir}/chanvoy-release-signing-key.asc" ]    || missing+=("${release_dir}/chanvoy-release-signing-key.asc")
 
 if [ "${#missing[@]}" -gt 0 ]; then
     echo "error: release dir is missing required artifacts:" >&2
@@ -105,8 +105,8 @@ done < <(
         \( -name 'chanvoy-v*-*' \
         -o -name 'checksums.txt' \
         -o -name 'checksums.txt.asc' \
-        -o -name 'chanvoy.pub' \
-        -o -name 'chanvoy.gpg.asc' \) |
+        -o -name 'chanvoy-minisign.pub' \
+        -o -name 'chanvoy-release-signing-key.asc' \) |
         sort
 )
 
