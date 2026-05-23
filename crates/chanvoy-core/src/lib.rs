@@ -655,17 +655,25 @@ pub struct UnpinParams {
 /// useful for the dispatch pin-rotation workflow. Determined by
 /// reading the post object's `is_pinned` field before issuing the
 /// write (zero extra round-trips: the channel-membership assertion
-/// already needs to GET the post). `team`/`channel` mirror
-/// `ReactionResult` so JSON consumers can disambiguate cross-team
-/// channel duplicates.
+/// already needs to GET the post).
+///
+/// Field shape (per brief AC #5 + devrev PR #36 review):
+/// - `verb` and `channel_id` are explicit brief-required fields
+/// - `team` and `ok` mirror `ReactionResult`'s shape (PER-024 pre-impl
+///   pin #2) so cross-team channel disambiguation and the
+///   uniform-success contract are consistent across write verbs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PinResult {
+    /// Always `"pin"`. Lets `--json` consumers identify the verb
+    /// directly per brief §Output formats sample.
+    pub verb: String,
     pub team: String,
     pub channel: String,
+    /// Mattermost channel id (the stable provider-level id, not the
+    /// slug). Brief AC #5 sample field.
+    pub channel_id: String,
     pub post_id: String,
-    /// Always `"pinned"`. Mirrors the brief §Output formats `result`
-    /// field — lets `--json` consumers identify the verb without
-    /// inspecting the outer envelope.
+    /// `"pinned"` — the post-call state, distinct from `verb`.
     pub result: String,
     /// True iff `is_pinned` was already true when this call started.
     pub was_already_pinned: bool,
@@ -677,10 +685,13 @@ pub struct PinResult {
 /// signal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnpinResult {
+    /// Always `"unpin"`.
+    pub verb: String,
     pub team: String,
     pub channel: String,
+    pub channel_id: String,
     pub post_id: String,
-    /// Always `"unpinned"`.
+    /// `"unpinned"`.
     pub result: String,
     /// True iff `is_pinned` was already false when this call started.
     pub was_already_unpinned: bool,
@@ -1558,6 +1569,27 @@ pub enum CoreError {
     Json(#[from] serde_json::Error),
     #[error("api error {status}: {message}")]
     Api { status: StatusCode, message: String },
+    /// PER-034 AC #8: chanvoy normalizes MM 403 on `POST /posts/{id}/pin`
+    /// or `/unpin` into a verb-specific diagnostic that names the
+    /// missing channel-admin permission, rather than surfacing the
+    /// generic API-error path. Operators with no MM-API context see
+    /// what to ask their workspace admin for.
+    #[error(
+        "bot {bot_username:?} lacks the channel-admin permission required \
+         to {verb} posts in {team:?}/{channel:?}. \
+         Ask your Mattermost workspace admin to grant the bot the \
+         `manage_public_channel_members` / `manage_private_channel_members` \
+         scheme role on the channel, or use a profile whose bot already \
+         has channel-admin there. \
+         Mattermost reported: {message}"
+    )]
+    PinPermissionDenied {
+        verb: &'static str,
+        bot_username: String,
+        team: String,
+        channel: String,
+        message: String,
+    },
 }
 
 pub fn default_profile_dir() -> PathBuf {
@@ -3364,12 +3396,34 @@ impl MattermostClient {
         let was_already_pinned = self
             .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
             .await?;
-        let _: Value = self
-            .request("POST", &format!("/posts/{post_id}/pin"), None::<Value>)
-            .await?;
+        match self
+            .request::<Value, Value>("POST", &format!("/posts/{post_id}/pin"), None)
+            .await
+        {
+            Ok(_) => {}
+            // PER-034 AC #8: MM 403 on the pin write means the bot
+            // lacks channel-admin. Normalize into a verb-specific
+            // diagnostic naming the missing permission.
+            Err(CoreError::Api {
+                status: StatusCode::FORBIDDEN,
+                message,
+            }) => {
+                let bot_username = self.whoami().await.map(|i| i.username).unwrap_or_default();
+                return Err(CoreError::PinPermissionDenied {
+                    verb: "pin",
+                    bot_username,
+                    team: resolved.team_name,
+                    channel: resolved.channel_name,
+                    message,
+                });
+            }
+            Err(other) => return Err(other),
+        }
         Ok(PinResult {
+            verb: "pin".to_string(),
             team: resolved.team_name,
             channel: resolved.channel_name,
+            channel_id: resolved.channel_id,
             post_id: post_id.to_string(),
             result: "pinned".to_string(),
             was_already_pinned,
@@ -3378,7 +3432,9 @@ impl MattermostClient {
     }
 
     /// PER-034: unpin a post. Symmetric to `pin_post`. Idempotent
-    /// on already-unpinned (MM returns 200 either way).
+    /// on already-unpinned (MM returns 200 either way). 403 from the
+    /// write surfaces via `CoreError::PinPermissionDenied` with
+    /// `verb: "unpin"`.
     pub async fn unpin_post(
         &self,
         channel_name: &str,
@@ -3389,12 +3445,31 @@ impl MattermostClient {
         let was_pinned = self
             .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
             .await?;
-        let _: Value = self
-            .request("POST", &format!("/posts/{post_id}/unpin"), None::<Value>)
-            .await?;
+        match self
+            .request::<Value, Value>("POST", &format!("/posts/{post_id}/unpin"), None)
+            .await
+        {
+            Ok(_) => {}
+            Err(CoreError::Api {
+                status: StatusCode::FORBIDDEN,
+                message,
+            }) => {
+                let bot_username = self.whoami().await.map(|i| i.username).unwrap_or_default();
+                return Err(CoreError::PinPermissionDenied {
+                    verb: "unpin",
+                    bot_username,
+                    team: resolved.team_name,
+                    channel: resolved.channel_name,
+                    message,
+                });
+            }
+            Err(other) => return Err(other),
+        }
         Ok(UnpinResult {
+            verb: "unpin".to_string(),
             team: resolved.team_name,
             channel: resolved.channel_name,
+            channel_id: resolved.channel_id,
             post_id: post_id.to_string(),
             result: "unpinned".to_string(),
             was_already_unpinned: !was_pinned,

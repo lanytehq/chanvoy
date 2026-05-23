@@ -106,9 +106,14 @@ async fn pin_happy_path() {
         String::from_utf8_lossy(&out.stderr)
     );
     let result: serde_json::Value = serde_json::from_slice(&out.stdout).expect("pin --json parses");
+    // Brief AC #5 field set: verb + channel + channel_id + post_id +
+    // result + was_already_pinned (plus team + ok mirroring
+    // ReactionResult per PER-024 pre-impl pin #2).
+    assert_eq!(result["verb"].as_str(), Some("pin"));
     assert_eq!(result["ok"].as_bool(), Some(true));
     assert_eq!(result["team"].as_str(), Some("org-lanytehq"));
     assert_eq!(result["channel"].as_str(), Some("bravo-team"));
+    assert_eq!(result["channel_id"].as_str(), Some("chan-id-ph"));
     assert_eq!(result["post_id"].as_str(), Some("post-ph"));
     assert_eq!(result["result"].as_str(), Some("pinned"));
     assert_eq!(result["was_already_pinned"].as_bool(), Some(false));
@@ -176,7 +181,9 @@ async fn unpin_happy_path() {
     );
     let result: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("unpin --json parses");
+    assert_eq!(result["verb"].as_str(), Some("unpin"));
     assert_eq!(result["ok"].as_bool(), Some(true));
+    assert_eq!(result["channel_id"].as_str(), Some("chan-id-uh"));
     assert_eq!(result["result"].as_str(), Some("unpinned"));
     assert_eq!(result["was_already_unpinned"].as_bool(), Some(false));
 
@@ -275,12 +282,15 @@ async fn pin_post_not_found() {
 }
 
 /// `chanvoy pin` on a post the bot lacks channel-admin to pin
-/// (MM 403): the verb exits non-zero with the MM 403 surfaced as a
-/// CoreError::Api. Per the brief Open Question, chanvoy doesn't
-/// pre-check permissions — MM's 403 is the operator-facing signal.
+/// (MM 403): chanvoy normalizes the 403 into a verb-specific
+/// diagnostic naming the missing channel-admin permission per
+/// AC #8 (devrev PR #36 F1). Per brief Open Question lean,
+/// chanvoy doesn't pre-check — the normalization happens on the
+/// MM error path so operators with no MM-API context see what to
+/// ask their workspace admin for.
 #[tokio::test]
 #[ignore = "integration: run via make test-integration"]
-async fn pin_permission_error() {
+async fn pin_permission_error_diagnostic() {
     let env = TestEnv::new("per-034-pin-403").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     env.mock_baseline("bot-id-perr", "agent-bravo-devlead", "team-id-456")
@@ -303,6 +313,158 @@ async fn pin_permission_error() {
         !out.status.success(),
         "pin without channel-admin must exit non-zero"
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Brief AC #8: the diagnostic must NAME the missing permission,
+    // not just surface "api error 403: ...". Falsifiable assertions:
+    assert!(
+        stderr.contains("channel-admin"),
+        "stderr must name the channel-admin permission; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("agent-bravo-devlead"),
+        "stderr must name the bot username; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("bravo-team"),
+        "stderr must name the channel; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("pin posts"),
+        "stderr must distinguish pin vs unpin (verb-specific diagnostic); got: {stderr}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// Mount the additional mocks needed for cross-team `--team` /
+/// `<team>/<channel>` resolution. Mirrors PER-024 / PER-023 pattern
+/// (the alternate team surfaces in the bot's membership list so the γ
+/// hybrid resolver can route explicit alternate-team requests).
+async fn mount_alternate_team(
+    env: &TestEnv,
+    primary_team_id: &str,
+    alt_team: &str,
+    alt_team_id: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me/teams"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": primary_team_id,
+                "name": "org-lanytehq",
+                "display_name": "lanytehq",
+            },
+            {
+                "id": alt_team_id,
+                "name": alt_team,
+                "display_name": alt_team,
+            },
+        ])))
+        .mount(&env.mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/teams/name/{alt_team}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": alt_team_id,
+            "name": alt_team,
+        })))
+        .mount(&env.mock)
+        .await;
+}
+
+/// PER-034 AC #9 — `--team` override flows through identically on
+/// pin. Uses an explicit alternate team (not the profile's default)
+/// to verify cross-team resolution paths the same way other γ hybrid
+/// verbs do. Adds the new RPC path coverage devrev PR #36 F2
+/// flagged was missing.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn pin_team_override() {
+    let env = TestEnv::new("per-034-pin-team").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-pt", "agent-bravo-devlead", "team-id-456")
+        .await;
+    mount_alternate_team(&env, "team-id-456", "org-other", "team-id-other").await;
+    env.mock_channel_lookup_for_team("team-id-other", "ops-updates", "chan-id-pt")
+        .await;
+    env.mock_post_lookup_pinned("post-pt", "chan-id-pt", false)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/posts/post-pt/pin"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "OK"})))
+        .mount(&env.mock)
+        .await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "pin",
+            "ops-updates",
+            "post-pt",
+            "--team",
+            "org-other",
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "pin with --team must exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).expect("pin --json parses");
+    assert_eq!(result["team"].as_str(), Some("org-other"));
+    assert_eq!(result["channel"].as_str(), Some("ops-updates"));
+    assert_eq!(result["channel_id"].as_str(), Some("chan-id-pt"));
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// PER-034 AC #9 — `--team` override behaves identically on unpin.
+/// Symmetric to `pin_team_override`.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn unpin_team_override() {
+    let env = TestEnv::new("per-034-unpin-team").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-ut", "agent-bravo-devlead", "team-id-456")
+        .await;
+    mount_alternate_team(&env, "team-id-456", "org-other", "team-id-other").await;
+    env.mock_channel_lookup_for_team("team-id-other", "ops-updates", "chan-id-ut")
+        .await;
+    env.mock_post_lookup_pinned("post-ut", "chan-id-ut", true)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/posts/post-ut/unpin"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "OK"})))
+        .mount(&env.mock)
+        .await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "unpin",
+            "ops-updates",
+            "post-ut",
+            "--team",
+            "org-other",
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "unpin with --team must exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("unpin --json parses");
+    assert_eq!(result["verb"].as_str(), Some("unpin"));
+    assert_eq!(result["team"].as_str(), Some("org-other"));
+    assert_eq!(result["channel"].as_str(), Some("ops-updates"));
+    assert_eq!(result["channel_id"].as_str(), Some("chan-id-ut"));
 
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
