@@ -13,10 +13,11 @@ use chanvoy_core::{
     CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, DaemonHealth,
     DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
-    NotifyParams, PinnedChannelParams, PostMessageParams, Profile, ProfileStatus, Provider,
-    ReactParams, ReactionResult, ReadChannelParams, ReadDirectMessageParams, SearchParams,
-    SearchResult, ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter,
-    UnreactParams, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
+    NotifyParams, PinParams, PinResult, PinnedChannelParams, PostMessageParams, Profile,
+    ProfileStatus, Provider, ReactParams, ReactionResult, ReadChannelParams,
+    ReadDirectMessageParams, SearchParams, SearchResult, ShutdownResult, SubscribeParams,
+    SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult, UnreactParams,
+    UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -749,6 +750,25 @@ async fn dispatch_request(
                     &params.emoji,
                     params.team.as_deref(),
                 )
+                .await
+        })
+        .await
+        .map(to_value),
+        "pin_post" => parse_and_call(&request.params, |params: PinParams| async move {
+            // PER-034: cursor-neutral write verb. Channel resolution
+            // + post-in-channel assertion live in chanvoy-core.
+            state
+                .client
+                .pin_post(&params.channel, &params.post_id, params.team.as_deref())
+                .await
+        })
+        .await
+        .map(to_value),
+        "unpin_post" => parse_and_call(&request.params, |params: UnpinParams| async move {
+            // PER-034: symmetric to pin_post.
+            state
+                .client
+                .unpin_post(&params.channel, &params.post_id, params.team.as_deref())
                 .await
         })
         .await
@@ -1942,6 +1962,44 @@ impl DaemonClient {
                 channel: channel.to_string(),
                 post_id: post_id.to_string(),
                 emoji: emoji.to_string(),
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-034: pin a post via MM v4 `POST /posts/{id}/pin`.
+    /// Idempotent on already-pinned. Channel positional matches
+    /// the cross-team γ hybrid resolver convention.
+    pub async fn pin_post(
+        &self,
+        channel: &str,
+        post_id: &str,
+        team: Option<String>,
+    ) -> Result<PinResult, DaemonError> {
+        self.call(
+            "pin_post",
+            serde_json::to_value(PinParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-034: unpin a post. Symmetric to `pin_post`.
+    pub async fn unpin_post(
+        &self,
+        channel: &str,
+        post_id: &str,
+        team: Option<String>,
+    ) -> Result<UnpinResult, DaemonError> {
+        self.call(
+            "unpin_post",
+            serde_json::to_value(UnpinParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
                 team,
             })?,
         )

@@ -259,6 +259,23 @@ impl TestEnv {
             .await;
     }
 
+    /// PER-034: like `mock_post_lookup` (exists=true) but also sets the
+    /// `is_pinned` field so `fetch_post_pinned_state` returns the
+    /// expected pre-call pin state. Used by pin/unpin idempotency
+    /// tests where the `was_already_pinned` / `was_already_unpinned`
+    /// JSON output reflects this value.
+    pub async fn mock_post_lookup_pinned(&self, post_id: &str, channel_id: &str, is_pinned: bool) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/posts/{post_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": post_id,
+                "channel_id": channel_id,
+                "is_pinned": is_pinned,
+            })))
+            .mount(&self.mock)
+            .await;
+    }
+
     /// `GET /users/me/teams/{team_id}/channels` returning an empty
     /// membership list. `seed_cursors` with empty memberships produces
     /// no outcomes, so auto-setup exits 0 cleanly without needing

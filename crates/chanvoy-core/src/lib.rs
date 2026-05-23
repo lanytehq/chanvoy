@@ -629,6 +629,64 @@ pub struct ReactionResult {
     pub ok: bool,
 }
 
+/// PER-034: parameters for `chanvoy pin <channel> <post_id>`. Same
+/// shape as `ReactParams` minus the emoji; pin/unpin operate on a
+/// (channel, post-id) pair without further qualifiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinParams {
+    pub channel: String,
+    pub post_id: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-034: parameters for `chanvoy unpin <channel> <post_id>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnpinParams {
+    pub channel: String,
+    pub post_id: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-034: outcome of a `chanvoy pin` call. `was_already_pinned`
+/// surfaces the pre-call pin state so wrapping scripts can
+/// distinguish "I just pinned this" from "this was already pinned" —
+/// useful for the dispatch pin-rotation workflow. Determined by
+/// reading the post object's `is_pinned` field before issuing the
+/// write (zero extra round-trips: the channel-membership assertion
+/// already needs to GET the post). `team`/`channel` mirror
+/// `ReactionResult` so JSON consumers can disambiguate cross-team
+/// channel duplicates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinResult {
+    pub team: String,
+    pub channel: String,
+    pub post_id: String,
+    /// Always `"pinned"`. Mirrors the brief §Output formats `result`
+    /// field — lets `--json` consumers identify the verb without
+    /// inspecting the outer envelope.
+    pub result: String,
+    /// True iff `is_pinned` was already true when this call started.
+    pub was_already_pinned: bool,
+    pub ok: bool,
+}
+
+/// PER-034: outcome of a `chanvoy unpin` call. Symmetric to
+/// `PinResult` with `was_already_unpinned` as the idempotency
+/// signal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnpinResult {
+    pub team: String,
+    pub channel: String,
+    pub post_id: String,
+    /// Always `"unpinned"`.
+    pub result: String,
+    /// True iff `is_pinned` was already false when this call started.
+    pub was_already_unpinned: bool,
+    pub ok: bool,
+}
+
 /// PER-025 primitive 1: parameters for `chanvoy search <channel>
 /// <query>`. Cross-channel / team-wide search is explicitly deferred
 /// from v1 per cross-reviewer alignment (see brief §Out of scope) —
@@ -3285,6 +3343,65 @@ impl MattermostClient {
         })
     }
 
+    /// PER-034: pin a post under the bot's identity. Validation
+    /// order mirrors `add_reaction`: resolve channel → assert post
+    /// in resolved channel → write. The post-fetch step also returns
+    /// the current `is_pinned` value so the result surfaces
+    /// `was_already_pinned` with no extra round-trips.
+    ///
+    /// Idempotent: re-pinning a pinned post issues the POST anyway
+    /// and accepts MM's success response (MM v4 returns 200 on
+    /// already-pinned posts). The operator-facing contract is "this
+    /// post is pinned after this call returns"; `was_already_pinned`
+    /// surfaces the prior state for callers who care.
+    pub async fn pin_post(
+        &self,
+        channel_name: &str,
+        post_id: &str,
+        team: Option<&str>,
+    ) -> Result<PinResult, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        let was_already_pinned = self
+            .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
+            .await?;
+        let _: Value = self
+            .request("POST", &format!("/posts/{post_id}/pin"), None::<Value>)
+            .await?;
+        Ok(PinResult {
+            team: resolved.team_name,
+            channel: resolved.channel_name,
+            post_id: post_id.to_string(),
+            result: "pinned".to_string(),
+            was_already_pinned,
+            ok: true,
+        })
+    }
+
+    /// PER-034: unpin a post. Symmetric to `pin_post`. Idempotent
+    /// on already-unpinned (MM returns 200 either way).
+    pub async fn unpin_post(
+        &self,
+        channel_name: &str,
+        post_id: &str,
+        team: Option<&str>,
+    ) -> Result<UnpinResult, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        let was_pinned = self
+            .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
+            .await?;
+        let _: Value = self
+            .request("POST", &format!("/posts/{post_id}/unpin"), None::<Value>)
+            .await?;
+        Ok(UnpinResult {
+            team: resolved.team_name,
+            channel: resolved.channel_name,
+            post_id: post_id.to_string(),
+            result: "unpinned".to_string(),
+            was_already_unpinned: !was_pinned,
+            ok: true,
+        })
+    }
+
     pub async fn read_thread(&self, root_post_id: &str) -> Result<Vec<Message>, CoreError> {
         #[derive(Deserialize)]
         struct RawPost {
@@ -3781,6 +3898,46 @@ impl MattermostClient {
         }
 
         Ok(())
+    }
+
+    /// PER-034: like `assert_post_in_channel`, but returns the
+    /// `is_pinned` field of the post so callers can surface the
+    /// pre-call pin state without a second round-trip. The
+    /// channel-mismatch and not-found error paths match
+    /// `assert_post_in_channel` exactly.
+    async fn fetch_post_pinned_state(
+        &self,
+        expected_channel_id: &str,
+        channel_name: &str,
+        post_id: &str,
+    ) -> Result<bool, CoreError> {
+        #[derive(Deserialize)]
+        struct PostResponse {
+            channel_id: String,
+            #[serde(default)]
+            is_pinned: bool,
+        }
+
+        let post: PostResponse = match self
+            .request("GET", &format!("/posts/{post_id}"), None::<Value>)
+            .await
+        {
+            Ok(post) => post,
+            Err(CoreError::Api {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }) => return Err(CoreError::AnchorNotFound(post_id.to_string())),
+            Err(error) => return Err(error),
+        };
+
+        if post.channel_id != expected_channel_id {
+            return Err(CoreError::AnchorChannelMismatch {
+                post_id: post_id.to_string(),
+                channel: channel_name.to_string(),
+            });
+        }
+
+        Ok(post.is_pinned)
     }
 
     async fn request<T, B>(

@@ -17,7 +17,7 @@
     "list_teams": {
       "method": "GET",
       "path_template": "/users/me/teams",
-      "verbs": ["channels", "read --since", "read --after", "read --since-last-mine", "read --since-bootstrap", "pinned", "ack", "check", "wait", "post", "post --reply-to", "react", "unreact", "search", "notifications", "channel create", "channel archive", "channel restore", "dm send", "dm read", "dms", "notify", "channel add-member"],
+      "verbs": ["channels", "read --since", "read --after", "read --since-last-mine", "read --since-bootstrap", "pinned", "ack", "check", "wait", "post", "post --reply-to", "react", "unreact", "pin", "unpin", "search", "notifications", "channel create", "channel archive", "channel restore", "dm send", "dm read", "dms", "notify", "channel add-member"],
       "tier_b_live_smoke": true,
       "comment": "Bot team-membership enumeration. Hit by the PER-019 γ hybrid resolver on every team-bearing verb. Cached after first fetch."
     },
@@ -45,7 +45,7 @@
     "channel_by_name": {
       "method": "GET",
       "path_template": "/teams/{team_id}/channels/name/{channel_name}",
-      "verbs": ["channels", "read", "post", "search", "pinned", "ack", "check", "wait", "react", "unreact", "channel archive", "channel restore", "channel add-member"],
+      "verbs": ["channels", "read", "post", "search", "pinned", "ack", "check", "wait", "react", "unreact", "pin", "unpin", "channel archive", "channel restore", "channel add-member"],
       "tier_b_live_smoke": true,
       "comment": "Per-channel lookup by name within a resolved team. Hit by every channel-targeting verb."
     },
@@ -66,9 +66,9 @@
     "post_by_id": {
       "method": "GET",
       "path_template": "/posts/{post_id}",
-      "verbs": ["check", "read --after"],
+      "verbs": ["check", "read --after", "react", "unreact", "pin", "unpin"],
       "tier_b_live_smoke": true,
-      "comment": "Anchor-post existence probe. Hit by `assert_post_in_channel` / stale-cursor detection."
+      "comment": "Anchor-post existence probe. Hit by `assert_post_in_channel` / stale-cursor detection. PER-034 also routes through this endpoint via `fetch_post_pinned_state` to surface `was_already_pinned` / `was_already_unpinned` without an extra round-trip."
     },
     "post_thread": {
       "method": "GET",
@@ -143,6 +143,22 @@
       "verbs": ["unreact"],
       "tier_b_live_smoke": true,
       "comment": "Emoji reaction removal. Idempotent on already-removed reactions (404 → success exit per the PER-024 contract)."
+    },
+    "pin_post": {
+      "method": "POST",
+      "path_template": "/posts/{post_id}/pin",
+      "verbs": ["pin"],
+      "tier_b_live_smoke": true,
+      "tier_b_dropped_rationale": "Live smoke is best-effort: pin requires channel-admin on the disposable smoke channel. When the bot lacks admin, the verb degrades to manifest-only Tier-A coverage. PER-034 §Scope acknowledges this.",
+      "comment": "PER-034 pin write verb. Idempotent on already-pinned: chanvoy pre-reads is_pinned from the post object to surface `was_already_pinned` without an extra round-trip."
+    },
+    "unpin_post": {
+      "method": "POST",
+      "path_template": "/posts/{post_id}/unpin",
+      "verbs": ["unpin"],
+      "tier_b_live_smoke": true,
+      "tier_b_dropped_rationale": "Live smoke is best-effort: unpin requires channel-admin on the disposable smoke channel. PER-034 §Scope.",
+      "comment": "PER-034 unpin write verb. Symmetric to pin_post; idempotent on already-unpinned via `was_already_unpinned`."
     },
     "delete_channel": {
       "method": "DELETE",
