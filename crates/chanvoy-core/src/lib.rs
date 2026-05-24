@@ -629,6 +629,75 @@ pub struct ReactionResult {
     pub ok: bool,
 }
 
+/// PER-034: parameters for `chanvoy pin <channel> <post_id>`. Same
+/// shape as `ReactParams` minus the emoji; pin/unpin operate on a
+/// (channel, post-id) pair without further qualifiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinParams {
+    pub channel: String,
+    pub post_id: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-034: parameters for `chanvoy unpin <channel> <post_id>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnpinParams {
+    pub channel: String,
+    pub post_id: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// PER-034: outcome of a `chanvoy pin` call. `was_already_pinned`
+/// surfaces the pre-call pin state so wrapping scripts can
+/// distinguish "I just pinned this" from "this was already pinned" —
+/// useful for the dispatch pin-rotation workflow. Determined by
+/// reading the post object's `is_pinned` field before issuing the
+/// write (zero extra round-trips: the channel-membership assertion
+/// already needs to GET the post).
+///
+/// Field shape (per brief AC #5 + devrev PR #36 review):
+/// - `verb` and `channel_id` are explicit brief-required fields
+/// - `team` and `ok` mirror `ReactionResult`'s shape (PER-024 pre-impl
+///   pin #2) so cross-team channel disambiguation and the
+///   uniform-success contract are consistent across write verbs
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinResult {
+    /// Always `"pin"`. Lets `--json` consumers identify the verb
+    /// directly per brief §Output formats sample.
+    pub verb: String,
+    pub team: String,
+    pub channel: String,
+    /// Mattermost channel id (the stable provider-level id, not the
+    /// slug). Brief AC #5 sample field.
+    pub channel_id: String,
+    pub post_id: String,
+    /// `"pinned"` — the post-call state, distinct from `verb`.
+    pub result: String,
+    /// True iff `is_pinned` was already true when this call started.
+    pub was_already_pinned: bool,
+    pub ok: bool,
+}
+
+/// PER-034: outcome of a `chanvoy unpin` call. Symmetric to
+/// `PinResult` with `was_already_unpinned` as the idempotency
+/// signal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnpinResult {
+    /// Always `"unpin"`.
+    pub verb: String,
+    pub team: String,
+    pub channel: String,
+    pub channel_id: String,
+    pub post_id: String,
+    /// `"unpinned"`.
+    pub result: String,
+    /// True iff `is_pinned` was already false when this call started.
+    pub was_already_unpinned: bool,
+    pub ok: bool,
+}
+
 /// PER-025 primitive 1: parameters for `chanvoy search <channel>
 /// <query>`. Cross-channel / team-wide search is explicitly deferred
 /// from v1 per cross-reviewer alignment (see brief §Out of scope) —
@@ -1500,6 +1569,27 @@ pub enum CoreError {
     Json(#[from] serde_json::Error),
     #[error("api error {status}: {message}")]
     Api { status: StatusCode, message: String },
+    /// PER-034 AC #8: chanvoy normalizes MM 403 on `POST /posts/{id}/pin`
+    /// or `/unpin` into a verb-specific diagnostic that names the
+    /// missing channel-admin permission, rather than surfacing the
+    /// generic API-error path. Operators with no MM-API context see
+    /// what to ask their workspace admin for.
+    #[error(
+        "bot {bot_username:?} lacks the channel-admin permission required \
+         to {verb} posts in {team:?}/{channel:?}. \
+         Ask your Mattermost workspace admin to grant the bot the \
+         `manage_public_channel_members` / `manage_private_channel_members` \
+         scheme role on the channel, or use a profile whose bot already \
+         has channel-admin there. \
+         Mattermost reported: {message}"
+    )]
+    PinPermissionDenied {
+        verb: &'static str,
+        bot_username: String,
+        team: String,
+        channel: String,
+        message: String,
+    },
 }
 
 pub fn default_profile_dir() -> PathBuf {
@@ -3285,6 +3375,108 @@ impl MattermostClient {
         })
     }
 
+    /// PER-034: pin a post under the bot's identity. Validation
+    /// order mirrors `add_reaction`: resolve channel → assert post
+    /// in resolved channel → write. The post-fetch step also returns
+    /// the current `is_pinned` value so the result surfaces
+    /// `was_already_pinned` with no extra round-trips.
+    ///
+    /// Idempotent: re-pinning a pinned post issues the POST anyway
+    /// and accepts MM's success response (MM v4 returns 200 on
+    /// already-pinned posts). The operator-facing contract is "this
+    /// post is pinned after this call returns"; `was_already_pinned`
+    /// surfaces the prior state for callers who care.
+    pub async fn pin_post(
+        &self,
+        channel_name: &str,
+        post_id: &str,
+        team: Option<&str>,
+    ) -> Result<PinResult, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        let was_already_pinned = self
+            .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
+            .await?;
+        match self
+            .request::<Value, Value>("POST", &format!("/posts/{post_id}/pin"), None)
+            .await
+        {
+            Ok(_) => {}
+            // PER-034 AC #8: MM 403 on the pin write means the bot
+            // lacks channel-admin. Normalize into a verb-specific
+            // diagnostic naming the missing permission.
+            Err(CoreError::Api {
+                status: StatusCode::FORBIDDEN,
+                message,
+            }) => {
+                let bot_username = self.whoami().await.map(|i| i.username).unwrap_or_default();
+                return Err(CoreError::PinPermissionDenied {
+                    verb: "pin",
+                    bot_username,
+                    team: resolved.team_name,
+                    channel: resolved.channel_name,
+                    message,
+                });
+            }
+            Err(other) => return Err(other),
+        }
+        Ok(PinResult {
+            verb: "pin".to_string(),
+            team: resolved.team_name,
+            channel: resolved.channel_name,
+            channel_id: resolved.channel_id,
+            post_id: post_id.to_string(),
+            result: "pinned".to_string(),
+            was_already_pinned,
+            ok: true,
+        })
+    }
+
+    /// PER-034: unpin a post. Symmetric to `pin_post`. Idempotent
+    /// on already-unpinned (MM returns 200 either way). 403 from the
+    /// write surfaces via `CoreError::PinPermissionDenied` with
+    /// `verb: "unpin"`.
+    pub async fn unpin_post(
+        &self,
+        channel_name: &str,
+        post_id: &str,
+        team: Option<&str>,
+    ) -> Result<UnpinResult, CoreError> {
+        let resolved = self.resolve_channel(channel_name, team).await?;
+        let was_pinned = self
+            .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
+            .await?;
+        match self
+            .request::<Value, Value>("POST", &format!("/posts/{post_id}/unpin"), None)
+            .await
+        {
+            Ok(_) => {}
+            Err(CoreError::Api {
+                status: StatusCode::FORBIDDEN,
+                message,
+            }) => {
+                let bot_username = self.whoami().await.map(|i| i.username).unwrap_or_default();
+                return Err(CoreError::PinPermissionDenied {
+                    verb: "unpin",
+                    bot_username,
+                    team: resolved.team_name,
+                    channel: resolved.channel_name,
+                    message,
+                });
+            }
+            Err(other) => return Err(other),
+        }
+        Ok(UnpinResult {
+            verb: "unpin".to_string(),
+            team: resolved.team_name,
+            channel: resolved.channel_name,
+            channel_id: resolved.channel_id,
+            post_id: post_id.to_string(),
+            result: "unpinned".to_string(),
+            was_already_unpinned: !was_pinned,
+            ok: true,
+        })
+    }
+
     pub async fn read_thread(&self, root_post_id: &str) -> Result<Vec<Message>, CoreError> {
         #[derive(Deserialize)]
         struct RawPost {
@@ -3781,6 +3973,46 @@ impl MattermostClient {
         }
 
         Ok(())
+    }
+
+    /// PER-034: like `assert_post_in_channel`, but returns the
+    /// `is_pinned` field of the post so callers can surface the
+    /// pre-call pin state without a second round-trip. The
+    /// channel-mismatch and not-found error paths match
+    /// `assert_post_in_channel` exactly.
+    async fn fetch_post_pinned_state(
+        &self,
+        expected_channel_id: &str,
+        channel_name: &str,
+        post_id: &str,
+    ) -> Result<bool, CoreError> {
+        #[derive(Deserialize)]
+        struct PostResponse {
+            channel_id: String,
+            #[serde(default)]
+            is_pinned: bool,
+        }
+
+        let post: PostResponse = match self
+            .request("GET", &format!("/posts/{post_id}"), None::<Value>)
+            .await
+        {
+            Ok(post) => post,
+            Err(CoreError::Api {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }) => return Err(CoreError::AnchorNotFound(post_id.to_string())),
+            Err(error) => return Err(error),
+        };
+
+        if post.channel_id != expected_channel_id {
+            return Err(CoreError::AnchorChannelMismatch {
+                post_id: post_id.to_string(),
+                channel: channel_name.to_string(),
+            });
+        }
+
+        Ok(post.is_pinned)
     }
 
     async fn request<T, B>(

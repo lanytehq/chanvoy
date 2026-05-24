@@ -9,9 +9,9 @@ use chanvoy_core::{
     store_profile, AckResult, AttentionListResult, AttentionShowResult, AttentionSource,
     CapabilityClass, Channel, ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState,
     DaemonStatus, DmConversation, Identity, LegacyChannel, MattermostClient, Message, Notification,
-    PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
-    SeededChannelOutcome, TimeWindowDefaultUnit, UnreadNotifications, WaitResult,
-    WsConnectionState,
+    PinResult, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult,
+    SeedCursorsResult, SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult,
+    UnreadNotifications, WaitResult, WsConnectionState,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -89,6 +89,14 @@ enum CommandSet {
     /// Remove the bot's emoji reaction. Idempotent on missing-reaction
     /// (success exit).
     Unreact(ReactArgs),
+    /// Pin a post under the bot's identity. Channel positional matches
+    /// the cross-team γ hybrid resolver convention; accepts
+    /// <team>/<channel> syntax and the --team flag. Idempotent on
+    /// already-pinned: JSON output surfaces `was_already_pinned`.
+    Pin(PinArgs),
+    /// Unpin a post. Symmetric to `pin`. Idempotent on already-unpinned;
+    /// JSON output surfaces `was_already_unpinned`.
+    Unpin(PinArgs),
     /// Channel-scoped search via Mattermost's
     /// `/teams/{id}/posts/search` endpoint. Channel positional and
     /// required (cross-channel search not yet supported). Refuses
@@ -362,6 +370,20 @@ struct ReactArgs {
     /// MM-UI form (`:+1:`) is accepted with the colons stripped before
     /// the API call.
     emoji: String,
+    /// Explicit team override for cross-team channel resolution.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PinArgs {
+    /// Channel context (positional, required). Accepts
+    /// `<team>/<channel>` syntax for cross-team resolution; uses the
+    /// γ hybrid resolver (same shape as `pinned` / `react`).
+    channel: String,
+    /// Post ID to pin / unpin. Format matches `chanvoy post`'s
+    /// returned ID and `chanvoy read --json`'s `id` field.
+    post_id: String,
     /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
@@ -693,6 +715,18 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
             cli.json,
             &daemon_client(&profile)
                 .unreact_post(&args.channel, &args.post_id, &args.emoji, args.team.clone())
+                .await?,
+        ),
+        CommandSet::Pin(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .pin_post(&args.channel, &args.post_id, args.team.clone())
+                .await?,
+        ),
+        CommandSet::Unpin(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .unpin_post(&args.channel, &args.post_id, args.team.clone())
                 .await?,
         ),
         CommandSet::Search(args) => {
@@ -2358,6 +2392,29 @@ impl HumanReadable for ReactionResult {
             self.team, self.channel, self.emoji, self.post_id
         )
     }
+}
+
+impl HumanReadable for PinResult {
+    fn to_human_string(&self) -> String {
+        // PER-034 §Output formats: human-readable form is
+        // `pinned: <post-id-short> in <team>/<channel>`.
+        let short = short_post_id(&self.post_id);
+        format!("pinned: {} in {}/{}", short, self.team, self.channel)
+    }
+}
+
+impl HumanReadable for UnpinResult {
+    fn to_human_string(&self) -> String {
+        let short = short_post_id(&self.post_id);
+        format!("unpinned: {} in {}/{}", short, self.team, self.channel)
+    }
+}
+
+/// PER-034: shorten an MM post-id for the human-readable output.
+/// First 8 hex chars are sufficient for operator-visible
+/// disambiguation; full IDs land in `--json` output.
+fn short_post_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 impl HumanReadable for SearchResult {

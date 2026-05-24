@@ -610,6 +610,69 @@ async fn replay_delete_reaction() {
     assert_request_to(&server, "DELETE", &delete_path, "delete_reaction").await;
 }
 
+/// PER-034 — `pin_post` hits `POST /posts/{post_id}/pin` (covers
+/// `pin_post`) and `GET /posts/{post_id}` (covers the
+/// `fetch_post_pinned_state` helper that surfaces
+/// `was_already_pinned` without an extra round-trip).
+#[tokio::test]
+async fn replay_pin_post() {
+    let server = MockServer::start().await;
+    mount_resolver_baseline(&server).await;
+    mount_fixture(&server, "GET", &format!("/posts/{POST_ID}"), "post_by_id").await;
+    mount_fixture(
+        &server,
+        "POST",
+        &format!("/posts/{POST_ID}/pin"),
+        "pin_post",
+    )
+    .await;
+    let client = build_client(&server.uri());
+
+    client
+        .pin_post(CHANNEL_NAME, POST_ID, None)
+        .await
+        .expect("pin_post succeeds");
+
+    assert_request_to(
+        &server,
+        "POST",
+        &format!("/posts/{POST_ID}/pin"),
+        "pin_post",
+    )
+    .await;
+}
+
+/// PER-034 — `unpin_post` hits `POST /posts/{post_id}/unpin` (covers
+/// `unpin_post`). Same `fetch_post_pinned_state` pre-read shape as
+/// `pin_post`.
+#[tokio::test]
+async fn replay_unpin_post() {
+    let server = MockServer::start().await;
+    mount_resolver_baseline(&server).await;
+    mount_fixture(&server, "GET", &format!("/posts/{POST_ID}"), "post_by_id").await;
+    mount_fixture(
+        &server,
+        "POST",
+        &format!("/posts/{POST_ID}/unpin"),
+        "unpin_post",
+    )
+    .await;
+    let client = build_client(&server.uri());
+
+    client
+        .unpin_post(CHANNEL_NAME, POST_ID, None)
+        .await
+        .expect("unpin_post succeeds");
+
+    assert_request_to(
+        &server,
+        "POST",
+        &format!("/posts/{POST_ID}/unpin"),
+        "unpin_post",
+    )
+    .await;
+}
+
 /// `direct_message` hits `POST /channels/direct` (covers
 /// `create_direct_channel`) plus the user-by-username lookup. The
 /// underlying `dm send` verb is dropped from Tier-B live smoke
@@ -690,6 +753,8 @@ fn coverage_map() -> BTreeMap<&'static str, Vec<&'static str>> {
             vec![
                 "replay_create_reaction_and_post_by_id",
                 "replay_delete_reaction",
+                "replay_pin_post",
+                "replay_unpin_post",
             ],
         ),
         ("post_thread", vec!["replay_post_thread"]),
@@ -719,6 +784,8 @@ fn coverage_map() -> BTreeMap<&'static str, Vec<&'static str>> {
             vec!["replay_create_reaction_and_post_by_id"],
         ),
         ("delete_reaction", vec!["replay_delete_reaction"]),
+        ("pin_post", vec!["replay_pin_post"]),
+        ("unpin_post", vec!["replay_unpin_post"]),
         ("delete_channel", vec!["replay_delete_channel"]),
         ("search_posts", vec!["replay_search_posts"]),
     ])
