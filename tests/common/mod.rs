@@ -29,7 +29,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chanvoy_core::{AttentionState, Profile};
+use chanvoy_core::{AttentionState, Profile, ReducePolicy};
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 use wiremock::matchers::{method, path};
@@ -50,6 +50,11 @@ pub struct TestEnv {
     pub profile_name: String,
     pub token_env_name: String,
     pub token_value: String,
+    /// PER-035: extra env vars injected child-only into every
+    /// `chanvoy_command`. Used to supply a *second* bot token (the
+    /// family identity a stream profile reduces to) so the daemon can
+    /// build its reduce writer at startup. Empty by default.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl TestEnv {
@@ -61,7 +66,54 @@ impl TestEnv {
             profile_name: profile_name.to_string(),
             token_env_name: "LANYTE_MM_TOKEN".to_string(),
             token_value: "test-token-value".to_string(),
+            extra_env: Vec::new(),
         }
+    }
+
+    /// PER-035: register an additional env var (e.g. a family-bot token)
+    /// injected child-only into every subsequent `chanvoy_command`.
+    pub fn set_extra_env(&mut self, name: &str, value: &str) {
+        self.extra_env.push((name.to_string(), value.to_string()));
+    }
+
+    /// PER-035: write an arbitrarily-named profile (the default
+    /// `write_default_profile` always uses `self.profile_name`). Used to
+    /// materialize the *family* profile a stream profile reduces to, and
+    /// to set a `[reduce]` policy on the stream profile. `env_name` lets
+    /// the family profile read a different token env than the stream's.
+    pub fn write_named_profile(
+        &self,
+        name: &str,
+        bot_username: &str,
+        team_name: &str,
+        env_name: &str,
+        reduce_use_profile: Option<&str>,
+    ) {
+        let profile = Profile {
+            name: name.to_string(),
+            role: "dataeng".to_string(),
+            scope: "galaxy".to_string(),
+            provider: chanvoy_core::Provider::Mattermost,
+            bot_username: bot_username.to_string(),
+            team_name: team_name.to_string(),
+            server_url: self.server_url(),
+            env_name: env_name.to_string(),
+            env_file: None,
+            credential_mode: chanvoy_core::CredentialMode::EnvName,
+            capability_class: chanvoy_core::CapabilityClass::Standard,
+            monitored_channels: Vec::new(),
+            ipc: None,
+            reduce: reduce_use_profile.map(|p| ReducePolicy {
+                use_profile: p.to_string(),
+            }),
+        };
+        let dir = self.chanvoy_config_dir().join("profiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(format!("{name}.toml"));
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(toml::to_string_pretty(&profile).unwrap().as_bytes())
+            .unwrap();
     }
 
     pub fn server_url(&self) -> String {
@@ -129,6 +181,7 @@ impl TestEnv {
             capability_class: chanvoy_core::CapabilityClass::Standard,
             monitored_channels: monitored_channels.iter().map(|s| s.to_string()).collect(),
             ipc: None,
+            reduce: None,
         };
         let dir = self.profile_path().parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
@@ -310,6 +363,11 @@ impl TestEnv {
             .env("CHANVOY_CONFIG_DIR", self.chanvoy_config_dir())
             .env("CHANVOY_RUNTIME_DIR", self.chanvoy_runtime_dir())
             .env(&self.token_env_name, &self.token_value);
+        // PER-035: inject any extra tokens (e.g. the family-bot token a
+        // stream profile reduces to) child-only.
+        for (name, value) in &self.extra_env {
+            cmd.env(name, value);
+        }
         cmd
     }
 }

@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    check_search_operator_conflicts, list_profiles, load_active_profile, load_token,
+    check_search_operator_conflicts, list_profiles, load_active_profile, load_profile, load_token,
     parse_time_window, pid_path_for_profile, socket_path_for_profile, store_active_profile,
     store_profile, AckResult, AttentionListResult, AttentionShowResult, AttentionSource,
     CapabilityClass, Channel, ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState,
@@ -157,6 +157,17 @@ struct AutoSetupArgs {
     /// secondary profile without stealing active-profile resolution (multi-profile operators).
     #[arg(long)]
     no_activate: bool,
+    /// PER-035: register an identity-reduction policy on this profile.
+    /// The value is the bare family profile name to reduce to. After
+    /// bootstrap, channel-targeted writes whose resolved channel lives
+    /// outside this profile's team post under the family identity
+    /// instead — no per-call `--profile` discipline needed. The scope
+    /// marker is the profile's own `team_name` (set from the sourced
+    /// identity); there is no separate `--reduce-outside-team` flag.
+    /// Omitting the flag on a refresh preserves any existing policy;
+    /// passing a new value updates it (surfaced as a refresh).
+    #[arg(long, value_name = "FAMILY_PROFILE")]
+    reduce_profile: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -173,6 +184,17 @@ enum ProfileCommand {
     Active,
     Create(ProfileCreateArgs),
     CreateFromEnv(ProfileCreateFromEnvArgs),
+    /// PER-035 diagnostic: report a profile's identity + reduction
+    /// policy. Read-only; operates on profile storage directly (no
+    /// daemon, no resolver) so it works for a freshly-provisioned
+    /// stream profile before its daemon is up.
+    Show(ProfileShowArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProfileShowArgs {
+    /// Profile name to inspect (e.g. `dataeng-galaxy-s2`).
+    name: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -967,7 +989,65 @@ async fn handle_profile(json: bool, command: ProfileCommand) -> Result<(), CliEr
             let profile = profile_from_env_args(&args).await?;
             store_profile_and_maybe_activate(json, &profile, args.activate)
         }
+        ProfileCommand::Show(args) => handle_profile_show(json, &args.name),
     }
+}
+
+/// PER-035: report a profile's identity + reduction policy. The
+/// `reduce` block, when present, is reported with the family target and
+/// a one-line semantics reminder so an operator can confirm a stream
+/// profile is configured before relying on auto-reduction. Surfaces
+/// whether the named `use_profile` exists on disk (a dangling target is
+/// the negative case the daemon refuses to start on).
+fn handle_profile_show(json: bool, name: &str) -> Result<(), CliError> {
+    let profile = load_profile(name)?;
+    let reduce_target_exists = profile
+        .reduce
+        .as_ref()
+        .map(|r| load_profile(&r.use_profile).is_ok());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": profile.name,
+                "role": profile.role,
+                "scope": profile.scope,
+                "bot_username": profile.bot_username,
+                "team_name": profile.team_name,
+                "server_url": profile.server_url,
+                "reduce": profile.reduce.as_ref().map(|r| serde_json::json!({
+                    "use_profile": r.use_profile,
+                    "use_profile_exists": reduce_target_exists,
+                })),
+            }))?
+        );
+        return Ok(());
+    }
+    println!("profile:      {}", profile.name);
+    println!(
+        "identity:     {} ({}/{})",
+        profile.bot_username, profile.role, profile.scope
+    );
+    println!("team_name:    {}", profile.team_name);
+    println!("server_url:   {}", profile.server_url);
+    match &profile.reduce {
+        Some(policy) => {
+            println!("reduce:       → {} (identity-reduce)", policy.use_profile);
+            println!(
+                "              posts inside {} keep this identity; posts elsewhere reduce to {}",
+                profile.team_name, policy.use_profile
+            );
+            if reduce_target_exists == Some(false) {
+                println!(
+                    "  WARNING:    reduce target '{}' does not exist on disk — the daemon will \
+                     refuse to start until it is created or the policy is corrected",
+                    policy.use_profile
+                );
+            }
+        }
+        None => println!("reduce:       (none — this profile posts as itself everywhere)"),
+    }
+    Ok(())
 }
 
 async fn handle_auto_setup(
@@ -975,13 +1055,14 @@ async fn handle_auto_setup(
     profile_override: Option<&str>,
     args: AutoSetupArgs,
 ) -> Result<(), CliError> {
-    let desired = match build_desired_profile_from_env(profile_override) {
-        Ok(profile) => profile,
-        Err(err) => {
-            print_auto_setup_error(json, "env_input", &err.to_string())?;
-            process::exit(EXIT_ENV_INPUT);
-        }
-    };
+    let desired =
+        match build_desired_profile_from_env(profile_override, args.reduce_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(err) => {
+                print_auto_setup_error(json, "env_input", &err.to_string())?;
+                process::exit(EXIT_ENV_INPUT);
+            }
+        };
 
     let existing = match chanvoy_core::load_profile(&desired.name) {
         Ok(existing) => Some(existing),
@@ -1174,6 +1255,15 @@ fn merge_forward_for_refresh(mut desired: Profile, existing: &Profile) -> Profil
     if desired.env_file.is_none() && existing.env_file.is_some() {
         desired.env_file = existing.env_file.clone();
     }
+    // PER-035: reduction policy is flag-owned but sticky. Omitting
+    // `--reduce-profile` on a refresh (desired.reduce == None) preserves
+    // any previously-configured policy; passing the flag carries the new
+    // value forward and is surfaced as a refresh diff. (Removing a
+    // policy is YAGNI — no `--no-reduce` today; rewrite the profile or
+    // edit the TOML.)
+    if desired.reduce.is_none() {
+        desired.reduce = existing.reduce.clone();
+    }
     desired
 }
 
@@ -1218,7 +1308,10 @@ fn print_identity_drift_error(json: bool, diff: &[ProfileFieldDiff]) -> Result<(
     Ok(())
 }
 
-fn build_desired_profile_from_env(profile_override: Option<&str>) -> Result<Profile, CliError> {
+fn build_desired_profile_from_env(
+    profile_override: Option<&str>,
+    reduce_profile: Option<&str>,
+) -> Result<Profile, CliError> {
     let role = required_env("LANYTE_AGENT_ROLE")?;
     let scope = required_env("LANYTE_AGENT_SCOPE")?;
     let server_url = required_env("LANYTE_MM_URL")?;
@@ -1248,6 +1341,15 @@ fn build_desired_profile_from_env(profile_override: Option<&str>) -> Result<Prof
         capability_class: CapabilityClass::Standard,
         monitored_channels: Vec::new(),
         ipc: None,
+        // PER-035: reduction policy from the `--reduce-profile` flag.
+        // The scope marker is `team_name` (derived above from scope), so
+        // no second field is needed. None ⇒ no reduction (today's
+        // behavior); on a refresh, a None here is merge-forward-preserved
+        // from the existing profile so omitting the flag never wipes a
+        // configured policy.
+        reduce: reduce_profile.map(|name| chanvoy_core::ReducePolicy {
+            use_profile: name.to_string(),
+        }),
     };
     validate_profile_create_args(&profile)?;
     // Missing credential is an env-input problem (exit 2), not a remote preflight
@@ -1577,6 +1679,28 @@ fn refreshable_profile_diff(from: &Profile, to: &Profile) -> Vec<ProfileFieldDif
         &format!("{:?}", from.capability_class),
         &format!("{:?}", to.capability_class),
     );
+    // PER-035: a *changed* reduction policy is a visible refresh, never
+    // an identity-drift hard-error (it does not change WHO the profile
+    // authenticates as or WHERE its primary team is — only which family
+    // identity outside-team writes defer to). Only diff when `to` (the
+    // env/flag-derived desired) actually carries a policy: omitting the
+    // flag leaves `to.reduce == None`, which merge-forward then restores
+    // from `from`, so a no-flag refresh must not register a spurious
+    // diff here.
+    if to.reduce.is_some() && from.reduce != to.reduce {
+        push_if_diff(
+            &mut diff,
+            "reduce.use_profile",
+            from.reduce
+                .as_ref()
+                .map(|r| r.use_profile.as_str())
+                .unwrap_or("(none)"),
+            to.reduce
+                .as_ref()
+                .map(|r| r.use_profile.as_str())
+                .unwrap_or("(none)"),
+        );
+    }
     // Excluded from all diffs: `name` (key), `bot_username` (derived from token),
     // `monitored_channels`, `ipc`, `env_file`, `provider` (pass through via merge-forward).
     diff
@@ -1919,6 +2043,9 @@ fn profile_from_create_args(args: &ProfileCreateArgs) -> Profile {
         },
         monitored_channels: Vec::new(),
         ipc: None,
+        // PER-035: `profile create` does not expose a reduction flag;
+        // reduction policy is set via `auto-setup --reduce-profile`.
+        reduce: None,
     }
 }
 
@@ -1955,6 +2082,9 @@ async fn profile_from_env_args(args: &ProfileCreateFromEnvArgs) -> Result<Profil
         },
         monitored_channels: Vec::new(),
         ipc: None,
+        // PER-035: reduction policy is auto-setup-owned, not a
+        // `profile create-from-env` surface.
+        reduce: None,
     };
 
     validate_profile_create_args(&profile)?;
@@ -3081,6 +3211,7 @@ mod tests {
             capability_class: CapabilityClass::Standard,
             monitored_channels: Vec::new(),
             ipc: None,
+            reduce: None,
         }
     }
 
@@ -3165,6 +3296,81 @@ mod tests {
         assert!(identity_surface_diff(&a, &b).is_empty());
     }
 
+    // ---- PER-035: reduction policy in auto-setup decide/merge logic ----
+
+    fn reduce_to(name: &str) -> Option<chanvoy_core::ReducePolicy> {
+        Some(chanvoy_core::ReducePolicy {
+            use_profile: name.to_string(),
+        })
+    }
+
+    #[test]
+    fn changing_reduce_policy_is_a_refresh_not_identity_drift() {
+        // A new/changed reduction target is a visible refresh — it does
+        // not change WHO the profile authenticates as or its primary
+        // team, so it must never hard-error as identity drift.
+        let mut desired = sample_profile();
+        desired.reduce = reduce_to("dataeng-galaxy");
+        let existing = sample_profile(); // reduce: None
+        match decide_profile_action(&desired, Some(&existing)) {
+            ProfileAction::Refresh(diff) => {
+                assert_eq!(diff.len(), 1);
+                assert_eq!(diff[0].field, "reduce.use_profile");
+                assert_eq!(diff[0].to, "dataeng-galaxy");
+            }
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn omitting_reduce_flag_on_refresh_preserves_existing_policy() {
+        // desired.reduce == None models "flag not passed". decide must
+        // NOT register a spurious diff (Reuse), and merge-forward must
+        // restore the existing policy so it is not wiped.
+        let desired = sample_profile(); // reduce: None (flag omitted)
+        let mut existing = sample_profile();
+        existing.reduce = reduce_to("dataeng-galaxy");
+        assert_eq!(
+            decide_profile_action(&desired, Some(&existing)),
+            ProfileAction::Reuse
+        );
+        let merged = merge_forward_for_refresh(desired, &existing);
+        assert_eq!(
+            merged.reduce.as_ref().map(|r| r.use_profile.as_str()),
+            Some("dataeng-galaxy"),
+            "omitting --reduce-profile must preserve the existing policy"
+        );
+    }
+
+    #[test]
+    fn unchanged_reduce_policy_reuses() {
+        let mut desired = sample_profile();
+        desired.reduce = reduce_to("dataeng-galaxy");
+        let mut existing = sample_profile();
+        existing.reduce = reduce_to("dataeng-galaxy");
+        assert_eq!(
+            decide_profile_action(&desired, Some(&existing)),
+            ProfileAction::Reuse
+        );
+    }
+
+    #[test]
+    fn repointing_reduce_target_is_a_refresh() {
+        let mut desired = sample_profile();
+        desired.reduce = reduce_to("dataeng-galaxy-new");
+        let mut existing = sample_profile();
+        existing.reduce = reduce_to("dataeng-galaxy-old");
+        match decide_profile_action(&desired, Some(&existing)) {
+            ProfileAction::Refresh(diff) => {
+                assert_eq!(diff.len(), 1);
+                assert_eq!(diff[0].field, "reduce.use_profile");
+                assert_eq!(diff[0].from, "dataeng-galaxy-old");
+                assert_eq!(diff[0].to, "dataeng-galaxy-new");
+            }
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+    }
+
     #[test]
     fn check_token_available_maps_missing_env_to_bootstrap() {
         // devrev finding #2 (chanvoy#7): missing token env is an env-input failure
@@ -3185,6 +3391,7 @@ mod tests {
             capability_class: CapabilityClass::Standard,
             monitored_channels: Vec::new(),
             ipc: None,
+            reduce: None,
         };
         let err = check_token_available(&profile).expect_err("must fail when env unset");
         assert!(
