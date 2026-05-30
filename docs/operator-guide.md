@@ -565,10 +565,20 @@ selects *which* reduction policy applies; the policy then fires);
 `chanvoy --profile dataeng-galaxy post <outside-channel>` does **not**
 reduce (the family profile carries no policy).
 
-If `reduce.use_profile` does not exist on disk, the daemon **refuses to
-start** with a clear diagnostic rather than silently posting stream
-identity into the galaxy. Inspect a profile's policy (and whether its
-target resolves) with:
+The family profile **must have its own token env** (a distinct
+`env_name` from the stream profile). At startup the daemon loads the
+family token and validates it with `whoami` against the family profile's
+expected bot — if the family profile shares `env_name` with the stream
+(both default `LANYTE_MM_TOKEN`), it would resolve to the *stream* token
+in a stream shell, and the daemon **refuses to start** with a
+`ReduceIdentityMismatch` rather than post stream identity under a false
+family attribution. Give the family profile a dedicated token env (e.g.
+`CHANVOY_TOKEN_ENV_NAME=FAMILY_MM_TOKEN` when running its `auto-setup`).
+
+If `reduce.use_profile` does not exist on disk, the daemon likewise
+**refuses to start** with a clear diagnostic rather than silently
+posting stream identity into the galaxy. Inspect a profile's policy (and
+whether its target resolves) with:
 
 ```bash
 chanvoy profile show dataeng-galaxy-s2

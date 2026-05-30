@@ -1627,6 +1627,25 @@ pub enum CoreError {
         missing: String,
         available: Vec<String>,
     },
+    /// PER-035 (devrev PR #37 P1): the token loaded for a reduce target
+    /// authenticates as a *different* bot than the family profile names.
+    /// This is the silent-identity-leak guard: if the family profile
+    /// shares an `env_name` with the stream profile, `load_token` returns
+    /// the stream token, and the "family" client would post as the
+    /// stream bot while the audit log claimed family identity. The daemon
+    /// refuses to start rather than leak stream identity into the galaxy
+    /// under a false attribution.
+    #[error(
+        "reduce target profile '{profile}' is configured for bot '{expected}', but the token \
+         resolved for it authenticates as '{actual}' — the family profile likely shares an \
+         env_name/token source with the calling (stream) profile. Give the family profile its \
+         own token env (distinct `env_name`) so its identity cannot be shadowed by the stream's."
+    )]
+    ReduceIdentityMismatch {
+        profile: String,
+        expected: String,
+        actual: String,
+    },
     #[error("unknown provider in profile")]
     UnsupportedProvider,
     #[error("io error: {0}")]

@@ -138,7 +138,22 @@ fn log_posting_identity(
 /// from the daemon's environment via the family profile's
 /// `credential_mode`; an unresolvable token surfaces as a normal
 /// token-load error so the operator sees exactly what is missing.
-fn build_reduce_writer(
+///
+/// PER-035 (devrev PR #37 P1): the loaded token is **validated** with a
+/// `whoami` against the family profile's expected `bot_username` before
+/// the writer is trusted. Without this, a family profile that shares an
+/// `env_name` with the stream profile (both default `LANYTE_MM_TOKEN`)
+/// would load the *stream* token in a stream shell — every outside-team
+/// write would post as the stream bot while the audit log claimed
+/// family identity. The whoami-returned username is recorded as the
+/// authoritative audit identity (so the log can never disagree with the
+/// token that actually posts). This is a network call at startup, made
+/// only for reduce-configured profiles; it fails closed (the daemon
+/// refuses to start) on mismatch or unreachable identity endpoint,
+/// because a stream daemon that cannot prove its family identity must
+/// not bind — every reduced write would otherwise be a potential
+/// identity leak.
+async fn build_reduce_writer(
     calling: &Profile,
     policy: &chanvoy_core::ReducePolicy,
 ) -> Result<ReduceWriter, DaemonError> {
@@ -159,9 +174,21 @@ fn build_reduce_writer(
     };
     let token = load_token(&family)?;
     let client = MattermostClient::new(&family, token)?;
+    let identity = client.whoami().await?;
+    if !family.bot_username.is_empty() && identity.username != family.bot_username {
+        return Err(CoreError::ReduceIdentityMismatch {
+            profile: family.name.clone(),
+            expected: family.bot_username.clone(),
+            actual: identity.username,
+        }
+        .into());
+    }
     Ok(ReduceWriter {
         profile_name: family.name.clone(),
-        bot_username: family.bot_username.clone(),
+        // Authoritative, whoami-verified identity — never the
+        // potentially-stale stored value, so the audit log cannot
+        // disagree with the token that actually posts.
+        bot_username: identity.username,
         client,
     })
 }
@@ -199,7 +226,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     // silently post stream identity into the galaxy.
     let reduce_writer = match &profile.reduce {
         Some(policy) => {
-            let writer = build_reduce_writer(&profile, policy)?;
+            let writer = build_reduce_writer(&profile, policy).await?;
             info!(
                 profile = profile_name,
                 reduce_to = %writer.profile_name,

@@ -34,7 +34,7 @@ mod common;
 use std::time::Duration;
 
 use common::{run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 const STREAM_PROFILE: &str = "dataeng-galaxy-s2";
@@ -77,14 +77,29 @@ async fn stream_env(slug: &str, reduce_target: &str) -> TestEnv {
     env
 }
 
-/// Daemon-startup whoami for the STREAM identity (legacy `daemon serve`
-/// path runs a network whoami and asserts it matches `bot_username`).
-async fn mock_stream_startup(env: &TestEnv) {
+/// Token-keyed `/users/me` mocks. Two distinct identities resolve by
+/// bearer token so startup validation can tell the stream and family
+/// clients apart:
+/// - the STREAM token authenticates as the stream bot (primary
+///   `daemon serve` whoami),
+/// - the FAMILY token authenticates as the family bot (PER-035 reduce-
+///   writer validation, devrev PR #37 P1).
+///
+/// This is what makes the leak detectable: if both profiles resolved
+/// the same token, the family client's whoami would return the wrong
+/// bot and startup would refuse.
+async fn mock_identities(env: &TestEnv) {
+    mock_whoami_for_token(env, STREAM_TOKEN, "stream-bot-id", STREAM_BOT).await;
+    mock_whoami_for_token(env, FAMILY_TOKEN, "family-bot-id", FAMILY_BOT).await;
+}
+
+async fn mock_whoami_for_token(env: &TestEnv, token: &str, bot_id: &str, username: &str) {
     Mock::given(method("GET"))
         .and(path("/api/v4/users/me"))
+        .and(header("authorization", format!("Bearer {token}").as_str()))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": "stream-bot-id",
-            "username": STREAM_BOT,
+            "id": bot_id,
+            "username": username,
             "is_bot": true,
             "nickname": null,
             "email": null,
@@ -171,7 +186,7 @@ async fn bearer_for(env: &TestEnv, req_method: &str, req_path: &str) -> String {
 #[ignore = "integration: run via make test-integration"]
 async fn post_reduces_to_family_identity_outside_team() {
     let env = stream_env("reduce-outside", FAMILY_PROFILE).await;
-    mock_stream_startup(&env).await;
+    mock_identities(&env).await;
     // Explicit `--team` resolution routes through the bot's membership
     // list (`GET /users/me/teams`), not `GET /teams/name/...`.
     mock_team_membership(&env).await;
@@ -226,7 +241,7 @@ async fn post_reduces_to_family_identity_outside_team() {
 #[ignore = "integration: run via make test-integration"]
 async fn post_keeps_stream_identity_in_engagement_team() {
     let env = stream_env("no-reduce-in-team", FAMILY_PROFILE).await;
-    mock_stream_startup(&env).await;
+    mock_identities(&env).await;
     // Primary-team resolution: team-by-name for the engagement team +
     // channel lookup under it. No --team flag → primary path.
     mock_team_by_name(&env, STREAM_TEAM, "team-codename-id").await;
@@ -265,7 +280,7 @@ async fn post_keeps_stream_identity_in_engagement_team() {
 #[ignore = "integration: run via make test-integration"]
 async fn whoami_returns_stream_identity_no_reduction() {
     let env = stream_env("whoami", FAMILY_PROFILE).await;
-    mock_stream_startup(&env).await;
+    mock_identities(&env).await;
 
     let daemon = spawn_daemon(&env).await;
     let out = run_chanvoy(&env, &["--json", "whoami"]).await;
@@ -378,7 +393,7 @@ async fn missing_reduce_target_refuses_daemon_start() {
         "LANYTE_MM_TOKEN",
         Some("dataeng-galaxy-does-not-exist"),
     );
-    mock_stream_startup(&env).await;
+    mock_identities(&env).await;
 
     // `daemon serve` returns immediately on a start error (before
     // binding the socket); on success it would block, so bound the wait.
@@ -406,5 +421,64 @@ async fn missing_reduce_target_refuses_daemon_start() {
     assert!(
         stderr.contains("ReduceProfileNotFound"),
         "diagnostic must attribute the failure to the reduction policy; got: {stderr}"
+    );
+}
+
+/// Brief AC negative case + devrev PR #37 P1: a reduce target whose
+/// token authenticates as a *different* bot than the family profile
+/// names must refuse daemon start — never silently post stream identity
+/// under a false family attribution. We give the family profile the
+/// SAME `env_name` (`LANYTE_MM_TOKEN`) as the stream, so in this shell
+/// it resolves to the stream token and the family client's whoami
+/// returns the stream bot. Startup must refuse with
+/// `ReduceIdentityMismatch` naming the expected family bot.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn reduce_target_token_shadowed_by_stream_refuses_start() {
+    let env = TestEnv::new(STREAM_PROFILE).await;
+    // Stream profile reduces to the family profile.
+    env.write_named_profile(
+        STREAM_PROFILE,
+        STREAM_BOT,
+        STREAM_TEAM,
+        "LANYTE_MM_TOKEN",
+        Some(FAMILY_PROFILE),
+    );
+    // Family profile shares the stream's token env — the leak setup.
+    // In this shell LANYTE_MM_TOKEN holds the STREAM token, so the
+    // family client would authenticate as the stream bot.
+    env.write_named_profile(
+        FAMILY_PROFILE,
+        FAMILY_BOT,
+        FAMILY_TEAM,
+        "LANYTE_MM_TOKEN",
+        None,
+    );
+    mock_identities(&env).await;
+
+    let serve = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(STREAM_PROFILE)
+        .arg("daemon")
+        .arg("serve")
+        .output();
+    let out = tokio::time::timeout(Duration::from_secs(10), serve)
+        .await
+        .expect("daemon serve must fail fast on a shadowed reduce identity, not block")
+        .expect("spawn daemon serve");
+
+    assert!(
+        !out.status.success(),
+        "daemon serve must exit non-zero when the reduce token authenticates as the wrong bot"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ReduceIdentityMismatch"),
+        "diagnostic must attribute the failure to identity-mismatch; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(FAMILY_BOT) && stderr.contains(STREAM_BOT),
+        "diagnostic must name both the expected (family) and actual (stream) bot; got: {stderr}"
     );
 }
