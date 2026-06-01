@@ -333,6 +333,7 @@ mod tests {
             capability_class: CapabilityClass::Standard,
             monitored_channels: Vec::new(),
             ipc: None,
+            reduce: None,
         }
     }
 

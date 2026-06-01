@@ -150,6 +150,7 @@ fn build_client(mock_url: &str) -> MattermostClient {
         capability_class: CapabilityClass::Standard,
         monitored_channels: vec![],
         ipc: None,
+        reduce: None,
     };
     MattermostClient::new(&profile, "fixture-token".to_string()).expect("build MattermostClient")
 }

@@ -6,17 +6,17 @@ use std::sync::Arc;
 use std::{env, fs, io};
 
 use chanvoy_core::{
-    daemon_event_to_notification, load_attention_state, load_profile, load_token, now_unix_millis,
-    pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile, store_attention_state,
-    AckChannelParams, AckResult, AddMemberParams, ArchiveChannelParams, AttentionShowParams,
-    AttentionState, CapabilityClass, Channel, CheckChannelParams, CheckResult, CoreError,
-    CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, DaemonHealth,
-    DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
-    NotifyParams, PinParams, PinResult, PinnedChannelParams, PostMessageParams, Profile,
-    ProfileStatus, Provider, ReactParams, ReactionResult, ReadChannelParams,
-    ReadDirectMessageParams, SearchParams, SearchResult, ShutdownResult, SubscribeParams,
-    SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult, UnreactParams,
+    daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
+    now_unix_millis, pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile,
+    store_attention_state, AckChannelParams, AckResult, AddMemberParams, ArchiveChannelParams,
+    AttentionShowParams, AttentionState, CapabilityClass, Channel, CheckChannelParams, CheckResult,
+    CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
+    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs,
+    NotificationsParams, NotifyParams, PinParams, PinResult, PinnedChannelParams,
+    PostMessageParams, Profile, ProfileStatus, Provider, ReactParams, ReactionResult,
+    ReadChannelParams, ReadDirectMessageParams, SearchParams, SearchResult, ShutdownResult,
+    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult, UnreactParams,
     UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
@@ -62,6 +62,135 @@ struct AppState {
     /// stays bound so operators can query `daemon_status` to learn what's
     /// wrong.
     identity_drift: Arc<AtomicBool>,
+    /// PER-035: the family-identity writer this profile reduces to, if a
+    /// `[reduce]` policy is configured. `None` ⇒ no reduction; every
+    /// write posts under `client`'s identity (today's behavior). Built
+    /// once at `start()` from `profile.reduce.use_profile`; a missing
+    /// target fails startup (never a silent bare-identity fallback).
+    reduce_writer: Option<ReduceWriter>,
+}
+
+/// PER-035: a pre-built client bound to the family profile a stream
+/// profile reduces to. Channel-targeted **writes** whose resolved
+/// channel lives outside the calling profile's `team_name` route their
+/// terminal MM call through this client; resolution and pre-write
+/// verification always stay on the calling `AppState::client`.
+#[derive(Clone)]
+struct ReduceWriter {
+    /// Family profile name (the reduce target). Surfaced in the
+    /// startup log so operators can confirm the active reduction.
+    profile_name: String,
+    /// Family bot username, captured from the family profile so the
+    /// audit log can name the posting identity without a startup whoami.
+    bot_username: String,
+    /// Client bound to the family profile's token.
+    client: MattermostClient,
+}
+
+impl AppState {
+    /// PER-035: pick the client that performs the terminal write for a
+    /// channel that resolved into `resolved_team`. Reduces to the family
+    /// identity iff a reduction policy is configured AND the channel
+    /// lives outside this profile's `team_name` (the brief's §Scope
+    /// rule, via the pure `identity_reduces` helper). Returns the chosen
+    /// client, the bot username it posts as (audit logging), and whether
+    /// reduction was applied. With no policy, or for an in-team channel,
+    /// returns this profile's own client unchanged.
+    fn select_writer(&self, resolved_team: &str) -> (&MattermostClient, &str, bool) {
+        match &self.reduce_writer {
+            Some(rw) if chanvoy_core::identity_reduces(&self.profile.team_name, resolved_team) => {
+                (&rw.client, rw.bot_username.as_str(), true)
+            }
+            _ => (&self.client, self.profile.bot_username.as_str(), false),
+        }
+    }
+}
+
+/// PER-035: emit the audit-log line for a channel-targeted write,
+/// naming the PER-019 channel-resolution provenance and the PER-035
+/// posting-identity provenance independently (brief AC). `posting_identity`
+/// is the bot the terminal write actually lands under.
+fn log_posting_identity(
+    verb: &str,
+    state: &AppState,
+    resolved: &chanvoy_core::ResolvedChannel,
+    posting_identity: &str,
+    reduced: bool,
+) {
+    let provenance = chanvoy_core::posting_provenance_tags(resolved.resolution_source, reduced);
+    info!(
+        verb,
+        selected_profile = %state.profile.name,
+        posting_identity = %posting_identity,
+        channel = %resolved.channel_name,
+        team = %resolved.team_name,
+        channel_resolution = ?resolved.resolution_source,
+        identity_reduced = reduced,
+        provenance = ?provenance,
+        "chanvoy write identity resolution"
+    );
+}
+
+/// PER-035: build the family-identity writer for a profile that carries
+/// a reduction policy. A missing reduce target is a loud
+/// `ReduceProfileNotFound` (brief AC: negative case — never a silent
+/// fall-back to the bare daemon identity). The family token is loaded
+/// from the daemon's environment via the family profile's
+/// `credential_mode`; an unresolvable token surfaces as a normal
+/// token-load error so the operator sees exactly what is missing.
+///
+/// PER-035 (devrev PR #37 P1): the loaded token is **validated** with a
+/// `whoami` against the family profile's expected `bot_username` before
+/// the writer is trusted. Without this, a family profile that shares an
+/// `env_name` with the stream profile (both default `LANYTE_MM_TOKEN`)
+/// would load the *stream* token in a stream shell — every outside-team
+/// write would post as the stream bot while the audit log claimed
+/// family identity. The whoami-returned username is recorded as the
+/// authoritative audit identity (so the log can never disagree with the
+/// token that actually posts). This is a network call at startup, made
+/// only for reduce-configured profiles; it fails closed (the daemon
+/// refuses to start) on mismatch or unreachable identity endpoint,
+/// because a stream daemon that cannot prove its family identity must
+/// not bind — every reduced write would otherwise be a potential
+/// identity leak.
+async fn build_reduce_writer(
+    calling: &Profile,
+    policy: &chanvoy_core::ReducePolicy,
+) -> Result<ReduceWriter, DaemonError> {
+    let family = match load_profile(&policy.use_profile) {
+        Ok(family) => family,
+        Err(CoreError::ProfileNotFound(_)) => {
+            let available = list_profiles()
+                .map(|profiles| profiles.into_iter().map(|p| p.name).collect())
+                .unwrap_or_default();
+            return Err(CoreError::ReduceProfileNotFound {
+                calling: calling.name.clone(),
+                missing: policy.use_profile.clone(),
+                available,
+            }
+            .into());
+        }
+        Err(other) => return Err(other.into()),
+    };
+    let token = load_token(&family)?;
+    let client = MattermostClient::new(&family, token)?;
+    let identity = client.whoami().await?;
+    if !family.bot_username.is_empty() && identity.username != family.bot_username {
+        return Err(CoreError::ReduceIdentityMismatch {
+            profile: family.name.clone(),
+            expected: family.bot_username.clone(),
+            actual: identity.username,
+        }
+        .into());
+    }
+    Ok(ReduceWriter {
+        profile_name: family.name.clone(),
+        // Authoritative, whoami-verified identity — never the
+        // potentially-stale stored value, so the audit log cannot
+        // disagree with the token that actually posts.
+        bot_username: identity.username,
+        client,
+    })
 }
 
 #[derive(Serialize)]
@@ -90,6 +219,24 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     }
     let token = load_token(&profile)?;
     let client = MattermostClient::new(&profile, token)?;
+
+    // PER-035: if this profile carries a reduction policy, build the
+    // family-identity writer up-front. Loud failure on a missing target
+    // (the brief's negative case) — we must not bind a daemon that would
+    // silently post stream identity into the galaxy.
+    let reduce_writer = match &profile.reduce {
+        Some(policy) => {
+            let writer = build_reduce_writer(&profile, policy).await?;
+            info!(
+                profile = profile_name,
+                reduce_to = %writer.profile_name,
+                reduce_identity = %writer.bot_username,
+                "PER-035 reduction policy active: outside-team writes reduce to family identity"
+            );
+            Some(writer)
+        }
+        None => None,
+    };
 
     // PER-014: three startup paths, distinguished by whether the parent
     // advertised a handoff via `CHANVOY_BOOTSTRAP_NONCE` and whether the
@@ -219,6 +366,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         ipc_state,
         attention_state: Arc::new(Mutex::new(attention)),
         identity_drift,
+        reduce_writer,
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -690,33 +838,39 @@ async fn dispatch_request(
             .map(to_value)
         }
         "post_message" => parse_and_call(&request.params, |params: PostMessageParams| async move {
-            // PER-024 primitive 1: when thread_root_id is set, route to
-            // the threaded path which performs resolve→verify→write
-            // (validation order per AC #3). Cursor recording semantics
-            // are unchanged — both top-level and threaded posts advance
-            // the channel cursor, since both result in a write the
-            // operator wants reflected in attention state.
+            // PER-035: resolve the channel on the CALLING identity
+            // (resolution + verification never reduce), decide whether
+            // the terminal write reduces to the family identity, then
+            // write through the chosen client. PER-024 threaded path is
+            // preserved: when thread_root_id is set we verify the parent
+            // exists on the resolved channel (calling identity) before
+            // the threaded write.
+            let resolved = state
+                .client
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            let (writer, posting_identity, reduced) = state.select_writer(&resolved.team_name);
+            log_posting_identity("post", state, &resolved, posting_identity, reduced);
             let receipt = if let Some(root_id) = &params.thread_root_id {
                 state
                     .client
-                    .post_threaded_reply_in_channel(
-                        &params.channel,
-                        root_id,
-                        &params.message,
-                        params.team.as_deref(),
-                    )
+                    .assert_post_in_channel(&resolved.channel_id, &resolved.channel_name, root_id)
+                    .await?;
+                writer
+                    .post_threaded_reply(&resolved.channel_id, root_id, &params.message)
                     .await?
             } else {
-                state
-                    .client
-                    .post_message(&params.channel, &params.message, params.team.as_deref())
+                writer
+                    .post_message_by_id(&resolved.channel_id, &params.message)
                     .await?
             };
             // PER-019 (devrev PR #17 finding #2): cursor recording must
             // bind to the same team the post landed on. Pass the
             // operator's --team override through; otherwise a
             // duplicate-name channel could record under the
-            // primary-team key while the post went to Ops.
+            // primary-team key while the post went to Ops. Cursor is the
+            // calling profile's attention state regardless of which
+            // identity authored the post.
             record_channel_cursor(state, &params.channel, &receipt.id, params.team.as_deref())
                 .await?;
             Ok(receipt)
@@ -725,50 +879,97 @@ async fn dispatch_request(
         .map(to_value),
         "react_post" => parse_and_call(&request.params, |params: ReactParams| async move {
             // PER-024 AC #5b: reactions are auth-bound metadata writes
-            // with NO cursor side effects. The chanvoy-core method
-            // performs resolve→verify→write per AC #5a; this dispatch
-            // does NOT call record_channel_cursor.
+            // with NO cursor side effects; this dispatch does NOT call
+            // record_channel_cursor. PER-035: resolve + verify on the
+            // calling identity; the reaction itself is bound to the
+            // chosen writer's user, so it reduces to the family bot for
+            // outside-team channels.
+            let resolved = state
+                .client
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            let (writer, posting_identity, reduced) = state.select_writer(&resolved.team_name);
+            log_posting_identity("react", state, &resolved, posting_identity, reduced);
             state
                 .client
-                .add_reaction(
-                    &params.channel,
+                .assert_post_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
                     &params.post_id,
-                    &params.emoji,
-                    params.team.as_deref(),
                 )
+                .await?;
+            writer
+                .react_by_id(&resolved, &params.post_id, &params.emoji)
                 .await
         })
         .await
         .map(to_value),
         "unreact_post" => parse_and_call(&request.params, |params: UnreactParams| async move {
             // PER-024 AC #5b: same cursor-neutral contract as react.
+            // PER-035: reduces identity the same way react does.
+            let resolved = state
+                .client
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            let (writer, posting_identity, reduced) = state.select_writer(&resolved.team_name);
+            log_posting_identity("unreact", state, &resolved, posting_identity, reduced);
             state
                 .client
-                .remove_reaction(
-                    &params.channel,
+                .assert_post_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
                     &params.post_id,
-                    &params.emoji,
-                    params.team.as_deref(),
                 )
+                .await?;
+            writer
+                .unreact_by_id(&resolved, &params.post_id, &params.emoji)
                 .await
         })
         .await
         .map(to_value),
         "pin_post" => parse_and_call(&request.params, |params: PinParams| async move {
-            // PER-034: cursor-neutral write verb. Channel resolution
-            // + post-in-channel assertion live in chanvoy-core.
-            state
+            // PER-034: cursor-neutral write verb. PER-035: resolve +
+            // pin-state pre-read on the calling identity; the pin write
+            // reduces to the family identity for outside-team channels.
+            let resolved = state
                 .client
-                .pin_post(&params.channel, &params.post_id, params.team.as_deref())
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            let (writer, posting_identity, reduced) = state.select_writer(&resolved.team_name);
+            log_posting_identity("pin", state, &resolved, posting_identity, reduced);
+            let was_already_pinned = state
+                .client
+                .fetch_post_pinned_state(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &params.post_id,
+                )
+                .await?;
+            writer
+                .pin_by_id(&resolved, &params.post_id, was_already_pinned)
                 .await
         })
         .await
         .map(to_value),
         "unpin_post" => parse_and_call(&request.params, |params: UnpinParams| async move {
-            // PER-034: symmetric to pin_post.
-            state
+            // PER-034: symmetric to pin_post. PER-035: reduces identity
+            // the same way pin does.
+            let resolved = state
                 .client
-                .unpin_post(&params.channel, &params.post_id, params.team.as_deref())
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            let (writer, posting_identity, reduced) = state.select_writer(&resolved.team_name);
+            log_posting_identity("unpin", state, &resolved, posting_identity, reduced);
+            let was_pinned = state
+                .client
+                .fetch_post_pinned_state(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &params.post_id,
+                )
+                .await?;
+            writer
+                .unpin_by_id(&resolved, &params.post_id, was_pinned)
                 .await
         })
         .await

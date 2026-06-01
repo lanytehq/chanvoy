@@ -507,6 +507,107 @@ looks it up via the same `/users/me/teams` membership cache that
 powers cross-team `read` / `post` / `search` etc.). Every chanvoy
 verb that touches a channel is now cross-team aware.
 
+## Identity Reduction (Parallel-Stream Profiles)
+
+> Distinct from cross-team **fallback** above. Fallback decides *which
+> channel* a name resolves to (PER-019). Reduction decides *which
+> identity posts* once the channel is resolved (PER-035). They compose:
+> a single write can resolve its channel via team-fallback **and** post
+> under a reduced identity, and the audit log names both independently.
+
+When one family bot runs multiple parallel sessions inside a
+confidential engagement (per SOP-MM-018: `agent-dataeng-blue-s1`,
+`-s2`, ... alongside the bare family `agent-dataeng-blue`), each stream
+session wants to post under its stream identity *inside* the engagement
+team but under the bare family identity *everywhere else in the galaxy*
+(shared 3leaps/fulmenhq channels, where `s2` is meaningless to outside
+readers).
+
+A profile-level **reduction policy** makes that automatic. Provision
+the stream profile once with a reduce target:
+
+```bash
+chanvoy auto-setup --profile dataeng-galaxy-s2 \
+  --reduce-profile dataeng-galaxy \
+  --no-activate
+```
+
+This writes a `[reduce]` table onto the profile:
+
+```toml
+name = "dataeng-galaxy-s2"
+team_name = "org-codename"        # the engagement team (scope marker)
+bot_username = "agent-dataeng-blue-s2"
+# ...
+[reduce]
+use_profile = "dataeng-galaxy"    # the bare family profile to reduce to
+```
+
+### Semantics
+
+The scope marker is the profile's existing `team_name` (no separate
+field). For any channel-targeted **write** (`post`, `post --reply-to`,
+`react`, `unreact`, `pin`, `unpin`):
+
+- **Channel resolves inside `team_name`** → post under this profile's
+  (stream) identity.
+- **Channel resolves anywhere else** → post under
+  `reduce.use_profile`'s (family) identity.
+
+Channel **resolution** and pre-write **verification** always run on the
+calling (stream) identity — only the terminal write reduces. `whoami`
+is a self-query, not a channel-targeted write, so it always reports the
+stream identity (never the family identity).
+
+Explicit `--profile` still wins as an escape hatch: `chanvoy --profile
+dataeng-galaxy-s2 post <outside-channel>` still reduces (the `--profile`
+selects *which* reduction policy applies; the policy then fires);
+`chanvoy --profile dataeng-galaxy post <outside-channel>` does **not**
+reduce (the family profile carries no policy).
+
+The family profile **must have its own token env** (a distinct
+`env_name` from the stream profile). At startup the daemon loads the
+family token and validates it with `whoami` against the family profile's
+expected bot — if the family profile shares `env_name` with the stream
+(both default `LANYTE_MM_TOKEN`), it would resolve to the *stream* token
+in a stream shell, and the daemon **refuses to start** with a
+`ReduceIdentityMismatch` rather than post stream identity under a false
+family attribution. Give the family profile a dedicated token env (e.g.
+`CHANVOY_TOKEN_ENV_NAME=FAMILY_MM_TOKEN` when running its `auto-setup`).
+
+If `reduce.use_profile` does not exist on disk, the daemon likewise
+**refuses to start** with a clear diagnostic rather than silently
+posting stream identity into the galaxy. Inspect a profile's policy (and
+whether its target resolves) with:
+
+```bash
+chanvoy profile show dataeng-galaxy-s2
+```
+
+### Audit provenance
+
+Each write logs its resolution provenance, naming the two paths
+independently:
+
+- `[team-fallback]` — the channel name resolved via a non-primary team
+  (PER-019).
+- `[identity-reduce]` — the posting identity reduced to the family
+  profile (PER-035).
+
+A write that resolves on the primary team with no reduction carries
+neither tag; a galaxy write that resolves via fallback **and** reduces
+carries both.
+
+### Out of scope
+
+- **Inbound** mention routing is unchanged: an `@agent-dataeng-blue`
+  mention in a galaxy channel is not auto-routed to a specific stream;
+  inbound stays family-level (the asymmetry is deliberate).
+- Reduction is one level only (stream → family); no transitive chains.
+- The only scope distinction is "inside `team_name`" vs "elsewhere"
+  (single-team engagements). Multi-team engagements are a future
+  additive extension.
+
 ## Profile Resolution
 
 When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profile in order:

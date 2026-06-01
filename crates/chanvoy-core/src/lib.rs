@@ -74,6 +74,63 @@ pub struct Profile {
     pub monitored_channels: Vec<String>,
     #[serde(default)]
     pub ipc: Option<IpcConfig>,
+    /// PER-035: optional profile-level identity-reduction policy. When
+    /// set, channel-targeted writes whose resolved channel lives
+    /// *outside* this profile's `team_name` post under
+    /// `reduce.use_profile`'s identity instead of this profile's. Lets a
+    /// stream-suffixed engagement bot defer to its bare family bot for
+    /// galaxy-wide posts without per-call `--profile` discipline.
+    /// Omitted (`None`) ⇒ no reduction; this profile handles all posts
+    /// (today's behavior). Distinct from PER-019's channel-team
+    /// `fallback` (which resolves *which channel*); `reduce` resolves
+    /// *which identity posts*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduce: Option<ReducePolicy>,
+}
+
+/// PER-035: identity-reduction policy. Serializes as a `[reduce]` TOML
+/// table on the profile. One level only (stream → family); no
+/// transitive chains (brief §Out of scope).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReducePolicy {
+    /// Name of the bare family profile to reduce to. Must exist on disk
+    /// (`<profile-dir>/<use_profile>.toml`); a missing target is a loud
+    /// failure at daemon start, never a silent fall-back to the bare
+    /// daemon identity (brief AC: negative case).
+    pub use_profile: String,
+}
+
+/// PER-035 (pure, testable): does posting identity reduce for a write
+/// whose channel resolved into `resolved_team_name`, given the calling
+/// profile's primary team `profile_team_name`?
+///
+/// The rule is exactly the brief's §Scope semantics: inside the
+/// profile's own team ⇒ keep this identity; anywhere else ⇒ reduce.
+/// The `--team` override and `<team>/<channel>` syntax change *which*
+/// team the channel resolves into, so they flow through this same
+/// comparison with no special-casing.
+pub fn identity_reduces(profile_team_name: &str, resolved_team_name: &str) -> bool {
+    profile_team_name != resolved_team_name
+}
+
+/// PER-035 (pure, testable): the provenance tags a write's audit-log
+/// line carries, naming the PER-019 channel-resolution path and the
+/// PER-035 posting-identity path *independently* (brief AC). Returns
+/// `[team-fallback]` when the channel resolved via a non-primary team,
+/// and `[identity-reduce]` when the posting identity reduced; both when
+/// both apply; empty when neither (primary-team channel, no reduction).
+pub fn posting_provenance_tags(
+    resolution_source: ResolutionSource,
+    identity_reduced: bool,
+) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if resolution_source == ResolutionSource::Fallback {
+        tags.push("team-fallback");
+    }
+    if identity_reduced {
+        tags.push("identity-reduce");
+    }
+    tags
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1555,6 +1612,40 @@ pub enum CoreError {
     WaitTimeout(String),
     #[error("profile {0} not found")]
     ProfileNotFound(String),
+    /// PER-035: a profile's `reduce.use_profile` names a family profile
+    /// that does not exist on disk. Loud failure at daemon start — the
+    /// daemon must NOT silently fall back to the bare daemon identity
+    /// (brief AC: negative case), since that would leak stream identity
+    /// into the galaxy precisely when the operator asked for reduction.
+    #[error(
+        "profile '{calling}' has reduce.use_profile = '{missing}' but no such profile exists; \
+         create it (`chanvoy auto-setup` under the family identity) or correct the reduce policy. \
+         Available profiles: {available:?}"
+    )]
+    ReduceProfileNotFound {
+        calling: String,
+        missing: String,
+        available: Vec<String>,
+    },
+    /// PER-035 (devrev PR #37 P1): the token loaded for a reduce target
+    /// authenticates as a *different* bot than the family profile names.
+    /// This is the silent-identity-leak guard: if the family profile
+    /// shares an `env_name` with the stream profile, `load_token` returns
+    /// the stream token, and the "family" client would post as the
+    /// stream bot while the audit log claimed family identity. The daemon
+    /// refuses to start rather than leak stream identity into the galaxy
+    /// under a false attribution.
+    #[error(
+        "reduce target profile '{profile}' is configured for bot '{expected}', but the token \
+         resolved for it authenticates as '{actual}' — the family profile likely shares an \
+         env_name/token source with the calling (stream) profile. Give the family profile its \
+         own token env (distinct `env_name`) so its identity cannot be shadowed by the stream's."
+    )]
+    ReduceIdentityMismatch {
+        profile: String,
+        expected: String,
+        actual: String,
+    },
     #[error("unknown provider in profile")]
     UnsupportedProvider,
     #[error("io error: {0}")]
@@ -3308,6 +3399,24 @@ impl MattermostClient {
         let resolved = self.resolve_channel(channel_name, team).await?;
         self.assert_post_in_channel(&resolved.channel_id, &resolved.channel_name, post_id)
             .await?;
+        self.react_by_id(&resolved, post_id, emoji).await
+    }
+
+    /// PER-035 terminal write: add the reaction on an already-resolved,
+    /// already-verified channel. Split out of `add_reaction` so the
+    /// daemon can run resolution + the `assert_post_in_channel` check on
+    /// the *calling* identity, then route this write to a *reduced*
+    /// identity for outside-team channels. The reaction is bound to
+    /// **this** client's user (`self.whoami()`), so calling it on the
+    /// family client posts the reaction under the family bot — exactly
+    /// the reduction contract. When `self` is the calling client (no
+    /// reduction), behavior is identical to the pre-split `add_reaction`.
+    pub async fn react_by_id(
+        &self,
+        resolved: &ResolvedChannel,
+        post_id: &str,
+        emoji: &str,
+    ) -> Result<ReactionResult, CoreError> {
         let user_id = self.whoami().await?.id;
         let normalized = normalize_emoji_name(emoji);
         #[derive(Serialize)]
@@ -3331,8 +3440,8 @@ impl MattermostClient {
             )
             .await?;
         Ok(ReactionResult {
-            team: resolved.team_name,
-            channel: resolved.channel_name,
+            team: resolved.team_name.clone(),
+            channel: resolved.channel_name.clone(),
             post_id: post_id.to_string(),
             emoji: normalized,
             ok: true,
@@ -3355,6 +3464,19 @@ impl MattermostClient {
         let resolved = self.resolve_channel(channel_name, team).await?;
         self.assert_post_in_channel(&resolved.channel_id, &resolved.channel_name, post_id)
             .await?;
+        self.unreact_by_id(&resolved, post_id, emoji).await
+    }
+
+    /// PER-035 terminal write: remove the reaction on an
+    /// already-resolved, already-verified channel. The DELETE is scoped
+    /// to **this** client's user, so reducing to the family client
+    /// removes the family bot's reaction. Symmetric to `react_by_id`.
+    pub async fn unreact_by_id(
+        &self,
+        resolved: &ResolvedChannel,
+        post_id: &str,
+        emoji: &str,
+    ) -> Result<ReactionResult, CoreError> {
         let user_id = self.whoami().await?.id;
         let normalized = normalize_emoji_name(emoji);
         let path = format!("/users/{user_id}/posts/{post_id}/reactions/{normalized}");
@@ -3367,8 +3489,8 @@ impl MattermostClient {
             Err(other) => return Err(other),
         }
         Ok(ReactionResult {
-            team: resolved.team_name,
-            channel: resolved.channel_name,
+            team: resolved.team_name.clone(),
+            channel: resolved.channel_name.clone(),
             post_id: post_id.to_string(),
             emoji: normalized,
             ok: true,
@@ -3396,6 +3518,23 @@ impl MattermostClient {
         let was_already_pinned = self
             .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
             .await?;
+        self.pin_by_id(&resolved, post_id, was_already_pinned).await
+    }
+
+    /// PER-035 terminal write: pin on an already-resolved,
+    /// already-pin-state-read channel. The pin write lands under
+    /// **this** client's token, so reducing to the family client pins
+    /// as the family bot. `was_already_pinned` is the pre-read taken on
+    /// the calling client and threaded through for the result's
+    /// idempotency field. The 403 → `PinPermissionDenied` normalization
+    /// names *this* client's bot (the identity that actually attempted
+    /// the write).
+    pub async fn pin_by_id(
+        &self,
+        resolved: &ResolvedChannel,
+        post_id: &str,
+        was_already_pinned: bool,
+    ) -> Result<PinResult, CoreError> {
         match self
             .request::<Value, Value>("POST", &format!("/posts/{post_id}/pin"), None)
             .await
@@ -3412,8 +3551,8 @@ impl MattermostClient {
                 return Err(CoreError::PinPermissionDenied {
                     verb: "pin",
                     bot_username,
-                    team: resolved.team_name,
-                    channel: resolved.channel_name,
+                    team: resolved.team_name.clone(),
+                    channel: resolved.channel_name.clone(),
                     message,
                 });
             }
@@ -3421,9 +3560,9 @@ impl MattermostClient {
         }
         Ok(PinResult {
             verb: "pin".to_string(),
-            team: resolved.team_name,
-            channel: resolved.channel_name,
-            channel_id: resolved.channel_id,
+            team: resolved.team_name.clone(),
+            channel: resolved.channel_name.clone(),
+            channel_id: resolved.channel_id.clone(),
             post_id: post_id.to_string(),
             result: "pinned".to_string(),
             was_already_pinned,
@@ -3445,6 +3584,18 @@ impl MattermostClient {
         let was_pinned = self
             .fetch_post_pinned_state(&resolved.channel_id, &resolved.channel_name, post_id)
             .await?;
+        self.unpin_by_id(&resolved, post_id, was_pinned).await
+    }
+
+    /// PER-035 terminal write: unpin on an already-resolved,
+    /// already-pin-state-read channel. Symmetric to `pin_by_id`;
+    /// reduces identity the same way.
+    pub async fn unpin_by_id(
+        &self,
+        resolved: &ResolvedChannel,
+        post_id: &str,
+        was_pinned: bool,
+    ) -> Result<UnpinResult, CoreError> {
         match self
             .request::<Value, Value>("POST", &format!("/posts/{post_id}/unpin"), None)
             .await
@@ -3458,8 +3609,8 @@ impl MattermostClient {
                 return Err(CoreError::PinPermissionDenied {
                     verb: "unpin",
                     bot_username,
-                    team: resolved.team_name,
-                    channel: resolved.channel_name,
+                    team: resolved.team_name.clone(),
+                    channel: resolved.channel_name.clone(),
                     message,
                 });
             }
@@ -3467,9 +3618,9 @@ impl MattermostClient {
         }
         Ok(UnpinResult {
             verb: "unpin".to_string(),
-            team: resolved.team_name,
-            channel: resolved.channel_name,
-            channel_id: resolved.channel_id,
+            team: resolved.team_name.clone(),
+            channel: resolved.channel_name.clone(),
+            channel_id: resolved.channel_id.clone(),
             post_id: post_id.to_string(),
             result: "unpinned".to_string(),
             was_already_unpinned: !was_pinned,
@@ -3942,7 +4093,11 @@ impl MattermostClient {
         Ok(user.id)
     }
 
-    async fn assert_post_in_channel(
+    /// PER-035: `pub` so the daemon can run the pre-write
+    /// existence/channel-binding check on the **calling** profile's
+    /// client (resolution + verification stay with the caller) before
+    /// routing the terminal write to a possibly-reduced identity.
+    pub async fn assert_post_in_channel(
         &self,
         expected_channel_id: &str,
         channel_name: &str,
@@ -3980,7 +4135,11 @@ impl MattermostClient {
     /// pre-call pin state without a second round-trip. The
     /// channel-mismatch and not-found error paths match
     /// `assert_post_in_channel` exactly.
-    async fn fetch_post_pinned_state(
+    ///
+    /// PER-035: `pub` for the same reason as `assert_post_in_channel` —
+    /// the pin-state pre-read runs on the calling client; only the
+    /// terminal pin/unpin write reduces.
+    pub async fn fetch_post_pinned_state(
         &self,
         expected_channel_id: &str,
         channel_name: &str,
@@ -4815,6 +4974,76 @@ mod tests {
         assert_eq!(values.get("OTHER"), Some(&"value".to_string()));
     }
 
+    // ---- PER-035: identity-reduction pure helpers ----
+
+    #[test]
+    fn identity_reduces_only_outside_team() {
+        // In-team write keeps the calling identity; outside-team reduces.
+        assert!(!identity_reduces("org-acme", "org-acme"));
+        assert!(identity_reduces("org-acme", "org-3leaps"));
+        assert!(identity_reduces("org-acme", "org-fulmenhq"));
+    }
+
+    #[test]
+    fn provenance_tags_name_both_paths_independently() {
+        // Primary-team channel, no reduction → no tags.
+        assert!(posting_provenance_tags(ResolutionSource::Primary, false).is_empty());
+        // PER-019 channel team-fallback only.
+        assert_eq!(
+            posting_provenance_tags(ResolutionSource::Fallback, false),
+            vec!["team-fallback"]
+        );
+        // PER-035 identity reduction only (channel resolved on primary).
+        assert_eq!(
+            posting_provenance_tags(ResolutionSource::Primary, true),
+            vec!["identity-reduce"]
+        );
+        // Both apply on one call → both named, independently and in order.
+        assert_eq!(
+            posting_provenance_tags(ResolutionSource::Fallback, true),
+            vec!["team-fallback", "identity-reduce"]
+        );
+        // Explicit `<team>/<channel>` resolution is not a fallback, so it
+        // contributes no channel-resolution tag even when identity reduces.
+        assert_eq!(
+            posting_provenance_tags(ResolutionSource::Explicit, true),
+            vec!["identity-reduce"]
+        );
+    }
+
+    #[test]
+    fn reduce_policy_toml_round_trips_and_defaults_absent() {
+        // A profile with no `[reduce]` table parses to `reduce: None`
+        // (back-compat: existing on-disk profiles predate the field).
+        let without = "\
+name = \"dataeng-galaxy\"
+role = \"dataeng\"
+scope = \"galaxy\"
+provider = \"mattermost\"
+bot_username = \"agent-dataeng-blue\"
+team_name = \"org-3leaps\"
+server_url = \"https://mm.example.com\"
+env_name = \"LANYTE_MM_TOKEN\"
+";
+        let parsed: Profile = toml::from_str(without).unwrap();
+        assert!(parsed.reduce.is_none());
+
+        // A `[reduce]` table parses into the policy, and re-serializes
+        // back to the same table (round-trip stable).
+        let with = format!("{without}\n[reduce]\nuse_profile = \"dataeng-galaxy\"\n");
+        let parsed: Profile = toml::from_str(&with).unwrap();
+        assert_eq!(
+            parsed.reduce.as_ref().map(|r| r.use_profile.as_str()),
+            Some("dataeng-galaxy")
+        );
+        let reserialized = toml::to_string_pretty(&parsed).unwrap();
+        assert!(
+            reserialized.contains("[reduce]"),
+            "reduce table must survive re-serialization; got:\n{reserialized}"
+        );
+        assert!(reserialized.contains("use_profile = \"dataeng-galaxy\""));
+    }
+
     #[test]
     fn stores_and_loads_attention_state() {
         let _guard = CONFIG_ENV_LOCK.lock().unwrap();
@@ -5137,6 +5366,7 @@ monitored_channels = ["per-003", "per-004"]
                 capability_class: CapabilityClass::Standard,
                 monitored_channels: Vec::new(),
                 ipc: None,
+                reduce: None,
             }
         }
 
@@ -5942,6 +6172,7 @@ monitored_channels = ["per-003", "per-004"]
                 capability_class: CapabilityClass::Standard,
                 monitored_channels: Vec::new(),
                 ipc: None,
+                reduce: None,
             };
             let client = MattermostClient::new(&profile, "token".into()).unwrap();
 
@@ -6369,6 +6600,7 @@ monitored_channels = ["per-003", "per-004"]
                 capability_class: CapabilityClass::Standard,
                 monitored_channels: Vec::new(),
                 ipc: None,
+                reduce: None,
             }
         }
 
