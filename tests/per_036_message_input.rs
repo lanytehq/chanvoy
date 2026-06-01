@@ -345,6 +345,65 @@ async fn legacy_dm_mutex_positional_and_file_rejected() {
 }
 
 #[tokio::test]
+async fn legacy_dm_duplicate_message_file_rejected() {
+    // devrev PR #38: the manual-parse path must reject a repeated
+    // --message-file rather than last-wins.
+    let env = TestEnv::new("per-036-dmlegacy-dup").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+
+    let out = run_chanvoy(
+        &env,
+        &[
+            "dm",
+            "bob",
+            "--message-file",
+            "/tmp/a.md",
+            "--message-file",
+            "/tmp/b.md",
+        ],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "duplicate --message-file must reject"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("more than once"),
+        "must reject the repeated flag; got: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn post_message_file_non_regular_rejected() {
+    // devrev PR #38: a non-regular file (here a directory) is refused
+    // before any read, end-to-end through the CLI.
+    let env = TestEnv::new("per-036-post-special").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = run_chanvoy(
+        &env,
+        &[
+            "post",
+            "bravo-team",
+            "--message-file",
+            dir.path().to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "non-regular --message-file must reject"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a regular file"),
+        "must name the non-regular-file cause; got: {stderr}"
+    );
+}
+
+#[tokio::test]
 async fn notify_no_source_rejected() {
     let env = TestEnv::new("per-036-notify-nosource").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");

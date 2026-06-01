@@ -931,18 +931,30 @@ fn no_message_source() -> CliError {
     )
 }
 
+/// PER-036 (devrev PR #38 hardening): an upper bound on message-body
+/// input read from a file or stdin. This is a **resource guard** against
+/// OOM / endless-pipe / huge-file footguns — NOT a content-policy limit.
+/// It is deliberately far above any realistic MM `Posts.MaxPostSize`
+/// (default 16384 characters, server-configurable), so legitimate posts
+/// always pass through to MM and only MM enforces the actual post-size
+/// policy (see `map_post_error`). Inputs over this cap are refused
+/// before the body is fully materialized.
+const MAX_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
+
 fn read_message_file(path: &Path) -> Result<String, CliError> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(body) => body,
+    read_message_file_capped(path, MAX_MESSAGE_BYTES)
+}
+
+fn read_message_file_capped(path: &Path, max_bytes: u64) -> Result<String, CliError> {
+    // Stat first: refuse non-regular files (FIFO, device, socket,
+    // directory) and over-cap files BEFORE reading, so a special file or
+    // a multi-GB file can't block or OOM the CLI. `metadata` follows
+    // symlinks, so a symlink to a regular file is fine.
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => {
             return Err(CliError::Bootstrap(format!(
                 "message file not found: {}",
-                path.display()
-            )));
-        }
-        Err(err) if err.kind() == ErrorKind::InvalidData => {
-            return Err(CliError::Bootstrap(format!(
-                "message file {} is not valid UTF-8 text; chanvoy posts text bodies only",
                 path.display()
             )));
         }
@@ -953,6 +965,30 @@ fn read_message_file(path: &Path) -> Result<String, CliError> {
             )));
         }
     };
+    if !meta.is_file() {
+        return Err(CliError::Bootstrap(format!(
+            "message file {} is not a regular file (FIFO, device, socket, or directory); \
+             refusing to read",
+            path.display()
+        )));
+    }
+    if meta.len() > max_bytes {
+        return Err(CliError::Bootstrap(format!(
+            "message file {} is {} bytes, over chanvoy's {max_bytes}-byte input cap \
+             (a resource guard, not Mattermost's post-size limit); split or trim the file",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let file = std::fs::File::open(path).map_err(|err| {
+        CliError::Bootstrap(format!(
+            "failed to read message file {}: {err}",
+            path.display()
+        ))
+    })?;
+    // Bounded read as belt-and-suspenders against a file that grows
+    // between the stat and the read (TOCTOU).
+    let body = read_capped_utf8(file, &format!("message file {}", path.display()), max_bytes)?;
     if body.trim().is_empty() {
         return Err(CliError::Bootstrap(format!(
             "message file {} is empty (or whitespace-only); nothing to post",
@@ -967,9 +1003,18 @@ fn read_message_stdin() -> Result<String, CliError> {
     read_message_from_reader(stdin.is_terminal(), stdin.lock())
 }
 
-/// Inner, injectable stdin reader so the TTY guard and the empty/UTF-8
-/// diagnostics are unit-testable without a real terminal (PER-036 AC #9).
-fn read_message_from_reader(is_terminal: bool, mut reader: impl Read) -> Result<String, CliError> {
+/// Inner, injectable stdin reader so the TTY guard, the cap, and the
+/// empty/UTF-8 diagnostics are unit-testable without a real terminal
+/// (PER-036 AC #9 + devrev PR #38 bounded-read hardening).
+fn read_message_from_reader(is_terminal: bool, reader: impl Read) -> Result<String, CliError> {
+    read_message_from_reader_capped(is_terminal, reader, MAX_MESSAGE_BYTES)
+}
+
+fn read_message_from_reader_capped(
+    is_terminal: bool,
+    reader: impl Read,
+    max_bytes: u64,
+) -> Result<String, CliError> {
     if is_terminal {
         return Err(CliError::Bootstrap(
             "`-` specified but stdin is a TTY; either pipe input \
@@ -977,20 +1022,7 @@ fn read_message_from_reader(is_terminal: bool, mut reader: impl Read) -> Result<
                 .to_string(),
         ));
     }
-    let mut body = String::new();
-    match reader.read_to_string(&mut body) {
-        Ok(_) => {}
-        Err(err) if err.kind() == ErrorKind::InvalidData => {
-            return Err(CliError::Bootstrap(
-                "stdin is not valid UTF-8 text; chanvoy posts text bodies only".to_string(),
-            ));
-        }
-        Err(err) => {
-            return Err(CliError::Bootstrap(format!(
-                "failed to read message from stdin: {err}"
-            )));
-        }
-    }
+    let body = read_capped_utf8(reader, "stdin", max_bytes)?;
     if body.trim().is_empty() {
         return Err(CliError::Bootstrap(
             "stdin produced no message body (empty or whitespace-only); nothing to post"
@@ -998,6 +1030,29 @@ fn read_message_from_reader(is_terminal: bool, mut reader: impl Read) -> Result<
         ));
     }
     Ok(body)
+}
+
+/// Read at most `max_bytes` from `reader` and decode as UTF-8, refusing
+/// input that exceeds the cap (an endless pipe or oversized stream is
+/// bounded by `Take(max_bytes + 1)` so we never allocate without limit).
+/// `source` labels the input in diagnostics ("stdin", "message file …").
+fn read_capped_utf8(reader: impl Read, source: &str, max_bytes: u64) -> Result<String, CliError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| CliError::Bootstrap(format!("failed to read {source}: {err}")))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CliError::Bootstrap(format!(
+            "{source} exceeds chanvoy's {max_bytes}-byte input cap \
+             (a resource guard, not Mattermost's post-size limit); trim the input"
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        CliError::Bootstrap(format!(
+            "{source} is not valid UTF-8 text; chanvoy posts text bodies only"
+        ))
+    })
 }
 
 /// PER-036 AC #8: chanvoy does not enforce a local length limit (MM's
@@ -1048,6 +1103,15 @@ async fn handle_dm_raw(profile: &str, json: bool, args: Vec<String>) -> Result<(
             let path = iter.next().ok_or_else(|| {
                 CliError::Bootstrap("--message-file requires a path argument".to_string())
             })?;
+            // Reject a repeated flag rather than last-wins, to honor the
+            // single-source/single-file contract (devrev PR #38). The
+            // clap-parsed verbs reject duplicates automatically; this
+            // manual-parse path must do it explicitly.
+            if message_file.is_some() {
+                return Err(CliError::Bootstrap(
+                    "--message-file specified more than once; supply exactly one".to_string(),
+                ));
+            }
             message_file = Some(PathBuf::from(path));
         } else {
             words.push(token);
@@ -3741,5 +3805,47 @@ mod tests {
             !mapped.to_string().contains("Posts.MaxPostSize"),
             "non-length errors must pass through unchanged"
         );
+    }
+
+    // ---- PER-036 hardening (devrev PR #38): bounded reads ----
+
+    #[test]
+    fn read_message_file_rejects_non_regular_file() {
+        // A directory (or any non-regular file: FIFO, device, socket)
+        // must be refused before any read, naming the cause.
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_message_file(dir.path()).expect_err("directory must be refused");
+        assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("not a regular file")));
+    }
+
+    #[test]
+    fn read_message_file_rejects_oversize_before_reading() {
+        // The size check uses metadata, so an over-cap file is refused
+        // without materializing it (tested here with a small cap).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.md");
+        std::fs::write(&path, "x".repeat(100)).unwrap();
+        let err = read_message_file_capped(&path, 10).expect_err("over-cap file must be refused");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("input cap") && m.contains("100 bytes"))
+        );
+    }
+
+    #[test]
+    fn read_capped_reader_rejects_oversize_stream() {
+        // An over-cap stream (stand-in for an endless pipe) is bounded by
+        // Take(max+1) and refused, never read without limit.
+        let big = [b'x'; 100];
+        let err = read_message_from_reader_capped(false, &big[..], 10)
+            .expect_err("over-cap stdin must be refused");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("input cap") && m.contains("stdin"))
+        );
+    }
+
+    #[test]
+    fn read_capped_reader_accepts_within_cap() {
+        let body = read_message_from_reader_capped(false, &b"ok body\n"[..], 1024).unwrap();
+        assert_eq!(body, "ok body\n");
     }
 }

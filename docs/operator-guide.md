@@ -261,10 +261,15 @@ Rules:
   message. Non-UTF-8 input is refused.
 - `-` requires piped stdin; on an interactive TTY it errors rather
   than hang waiting for input.
-- chanvoy does **not** enforce a local length cap (MM's
+- chanvoy does **not** enforce a content-length policy (MM's
   `Posts.MaxPostSize` is server-configurable). An over-length body is
   sent to MM; if MM rejects it, chanvoy reports the received character
-  count and points at the `Posts.MaxPostSize` setting.
+  count and points at the `Posts.MaxPostSize` setting. Separately, a
+  generous **resource guard** (4 MiB) refuses pathological inputs — a
+  non-regular file (FIFO/device/directory), an over-cap file, or an
+  endless pipe is rejected before the body is materialized, so it can't
+  OOM or hang the CLI. The guard sits far above any realistic post size,
+  so it never rejects a legitimate message.
 
 ### Threaded replies (`post --reply-to`)
 
