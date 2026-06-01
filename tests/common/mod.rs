@@ -383,6 +383,51 @@ pub async fn run_chanvoy(env: &TestEnv, args: &[&str]) -> std::process::Output {
         .expect("spawn chanvoy cli")
 }
 
+/// PER-036: run a `chanvoy` CLI subcommand with `stdin_input` piped to
+/// its stdin (for the `-` stdin-message convention). Writes the bytes,
+/// closes stdin, then collects output.
+pub async fn run_chanvoy_with_stdin(
+    env: &TestEnv,
+    args: &[&str],
+    stdin_input: &[u8],
+) -> std::process::Output {
+    use tokio::io::AsyncWriteExt;
+    let mut child = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn chanvoy cli with piped stdin");
+    {
+        let mut stdin = child.stdin.take().expect("child stdin piped");
+        stdin.write_all(stdin_input).await.expect("write stdin");
+        // Drop closes the pipe → EOF for the child's read_to_string.
+    }
+    child
+        .wait_with_output()
+        .await
+        .expect("collect chanvoy output")
+}
+
+/// PER-036: the `message` field of the first `POST /api/v4/posts` the
+/// mock recorded. Panics if no post was made.
+pub async fn posted_message_body(env: &TestEnv) -> String {
+    let requests = env.mock.received_requests().await.unwrap_or_default();
+    let req = requests
+        .iter()
+        .find(|r| r.method.as_str().eq_ignore_ascii_case("POST") && r.url.path() == "/api/v4/posts")
+        .expect("a POST /api/v4/posts request was recorded");
+    let body: serde_json::Value = serde_json::from_slice(&req.body).expect("post body is JSON");
+    body["message"]
+        .as_str()
+        .expect("post body has a string `message` field")
+        .to_string()
+}
+
 /// Read the daemon-persisted attention state file. Returns None if
 /// absent. Uses direct file read so assertions don't depend on
 /// parent-process env or chanvoy-core's dir resolution.

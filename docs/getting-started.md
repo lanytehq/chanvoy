@@ -196,6 +196,18 @@ chanvoy post <channel> "your message here"
 # → posted: <post_id>
 ```
 
+For multi-line / markdown bodies, read from a file or stdin instead of
+quoting (avoids shell-escaping pitfalls with newlines, backticks, `$`):
+
+```bash
+chanvoy post <channel> --message-file /tmp/notes.md
+cat /tmp/notes.md | chanvoy post <channel> -
+```
+
+The same `--message-file` / `-` shapes work on `dm send`, the legacy
+`dm <user> <message>` form, and `notify`. See the operator guide
+("Multi-line message input") for the full rules.
+
 Replies in a thread:
 
 ```bash
