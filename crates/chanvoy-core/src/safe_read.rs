@@ -434,12 +434,28 @@ mod tests {
     #[test]
     fn directory_is_refused_as_non_regular() {
         let dir = tempfile::tempdir().unwrap();
+        // caller-named has no private-parent check, so the directory itself
+        // is refused as non-regular regardless of where it lives.
         assert!(matches!(
             read_caller_named_file(dir.path(), DEFAULT_MAX_BYTES),
             Err(SafeReadError::NonRegular { .. })
         ));
+        // tool-owned verifies the *parent* dir first. The directory-under-test
+        // must therefore sit inside a private 0700 parent — otherwise on CI
+        // (whose tempdir root is world-writable) the parent check fires first
+        // and we'd see InsecureParentDir instead of NonRegular. Nest the
+        // subject directory inside our own 0700 tempdir to isolate the
+        // non-regular assertion. (The world-writable-parent path has its own
+        // fixture: `tool_owned_refuses_group_or_world_writable_dir`.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let subdir = dir.path().join("inner");
+        std::fs::create_dir(&subdir).unwrap();
         assert!(matches!(
-            read_tool_owned_file(dir.path(), DEFAULT_MAX_BYTES),
+            read_tool_owned_file(&subdir, DEFAULT_MAX_BYTES),
             Err(SafeReadError::NonRegular { .. })
         ));
     }
