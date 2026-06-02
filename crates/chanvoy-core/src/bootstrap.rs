@@ -71,6 +71,8 @@ pub enum BootstrapError {
     UsernameMismatch { file: String, profile: String },
     #[error("bootstrap-state file io error: {0}")]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    SafeRead(#[from] crate::safe_read::SafeReadError),
     #[error("bootstrap-state file deserialize error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("bootstrap-state file system clock before unix epoch")]
@@ -163,13 +165,20 @@ pub fn write_bootstrap_state(state: &BootstrapState) -> Result<PathBuf, Bootstra
 /// only on actual io / deserialize failures.
 pub fn read_bootstrap_state(profile: &str) -> Result<Option<BootstrapState>, BootstrapError> {
     let path = bootstrap_path_for_profile(profile);
-    match fs::read(&path) {
-        Ok(bytes) => {
-            let state: BootstrapState = serde_json::from_slice(&bytes)?;
+    // PER-036A / ADR-0016: the bootstrap-state handoff seeds the daemon's
+    // pre-validated identity (consumed once at startup), so it is
+    // agent-critical. It lives in the chanvoy-created 0700 runtime dir →
+    // tool-owned tier: non-regular refusal + bounded read before deserialize.
+    // (Freshness/fingerprint/nonce/username validation still runs downstream
+    // in `validate_bootstrap_state`.) Absent file is the normal
+    // no-handoff-in-flight case.
+    match crate::safe_read::read_tool_owned_file(&path, crate::safe_read::DEFAULT_MAX_BYTES) {
+        Ok(contents) => {
+            let state: BootstrapState = serde_json::from_str(&contents)?;
             Ok(Some(state))
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(BootstrapError::Io(err)),
+        Err(err) if err.is_not_found() => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 

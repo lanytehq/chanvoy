@@ -31,3 +31,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = "0.6"
+# libc: PER-036A safe-read conformance fixtures use libc::mkfifo to create
+# a real FIFO (non-regular file) on Unix; the other special-file fixtures
+# use std (UnixListener socket, /dev/null device).
+libc = "0.2"

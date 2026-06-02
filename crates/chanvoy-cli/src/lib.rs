@@ -1872,6 +1872,18 @@ async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
 /// case, which surfaces EXIT_DAEMON_FAILED with a clear message.
 fn read_daemon_pid_for_force_kill(profile: &str) -> Option<u32> {
     let pid_path = pid_path_for_profile(profile);
+    // PER-036A / ADR-0016 classification: tool-owned numeric
+    // process-management state (a pid in the chanvoy-created 0700 runtime
+    // dir), NOT agent-critical context — exempt from the full safe-read
+    // helper. But since this is only a force-kill fallback, cheaply guard
+    // against a non-regular path: a planted FIFO here would otherwise block
+    // the read. Anything non-regular is ignored, same as an absent file.
+    if !std::fs::metadata(&pid_path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
     std::fs::read_to_string(pid_path).ok()?.trim().parse().ok()
 }
 
@@ -3838,6 +3850,7 @@ mod tests {
         assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("not a regular file")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_message_file_refuses_symlink_to_regular_file() {
         // ADR-0016: a symlink whose target is a perfectly valid regular
