@@ -1,4 +1,10 @@
 pub mod bootstrap;
+pub mod safe_read;
+
+pub use safe_read::{
+    read_caller_named_file, read_credential_file, read_tool_owned_file, SafeReadError,
+    CREDENTIAL_MAX_BYTES, DEFAULT_MAX_BYTES,
+};
 
 pub use bootstrap::{
     bootstrap_path_for_profile, build_bootstrap_state, compute_profile_fingerprint,
@@ -1646,6 +1652,11 @@ pub enum CoreError {
         expected: String,
         actual: String,
     },
+    /// PER-036A / ADR-0016: an agent-critical file read was refused
+    /// (symlink, non-regular file, over-cap, loose credential permissions,
+    /// or non-UTF-8). Carries the specific reason + remediation.
+    #[error(transparent)]
+    SafeRead(#[from] SafeReadError),
     #[error("unknown provider in profile")]
     UnsupportedProvider,
     #[error("io error: {0}")]
@@ -1730,7 +1741,13 @@ pub fn attention_state_path(profile_name: &str) -> PathBuf {
 }
 
 pub fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>, CoreError> {
-    let contents = fs::read_to_string(path)?;
+    // PER-036A / ADR-0016: an env-file is caller-named credential material
+    // (it carries the Mattermost token and determines posting identity).
+    // Read it through the credential-tier safe reader: refuse a symlinked
+    // final component, non-regular files, group/world-accessible perms, and
+    // bound the read at 64 KiB — before parsing. Diagnostics name the path
+    // and policy failure, never token contents.
+    let contents = safe_read::read_credential_file(path, safe_read::CREDENTIAL_MAX_BYTES)?;
     let mut values = BTreeMap::new();
     for line in contents.lines() {
         let trimmed = line.trim();
@@ -1758,13 +1775,17 @@ fn strip_quotes(input: &str) -> &str {
 
 pub fn load_profile(name: &str) -> Result<Profile, CoreError> {
     let path = default_profile_dir().join(format!("{name}.toml"));
-    let contents = fs::read_to_string(&path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            CoreError::ProfileNotFound(name.to_string())
-        } else {
-            CoreError::Io(err)
-        }
-    })?;
+    // PER-036A / ADR-0016: persisted profile TOML carries identity
+    // (bot_username, team) and the PER-035 reduction policy — agent-critical.
+    // It is a chanvoy-owned config read (the profile dir is chanvoy-created
+    // 0700), so use the tool-owned tier: a symlink to a regular file is
+    // allowed (dotfile/seclusor layouts), but non-regular targets are refused
+    // and the read is bounded before parsing.
+    let contents = match safe_read::read_tool_owned_file(&path, safe_read::DEFAULT_MAX_BYTES) {
+        Ok(contents) => contents,
+        Err(err) if err.is_not_found() => return Err(CoreError::ProfileNotFound(name.to_string())),
+        Err(err) => return Err(err.into()),
+    };
     let mut profile: Profile = toml::from_str(&contents)?;
     if profile.name.is_empty() {
         profile.name = name.to_string();
@@ -1774,7 +1795,12 @@ pub fn load_profile(name: &str) -> Result<Profile, CoreError> {
 
 pub fn load_active_profile() -> Result<Option<String>, CoreError> {
     let path = active_profile_path();
-    match fs::read_to_string(path) {
+    // PER-036A / ADR-0016: the active-profile marker is low-criticality
+    // tool-owned state (a single profile name in the chanvoy-created 0700
+    // config dir), but route it through the tool-owned reader anyway so a
+    // non-regular path can't block and the read is bounded. Absent marker is
+    // the normal "no active profile" case.
+    match safe_read::read_tool_owned_file(&path, safe_read::DEFAULT_MAX_BYTES) {
         Ok(contents) => {
             let trimmed = contents.trim();
             if trimmed.is_empty() {
@@ -1783,8 +1809,8 @@ pub fn load_active_profile() -> Result<Option<String>, CoreError> {
                 Ok(Some(trimmed.to_string()))
             }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(CoreError::Io(err)),
+        Err(err) if err.is_not_found() => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1809,7 +1835,12 @@ pub fn list_profiles() -> Result<Vec<Profile>, CoreError> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
         }
-        let contents = fs::read_to_string(&path)?;
+        // PER-036A / ADR-0016 (devrev PR #39 finding #1): each profile TOML
+        // feeds the resolver / profile collection, so it is agent-critical
+        // and must go through the same tool-owned safe reader as
+        // `load_profile` — non-regular refusal, private-parent verification,
+        // and a bounded read — not a raw `fs::read_to_string`.
+        let contents = safe_read::read_tool_owned_file(&path, safe_read::DEFAULT_MAX_BYTES)?;
         let profile: Profile = toml::from_str(&contents)?;
         profiles.push(profile);
     }
@@ -2009,10 +2040,14 @@ pub fn resolve_profile_name(
 
 pub fn load_attention_state(profile_name: &str) -> Result<AttentionState, CoreError> {
     let path = attention_state_path(profile_name);
-    match fs::read_to_string(path) {
+    // PER-036A / ADR-0016: attention state is tool-owned control-plane state
+    // (cursors) in the chanvoy-created 0700 config dir. Tool-owned tier:
+    // non-regular refusal + bounded read before parsing; absent file is the
+    // normal cold-start default.
+    match safe_read::read_tool_owned_file(&path, safe_read::DEFAULT_MAX_BYTES) {
         Ok(contents) => Ok(serde_json::from_str(&contents)?),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AttentionState::default()),
-        Err(err) => Err(CoreError::Io(err)),
+        Err(err) if err.is_not_found() => Ok(AttentionState::default()),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -4969,9 +5004,82 @@ mod tests {
             "export LANYTE_MM_TOKEN=\"secret\"\n# comment\nOTHER=value\n",
         )
         .unwrap();
+        // PER-036A / ADR-0016: env-files are credential material and must be
+        // owner-only; the credential reader refuses group/world-accessible
+        // modes, so a realistic test fixture is chmod 600.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let values = parse_env_file(&path).unwrap();
         assert_eq!(values.get("LANYTE_MM_TOKEN"), Some(&"secret".to_string()));
         assert_eq!(values.get("OTHER"), Some(&"value".to_string()));
+    }
+
+    #[cfg(unix)]
+    fn env_file_profile(env_file: &Path) -> Profile {
+        Profile {
+            name: "cred-test".to_string(),
+            role: "test".to_string(),
+            scope: "test".to_string(),
+            provider: Provider::Mattermost,
+            bot_username: String::new(),
+            team_name: "org-test".to_string(),
+            server_url: "https://mm.example.com".to_string(),
+            env_name: "LANYTE_MM_TOKEN".to_string(),
+            env_file: Some(env_file.to_path_buf()),
+            credential_mode: CredentialMode::EnvFile,
+            capability_class: CapabilityClass::Standard,
+            monitored_channels: Vec::new(),
+            ipc: None,
+            reduce: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_token_reads_owner_only_env_file() {
+        // PER-036A: daemon token loading happy path — a 0600 env-file loads.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mm.env");
+        fs::write(&path, "LANYTE_MM_TOKEN=tok-123\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let token = load_token(&env_file_profile(&path)).unwrap();
+        assert_eq!(token, "tok-123");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_token_refuses_loose_permission_env_file() {
+        // PER-036A / ADR-0016 A2: a group/world-accessible credential file
+        // is refused before parsing — a token leak even when not symlinked.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loose.env");
+        fs::write(&path, "LANYTE_MM_TOKEN=tok-123\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = load_token(&env_file_profile(&path)).expect_err("0644 env-file must be refused");
+        assert!(
+            matches!(
+                err,
+                CoreError::SafeRead(SafeReadError::LoosePermissions { .. })
+            ),
+            "expected LoosePermissions, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_token_refuses_symlinked_env_file() {
+        // PER-036A / ADR-0016 A2: credential files fail closed on a
+        // symlinked final component (pass the resolved path).
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.env");
+        fs::write(&target, "LANYTE_MM_TOKEN=tok-123\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link.env");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = load_token(&env_file_profile(&link)).expect_err("symlinked env-file must refuse");
+        assert!(
+            matches!(err, CoreError::SafeRead(SafeReadError::Symlink { .. })),
+            "expected Symlink, got {err:?}"
+        );
     }
 
     // ---- PER-035: identity-reduction pure helpers ----
@@ -5078,6 +5186,38 @@ env_name = \"LANYTE_MM_TOKEN\"
         assert!(path.ends_with("lanytehq/chanvoy/state-bravo-devlead.json"));
 
         unsafe { env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_profiles_routes_through_safe_reader() {
+        // PER-036A / ADR-0016 (devrev PR #39 #1): list_profiles must read each
+        // profile TOML via the tool-owned safe reader, so a non-regular entry
+        // (here a directory named like a profile) is refused, not blindly
+        // read. Proves the resolver/collection input is covered, not just
+        // load_profile.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        unsafe { env::set_var("CHANVOY_CONFIG_DIR", config.path()) };
+
+        let profiles_dir = config.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::set_permissions(&profiles_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // A valid profile lists fine on its own.
+        let good = "name = \"good\"\nrole = \"r\"\nscope = \"s\"\nprovider = \"mattermost\"\n\
+                    bot_username = \"agent-good\"\nteam_name = \"org-s\"\n\
+                    server_url = \"https://mm.example.com\"\nenv_name = \"LANYTE_MM_TOKEN\"\n";
+        fs::write(profiles_dir.join("good.toml"), good).unwrap();
+        // A directory whose name ends in `.toml` is a non-regular "profile".
+        fs::create_dir(profiles_dir.join("evil.toml")).unwrap();
+
+        let result = list_profiles();
+        unsafe { env::remove_var("CHANVOY_CONFIG_DIR") };
+
+        match result {
+            Err(CoreError::SafeRead(SafeReadError::NonRegular { .. })) => {}
+            other => panic!("expected NonRegular refusal from list_profiles, got {other:?}"),
+        }
     }
 
     #[test]

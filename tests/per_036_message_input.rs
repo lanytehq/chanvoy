@@ -403,6 +403,7 @@ async fn post_message_file_non_regular_rejected() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn post_message_file_symlink_refused() {
     // ADR-0016: a symlinked --message-file is refused end-to-end, even

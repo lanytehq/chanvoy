@@ -28,6 +28,14 @@ toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+# libc (Unix only): PER-036A / ADR-0016 tool-owned reads verify the containing
+# directory is operator-owned (euid via libc::geteuid) + not group/world-writable
+# before trusting a followed symlink. Conformance fixtures also use libc::mkfifo.
+# Already a transitive dep (reqwest etc.) and declared directly elsewhere in the
+# workspace; Unix-gated since the checks are Unix-only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = "0.6"

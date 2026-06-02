@@ -60,6 +60,36 @@ chanvoy daemon status
 
 The two overrides are independent; either can be set without the other. Profile data and runtime state partition by directory.
 
+## Agent-Critical File Reads (ADR-0016)
+
+chanvoy reads several local files whose contents carry agent-critical
+context. Per [ADR-0016](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/decisions/adr-0016-agent-critical-file-input-symlink-policy.md)
+these reads fail closed against shared-filesystem redirects:
+
+- **Caller-named inputs** (`--message-file`): a **symlinked** final
+  component is refused (the named path is the trust assertion — chanvoy
+  does not follow it), as are non-regular files (FIFO/socket/device/
+  directory); the read is bounded at 4 MiB. Remediation: pass the real
+  (resolved) path.
+- **Credential `--env-file`** (`credential_mode = env_file`): refused if
+  the final component is a symlink, if it is a non-regular file, if it
+  exceeds **64 KiB**, or (on Unix) if it is **group- or world-accessible**
+  — a token in a loose-permission file is a leak. Keep credential files
+  owner-only (`chmod 600`). Diagnostics name the path and the policy
+  failure, never the token contents. For a legitimately symlinked
+  credential layout, pass the resolved materialized path.
+- **chanvoy-owned config/state** (persisted profiles, `active_profile`,
+  attention state, the bootstrap-state handoff): read from chanvoy's
+  own `0700` config/runtime dirs. A symlink to a regular file is allowed
+  (dotfile / seclusor layouts), but non-regular targets are refused and
+  reads are bounded before parsing. The daemon pid file (force-kill
+  fallback) is tool-owned numeric state, exempt from the full helper but
+  guarded against a non-regular path so it can't block.
+
+Scope is the ADR portable floor — final-component symlinks. Intermediate-
+directory symlinks and the metadata→open TOCTOU race are out of scope at
+this level (`O_NOFOLLOW`+`fstat` is the named Unix hardening upgrade).
+
 ## Bootstrap Flow
 
 ### Primary path: `chanvoy auto-setup`
