@@ -5,7 +5,64 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-06-NN
+
+First **public release** — signed cross-platform binaries published to a
+GitHub release with the full signing-and-publication pipeline in place;
+the repo flips PRIVATE → PUBLIC as the terminal action of the cycle. Full
+narrative in [`docs/releases/v0.2.2.md`](docs/releases/v0.2.2.md). (Date
+finalized at tag time.)
+
+### Added
+
+- **`pin` / `unpin` write verbs** (PER-034, #36). Pin/unpin a post under
+  the bot's identity via the cross-team γ hybrid resolver; idempotent and
+  cursor-neutral; a `403` is normalized to a verb-specific
+  channel-admin-permission diagnostic.
+- **Profile identity-reduction policy** (PER-035, #37). Optional
+  `[reduce]` block lets a stream-suffixed engagement bot defer to its
+  bare family identity for outside-team writes. Resolution/verification
+  stay on the calling identity; only the terminal write reduces. New
+  `auto-setup --reduce-profile <name>` and `profile show <name>`
+  surfaces. Applies to `post`, threaded replies, `react`, `unreact`,
+  `pin`, `unpin`. Off by default.
+- **`--message-file` + stdin (`-`) input** for `post`, `dm send`, legacy
+  `dm <user> <message>`, and `notify` (PER-036, #38). Exactly one source
+  per call; body sent verbatim. CLI-only. Over-length defers to
+  Mattermost with a normalized char-count diagnostic.
+- **`chanvoy-core::safe_read`** — ADR-0016 three-tier safe file-read
+  helpers (caller-named / credential / tool-owned) with a conformance
+  fixture suite (PER-036A, #39).
+- **Manual signing rails** — 7 release scripts + 13 Makefile targets +
+  `RELEASE_CHECKLIST.md` at the repo root (PER-030, #33).
+- **Tag-triggered release workflow** — `.github/workflows/release.yml`
+  produces a draft GitHub release with a 3-binary build matrix; `--locked`
+  release builds (PER-031, #30).
+- **Release-cycle hygiene** — `make release-smoke` live-Mattermost gate,
+  `read --since` test, endpoint manifest (PER-032, #27).
+
+### Changed
+
+- **`reqwest` 0.12.15 → 0.13.3** (PER-033, #31), clearing
+  RUSTSEC-2025-0134. TLS engine stays rustls; crypto provider `ring` →
+  `aws-lc-rs`; cert verification bundled `webpki-roots` →
+  `rustls-platform-verifier` (OS trust store). Private-CA Mattermost
+  deployments must have the CA in the OS trust store.
+
+### Security
+
+- **ADR-0016 agent-critical file handling** (PER-036A, #39 — reference
+  impl PER-036, #38). Named file inputs fail closed: caller-named
+  (`--message-file`) refuse symlinked final components + non-regular
+  files with a bounded read; credential `--env-file` adds a 64 KiB cap +
+  Unix loose-permission refusal (never prints secrets); tool-owned
+  config/state reads refuse non-regular targets, bound the read, and
+  verify the containing directory is operator-owned and not
+  group/world-writable. Closes a shared-`/tmp` redirect/exfil class.
+- **Reduce-target identity validation** (PER-035, #37). A reduce-
+  configured daemon whoami-validates the family token against the
+  expected bot at startup and fails closed on mismatch — preventing
+  stream identity from posting under a false family attribution.
 
 ### Documentation
 
@@ -47,9 +104,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signed-binary GitHub Releases, not crates.io. Every workspace
   member now reports non-empty metadata under `cargo metadata
   --no-deps`.
-
-No CLI behavior changes. No CLI surface changes. No Rust code
-changes outside `Cargo.toml` files.
+- **Operator-guide expansions.** Socket-access sandbox dimension
+  (PER-026 Class 3 follow-on, #32); "Multi-line message input"
+  (`--message-file` / stdin) and "Agent-Critical File Reads (ADR-0016)"
+  sections (PER-036 / PER-036A); the identity-reduction section
+  (PER-035). Getting-started gains the `--message-file` example.
+- **`.gitignore` comment rename** `lanyte-ctx` → `stashvoy` (CRT-011F
+  cross-consumer regen, #34).
 
 ## [0.2.1] - 2026-05-08
 
