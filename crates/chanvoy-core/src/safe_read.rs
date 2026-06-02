@@ -71,6 +71,17 @@ pub enum SafeReadError {
          (mode {mode:04o}); restrict it to owner-only (chmod 600)"
     )]
     LoosePermissions { path: String, mode: u32 },
+    #[error(
+        "refusing to read tool-owned file {path}: its containing directory {dir} is not \
+         private ({reason}); a writable or non-owned directory lets another user plant a \
+         redirect. Ensure chanvoy's config/runtime dir is owner-owned and not \
+         group/world-writable (chmod 700)"
+    )]
+    InsecureParentDir {
+        path: String,
+        dir: String,
+        reason: String,
+    },
     #[error("{path} is not valid UTF-8 text")]
     InvalidUtf8 { path: String },
     #[error("io error reading {path}: {source}")]
@@ -147,6 +158,13 @@ pub fn read_credential_file(path: &Path, max_bytes: u64) -> Result<String, SafeR
 /// seclusor layouts), but non-regular targets are refused and the read is
 /// bounded. Follows symlinks via `metadata` (resolving to the target's type).
 pub fn read_tool_owned_file(path: &Path, max_bytes: u64) -> Result<String, SafeReadError> {
+    // PER-036A / ADR-0016 (devrev PR #39 finding #2): the tool-owned tier
+    // FOLLOWS a symlink to a regular file, so the safety of the read rests on
+    // the containing directory being private — if another user can write the
+    // directory, they can plant a redirect that this tier would follow.
+    // Verify the parent is operator-owned and not group/world-writable BEFORE
+    // trusting the file. (`NotFound` is checked first so absent-file callers
+    // still get their normal branch.)
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -161,6 +179,7 @@ pub fn read_tool_owned_file(path: &Path, max_bytes: u64) -> Result<String, SafeR
             });
         }
     };
+    verify_private_parent(path)?;
     if !meta.is_file() {
         return Err(SafeReadError::NonRegular {
             path: display(path),
@@ -168,6 +187,55 @@ pub fn read_tool_owned_file(path: &Path, max_bytes: u64) -> Result<String, SafeR
     }
     enforce_size(path, meta.len(), max_bytes)?;
     bounded_utf8(path, max_bytes)
+}
+
+/// Verify the file's containing directory is private enough to trust a
+/// followed symlink: on Unix, owned by the current euid and not group- or
+/// world-writable. A writable-by-others or non-owned directory is where a
+/// redirect gets planted. No-op on non-Unix (the portable baseline does not
+/// model Windows ACLs here; symlink creation there is privilege-gated).
+#[cfg(unix)]
+fn verify_private_parent(path: &Path) -> Result<(), SafeReadError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    let meta = match std::fs::metadata(dir) {
+        Ok(meta) => meta,
+        // If the parent can't be stat'd, fall through — the file read itself
+        // will surface the real error with the file path.
+        Err(_) => return Ok(()),
+    };
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(SafeReadError::InsecureParentDir {
+            path: display(path),
+            dir: display(dir),
+            reason: format!("group/world-writable, mode {:04o}", mode & 0o7777),
+        });
+    }
+    // SAFETY: geteuid is a pure libc getter with no arguments and no memory
+    // effects; it cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(SafeReadError::InsecureParentDir {
+            path: display(path),
+            dir: display(dir),
+            reason: format!(
+                "owned by uid {}, not the current user (uid {euid})",
+                meta.uid()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_parent(_path: &Path) -> Result<(), SafeReadError> {
+    Ok(())
 }
 
 /// `symlink_metadata` (does NOT follow the final component) with NotFound
@@ -277,6 +345,39 @@ mod tests {
             read_tool_owned_file(&path, DEFAULT_MAX_BYTES).unwrap(),
             "{}"
         );
+    }
+
+    // ---- private-parent precondition for tool-owned reads (devrev PR #39 #2) ----
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_owned_accepts_private_0700_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = write_file(dir.path(), "ok.json", b"{}");
+        assert_eq!(
+            read_tool_owned_file(&path, DEFAULT_MAX_BYTES).unwrap(),
+            "{}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_owned_refuses_group_or_world_writable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "state.json", b"{}");
+        // Loosen the containing dir to world-writable — a redirect could be
+        // planted here, so the followed-symlink tier must refuse.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = read_tool_owned_file(&path, DEFAULT_MAX_BYTES).unwrap_err();
+        assert!(
+            matches!(err, SafeReadError::InsecureParentDir { .. }),
+            "world-writable parent dir must be refused; got {err:?}"
+        );
+        // Restore 0700 so TempDir cleanup is unsurprising.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     // ---- not found ----

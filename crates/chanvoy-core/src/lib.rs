@@ -1835,7 +1835,12 @@ pub fn list_profiles() -> Result<Vec<Profile>, CoreError> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
         }
-        let contents = fs::read_to_string(&path)?;
+        // PER-036A / ADR-0016 (devrev PR #39 finding #1): each profile TOML
+        // feeds the resolver / profile collection, so it is agent-critical
+        // and must go through the same tool-owned safe reader as
+        // `load_profile` — non-regular refusal, private-parent verification,
+        // and a bounded read — not a raw `fs::read_to_string`.
+        let contents = safe_read::read_tool_owned_file(&path, safe_read::DEFAULT_MAX_BYTES)?;
         let profile: Profile = toml::from_str(&contents)?;
         profiles.push(profile);
     }
@@ -5181,6 +5186,38 @@ env_name = \"LANYTE_MM_TOKEN\"
         assert!(path.ends_with("lanytehq/chanvoy/state-bravo-devlead.json"));
 
         unsafe { env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_profiles_routes_through_safe_reader() {
+        // PER-036A / ADR-0016 (devrev PR #39 #1): list_profiles must read each
+        // profile TOML via the tool-owned safe reader, so a non-regular entry
+        // (here a directory named like a profile) is refused, not blindly
+        // read. Proves the resolver/collection input is covered, not just
+        // load_profile.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        unsafe { env::set_var("CHANVOY_CONFIG_DIR", config.path()) };
+
+        let profiles_dir = config.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::set_permissions(&profiles_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // A valid profile lists fine on its own.
+        let good = "name = \"good\"\nrole = \"r\"\nscope = \"s\"\nprovider = \"mattermost\"\n\
+                    bot_username = \"agent-good\"\nteam_name = \"org-s\"\n\
+                    server_url = \"https://mm.example.com\"\nenv_name = \"LANYTE_MM_TOKEN\"\n";
+        fs::write(profiles_dir.join("good.toml"), good).unwrap();
+        // A directory whose name ends in `.toml` is a non-regular "profile".
+        fs::create_dir(profiles_dir.join("evil.toml")).unwrap();
+
+        let result = list_profiles();
+        unsafe { env::remove_var("CHANVOY_CONFIG_DIR") };
+
+        match result {
+            Err(CoreError::SafeRead(SafeReadError::NonRegular { .. })) => {}
+            other => panic!("expected NonRegular refusal from list_profiles, got {other:?}"),
+        }
     }
 
     #[test]
