@@ -404,6 +404,39 @@ async fn post_message_file_non_regular_rejected() {
 }
 
 #[tokio::test]
+async fn post_message_file_symlink_refused() {
+    // ADR-0016: a symlinked --message-file is refused end-to-end, even
+    // when its target is a valid regular file. Fail closed.
+    let env = TestEnv::new("per-036-post-symlink").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real.md");
+    std::fs::write(&target, "legit content\n").unwrap();
+    let link = dir.path().join("notes.md");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let out = run_chanvoy(
+        &env,
+        &[
+            "post",
+            "bravo-team",
+            "--message-file",
+            link.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "symlinked --message-file must reject"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("symlink"),
+        "must name the symlink cause; got: {stderr}"
+    );
+}
+
+#[tokio::test]
 async fn notify_no_source_rejected() {
     let env = TestEnv::new("per-036-notify-nosource").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");

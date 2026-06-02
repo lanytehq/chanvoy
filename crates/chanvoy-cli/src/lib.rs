@@ -946,11 +946,21 @@ fn read_message_file(path: &Path) -> Result<String, CliError> {
 }
 
 fn read_message_file_capped(path: &Path, max_bytes: u64) -> Result<String, CliError> {
-    // Stat first: refuse non-regular files (FIFO, device, socket,
-    // directory) and over-cap files BEFORE reading, so a special file or
-    // a multi-GB file can't block or OOM the CLI. `metadata` follows
-    // symlinks, so a symlink to a regular file is fine.
-    let meta = match std::fs::metadata(path) {
+    // ADR-0016 (agent-critical file input symlink policy): a
+    // `--message-file` body becomes a chat post / DM / notification, so
+    // the named path is part of the trust assertion — the file the
+    // caller named must be the file we read. On a shared dev machine
+    // (multiple agent roles, shared /tmp per AGENTS.local.md) a planted
+    // symlink at the named path would redirect the read to any
+    // operator-readable file and exfil it into a channel. We fail
+    // CLOSED: `symlink_metadata` (which does NOT follow the final
+    // component) lets us refuse a symlinked final component before any
+    // read. This is the ADR-0016 reference implementation; the portable
+    // baseline rejects the final-component symlink (the realistic
+    // shared-temp attack). Intermediate-directory symlinks and the
+    // metadata→open TOCTOU race are documented out-of-scope at this
+    // floor (O_NOFOLLOW+fstat is the named Unix hardening upgrade).
+    let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == ErrorKind::NotFound => {
             return Err(CliError::Bootstrap(format!(
@@ -965,6 +975,16 @@ fn read_message_file_capped(path: &Path, max_bytes: u64) -> Result<String, CliEr
             )));
         }
     };
+    if meta.file_type().is_symlink() {
+        return Err(CliError::Bootstrap(format!(
+            "message file {} is a symlink; symlinks are not followed for agent-critical \
+             message files (ADR-0016) — pass the real path",
+            path.display()
+        )));
+    }
+    // Refuse non-regular files (FIFO, device, socket, directory) and
+    // over-cap files BEFORE reading, so a special file or a multi-GB
+    // file can't block or OOM the CLI.
     if !meta.is_file() {
         return Err(CliError::Bootstrap(format!(
             "message file {} is not a regular file (FIFO, device, socket, or directory); \
@@ -3816,6 +3836,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = read_message_file(dir.path()).expect_err("directory must be refused");
         assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("not a regular file")));
+    }
+
+    #[test]
+    fn read_message_file_refuses_symlink_to_regular_file() {
+        // ADR-0016: a symlink whose target is a perfectly valid regular
+        // file must STILL be refused — the named path is the trust
+        // assertion, and following a planted redirect on shared /tmp is
+        // the exfil vector. Fail closed, naming "symlink".
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-notes.md");
+        std::fs::write(&target, "legitimate content\n").unwrap();
+        let link = dir.path().join("notes.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_message_file(&link).expect_err("symlinked message file must be refused");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("symlink")),
+            "diagnostic must name the symlink cause; got: {err:?}"
+        );
     }
 
     #[test]

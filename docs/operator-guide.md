@@ -270,6 +270,13 @@ Rules:
   endless pipe is rejected before the body is materialized, so it can't
   OOM or hang the CLI. The guard sits far above any realistic post size,
   so it never rejects a legitimate message.
+- A **symlinked** `--message-file` path is refused (ADR-0016): the
+  named path is the trust assertion, so chanvoy does not follow a
+  symlink at the final path component — on a shared machine a planted
+  symlink could otherwise redirect the read to any operator-readable
+  file and post its contents. Remediation is a 10-second fix: pass the
+  real (resolved) path. Resolve a `latest`-style convenience symlink to
+  its concrete target before passing it in.
 
 ### Threaded replies (`post --reply-to`)
 
