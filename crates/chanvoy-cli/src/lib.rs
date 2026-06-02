@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::{ErrorKind, IsTerminal, Read};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Stdio;
 use std::{env, ffi::OsStr};
@@ -333,7 +334,16 @@ struct WaitArgs {
 #[derive(Debug, Args)]
 struct PostArgs {
     channel: String,
-    message: String,
+    /// Message body. Optional: omit it and use `--message-file <path>`,
+    /// or pass `-` to read the body from stdin. Exactly one source must
+    /// be supplied (positional / `--message-file` / `-`).
+    message: Option<String>,
+    /// PER-036: read the message body from this file instead of the
+    /// positional argument. Mutually exclusive with a positional
+    /// message and with `-` (stdin). Body is posted verbatim
+    /// (trailing newline preserved).
+    #[arg(long, value_name = "PATH")]
+    message_file: Option<PathBuf>,
     /// When set, the post is created as a thread reply under the
     /// named parent post (Mattermost `root_id` / Slack `thread_ts`
     /// semantic). Channel resolution unchanged from the top-level
@@ -414,7 +424,13 @@ struct PinArgs {
 #[derive(Debug, Args)]
 struct DmSendArgs {
     username: String,
-    message: String,
+    /// Message body. Optional: omit and use `--message-file <path>`, or
+    /// pass `-` to read from stdin. Exactly one source must be supplied.
+    message: Option<String>,
+    /// PER-036: read the message body from this file. Mutually
+    /// exclusive with a positional message and `-` (stdin).
+    #[arg(long, value_name = "PATH")]
+    message_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -427,7 +443,13 @@ struct DmReadArgs {
 #[derive(Debug, Args)]
 struct NotifyArgs {
     bot_username: String,
-    message: String,
+    /// Message body. Optional: omit and use `--message-file <path>`, or
+    /// pass `-` to read from stdin. Exactly one source must be supplied.
+    message: Option<String>,
+    /// PER-036: read the message body from this file. Mutually
+    /// exclusive with a positional message and `-` (stdin).
+    #[arg(long, value_name = "PATH")]
+    message_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -616,25 +638,29 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 process::exit(1);
             }
         },
-        CommandSet::Post(args) => print_receipt(
-            cli.json,
-            "posted",
-            &daemon_client(&profile)
+        CommandSet::Post(args) => {
+            let body = resolve_message_body(args.message.as_deref(), args.message_file.as_deref())?;
+            let char_count = body.chars().count();
+            let receipt = daemon_client(&profile)
                 .post_message(
                     &args.channel,
-                    &args.message,
+                    &body,
                     args.team.clone(),
                     args.reply_to.clone(),
                 )
-                .await?,
-        ),
-        CommandSet::Dm(DmCommand::Send(args)) => print_dm_receipt(
-            cli.json,
-            &args.username,
-            &daemon_client(&profile)
-                .direct_message(&args.username, &args.message)
-                .await?,
-        ),
+                .await
+                .map_err(|err| map_post_error(err.into(), char_count))?;
+            print_receipt(cli.json, "posted", &receipt)
+        }
+        CommandSet::Dm(DmCommand::Send(args)) => {
+            let body = resolve_message_body(args.message.as_deref(), args.message_file.as_deref())?;
+            let char_count = body.chars().count();
+            let receipt = daemon_client(&profile)
+                .direct_message(&args.username, &body)
+                .await
+                .map_err(|err| map_post_error(err.into(), char_count))?;
+            print_dm_receipt(cli.json, &args.username, &receipt)
+        }
         CommandSet::Dm(DmCommand::Read(args)) => print_value(
             cli.json,
             &daemon_client(&profile)
@@ -642,13 +668,15 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 .await?,
         ),
         CommandSet::Dm(DmCommand::Raw(args)) => handle_dm_raw(&profile, cli.json, args).await,
-        CommandSet::Notify(args) => print_notify_receipt(
-            cli.json,
-            &args.bot_username,
-            &daemon_client(&profile)
-                .notify(&args.bot_username, &args.message)
-                .await?,
-        ),
+        CommandSet::Notify(args) => {
+            let body = resolve_message_body(args.message.as_deref(), args.message_file.as_deref())?;
+            let char_count = body.chars().count();
+            let receipt = daemon_client(&profile)
+                .notify(&args.bot_username, &body)
+                .await
+                .map_err(|err| map_post_error(err.into(), char_count))?;
+            print_notify_receipt(cli.json, &args.bot_username, &receipt)
+        }
         CommandSet::Notifications(args) => {
             let since_secs = parse_time_window(&args.since, TimeWindowDefaultUnit::Minutes)
                 .map_err(CliError::Bootstrap)?;
@@ -840,6 +868,235 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+// ----------------------------------------------------------------------
+// PER-036: message-body input resolution (positional / --message-file / stdin)
+// ----------------------------------------------------------------------
+
+/// PER-036: resolve a message body from the three input shapes —
+/// positional literal, `--message-file <path>`, or `-` (stdin). Shared
+/// by every message-writing verb (`post`, `dm send`, legacy `dm`,
+/// `notify`) so the ergonomics are identical regardless of surface.
+///
+/// Mutex: at most one source may be supplied; zero sources is an error
+/// (no body to send). The `-` positional is the stdin sentinel.
+///
+/// Body is returned **verbatim** — trailing newlines and CRLF line
+/// endings are preserved, because the file/stdin bytes are the
+/// operator's intent (PER-036 §Open questions lean). Empty- and
+/// whitespace-only file/stdin content is rejected (MM rejects empty
+/// posts; surface it earlier with a clearer diagnostic). A literal
+/// positional message is passed through unchanged — existing behavior,
+/// no new validation, so existing scripts can't break.
+fn resolve_message_body(
+    positional: Option<&str>,
+    message_file: Option<&Path>,
+) -> Result<String, CliError> {
+    let stdin_requested = positional == Some("-");
+    let literal = positional.filter(|m| *m != "-");
+
+    let source_count = [literal.is_some(), stdin_requested, message_file.is_some()]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if source_count > 1 {
+        return Err(message_source_conflict());
+    }
+    if source_count == 0 {
+        return Err(no_message_source());
+    }
+
+    if let Some(message) = literal {
+        Ok(message.to_string())
+    } else if stdin_requested {
+        read_message_stdin()
+    } else {
+        read_message_file(message_file.expect("source_count==1 with no literal/stdin ⇒ file"))
+    }
+}
+
+fn message_source_conflict() -> CliError {
+    CliError::Bootstrap(
+        "more than one message source supplied — pass exactly one of a positional message, \
+         `--message-file <path>`, or `-` (stdin). They are mutually exclusive so message \
+         content is never silently dropped."
+            .to_string(),
+    )
+}
+
+fn no_message_source() -> CliError {
+    CliError::Bootstrap(
+        "no message body supplied — pass a positional message, `--message-file <path>`, \
+         or `-` to read from stdin."
+            .to_string(),
+    )
+}
+
+/// PER-036 (devrev PR #38 hardening): an upper bound on message-body
+/// input read from a file or stdin. This is a **resource guard** against
+/// OOM / endless-pipe / huge-file footguns — NOT a content-policy limit.
+/// It is deliberately far above any realistic MM `Posts.MaxPostSize`
+/// (default 16384 characters, server-configurable), so legitimate posts
+/// always pass through to MM and only MM enforces the actual post-size
+/// policy (see `map_post_error`). Inputs over this cap are refused
+/// before the body is fully materialized.
+const MAX_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_message_file(path: &Path) -> Result<String, CliError> {
+    read_message_file_capped(path, MAX_MESSAGE_BYTES)
+}
+
+fn read_message_file_capped(path: &Path, max_bytes: u64) -> Result<String, CliError> {
+    // ADR-0016 (agent-critical file input symlink policy): a
+    // `--message-file` body becomes a chat post / DM / notification, so
+    // the named path is part of the trust assertion — the file the
+    // caller named must be the file we read. On a shared dev machine
+    // (multiple agent roles, shared /tmp per AGENTS.local.md) a planted
+    // symlink at the named path would redirect the read to any
+    // operator-readable file and exfil it into a channel. We fail
+    // CLOSED: `symlink_metadata` (which does NOT follow the final
+    // component) lets us refuse a symlinked final component before any
+    // read. This is the ADR-0016 reference implementation; the portable
+    // baseline rejects the final-component symlink (the realistic
+    // shared-temp attack). Intermediate-directory symlinks and the
+    // metadata→open TOCTOU race are documented out-of-scope at this
+    // floor (O_NOFOLLOW+fstat is the named Unix hardening upgrade).
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(CliError::Bootstrap(format!(
+                "message file not found: {}",
+                path.display()
+            )));
+        }
+        Err(err) => {
+            return Err(CliError::Bootstrap(format!(
+                "failed to read message file {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(CliError::Bootstrap(format!(
+            "message file {} is a symlink; symlinks are not followed for agent-critical \
+             message files (ADR-0016) — pass the real path",
+            path.display()
+        )));
+    }
+    // Refuse non-regular files (FIFO, device, socket, directory) and
+    // over-cap files BEFORE reading, so a special file or a multi-GB
+    // file can't block or OOM the CLI.
+    if !meta.is_file() {
+        return Err(CliError::Bootstrap(format!(
+            "message file {} is not a regular file (FIFO, device, socket, or directory); \
+             refusing to read",
+            path.display()
+        )));
+    }
+    if meta.len() > max_bytes {
+        return Err(CliError::Bootstrap(format!(
+            "message file {} is {} bytes, over chanvoy's {max_bytes}-byte input cap \
+             (a resource guard, not Mattermost's post-size limit); split or trim the file",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let file = std::fs::File::open(path).map_err(|err| {
+        CliError::Bootstrap(format!(
+            "failed to read message file {}: {err}",
+            path.display()
+        ))
+    })?;
+    // Bounded read as belt-and-suspenders against a file that grows
+    // between the stat and the read (TOCTOU).
+    let body = read_capped_utf8(file, &format!("message file {}", path.display()), max_bytes)?;
+    if body.trim().is_empty() {
+        return Err(CliError::Bootstrap(format!(
+            "message file {} is empty (or whitespace-only); nothing to post",
+            path.display()
+        )));
+    }
+    Ok(body)
+}
+
+fn read_message_stdin() -> Result<String, CliError> {
+    let stdin = std::io::stdin();
+    read_message_from_reader(stdin.is_terminal(), stdin.lock())
+}
+
+/// Inner, injectable stdin reader so the TTY guard, the cap, and the
+/// empty/UTF-8 diagnostics are unit-testable without a real terminal
+/// (PER-036 AC #9 + devrev PR #38 bounded-read hardening).
+fn read_message_from_reader(is_terminal: bool, reader: impl Read) -> Result<String, CliError> {
+    read_message_from_reader_capped(is_terminal, reader, MAX_MESSAGE_BYTES)
+}
+
+fn read_message_from_reader_capped(
+    is_terminal: bool,
+    reader: impl Read,
+    max_bytes: u64,
+) -> Result<String, CliError> {
+    if is_terminal {
+        return Err(CliError::Bootstrap(
+            "`-` specified but stdin is a TTY; either pipe input \
+             (e.g. `echo ... | chanvoy post <ch> -`) or supply `--message-file <path>`."
+                .to_string(),
+        ));
+    }
+    let body = read_capped_utf8(reader, "stdin", max_bytes)?;
+    if body.trim().is_empty() {
+        return Err(CliError::Bootstrap(
+            "stdin produced no message body (empty or whitespace-only); nothing to post"
+                .to_string(),
+        ));
+    }
+    Ok(body)
+}
+
+/// Read at most `max_bytes` from `reader` and decode as UTF-8, refusing
+/// input that exceeds the cap (an endless pipe or oversized stream is
+/// bounded by `Take(max_bytes + 1)` so we never allocate without limit).
+/// `source` labels the input in diagnostics ("stdin", "message file …").
+fn read_capped_utf8(reader: impl Read, source: &str, max_bytes: u64) -> Result<String, CliError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| CliError::Bootstrap(format!("failed to read {source}: {err}")))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CliError::Bootstrap(format!(
+            "{source} exceeds chanvoy's {max_bytes}-byte input cap \
+             (a resource guard, not Mattermost's post-size limit); trim the input"
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        CliError::Bootstrap(format!(
+            "{source} is not valid UTF-8 text; chanvoy posts text bodies only"
+        ))
+    })
+}
+
+/// PER-036 AC #8: chanvoy does not enforce a local length limit (MM's
+/// `Posts.MaxPostSize` is server-configurable, default 16384, and the
+/// CLI has no reliable source-of-truth for the actual value). When MM
+/// rejects an over-length post, normalize the diagnostic to name the
+/// received character count and point at the server setting, rather than
+/// surfacing a raw `api error 400: ...`. Detection keys off MM's stable
+/// `length` signature in the returned error text. Non-length errors pass
+/// through unchanged.
+fn map_post_error(err: CliError, char_count: usize) -> CliError {
+    let text = err.to_string();
+    let length_related = text.to_ascii_lowercase().contains("length");
+    if length_related {
+        CliError::Bootstrap(format!(
+            "message rejected by Mattermost as too long ({char_count} characters). \
+             Trim the message, or check the server's `Posts.MaxPostSize` setting \
+             (default 16384 characters, but server-configurable). Underlying error: {text}"
+        ))
+    } else {
+        err
+    }
+}
+
 async fn handle_dm_raw(profile: &str, json: bool, args: Vec<String>) -> Result<(), CliError> {
     if args.first().map(String::as_str) == Some("read") {
         let username = args.get(1).ok_or_else(dm_usage_error)?;
@@ -852,18 +1109,42 @@ async fn handle_dm_raw(profile: &str, json: bool, args: Vec<String>) -> Result<(
         );
     }
 
-    let username = args.first().ok_or_else(dm_usage_error)?;
-    if args.len() < 2 {
-        return Err(dm_usage_error());
+    // Legacy send form: `dm <user> [<message...>] [--message-file <path>]`.
+    // This arm is an `external_subcommand`, so clap hands us the raw
+    // token vec without flag parsing — PER-036 input shapes are parsed
+    // by hand here so the legacy form gets the same ergonomics as
+    // `dm send` (brief §CLI surface; devrev F1/F2 kept it in scope).
+    let mut iter = args.into_iter();
+    let username = iter.next().ok_or_else(dm_usage_error)?;
+    let mut message_file: Option<PathBuf> = None;
+    let mut words: Vec<String> = Vec::new();
+    while let Some(token) = iter.next() {
+        if token == "--message-file" {
+            let path = iter.next().ok_or_else(|| {
+                CliError::Bootstrap("--message-file requires a path argument".to_string())
+            })?;
+            // Reject a repeated flag rather than last-wins, to honor the
+            // single-source/single-file contract (devrev PR #38). The
+            // clap-parsed verbs reject duplicates automatically; this
+            // manual-parse path must do it explicitly.
+            if message_file.is_some() {
+                return Err(CliError::Bootstrap(
+                    "--message-file specified more than once; supply exactly one".to_string(),
+                ));
+            }
+            message_file = Some(PathBuf::from(path));
+        } else {
+            words.push(token);
+        }
     }
-    let message = args[1..].join(" ");
-    print_dm_receipt(
-        json,
-        username,
-        &daemon_client(profile)
-            .direct_message(username, &message)
-            .await?,
-    )
+    let positional = (!words.is_empty()).then(|| words.join(" "));
+    let body = resolve_message_body(positional.as_deref(), message_file.as_deref())?;
+    let char_count = body.chars().count();
+    let receipt = daemon_client(profile)
+        .direct_message(&username, &body)
+        .await
+        .map_err(|err| map_post_error(err.into(), char_count))?;
+    print_dm_receipt(json, &username, &receipt)
 }
 
 fn parse_since_arg(args: &[String]) -> Result<u64, CliError> {
@@ -3417,5 +3698,193 @@ mod tests {
         assert_eq!(merged.env_file, existing.env_file);
         // Env-owned field still took the desired value.
         assert_eq!(merged.env_name, "REFRESHED_TOKEN_ENV");
+    }
+
+    // ---- PER-036: message-body input resolution ----
+
+    #[test]
+    fn resolve_message_body_passes_literal_positional_through() {
+        // Existing behavior: a literal positional message is returned
+        // verbatim with no validation (AC #4, no breaking change).
+        let body = resolve_message_body(Some("hello world"), None).unwrap();
+        assert_eq!(body, "hello world");
+    }
+
+    #[test]
+    fn resolve_message_body_rejects_no_source() {
+        // AC #6: zero sources is a clear error.
+        let err = resolve_message_body(None, None).expect_err("no source must error");
+        assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("no message body")));
+    }
+
+    #[test]
+    fn resolve_message_body_rejects_multiple_sources() {
+        // AC #5: positional + --message-file is a mutex violation.
+        let err = resolve_message_body(Some("hi"), Some(Path::new("/tmp/x.md")))
+            .expect_err("positional + file must conflict");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("more than one message source"))
+        );
+        // stdin (`-`) + --message-file is also a conflict.
+        let err = resolve_message_body(Some("-"), Some(Path::new("/tmp/x.md")))
+            .expect_err("stdin + file must conflict");
+        assert!(matches!(err, CliError::Bootstrap(_)));
+    }
+
+    #[test]
+    fn read_message_file_happy_preserves_bytes_verbatim() {
+        // AC #1: multi-line markdown with newlines, backticks, and
+        // shell-special characters survives byte-for-byte, including the
+        // trailing newline (preserve-verbatim lean).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        let content = "# Title\n\nLine with `backtick` and $VAR and ! and \"quotes\".\n";
+        std::fs::write(&path, content).unwrap();
+        let body = read_message_file(&path).unwrap();
+        assert_eq!(body, content);
+    }
+
+    #[test]
+    fn read_message_file_errors_name_the_path() {
+        // AC #7: not-found, empty, whitespace-only each produce a clear
+        // diagnostic naming the path.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.md");
+        let err = read_message_file(&missing).expect_err("missing file must error");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("not found") && m.contains("nope.md"))
+        );
+
+        let empty = dir.path().join("empty.md");
+        std::fs::write(&empty, "").unwrap();
+        let err = read_message_file(&empty).expect_err("empty file must error");
+        assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("empty")));
+
+        let ws = dir.path().join("ws.md");
+        std::fs::write(&ws, "   \n\t\n").unwrap();
+        let err = read_message_file(&ws).expect_err("whitespace-only file must error");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("empty") || m.contains("whitespace"))
+        );
+    }
+
+    #[test]
+    fn read_message_file_rejects_non_utf8() {
+        // AC #7: binary / non-UTF-8 content is rejected with a clear
+        // diagnostic, not posted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.bin");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        let err = read_message_file(&path).expect_err("non-UTF-8 must error");
+        assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("UTF-8")));
+    }
+
+    #[test]
+    fn read_message_from_reader_rejects_tty() {
+        // AC #9: `-` on an interactive TTY (no pipe) errors clearly.
+        let err = read_message_from_reader(true, &b"ignored"[..]).expect_err("TTY must error");
+        assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("TTY")));
+    }
+
+    #[test]
+    fn read_message_from_reader_reads_piped_stdin() {
+        // AC #2: piped stdin body is read verbatim.
+        let body = read_message_from_reader(false, &b"piped message\n"[..]).unwrap();
+        assert_eq!(body, "piped message\n");
+    }
+
+    #[test]
+    fn read_message_from_reader_rejects_empty_pipe() {
+        let err = read_message_from_reader(false, &b""[..]).expect_err("empty stdin must error");
+        assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("no message body")));
+    }
+
+    #[test]
+    fn map_post_error_normalizes_length_rejections() {
+        // AC #8: a length-related MM error is normalized to name the
+        // char count + the Posts.MaxPostSize setting; other errors pass
+        // through unchanged.
+        let length_err = CliError::Bootstrap(
+            "rpc error -32000: api error 400: Post message exceeds the maximum permitted length"
+                .to_string(),
+        );
+        let mapped = map_post_error(length_err, 20000);
+        let text = mapped.to_string();
+        assert!(
+            text.contains("20000"),
+            "must name the char count; got: {text}"
+        );
+        assert!(
+            text.contains("Posts.MaxPostSize"),
+            "must point at the setting; got: {text}"
+        );
+
+        let other = CliError::Bootstrap("rpc error -32000: api error 403: forbidden".to_string());
+        let mapped = map_post_error(other, 10);
+        assert!(
+            !mapped.to_string().contains("Posts.MaxPostSize"),
+            "non-length errors must pass through unchanged"
+        );
+    }
+
+    // ---- PER-036 hardening (devrev PR #38): bounded reads ----
+
+    #[test]
+    fn read_message_file_rejects_non_regular_file() {
+        // A directory (or any non-regular file: FIFO, device, socket)
+        // must be refused before any read, naming the cause.
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_message_file(dir.path()).expect_err("directory must be refused");
+        assert!(matches!(err, CliError::Bootstrap(ref m) if m.contains("not a regular file")));
+    }
+
+    #[test]
+    fn read_message_file_refuses_symlink_to_regular_file() {
+        // ADR-0016: a symlink whose target is a perfectly valid regular
+        // file must STILL be refused — the named path is the trust
+        // assertion, and following a planted redirect on shared /tmp is
+        // the exfil vector. Fail closed, naming "symlink".
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-notes.md");
+        std::fs::write(&target, "legitimate content\n").unwrap();
+        let link = dir.path().join("notes.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_message_file(&link).expect_err("symlinked message file must be refused");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("symlink")),
+            "diagnostic must name the symlink cause; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_message_file_rejects_oversize_before_reading() {
+        // The size check uses metadata, so an over-cap file is refused
+        // without materializing it (tested here with a small cap).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.md");
+        std::fs::write(&path, "x".repeat(100)).unwrap();
+        let err = read_message_file_capped(&path, 10).expect_err("over-cap file must be refused");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("input cap") && m.contains("100 bytes"))
+        );
+    }
+
+    #[test]
+    fn read_capped_reader_rejects_oversize_stream() {
+        // An over-cap stream (stand-in for an endless pipe) is bounded by
+        // Take(max+1) and refused, never read without limit.
+        let big = [b'x'; 100];
+        let err = read_message_from_reader_capped(false, &big[..], 10)
+            .expect_err("over-cap stdin must be refused");
+        assert!(
+            matches!(err, CliError::Bootstrap(ref m) if m.contains("input cap") && m.contains("stdin"))
+        );
+    }
+
+    #[test]
+    fn read_capped_reader_accepts_within_cap() {
+        let body = read_message_from_reader_capped(false, &b"ok body\n"[..], 1024).unwrap();
+        assert_eq!(body, "ok body\n");
     }
 }

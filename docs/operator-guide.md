@@ -227,6 +227,57 @@ threaded replies and emoji reactions. Both are noise-reduction
 surfaces: a high-traffic review channel with many findings + acks
 no longer needs all of those as top-level posts.
 
+### Multi-line message input (`--message-file` / stdin)
+
+Every message-writing verb — `post`, `dm send`, the legacy
+`dm <user> <message>` form, and `notify` — accepts the message body
+three ways:
+
+```bash
+# 1. Positional (single-line, unchanged)
+chanvoy post repo-stashvoy-ops "shipped v0.2.2"
+
+# 2. From a file (recommended for multi-line / markdown bodies)
+chanvoy post repo-stashvoy-ops --message-file /tmp/release-notes.md
+
+# 3. From stdin via the `-` convention (pipe-friendly)
+cat /tmp/release-notes.md | chanvoy post repo-stashvoy-ops -
+chanvoy read other-channel --json | jq -r '.[0].message' | chanvoy dm send alice -
+```
+
+Prefer `--message-file` or `-` over `chanvoy post <ch> "$(cat file)"`
+for anything with newlines, backticks, `$`, or `!` — the shell-
+substitution form interacts badly with history/command expansion and
+can hit `ARG_MAX`. The file/stdin paths read the body directly.
+
+Rules:
+- **Exactly one** source per call. Supplying more than one (e.g. a
+  positional message *and* `--message-file`) is refused up front, so
+  message content is never silently dropped.
+- The body is sent **verbatim** — trailing newlines and CRLF line
+  endings are preserved (the file's bytes are your intent).
+- Empty / whitespace-only files (or empty stdin) are refused — MM
+  rejects empty posts; chanvoy surfaces it earlier with a clearer
+  message. Non-UTF-8 input is refused.
+- `-` requires piped stdin; on an interactive TTY it errors rather
+  than hang waiting for input.
+- chanvoy does **not** enforce a content-length policy (MM's
+  `Posts.MaxPostSize` is server-configurable). An over-length body is
+  sent to MM; if MM rejects it, chanvoy reports the received character
+  count and points at the `Posts.MaxPostSize` setting. Separately, a
+  generous **resource guard** (4 MiB) refuses pathological inputs — a
+  non-regular file (FIFO/device/directory), an over-cap file, or an
+  endless pipe is rejected before the body is materialized, so it can't
+  OOM or hang the CLI. The guard sits far above any realistic post size,
+  so it never rejects a legitimate message.
+- A **symlinked** `--message-file` path is refused (ADR-0016): the
+  named path is the trust assertion, so chanvoy does not follow a
+  symlink at the final path component — on a shared machine a planted
+  symlink could otherwise redirect the read to any operator-readable
+  file and post its contents. Remediation is a 10-second fix: pass the
+  real (resolved) path. Resolve a `latest`-style convenience symlink to
+  its concrete target before passing it in.
+
 ### Threaded replies (`post --reply-to`)
 
 ```bash
