@@ -1025,16 +1025,16 @@ async fn daemon_start_classifies_child_startup_failure() {
         String::from_utf8_lossy(&out.stdout)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // Assertions are against the text the operator actually sees. `main`
-    // renders errors with `Debug` (chanvoy-wide, unrelated to this task —
-    // it is why the field trace reads `Daemon(NotRunning(...sock))`), so
-    // the variant name and the `detail` payload are what land on stderr.
+    // Assertions are against the text the operator actually sees. `main` now
+    // renders errors with `Display`, so these match the `#[error(...)]`
+    // messages rather than enum shapes.
     assert!(
-        stderr.contains("DaemonStartup"),
-        "failure must be classified as a startup failure, not a bare NotRunning; stderr={stderr}"
+        stderr.contains("daemon startup failed"),
+        "failure must be classified as a startup failure, not a bare not-listening \
+         report; stderr={stderr}"
     );
     assert!(
-        !stderr.contains("NotRunning"),
+        !stderr.contains("no chanvoy daemon is listening"),
         "a child that started and died must not be reported as 'nothing is running'; \
          stderr={stderr}"
     );
@@ -1171,7 +1171,7 @@ async fn daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon()
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("DaemonStartup") && stderr.contains("startup budget"),
+        stderr.contains("daemon startup failed") && stderr.contains("startup budget"),
         "timeout must be classified as a startup failure; stderr={stderr}"
     );
 
@@ -1341,22 +1341,18 @@ async fn daemon_start_requires_explicit_profile_selection() {
         "bare `daemon start` must refuse to resolve via the active_profile marker"
     );
     let stderr = String::from_utf8_lossy(&implicit.stderr);
-    // Asserted against what actually reaches stderr. `main` renders errors with
-    // `Debug`, so the operator reads the variant name and fields — not the
-    // `Display` message. That is why this asserts `RequiresExplicit` + the
-    // available-profile list rather than the (corrected) prose.
-    //
-    // KNOWN GAP, pending a maintainer decision: because `Debug` is what shows,
-    // the operator still reads the word "Destructive" from the variant name
-    // `DestructiveRequiresExplicit`, which is the exact mis-description devrev
-    // flagged. Closing it needs either a `chanvoy-core` public-enum rename or
-    // switching `main` to `Display` rendering — both are surfaces that require
-    // maintainer sign-off, so this test locks in the behavior that is settled
-    // (the refusal itself) and deliberately does not assert wording that is
-    // still under decision.
+    // The previously-documented gap here is now closed: `main` renders
+    // `Display`, so the operator reads the typed message instead of the variant
+    // name `DestructiveRequiresExplicit` — which was mis-describing a daemon
+    // start as "destructive".
     assert!(
-        stderr.contains("RequiresExplicit"),
+        stderr.contains("requires explicit profile selection"),
         "refusal must come from the explicit-source requirement; stderr={stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("destructive"),
+        "`daemon start` is not destructive — no rendering of this refusal may say so; \
+         stderr={stderr}"
     );
     assert!(
         stderr.contains(&env.profile_name),

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Errors now print their message instead of their internal shape.** The CLI
+  returned errors from `main`, which makes Rust print the `Debug`
+  representation — so operators saw
+  `Error: Daemon(NotRunning("/var/.../profile.sock"))` and
+  `Error: Resolver(DestructiveRequiresExplicit { available: [...] })` while the
+  actual diagnostic messages went unread. Worse, the type name was doing the
+  talking: a `daemon start` refused for want of an explicit profile appeared to
+  call starting a daemon "destructive". Errors are now rendered as their
+  message, and the process still exits non-zero as before. Scripts that match
+  on stderr text will need updating; exit codes are unchanged.
+- **"daemon not running" message is accurate and actionable.** It named a
+  profile while actually carrying a socket path. It now reads
+  ``no chanvoy daemon is listening at <path>; start one with `chanvoy --profile
+  <name> daemon start` ``. This is the message quoted in most reports of a
+  daemon that vanished between commands.
+
 ### Fixed
 
 - **`daemon start` now starts a daemon that outlives the command that

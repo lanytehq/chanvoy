@@ -39,7 +39,7 @@ daemon started
 ...
 
 $ chanvoy read <channel>
-Error: Daemon(NotRunning)
+Error: no chanvoy daemon is listening at <runtime-path>/<profile>.sock; start one with `chanvoy --profile <name> daemon start`
 ```
 
 `auto-setup` reports success, but a follow-up CLI verb says the
@@ -96,7 +96,7 @@ daemon spawned under. This happens when:
 **Symptom**
 
 ```
-Error: Resolver(ActiveProfileNotFound { name: "<old-name>", ... })
+Error: the persistent active_profile marker points at '<old-name>' but no such profile exists (likely renamed or deleted); pass --profile, set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE, or run `chanvoy auto-setup` to refresh the marker. Available profiles: ["<other>"]
 ```
 
 **Cause**
@@ -136,10 +136,7 @@ all of which surface a meaningful diagnostic instead of a generic
 **Symptom**
 
 ```
-Error: ChannelNotFoundInAnyTeam {
-  name: "<your-channel>",
-  teams_searched: ["org-foo", "org-bar"]
-}
+Error: channel "<your-channel>" not found on any team you are a member of. Teams searched: ["org-foo", "org-bar"]. If the channel exists on a different team, ask dispatch to add the bot, or use the `<team>/<channel>` syntax with a team you are a member of.
 ```
 
 **Cause**
@@ -163,10 +160,7 @@ hosts the channel.
 **Symptom**
 
 ```
-Error: NotAMemberOfTeam {
-  team: "<requested-team>",
-  member_of: ["org-foo", "org-bar"]
-}
+Error: team "<requested-team>" requested via <team>/<channel> syntax, but you are not a member of it. Teams you are a member of: ["org-foo", "org-bar"].
 ```
 
 You see this only with explicit `<team>/<channel>` syntax or
@@ -180,19 +174,15 @@ silently falling back to the primary team.
 
 **Recovery**
 
-Either choose a team your bot belongs to (the `member_of` field lists
-them all), or have the workspace admin add the bot to the named
-team.
+Either choose a team your bot belongs to (the message lists them all),
+or have the workspace admin add the bot to the named team.
 
 ### `AmbiguousChannel`
 
 **Symptom**
 
 ```
-Error: AmbiguousChannel {
-  name: "<channel>",
-  found_on: ["org-foo", "org-bar"]
-}
+Error: channel "<channel>" is ambiguous — found on multiple teams: ["org-foo", "org-bar"]. Use `--team <slug>` or `<team>/<channel>` syntax to disambiguate.
 ```
 
 **Cause**
@@ -225,7 +215,7 @@ $ chanvoy daemon status --json | grep identity
 "mattermost_identity_drift": true
 
 $ chanvoy post <channel> "..."
-Error: IdentityDrift { ... }
+Error: rpc error -32000: identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.
 ```
 
 Network-backed RPCs (`post`, `read`, `check`, `notifications`,
@@ -399,7 +389,7 @@ $ chanvoy --profile <name> daemon start --json
 { "profile_name": "<name>", "socket_path": "..." }
 
 $ chanvoy --profile <name> post <channel> "hello"     # separate invocation
-Error: Daemon(NotRunning("<runtime-path>/<profile>.sock"))
+Error: no chanvoy daemon is listening at <runtime-path>/<profile>.sock; start one with `chanvoy --profile <name> daemon start`
 ```
 
 Most visible under agent tooling (Codex, sandboxed harnesses) where

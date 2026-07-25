@@ -36,7 +36,12 @@ pub enum DaemonError {
     Io(#[from] io::Error),
     #[error("socket already running at {0}")]
     AlreadyRunning(String),
-    #[error("daemon socket not available for profile {0}")]
+    /// Message reworded now that `Display` is what operators read: both
+    /// construction sites pass a **socket path**, so calling it a profile was
+    /// simply wrong. This is the string every field report of the
+    /// start-then-vanish failure quoted, so it is worth being both accurate and
+    /// actionable. Variant name and shape unchanged.
+    #[error("no chanvoy daemon is listening at {0}; start one with `chanvoy --profile <name> daemon start`")]
     NotRunning(String),
     #[error("rpc error {code}: {message}")]
     Rpc { code: i64, message: String },
