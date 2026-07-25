@@ -703,7 +703,7 @@ When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profi
 Two carve-outs:
 
 - **Profile-collection management verbs** (`profile list`, `profile create`, `profile create-from-env`) and the **`auto-setup` bootstrap verb** bypass this resolver entirely. They operate on the profile collection or env-derived synthesis, not on a single existing target — and forcing resolution would brick fresh bootstrap on an empty config.
-- **Side-effecting daemon-lifecycle verbs** (currently just `daemon stop`) refuse on rules 4 and 5. They require an explicit target — `--profile`, `CHANVOY_PROFILE`, or env-derived `<role>-<scope>` — to avoid acting on another operator's daemon on a shared machine.
+- **Side-effecting daemon-lifecycle verbs** (`daemon stop` and `daemon start`) refuse on rules 4 and 5. They require an explicit target — `--profile`, `CHANVOY_PROFILE`, or env-derived `<role>-<scope>` — to avoid acting on another operator's daemon on a shared machine. `daemon start` is in this set because it validates a live credential and then spawns a long-lived process under that identity: resolving its target from the active marker or "whichever daemon happens to be running" could start a daemon under an identity the operator did not name.
 
 The full resolver contract, including policy semantics and per-rule rationale, lives in [`lanyte-crucible/docs/specs/agent-chat-conventions.md`](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
 
@@ -730,19 +730,29 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
 
 ## Daemon Lifecycle
 
-- `chanvoy daemon start`
-  - starts the local daemon when absent
-  - reports `already running` if an existing daemon is healthy
-  - removes a stale socket before binding
+- `chanvoy --profile <name> daemon start` — **durable background start**
+  - validates the token, bot identity, and team access **in this process**, then spawns a detached daemon that survives the invocation
+  - reports `already running` if an existing daemon is healthy (network-aware check: a daemon holding a revoked or drifted credential is replaced, not reused)
+  - reconciles a stale socket and a dead pid file automatically — no manual file movement
+  - refuses when the live credential authenticates as a different bot than the profile records
+  - requires an explicit profile (`--profile`, `CHANVOY_PROFILE`, or a sourced agent identity)
+  - never creates or refreshes a profile, moves the `active_profile` marker, seeds cursors, or rewrites `bot_username` — use `auto-setup` for those
+- `chanvoy --profile <name> daemon serve` — **foreground diagnostic mode**
+  - runs attached to your terminal: logs to stdout/stderr, `Ctrl-C` stops it
+  - not a background start; the difference from `daemon start` is lifetime and detachment, not just where stdio points
+  - use it to watch a daemon that fails to start under `daemon start`
 - `chanvoy daemon status`
   - reports socket path, profile, and Mattermost health
-- `chanvoy daemon stop`
+- `chanvoy --profile <name> daemon stop`
   - stops a running daemon
   - returns `NotRunning` if the daemon is already absent
+  - requires an explicit profile
 
 Observed lifecycle behavior:
 
-- stale socket cleanup works on next `daemon start`
+- `auto-setup` and `daemon start` share one durable-spawn primitive, so a daemon started either way has the same lifetime: it is its own session leader and outlives the shell or agent tool invocation that started it
+- stale socket + dead pid cleanup works on the next `daemon start` or `auto-setup`
+- a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; re-run the same profile under `daemon serve` to see the underlying error
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior
 
 ## Sandboxed Agent Contexts

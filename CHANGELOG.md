@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`daemon start` now starts a daemon that outlives the command that
+  started it.** It previously spawned the daemon without detaching it
+  into its own session and without the parent-side identity handoff, so
+  the daemon could answer inside the invocation that started it and then
+  be gone by the next one — the command reported success and the
+  following `post` or `read` failed with `NotRunning`. Most visible
+  under agent tooling, where every command is a separate invocation.
+  The `auto-setup` **spawn path** was not affected; both background
+  starts now use the same durable-spawn path. (`auto-setup` could still
+  report an ephemeral daemon as `already running` and then lose it,
+  because the daemon it reused had been started by the defective path.)
+- **A background start that is reported as failed no longer leaves a
+  daemon running.** If the daemon had not answered its socket by the end
+  of the startup budget, the command returned an error while that child
+  kept starting — so the next start found nothing to clean up and
+  spawned a second daemon for the same profile. A failed start is now
+  terminal: the child is terminated and reaped, and its startup residue
+  swept, before the error is returned. This covers a daemon that died on
+  its own *after* binding its socket and writing its pid file — that
+  residue used to survive and make the next start look like a crashed-
+  predecessor recovery. In the rare case where termination cannot be
+  confirmed, the command says so and names the pid instead of claiming a
+  clean sweep, and leaves the runtime files alone rather than deleting
+  them under a process that may still be alive.
+
+### Changed
+
+- **`daemon start` validates the daemon's own identity in the calling
+  process** — token, bot identity, and team access — before spawning, and
+  refuses when the live credential authenticates as a different bot than
+  the profile records. Note this covers the daemon's *primary* identity:
+  a profile with a `[reduce]` policy still resolves its family identity
+  in the daemon at startup, so reduce-configured profiles under a
+  network-gated sandbox are not yet fully covered.
+- **`daemon start` requires an explicit profile** (`--profile`,
+  `CHANVOY_PROFILE`, or a sourced agent identity), matching
+  `daemon stop`. It no longer falls back to the `active_profile` marker
+  or to a single running daemon, so it cannot start a daemon under an
+  identity you did not name.
+- **`daemon start` reuses a running daemon only when it is healthy.**
+  The pre-start check is network-aware: a daemon holding a revoked or
+  drifted credential is replaced rather than reported as `already
+  running`.
+- **`daemon serve` documented as the foreground diagnostic surface.**
+  Behavior is unchanged (attached, `Ctrl-C`-able); the docs and
+  `--help` text no longer imply it differs from `daemon start` only in
+  where stdio points.
+
 ### Documentation
 
 - **CLI `--help` cleanup.** Stripped internal brief-ID references

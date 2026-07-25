@@ -22,6 +22,7 @@ follow the recovery steps. Symptoms are listed roughly in
 - [Sandbox: network approval prompt fires during auto-setup](#sandbox-network-approval-prompt-fires-during-auto-setup)
 - [Sandbox: permission denied reading or binding the socket](#sandbox-permission-denied-reading-or-binding-the-socket)
 - [Stale socket file blocks daemon start](#stale-socket-file-blocks-daemon-start)
+- [`daemon start` succeeded but the next command says the daemon is gone](#daemon-start-succeeded-but-the-next-command-says-the-daemon-is-gone)
 - ["bare --limit rejected"](#bare---limit-rejected)
 - [Diagnostic harness for unmatched symptoms](#diagnostic-harness)
 
@@ -268,16 +269,24 @@ host.
 **Cause**
 
 This is **expected behavior**, not an error. The chanvoy bootstrap
-deliberately moves the only network call (Mattermost `whoami()`) into
-the parent CLI process so the prompt can fire in your interactive
+deliberately moves the identity network call (Mattermost `whoami()`)
+into the parent CLI process so the prompt can fire in your interactive
 shell, where you can answer it. The detached daemon child inherits
-the validated identity and doesn't make the call itself.
+the validated identity and doesn't make that call itself.
 
 **Recovery**
 
 Approve the prompt. The validated identity is handed to the daemon
 via a per-profile bootstrap-state file with a one-shot nonce; the
-daemon binds without further network calls.
+daemon binds without repeating the identity call.
+
+**Exception — profiles with a `[reduce]` policy.** Those daemons also
+resolve their *family* identity at startup, and that call is made by
+the detached child. Under a sandbox that gates network per-process,
+that call can fail where the primary-identity path succeeds; the daemon
+then refuses to start rather than posting under the wrong identity.
+Extending the parent handoff to carry the family identity is tracked as
+a follow-up.
 
 If your sandbox prompts per-process rather than per-session, you may
 also see prompts for periodic identity re-checks and for outbound
@@ -362,23 +371,69 @@ because the file path is taken even though no process holds it.
 **Recovery**
 
 ```bash
-chanvoy auto-setup
+chanvoy --profile <name> daemon start   # or: chanvoy auto-setup
 ```
 
-`auto-setup` detects the stale socket condition (bind fails + no
-listener answers) and removes the stale file before the new daemon
-binds. If `auto-setup` itself fails the same way, manually remove
-the file and retry:
+Either background start detects the stale-socket condition (bind fails
++ no listener answers), sweeps the orphaned socket and pid file, and
+binds a fresh daemon. **Do not move or delete runtime files by hand.**
+Recovering from a crashed predecessor is the lifecycle verb's job; if
+you find yourself relocating `<profile>.sock` or `<profile>.pid` to
+make a start succeed, that is a bug worth reporting, not a workaround
+to keep using.
 
-```bash
-rm <runtime-path>/<profile>.sock
-chanvoy auto-setup
-```
-
-This is safe as long as no live daemon is listening (verify with
-`chanvoy daemon status` first).
+Pick `daemon start` when the profile already exists and you only want
+its daemon back; pick `auto-setup` when you also want the profile
+re-synthesized from the current environment.
 
 **Reference:** [operator-guide.md §Daemon Lifecycle](./operator-guide.md#daemon-lifecycle).
+
+---
+
+## `daemon start` succeeded but the next command says the daemon is gone
+
+**Symptom**
+
+```
+$ chanvoy --profile <name> daemon start --json
+{ "profile_name": "<name>", "socket_path": "..." }
+
+$ chanvoy --profile <name> post <channel> "hello"     # separate invocation
+Error: Daemon(NotRunning("<runtime-path>/<profile>.sock"))
+```
+
+Most visible under agent tooling (Codex, sandboxed harnesses) where
+each command is its own approved tool invocation.
+
+**Cause**
+
+Fixed. Before the shared durable-spawn primitive landed, `daemon start`
+spawned the daemon without `setsid()` and without the parent-side
+identity handoff, so the child was reachable inside the invocation that
+started it and died when that invocation's process group was torn down.
+The `auto-setup` spawn path was not affected — it had the durable path
+all along — but `auto-setup` could still report `already running`
+against an ephemeral daemon that a previous `daemon start` had created,
+and then lose it, which is why the symptom sometimes appeared to follow
+an `auto-setup` that claimed success.
+
+**Recovery**
+
+Upgrade. On any build with the converged path, `daemon start` and
+`auto-setup` produce identical daemon lifetimes. To confirm on a live
+daemon:
+
+```bash
+chanvoy --profile <name> daemon start
+# in a separate invocation:
+chanvoy --profile <name> daemon status
+ps -o pid,ppid,sess -p "$(cat <runtime-path>/<profile>.pid)"
+```
+
+The session id must equal the daemon pid (it is its own session
+leader), and the parent pid must not be the CLI that started it.
+
+**Reference:** [architecture.md §Background starts](./architecture.md#background-starts-one-shared-primitive).
 
 ---
 

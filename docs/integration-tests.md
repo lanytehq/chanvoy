@@ -126,20 +126,29 @@ read-only claim.
 
 ## Daemon lifecycle model (PER-008D detachment)
 
-`chanvoy auto-setup` spawns the daemon as a detached process: the spawn
-site in `ensure_daemon_running` (`crates/chanvoy-cli/src/lib.rs`) calls
+Both background entry points — `chanvoy auto-setup` and
+`chanvoy daemon start` — spawn the daemon through one shared primitive,
+`spawn_durable_daemon` (`crates/chanvoy-cli/src/lib.rs`), which calls
 `libc::setsid()` via `pre_exec`, making the daemon the leader of a new
 session and process group with no controlling terminal. Operational
 consequence: the daemon survives the spawning shell's exit, including
-the controlling terminal closing (no `SIGHUP` propagation). Operators
-returning to the same machine in a fresh session find the daemon still
-running on its profile socket.
+the controlling terminal closing (no `SIGHUP` propagation), and the end
+of an agent tool invocation. Operators returning to the same machine in
+a fresh session find the daemon still running on its profile socket.
 
 Direct `chanvoy daemon serve` (the foreground / debug path) is **not**
 detached — it intentionally stays attached to the spawning shell so
-operators can `Ctrl-C` it and follow logs. Use `auto-setup` for the
-durable case, `daemon serve` for the foreground-debug case. PER-008D
-explicitly narrowed detachment to the auto-setup path.
+operators can `Ctrl-C` it and follow logs.
+
+Test-design consequence, learned the hard way: **detachment coverage
+must name the entry point it exercises.** PER-008D narrowed detachment
+to the auto-setup path and the Phase 4 tests below were scoped to
+match, so the suite stayed green for months while `daemon start` — a
+documented lifecycle verb with its own spawn implementation — was
+non-durable. When a contract has two entry points, test both, and make
+the binding assertion cross-invocation (a *fresh process* reaching the
+daemon after its starter exited), not chained commands inside one
+shell.
 
 ## PER-008D detachment tests (Phase 4)
 
@@ -159,6 +168,59 @@ explicitly narrowed detachment to the auto-setup path.
   posts via the detached daemon in Session A, then a fresh CLI
   invocation (Session B) inspects attention state and observes
   Session A's cursor.
+
+## `daemon start` lifecycle gate (CHAN-TASK-001, Phase 5)
+
+The `daemon start` counterpart to the Phase 4 gate. Every case runs the
+CLI as a real subprocess and asserts on process/session state or fresh
+invocations — none of them sleep for a fixed duration to let things
+settle.
+
+- `daemon_start_detaches_into_new_session` — the binding gate. Spawns
+  `daemon start` as an intermediate process, waits for it to exit, then
+  asserts:
+  - `libc::getsid(daemon_pid) == daemon_pid` — own session leader
+  - daemon reparented away from the intermediate CLI pid
+  - the bootstrap handoff was consumed — proof the child bound on the
+    parent-validated identity rather than making its own network call
+  - `daemon status` answers from a fresh CLI process
+  - `whoami` (network-backed, through the daemon to the mock) succeeds
+    from a fresh CLI process and returns the validated identity — this
+    is the operation that failed in the field, and a socket-only probe
+    would not catch it
+- `daemon_start_recovers_from_stale_socket_and_dead_pid` — plants a
+  bound-then-dropped socket inode plus a pid file naming a reaped
+  process; a plain `daemon start` must recover with no manual file
+  movement
+- `daemon_start_refuses_on_bot_identity_mismatch` — live credential
+  resolves to a different bot than the profile records: nonzero exit,
+  both names in the diagnostic, and nothing spawned or mutated (no
+  socket, no pid file, no handoff, `bot_username` intact, no
+  `active_profile` marker)
+- `daemon_start_classifies_child_startup_failure` — forces a
+  child-only failure (reduce policy naming a nonexistent family
+  profile, which the daemon refuses at startup while the parent's own
+  validation passes); asserts the error is a startup-failure
+  classification naming the stage, not a bare `NotRunning`, and that
+  the unconsumed handoff is cleaned up
+- `daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon`
+  — a start reported as failed must be terminal. Forces a deterministic
+  hang (reduce policy whose family profile lives on a second mock server
+  that delays `whoami` past the startup budget, so the child blocks in
+  `build_reduce_writer` while the parent's own validation succeeds), then
+  asserts no live `daemon serve` process for the profile — counted from
+  the process table, not the pid file, because the failure mode is a
+  child alive *without* having written one — plus no pid file, socket, or
+  orphaned handoff, and that a retry yields exactly one daemon
+- `daemon_start_requires_explicit_profile_selection` — the
+  command-to-policy mapping, which core resolver unit tests do not cover:
+  bare `daemon start` refuses both the `active_profile` marker and the
+  single-running-daemon fallback, while `--profile` and env-exact
+  identity succeed. Also pins the scope of the widening by asserting a
+  read verb (`whoami`) still resolves via fallback
+- `daemon_serve_remains_attached_to_invoking_session` — the negative
+  control: `daemon serve` must *not* become a session leader and must
+  stay in the invoking process's session
 
 ## Adding a test
 
