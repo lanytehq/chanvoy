@@ -32,6 +32,12 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("bootstrap error: {0}")]
     Bootstrap(String),
+    /// CHAN-TASK-001: a background daemon spawn that never reached
+    /// readiness. Distinct from `Daemon(NotRunning)` — that means "no daemon
+    /// is listening", this means "we started one and it died during startup",
+    /// which is a different operator action.
+    #[error("daemon startup failed for profile {profile}: {detail}")]
+    DaemonStartup { profile: String, detail: String },
     #[error(transparent)]
     Resolver(chanvoy_core::ResolverError),
 }
@@ -173,9 +179,24 @@ struct AutoSetupArgs {
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
+    /// Start a durable background daemon for an existing profile and return.
+    ///
+    /// The daemon is detached into its own session, so it survives the shell
+    /// or agent tool invocation that started it and serves later, independent
+    /// invocations. Identity and team access are validated in this process
+    /// before the daemon is spawned. Requires an explicit profile
+    /// (`--profile`, `CHANVOY_PROFILE`, or a sourced agent identity); never
+    /// creates or modifies a profile.
     Start,
+    /// Run the daemon in the foreground, attached to this terminal.
+    ///
+    /// Diagnostic mode: logs go to your terminal and `Ctrl-C` stops it. It is
+    /// not a background start — the difference from `daemon start` is
+    /// lifetime and detachment, not just where stdio points.
     Serve,
+    /// Stop the daemon for a profile. Requires an explicit profile.
     Stop,
+    /// Report daemon health, including a live Mattermost identity probe.
     Status,
 }
 
@@ -570,10 +591,22 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     // Side-effecting verbs that could disrupt another operator's daemon
     // on a shared dev machine resolve via explicit sources only.
     // Read/inspect/post verbs may consult the broader fallback chain.
-    // Only `daemon stop` qualifies in the current verb surface; widening
-    // requires an explicit policy choice in the brief.
+    //
+    // CHAN-TASK-001 widens this from `daemon stop` to `daemon start`, which
+    // the brief's Step 2 requires: a durable `daemon start` now validates a
+    // live credential against a persisted identity and spawns a long-lived
+    // process under it, so resolving the target from the `active_profile`
+    // marker or "whichever single daemon happens to be running" is exactly
+    // the fall-back-to-another-identity case that must not happen. Explicit
+    // sources — `--profile`, `CHANVOY_PROFILE`, or an exact
+    // `LANYTE_AGENT_ROLE`+`LANYTE_AGENT_SCOPE` name match — still cover every
+    // identity-sourced agent session. `daemon serve` needs no widening: it is
+    // only ever reached with an explicit `--profile`, either from an operator
+    // debugging in the foreground or from `spawn_durable_daemon`.
     let policy = match &cli.command {
-        CommandSet::Daemon(DaemonCommand::Stop) => chanvoy_core::FallbackPolicy::ExplicitOnly,
+        CommandSet::Daemon(DaemonCommand::Stop | DaemonCommand::Start) => {
+            chanvoy_core::FallbackPolicy::ExplicitOnly
+        }
         _ => chanvoy_core::FallbackPolicy::AllowReadFallbacks,
     };
     let profile = resolve_profile_name(cli.profile.as_deref(), policy)?;
@@ -1167,42 +1200,84 @@ fn dm_usage_error() -> CliError {
 async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Result<(), CliError> {
     match command {
         DaemonCommand::Start => {
-            if let Ok(health) = ping(profile).await {
-                return print_json_or_text(
-                    json,
-                    &health,
-                    &format!(
-                        "daemon already running for profile {} at {}",
-                        health.profile_name,
-                        health.socket_path.display()
-                    ),
-                );
-            }
-            let exe = std::env::current_exe()?;
-            Command::new(exe)
-                .arg("--profile")
-                .arg(profile)
-                .arg("daemon")
-                .arg("serve")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-            for _ in 0..20 {
+            // CHAN-TASK-001: `daemon start` is a *durable* background start.
+            // It used to spawn `daemon serve` directly — no bootstrap
+            // handoff, no `setsid()` — which left the child doing its own
+            // network identity check on the wrong side of the sandbox
+            // boundary and living in the spawning invocation's session. The
+            // observable failure was a successful start receipt followed by
+            // `Daemon(NotRunning)` from the very next tool invocation.
+            //
+            // The spawn mechanics are now shared with `auto-setup` via
+            // `spawn_durable_daemon`. The profile-management semantics are
+            // deliberately NOT shared: `daemon start` operates on an
+            // already-persisted profile and never creates or refreshes one,
+            // never moves the `active_profile` marker, never seeds cursors,
+            // and never rewrites `bot_username`. It starts a daemon for a
+            // profile that already exists, or it fails.
+            let profile_config = load_profile(profile)?;
+
+            // Reuse a running daemon only when it is actually healthy. The
+            // network-aware `ping_full` (not the local-only `ping`) is what
+            // distinguishes a working daemon from one holding a revoked or
+            // drifted credential — the latter answers local RPCs fine and
+            // then fails every real operation, which is exactly the "start
+            // said OK, nothing works" shape this task is closing. Same
+            // health predicate as `ensure_daemon_running`.
+            let healthy = match tokio::time::timeout(PING_TIMEOUT, ping_full(profile)).await {
+                Ok(Ok(status)) => {
+                    status.mattermost_ok && !status.mattermost_identity_drift.unwrap_or(false)
+                }
+                _ => false,
+            };
+            if healthy {
+                // Report the local `ProfileStatus` shape, unchanged from the
+                // pre-CHAN-TASK-001 receipt so `--json` consumers keep
+                // parsing the same object.
                 if let Ok(health) = ping(profile).await {
                     return print_json_or_text(
                         json,
                         &health,
                         &format!(
-                            "daemon listening for profile {} at {}",
+                            "daemon already running for profile {} at {}",
                             health.profile_name,
                             health.socket_path.display()
                         ),
                     );
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            Err(DaemonError::NotRunning(profile.to_string()).into())
+
+            // Parent-side identity validation. This is the half of PER-014
+            // `daemon start` never adopted: the approved parent invocation
+            // holds the network authority, so it proves the token, the bot
+            // identity, and team access here and hands the result to the
+            // detached child, which then binds without repeating that call.
+            //
+            // Scope of the guarantee: the daemon's *primary* identity. A
+            // profile with a `[reduce]` policy still resolves its family
+            // identity inside the child (`build_reduce_writer` runs before the
+            // handoff is read), so reduce-configured profiles under a
+            // network-gated sandbox are not yet covered. Extending the handoff
+            // to carry the family identity is a follow-on, not this repair.
+            let identity = validate_persisted_profile_identity(&profile_config).await?;
+
+            // Absent / stale / wedged predecessor. Short-circuits when no
+            // socket exists (normal cold start); otherwise graceful shutdown
+            // RPC, then pid-file force-kill plus runtime-file sweep. This is
+            // what makes stale socket + dead pid recover without an operator
+            // moving files by hand.
+            stop_daemon_if_present(profile).await?;
+
+            let health = spawn_durable_daemon(&profile_config, &identity, profile).await?;
+            print_json_or_text(
+                json,
+                &health,
+                &format!(
+                    "daemon listening for profile {} at {}",
+                    health.profile_name,
+                    health.socket_path.display()
+                ),
+            )
         }
         DaemonCommand::Serve => {
             let health = start(profile).await?;
@@ -1661,6 +1736,35 @@ async fn validate_and_finalize_profile(
     Ok((profile, identity))
 }
 
+/// CHAN-TASK-001: parent-side identity validation for `daemon start`.
+///
+/// Sibling of [`validate_and_finalize_profile`], with one deliberate
+/// difference: this one is **read-only with respect to the profile**. Where
+/// auto-setup's variant adopts the `whoami` username into the profile it is
+/// about to persist, `daemon start` treats the persisted `bot_username` as
+/// the expectation and fails closed when the live credential disagrees.
+/// Silently rewriting it here would let a mis-sourced token quietly rebind a
+/// profile to a different bot — and would also break the handoff, since the
+/// child recomputes `profile_fingerprint` from the on-disk profile.
+///
+/// An empty persisted `bot_username` (profile created without validation) is
+/// not a mismatch: there is nothing to disagree with. It stays empty; only
+/// `auto-setup` fills it in.
+async fn validate_persisted_profile_identity(profile: &Profile) -> Result<Identity, CliError> {
+    let token = load_token(profile)?;
+    let client = MattermostClient::new(profile, token)?;
+    let identity = client.whoami().await?;
+    client.validate_team_access().await?;
+    if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
+        return Err(chanvoy_core::CoreError::ProfileIdentityMismatch {
+            expected: profile.bot_username.clone(),
+            actual: identity.username,
+        }
+        .into());
+    }
+    Ok(identity)
+}
+
 async fn ensure_daemon_running(
     profile: &Profile,
     identity: &Identity,
@@ -1703,12 +1807,57 @@ async fn ensure_daemon_running(
     // back to pid-file-driven SIGKILL when shutdown can't be served.
     stop_daemon_if_present(profile_name).await?;
 
+    spawn_durable_daemon(profile, identity, profile_name).await?;
+    Ok(DaemonState::Started)
+}
+
+/// CHAN-TASK-001: the **single** durable background-start primitive.
+///
+/// Both background entry points — `auto-setup` (via
+/// [`ensure_daemon_running`]) and `daemon start` (via [`handle_daemon`]) —
+/// route through here. Before this converged, `daemon start` had its own
+/// spawn implementation that wrote no bootstrap handoff and never called
+/// `setsid()`; under Codex (and any sandbox whose tool-execution boundary
+/// tears down the invocation's process group) that daemon could answer the
+/// post-spawn ping inside the approved command and then be gone by the next
+/// independent invocation, which saw `Daemon(NotRunning)`. Keeping exactly
+/// one copy of the bootstrap + detach sequence is what makes that class of
+/// divergence structurally impossible to reintroduce.
+///
+/// The caller owns everything *around* the spawn — health checks, stopping a
+/// stale/unhealthy predecessor, and all profile-management semantics
+/// (`auto-setup` creates/refreshes profiles and moves the active marker;
+/// `daemon start` deliberately does none of that). This helper owns only:
+///
+/// 1. nonce generation;
+/// 2. the PER-014 bootstrap-state handoff write;
+/// 3. the detached (`setsid`) `daemon serve` spawn with null stdio;
+/// 4. bounded UDS readiness polling;
+/// 5. early-child-exit classification; and
+/// 6. **terminal failure semantics** — a spawn reported as failed performs
+///    terminal cleanup once termination is *confirmed*, and escalates loudly
+///    with state preserved when it cannot be (see [`finalize_failed_spawn`]).
+///
+/// `profile` must be the profile **as persisted on disk**: the daemon child
+/// reloads it and recomputes `profile_fingerprint` over it, so handing in a
+/// locally-modified copy (e.g. one with `bot_username` filled in from a fresh
+/// `whoami` that was never stored) makes the child reject the handoff.
+///
+/// Returns the readiness `ProfileStatus` from the ping that proved the new
+/// daemon is listening, so callers can report it without a second RPC.
+async fn spawn_durable_daemon(
+    profile: &Profile,
+    identity: &Identity,
+    profile_name: &str,
+) -> Result<ProfileStatus, CliError> {
     // PER-014: write the bootstrap-state file co-located with the spawn.
-    // Site discipline by structural placement — only `ensure_daemon_running`
-    // emits a bootstrap file, so non-daemon-spawn paths (`profile create`)
-    // cannot produce one by construction. Daemon child reads, validates
+    // Site discipline by structural placement — only this helper emits a
+    // bootstrap file, so non-daemon-spawn paths (`profile create`) cannot
+    // produce one by construction. Daemon child reads, validates
     // (freshness + profile_fingerprint + nonce-env match + username match),
-    // consumes-and-deletes, then binds without calling whoami.
+    // consumes-and-deletes, then binds without calling whoami for its own
+    // identity. (A `[reduce]` profile's family whoami is a separate child-side
+    // call this handoff does not yet cover — see the note in `handle_daemon`.)
     let nonce = chanvoy_core::generate_nonce();
     let bootstrap = chanvoy_core::build_bootstrap_state(
         profile,
@@ -1731,7 +1880,19 @@ async fn ensure_daemon_running(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     detach_into_new_session(&mut cmd);
-    cmd.spawn()?;
+    // Keep the `Child` handle for the readiness loop. `setsid()` changes the
+    // child's session, not its parentage: it stays our direct child until
+    // this CLI exits, so `try_wait()` is a reliable "did startup fail?"
+    // signal for the whole poll. Dropping the handle afterwards does not
+    // signal the child (`kill_on_drop` is off by default).
+    let mut child = cmd.spawn()?;
+    // Capture the pid *now*. Tokio's `Child::id()` returns `None` once the
+    // child has been polled to completion, so reading it after `try_wait()`
+    // observes an exit yields `None` in exactly the case where residue cleanup
+    // matters most: the daemon binds its socket and writes its pid file before
+    // several fallible startup steps (attention-state load, token/WS setup), so
+    // an exit there leaves owned pid + socket files on disk. devrev P1 on rev 2.
+    let child_pid = child.id();
     // Each per-iteration `ping()` is bounded the same way as the
     // pre-spawn health check, for the same reason: a freshly spawned
     // daemon could wedge during startup (deadlocked WebSocket init,
@@ -1741,12 +1902,205 @@ async fn ensure_daemon_running(
     let spawn_ready_deadline = std::time::Instant::now() + SPAWN_READY_DEADLINE;
     while std::time::Instant::now() < spawn_ready_deadline {
         let ping_outcome = tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping(profile_name)).await;
-        if matches!(ping_outcome, Ok(Ok(_))) {
-            return Ok(DaemonState::Started);
+        if let Ok(Ok(health)) = ping_outcome {
+            return Ok(health);
+        }
+        // Ping order matters: a child that became ready and then exited
+        // still counts as "started" above. Only an exit observed while the
+        // socket is unreachable is a startup failure.
+        if let Some(exit) = child.try_wait()? {
+            return Err(
+                finalize_failed_spawn(profile_name, &mut child, child_pid, Some(exit)).await,
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    Err(DaemonError::NotRunning(profile_name.to_string()).into())
+    // Deadline expired. One last probe closes the race where the daemon became
+    // ready between the final poll and the deadline check; anything else is a
+    // failed spawn, and a failed spawn must be terminal.
+    if let Ok(Ok(health)) = tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping(profile_name)).await
+    {
+        return Ok(health);
+    }
+    Err(finalize_failed_spawn(profile_name, &mut child, child_pid, None).await)
+}
+
+/// Make a failed spawn terminal, then classify it.
+///
+/// devrev P1 on the CHAN-TASK-001 reviewset: the readiness-timeout path
+/// returned an error while the owned child was still alive. Because that child
+/// may not have written its pid or socket yet, the next `daemon start` sees no
+/// socket, `stop_daemon_if_present` short-circuits, and a second child is
+/// spawned — recreating exactly the two-daemons-one-profile condition the
+/// lifecycle code exists to prevent. Leaving the bootstrap handoff in place
+/// does not make it safe either: the retry overwrites the handoff and nonce
+/// while the first child is still live. And a daemon that becomes ready
+/// *after* the caller was told the start failed is its own hazard — the
+/// operator's next action is based on a receipt that has since gone stale.
+///
+/// `already_exited` carries the status when the poll loop observed the child
+/// die on its own; `None` means it is still running and must be killed.
+///
+/// **The guarantee, stated precisely**: when termination is *confirmed* —
+/// either the child exited on its own or `kill()` reaped it — this function
+/// performs terminal cleanup and nothing from the spawn is left alive. When
+/// termination cannot be confirmed, it does **not** silently pretend
+/// otherwise: it returns `TerminationUnconfirmed`, preserves the runtime state
+/// for the operator, and says so in the diagnostic. A child may still be alive
+/// on that path; that is the honest outcome, not a leak the caller can ignore.
+///
+/// Residue cleanup is scoped to *this* child: the pid file (and its socket)
+/// are removed only when the pid file names the pid we own. Anything else on
+/// that path belongs to a different process and is not ours to delete — both
+/// callers ran `stop_daemon_if_present` first, so a foreign pid here means
+/// concurrent activity, not stale residue.
+enum SpawnFailure {
+    /// The child died on its own during startup.
+    ChildExited(std::process::ExitStatus),
+    /// The child was still running at the readiness deadline and we terminated
+    /// it, confirmed. Distinct from `ChildExited` because the operator-facing
+    /// meaning differs: "it crashed" points at the daemon's own startup, "it
+    /// hung and we killed it" points at a blocked dependency — and reporting
+    /// our own SIGKILL as the child's exit status would be actively misleading.
+    WedgedAndTerminated,
+    /// We tried to terminate a wedged child and could not confirm it died.
+    /// Reported separately because the operator's next action differs and
+    /// because claiming "terminated and reaped" here would be a lie — the
+    /// invariant this code exists to establish is precisely the thing that
+    /// failed. Residue is deliberately left in place: a process that may still
+    /// be running owns its socket and pid file.
+    TerminationUnconfirmed { pid: Option<u32>, detail: String },
+}
+
+async fn finalize_failed_spawn(
+    profile_name: &str,
+    child: &mut tokio::process::Child,
+    child_pid: Option<u32>,
+    already_exited: Option<std::process::ExitStatus>,
+) -> CliError {
+    // Read the handoff state *before* any cleanup: whether the child got far
+    // enough to consume it is the signal that distinguishes a pre-identity
+    // failure from a post-identity one, and the sweep below destroys it.
+    let handoff_pending = chanvoy_core::bootstrap_path_for_profile(profile_name).exists();
+    let failure = match already_exited {
+        Some(status) => SpawnFailure::ChildExited(status),
+        None => {
+            // SIGKILL rather than a graceful signal: this child is by
+            // definition not answering its socket, and the states that hang
+            // here (blocked dependency probe, wedged WebSocket init) are the
+            // least likely to service a shutdown request. We sweep the residue
+            // ourselves precisely because SIGKILL skips the daemon's own
+            // cleanup.
+            //
+            // `kill()` is signal-then-wait, so `Ok` means the child is really
+            // gone. An `Err` must not be swallowed: it is either the benign
+            // race (the child exited between our last poll and the signal, so
+            // there is nothing left to kill) or a genuine failure to terminate.
+            //
+            // The owned `Child` handle is the authority for telling those
+            // apart — devrev round 3. A `kill -0` probe is not: nonzero is not
+            // uniquely `ESRCH` (`EPERM` means the process very much exists),
+            // and a probe that fails to launch is *unknown*, not dead. Both
+            // would be silently promoted to "confirmed terminated" in exactly
+            // the restricted-process-control conditions where `kill()` itself
+            // just failed — printing the false guarantee this branch exists to
+            // avoid. `try_wait` on the handle we already hold has none of that
+            // ambiguity and needs no shell-out.
+            match child.kill().await {
+                Ok(()) => SpawnFailure::WedgedAndTerminated,
+                Err(kill_err) => match child.try_wait() {
+                    // Reaped: the child was already gone when we signalled, so
+                    // the terminal-cleanup invariant does hold.
+                    Ok(Some(_status)) => SpawnFailure::WedgedAndTerminated,
+                    // Still running after a failed kill — the honest case.
+                    Ok(None) => SpawnFailure::TerminationUnconfirmed {
+                        pid: child_pid,
+                        detail: format!("{kill_err}; child still running after the kill attempt"),
+                    },
+                    // Cannot even read the child's status: unknown, not dead.
+                    Err(wait_err) => SpawnFailure::TerminationUnconfirmed {
+                        pid: child_pid,
+                        detail: format!("{kill_err}; exit status unreadable: {wait_err}"),
+                    },
+                },
+            }
+        }
+    };
+    // Only sweep when the child is confirmed gone. A process we could not
+    // confirm dead still owns its socket and pid file, and deleting them under
+    // a live daemon would strand it — unreachable but running, which is worse
+    // than the state we are reporting. Same reasoning for the handoff: a live
+    // child may still be about to read it.
+    if !matches!(failure, SpawnFailure::TerminationUnconfirmed { .. }) {
+        // Any surviving handoff is orphaned now. Consume it so it cannot shadow
+        // the next spawn (it would fail the nonce check anyway, but clearing
+        // poisoned residue at the source is cheaper than diagnosing it).
+        let _ = chanvoy_core::consume_bootstrap_state(profile_name);
+        if let Some(pid) = child_pid {
+            if read_daemon_pid_for_force_kill(profile_name) == Some(pid) {
+                let _ = std::fs::remove_file(pid_path_for_profile(profile_name));
+                let _ = std::fs::remove_file(socket_path_for_profile(profile_name));
+            }
+        }
+    }
+    daemon_child_startup_error(profile_name, failure, handoff_pending)
+}
+
+/// Classify a background daemon that never reached readiness.
+///
+/// Pre-CHAN-TASK-001 both spawn paths collapsed every early exit into a bare
+/// `Daemon(NotRunning(<socket>))`, which reads as "no daemon was ever
+/// started" and sent operators hunting stale runtime files. The child's stdio
+/// is null (a pipe would deadlock a long-lived daemon once its buffer filled,
+/// and closing our end would SIGPIPE it), so the classification is built from
+/// what the parent can observe without one: whether the child exited, with
+/// what status, and whether it lived long enough to consume the bootstrap
+/// handoff.
+///
+/// Pure: `finalize_failed_spawn` owns the killing and sweeping, and passes
+/// `handoff_pending` in because the sweep destroys that evidence.
+fn daemon_child_startup_error(
+    profile_name: &str,
+    failure: SpawnFailure,
+    handoff_pending: bool,
+) -> CliError {
+    let stage = if handoff_pending {
+        "before consuming the bootstrap handoff (failed during profile load, token load, \
+         or reduce-policy setup)"
+    } else {
+        "after consuming the bootstrap handoff, so it failed past identity resolution \
+         (socket bind, runtime-dir permissions, attention-state load, or token/WebSocket setup)"
+    };
+    let detail = match failure {
+        SpawnFailure::ChildExited(status) => format!(
+            "background daemon exited on its own ({status}) before its socket answered, \
+             {stage}; it has been reaped and its startup residue cleared"
+        ),
+        SpawnFailure::WedgedAndTerminated => format!(
+            "background daemon was still not answering its socket at the end of the startup \
+             budget, {stage}; it was wedged (blocked dependency probe or slow WebSocket init), \
+             so it has been terminated and reaped rather than left running unowned"
+        ),
+        SpawnFailure::TerminationUnconfirmed { pid, detail } => {
+            let which = match pid {
+                Some(pid) => format!("pid {pid}"),
+                None => "the child process".to_string(),
+            };
+            format!(
+                "background daemon was wedged during startup and could not be confirmed \
+                 terminated ({detail}); {which} may still be running, so its socket and pid \
+                 file were left in place rather than deleted under a live process. Check it \
+                 with `ps` and stop it before starting again"
+            )
+        }
+    };
+    CliError::DaemonStartup {
+        profile: profile_name.to_string(),
+        detail: format!(
+            "{detail}. Run `chanvoy --profile {profile_name} daemon serve` in the \
+             foreground to see the underlying error"
+        ),
+    }
 }
 
 /// Detach the spawned daemon into a new session so it survives the
@@ -3690,6 +4044,64 @@ mod tests {
         assert!(
             matches!(err, CliError::Bootstrap(_)),
             "expected Bootstrap (maps to EXIT_ENV_INPUT), got {err:?}"
+        );
+    }
+
+    /// CHAN-TASK-001 / devrev round 3: the unconfirmed-termination diagnostic
+    /// must never carry the reaped-and-cleared guarantee. The classifier is
+    /// pure, so the wording contract is unit-testable even though the branch
+    /// that reaches it needs a wedged child plus a failing `kill()`.
+    #[test]
+    fn unconfirmed_termination_never_claims_a_clean_sweep() {
+        let err = daemon_child_startup_error(
+            "unit-profile",
+            SpawnFailure::TerminationUnconfirmed {
+                pid: Some(4242),
+                detail: "operation not permitted; child still running after the kill attempt"
+                    .to_string(),
+            },
+            false,
+        );
+        let CliError::DaemonStartup { profile, detail } = err else {
+            panic!("expected DaemonStartup");
+        };
+        assert_eq!(profile, "unit-profile");
+        assert!(
+            detail.contains("could not be confirmed terminated") && detail.contains("4242"),
+            "operator must be told termination is unconfirmed, and which pid to check: {detail}"
+        );
+        assert!(
+            detail.contains("left in place"),
+            "diagnostic must say the runtime state was preserved: {detail}"
+        );
+        for lie in [
+            "has been reaped",
+            "residue cleared",
+            "terminated and reaped",
+        ] {
+            assert!(
+                !detail.contains(lie),
+                "unconfirmed termination must not claim {lie:?}: {detail}"
+            );
+        }
+    }
+
+    /// The confirmed paths keep their stronger wording — the point of the
+    /// split is that each outcome says only what is true of it.
+    #[test]
+    fn confirmed_termination_paths_state_the_cleanup_they_performed() {
+        let wedged =
+            daemon_child_startup_error("unit-profile", SpawnFailure::WedgedAndTerminated, true);
+        let CliError::DaemonStartup { detail, .. } = wedged else {
+            panic!("expected DaemonStartup");
+        };
+        assert!(
+            detail.contains("terminated and reaped") && !detail.contains("exited on its own"),
+            "wedged-and-killed must not read as a self-inflicted crash: {detail}"
+        );
+        assert!(
+            detail.contains("before consuming the bootstrap handoff"),
+            "handoff-pending stage must be reported: {detail}"
         );
     }
 

@@ -100,13 +100,22 @@ Five things happen, in order:
    `chanvoy daemon serve` subprocess and immediately calls
    `libc::setsid()` via `pre_exec`, making the daemon the leader of a
    new session and process group with no controlling terminal.
-4. **Daemon binds without network.** The detached daemon child reads
-   the bootstrap-state file, validates it (freshness + profile
-   fingerprint + nonce), then binds its UDS socket. No
-   `whoami()`-style network call from the daemon at startup. The
-   WebSocket connection opens after bind; if WS auth fails, the
+4. **Daemon binds without a primary-identity network call.** The
+   detached daemon child reads the bootstrap-state file, validates it
+   (freshness + profile fingerprint + nonce), then binds its UDS
+   socket. No `whoami()`-style network call for its **own** identity.
+   The WebSocket connection opens after bind; if WS auth fails, the
    daemon stays bound on the socket and reconnects on its existing
    schedule (gateway-friendly, sandbox-friendly).
+
+   **Bounded claim.** This covers the daemon's primary identity only. A
+   profile carrying a `[reduce]` policy also builds its family-identity
+   writer at startup, and that path performs a family `whoami()` *in the
+   detached child* — before the bootstrap handoff is even read. So a
+   reduce-configured profile under a network-gated sandbox is not yet
+   covered by the parent-validation guarantee; extending it needs a
+   handoff that can carry the family identity too. Non-reduce profiles
+   (the common case) are fully covered.
 5. **Cursor seeding.** The CLI then asks the daemon to enumerate the
    bot's channels and seed an initial "latest post seen" cursor for
    each, so a follow-up `chanvoy check <channel>` returns useful
@@ -121,24 +130,61 @@ can't escalate; by the time it starts, the network call has already
 happened in the parent and only the validated identity travels
 forward via the bootstrap-state file.
 
+### Background starts: one shared primitive
+
+There are two ways to start a daemon in the background, and they use
+**the same** bootstrap and detachment primitive:
+
+| Command | Purpose | Profile side effects |
+|---|---|---|
+| `chanvoy auto-setup` | Bootstrap or repair: synthesize/refresh the profile from env, then start the daemon | Creates or refreshes the profile, sets the active marker, seeds cursors |
+| `chanvoy --profile <name> daemon start` | Start a daemon for a profile that already exists | None — starts a daemon, nothing else |
+
+Steps (2), (3) and (4) above — parent-side identity validation, the
+bootstrap-state handoff, and the `setsid()` spawn — are identical for
+both. `daemon start` layers no profile management on top: it will not
+create or refresh a profile, will not move the `active_profile` marker,
+will not seed cursors, and will not rewrite `bot_username` if the live
+credential disagrees with the persisted one (it refuses instead).
+Because it validates a live credential and spawns a long-lived process
+under it, `daemon start` also requires an *explicit* profile —
+`--profile`, `CHANVOY_PROFILE`, or a sourced agent identity — and never
+falls back to "whichever daemon is running" or the active marker.
+
+Sharing one primitive is a deliberate structural choice, not a
+refactor for tidiness. When the two paths had separate spawn
+implementations, only one of them got PER-008D detachment and PER-014
+bootstrap; the other could report a successful start and then lose its
+daemon at the next process-group teardown.
+
 ### Detachment: surviving session boundaries
 
 The daemon is spawned with `libc::setsid()` so it becomes its own
 session leader. Operationally:
 
-- The daemon survives the spawning shell's exit.
+- The daemon survives the spawning shell's exit — or the end of the
+  agent tool invocation that started it.
 - `SIGHUP` from the controlling terminal closing does not propagate.
 - Operators returning to the same machine in a fresh shell find the
   same daemon still running on its profile socket.
 
 Cross-platform note: `setsid` is uniform across Linux init, systemd-user,
 and macOS launchd. This is the contract; tests assert
-`getsid(daemon_pid) == daemon_pid` against it.
+`getsid(daemon_pid) == daemon_pid` against it, for both background
+entry points.
 
-The foreground variant — `chanvoy daemon serve` — is **not** detached.
-It stays attached to the spawning shell so operators can `Ctrl-C` it
-and follow logs. Use `auto-setup` for the durable case, `daemon serve`
-for foreground-debug.
+The foreground variant — `chanvoy daemon serve` — is **not** detached,
+and the difference is lifetime, not just where stdio points. It stays
+in the invoking process's session so operators can `Ctrl-C` it and
+follow logs, and it validates identity itself (the legacy direct-start
+path) when no bootstrap handoff is in flight. Use `auto-setup` or
+`daemon start` for the durable case, `daemon serve` for
+foreground-debug.
+
+If a background daemon exits during startup, the starting command fails
+with a startup-failure classification naming the stage it died in
+(before or after consuming the bootstrap handoff) rather than a bare
+"not running" — the two call for different operator actions.
 
 ### Restart and recovery
 
@@ -146,8 +192,8 @@ Three restart shapes, all handled idempotently:
 
 | Shape | Detection | Recovery |
 |---|---|---|
-| Stale socket file (daemon died, file remains) | Bind fails with `EADDRINUSE`, then probe shows no listener | `daemon start` removes the stale file and binds fresh |
-| Wedged daemon (alive but unresponsive) | Ping over UDS times out | `auto-setup` `SIGKILL`s it via the pid file and respawns |
+| Stale socket file (daemon died, file remains) | Bind fails with `EADDRINUSE`, then probe shows no listener | `auto-setup` / `daemon start` remove the stale file and bind fresh — no manual file movement |
+| Wedged daemon (alive but unresponsive) | Ping over UDS times out | `auto-setup` / `daemon start` `SIGKILL` it via the pid file and respawn |
 | Identity drift (token now authenticates as a different bot) | Periodic `whoami()` re-check returns a different bot id | Daemon stays bound on the socket but refuses network-backed RPCs (`post`, `read`, `check`, `notifications`, `search`, `react`, etc.) with a clear diagnostic. `daemon status` remains queryable. Recovery: re-run `auto-setup` to re-validate end-to-end. |
 
 The drift gate is intentionally one-way: the daemon doesn't try to

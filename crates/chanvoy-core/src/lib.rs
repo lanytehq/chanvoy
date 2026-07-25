@@ -1918,8 +1918,15 @@ pub enum ResolverError {
          pass --profile to disambiguate"
     )]
     AmbiguousMultiDaemon { running: Vec<String> },
+    /// Variant name predates the widening of `ExplicitOnly` beyond
+    /// `daemon stop`. The message says "side-effecting daemon-lifecycle
+    /// verb" because that is what the policy actually covers: `daemon start`
+    /// is not destructive, but resolving its target by fallback could start a
+    /// daemon under an identity the operator never named. Renaming the
+    /// variant is a breaking change for downstream matchers and is not worth
+    /// it for accuracy the message already carries.
     #[error(
-        "destructive verb requires explicit profile selection; \
+        "side-effecting daemon-lifecycle verb requires explicit profile selection; \
          pass --profile, set CHANVOY_PROFILE, or source an identity script. \
          Available profiles: {available:?}"
     )]

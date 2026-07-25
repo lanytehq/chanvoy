@@ -34,6 +34,7 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use chanvoy_core::Profile;
@@ -41,6 +42,8 @@ use common::{
     kill_daemon, read_attention_state, run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv,
 };
 use tokio::process::Command;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Smoke test for Phase 1: the harness compiles, the daemon spawns against
 /// the mock, comes healthy (socket appears), and shuts down cleanly. No
@@ -715,6 +718,744 @@ async fn auto_setup_daemon_detaches_into_new_session() {
     // Explicit teardown (the guard's sync Drop is the safety net for
     // panic paths only).
     teardown_auto_setup_daemon(&env).await;
+}
+
+// ---- Phase 5: CHAN-TASK-001 `daemon start` lifecycle parity ----
+//
+// The Phase 4 detachment gate above was scoped to `auto-setup`. That
+// scoping was load-bearing in the wrong direction: `daemon start` had a
+// second, older spawn implementation that wrote no PER-014 bootstrap
+// handoff and never called `setsid()`, so the suite stayed green while
+// the documented `daemon start` lifecycle was non-durable. Under Codex
+// (and any sandbox that tears down the invocation's process group at the
+// tool-execution boundary) an operator saw a successful start receipt,
+// then `Daemon(NotRunning(...sock))` from the very next invocation.
+//
+// These tests hold both background entry points to the same contract.
+// The binding assertion is cross-invocation: the daemon must answer a
+// *fresh CLI process* after the process that started it has exited.
+// Nothing here sleeps for a fixed duration to "let things settle" —
+// readiness is proven by process/session state and real RPCs.
+
+/// Path to the PER-014 bootstrap handoff for this env's profile. The
+/// daemon consumes-and-deletes it during startup, so its absence after a
+/// successful start is evidence the child took the validated-bootstrap
+/// path rather than falling back to a child-side network `whoami`.
+fn bootstrap_handoff_path(env: &TestEnv) -> std::path::PathBuf {
+    env.chanvoy_runtime_dir()
+        .join(format!("{}.bootstrap.json", env.profile_name))
+}
+
+/// Allocate a pid that is guaranteed dead: spawn a trivial process and
+/// reap it. Models the crashed-daemon residue an operator finds on disk
+/// (pid file naming a process that no longer exists).
+async fn reaped_pid() -> u32 {
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exit 0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn throwaway process");
+    let pid = child.id().expect("throwaway pid");
+    child.wait().await.expect("reap throwaway process");
+    pid
+}
+
+/// CHAN-TASK-001 AC — `daemon start` produces a session leader that
+/// reparents away from its CLI parent and answers a fresh invocation.
+///
+/// This is the `daemon start` sibling of
+/// `auto_setup_daemon_detaches_into_new_session`, plus the two proofs
+/// that were missing from the auto-setup gate and are the actual field
+/// failure: a *network-backed* verb served after the spawning CLI exited,
+/// and evidence that the parent (not the detached child) did the identity
+/// validation.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_detaches_into_new_session() {
+    let env = TestEnv::new("chan-task-001-start-detachment").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-cts1", "agent-bravo-devlead", "team-id-456")
+        .await;
+
+    // Intermediate process, spawned with an explicit pid capture so the
+    // reparenting assertion has something to compare against.
+    let mut intermediate = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .arg("--json")
+        .arg("daemon")
+        .arg("start")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn intermediate daemon start");
+    let intermediate_pid: u32 = intermediate.id().expect("intermediate pid");
+    let exit = intermediate.wait().await.expect("intermediate wait");
+    assert!(
+        exit.success(),
+        "intermediate `daemon start` must exit 0 (daemon spawn happens during this run)"
+    );
+
+    let daemon_pid = read_daemon_pid(&env).expect("daemon pid file present after daemon start");
+    let _guard = env.daemon_guard();
+
+    // SETSID PROOF: identical contract to the auto-setup gate. Without
+    // it the daemon stays in the spawning invocation's session and dies
+    // with it — the exact Codex-visible failure.
+    //
+    // SAFETY: libc::getsid is a normal syscall, not in a post-fork
+    // context. The unsafe is purely the FFI requirement.
+    let daemon_sid = unsafe { libc::getsid(daemon_pid as i32) };
+    assert!(
+        daemon_sid > 0,
+        "getsid(daemon_pid={daemon_pid}) returned {daemon_sid}; errno may indicate the process is gone"
+    );
+    assert_eq!(
+        daemon_sid as u32, daemon_pid,
+        "daemon started by `daemon start` must be its own session leader (sid == pid); \
+         got sid={daemon_sid}, pid={daemon_pid}"
+    );
+
+    let info =
+        sysprims_proc::get_process(daemon_pid).expect("daemon must be alive after detachment");
+    assert_ne!(
+        info.ppid, intermediate_pid,
+        "daemon ppid should be reparented away from the intermediate `daemon start` CLI; \
+         got ppid={} intermediate_pid={intermediate_pid}",
+        info.ppid
+    );
+    assert_ne!(
+        info.ppid, daemon_pid,
+        "ppid sanity: daemon cannot be its own parent"
+    );
+
+    // PARENT-SIDE VALIDATION PROOF: the handoff exists only because the
+    // spawning CLI validated identity itself and passed the result down.
+    // The daemon consumes-and-deletes it, so an absent file after a
+    // healthy start means the child bound on the pre-validated identity
+    // instead of making its own (sandbox-blocked) `whoami` call.
+    assert!(
+        !bootstrap_handoff_path(&env).exists(),
+        "bootstrap handoff must be consumed by the daemon during startup; \
+         a surviving file means the child never took the validated path"
+    );
+
+    // CROSS-INVOCATION PROOF #1: local RPC from a fresh CLI process.
+    let status_out = run_chanvoy(&env, &["daemon", "status"]).await;
+    assert!(
+        status_out.status.success(),
+        "fresh CLI invocation must reach the daemon started by a now-exited CLI; stderr={}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+
+    // CROSS-INVOCATION PROOF #2: a network-backed verb. `daemon status`
+    // alone would pass against a daemon that bound its socket but has no
+    // working Mattermost client; `whoami` round-trips through the daemon
+    // to the mock server. This is the operation that failed in the field.
+    let whoami_out = run_chanvoy(&env, &["--json", "whoami"]).await;
+    assert!(
+        whoami_out.status.success(),
+        "fresh network-backed verb must succeed against the detached daemon; stderr={}",
+        String::from_utf8_lossy(&whoami_out.stderr)
+    );
+    let identity: serde_json::Value =
+        serde_json::from_slice(&whoami_out.stdout).expect("whoami json parses");
+    assert_eq!(
+        identity["username"].as_str(),
+        Some("agent-bravo-devlead"),
+        "daemon must serve the parent-validated identity; got {identity}"
+    );
+
+    teardown_auto_setup_daemon(&env).await;
+}
+
+/// CHAN-TASK-001 AC — stale socket + dead pid recover with no manual
+/// file movement.
+///
+/// The field trace shows an operator hand-moving pid and socket files to
+/// try to make `daemon start` work. That is not a product workflow: a
+/// documented lifecycle verb must clean up after a crashed predecessor
+/// itself. Plants both pieces of residue and requires a plain
+/// `daemon start` to recover.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_recovers_from_stale_socket_and_dead_pid() {
+    let env = TestEnv::new("chan-task-001-start-stale-residue").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-cts2", "agent-bravo-devlead", "team-id-456")
+        .await;
+
+    // Residue from a crashed daemon: a bound-then-dropped socket inode
+    // plus a pid file naming a process that has already been reaped.
+    let socket = env.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    drop(listener);
+    assert!(socket.exists(), "stale socket must be planted");
+
+    let dead_pid = reaped_pid().await;
+    let pid_path = env
+        .chanvoy_runtime_dir()
+        .join(format!("{}.pid", env.profile_name));
+    std::fs::write(&pid_path, dead_pid.to_string()).expect("plant stale pid file");
+
+    let out = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        out.status.success(),
+        "`daemon start` must recover from stale socket + dead pid without manual file surgery; \
+         exit={} stdout={} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let _guard = env.daemon_guard();
+    let daemon_pid = read_daemon_pid(&env).expect("fresh daemon pid file present");
+    assert_ne!(
+        daemon_pid, dead_pid,
+        "pid file must name the freshly started daemon, not the planted corpse"
+    );
+    assert!(
+        sysprims_proc::get_process(daemon_pid).is_ok(),
+        "fresh daemon pid {daemon_pid} must be live after recovery"
+    );
+    assert!(
+        run_chanvoy(&env, &["daemon", "status"])
+            .await
+            .status
+            .success(),
+        "recovered daemon must answer a fresh invocation"
+    );
+
+    teardown_auto_setup_daemon(&env).await;
+}
+
+/// CHAN-TASK-001 AC — `daemon start` fails closed on persisted
+/// bot-identity mismatch, before spawning anything, and mutates nothing.
+///
+/// The credential in the environment authenticates as a different bot
+/// than the profile records. Pre-convergence this check lived in the
+/// detached child (if it ran at all); moving it into the parent means the
+/// operator sees the refusal on the command they ran. The "mutates
+/// nothing" half is the other side of the convergence: `daemon start`
+/// shares spawn mechanics with `auto-setup` but explicitly not its
+/// profile-management semantics, so it must not "helpfully" adopt the new
+/// username or move the active marker.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_refuses_on_bot_identity_mismatch() {
+    let env = TestEnv::new("chan-task-001-start-identity-mismatch").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    // The live credential resolves to a different bot than the profile.
+    env.mock_baseline("bot-id-cts3", "agent-impostor", "team-id-456")
+        .await;
+
+    let out = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        !out.status.success(),
+        "`daemon start` must fail closed on bot-identity mismatch; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent-bravo-devlead") && stderr.contains("agent-impostor"),
+        "refusal must name both the expected and actual identity; stderr={stderr}"
+    );
+
+    // Nothing was spawned: no daemon, and no handoff left on disk.
+    assert!(
+        !env.socket_path().exists(),
+        "no socket may exist — refusal must precede the child spawn"
+    );
+    assert!(
+        read_daemon_pid(&env).is_none(),
+        "no pid file may exist — refusal must precede the child spawn"
+    );
+    assert!(
+        !bootstrap_handoff_path(&env).exists(),
+        "no bootstrap handoff may be written for a refused start"
+    );
+
+    // Nothing was mutated: profile identity intact, active marker unset.
+    let persisted = read_persisted_profile(&env);
+    assert_eq!(
+        persisted.bot_username, "agent-bravo-devlead",
+        "`daemon start` must not rewrite bot_username from a live whoami"
+    );
+    assert!(
+        !env.chanvoy_config_dir().join("active_profile").exists(),
+        "`daemon start` must not write the active_profile marker"
+    );
+}
+
+/// CHAN-TASK-001 AC — a child that dies during startup is reported as a
+/// startup failure, not as a bare "not running".
+///
+/// Pre-convergence, every early child exit collapsed into
+/// `Daemon(NotRunning(<socket>))`, which reads as "nothing was ever
+/// started" and sends operators looking for stale runtime files — the
+/// wrong diagnosis, and the one the field trace acted on. The forced
+/// failure here is child-side by construction: the profile carries a
+/// reduce policy naming a family profile that does not exist, which the
+/// daemon refuses at startup while the parent's own identity validation
+/// passes cleanly.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_classifies_child_startup_failure() {
+    let env = TestEnv::new("chan-task-001-start-child-failure").await;
+    env.write_named_profile(
+        &env.profile_name,
+        "agent-bravo-devlead",
+        "org-lanytehq",
+        &env.token_env_name,
+        Some("family-profile-that-does-not-exist"),
+    );
+    env.mock_baseline("bot-id-cts4", "agent-bravo-devlead", "team-id-456")
+        .await;
+
+    let out = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        !out.status.success(),
+        "`daemon start` must exit nonzero when its child dies during startup; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Assertions are against the text the operator actually sees. `main`
+    // renders errors with `Debug` (chanvoy-wide, unrelated to this task —
+    // it is why the field trace reads `Daemon(NotRunning(...sock))`), so
+    // the variant name and the `detail` payload are what land on stderr.
+    assert!(
+        stderr.contains("DaemonStartup"),
+        "failure must be classified as a startup failure, not a bare NotRunning; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("NotRunning"),
+        "a child that started and died must not be reported as 'nothing is running'; \
+         stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("before consuming the bootstrap handoff"),
+        "classification must name the startup stage the child died in; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("daemon serve"),
+        "classification must point at the foreground diagnostic path; stderr={stderr}"
+    );
+    assert!(
+        !bootstrap_handoff_path(&env).exists(),
+        "an unconsumed handoff must be cleaned up so it cannot shadow the next spawn"
+    );
+    assert!(
+        read_daemon_pid(&env).is_none(),
+        "a daemon that never bound must not leave a pid file"
+    );
+}
+
+/// Count live `chanvoy ... daemon serve` processes for one profile.
+///
+/// The direct proof for "a failed start left nothing running" and "a retry
+/// produced exactly one daemon". Matches on the profile slug, which is unique
+/// per test, so concurrent tests cannot contaminate the count. Deliberately
+/// process-table-based rather than pid-file-based: the failure mode being
+/// tested is a child that is alive *without* having written a pid file.
+fn count_daemon_serve_processes(profile_name: &str) -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-ax", "-o", "command="])
+        .output()
+        .expect("ps -ax");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| {
+            line.contains("chanvoy")
+                && line.contains("daemon")
+                && line.contains("serve")
+                && line.contains(profile_name)
+        })
+        .count()
+}
+
+/// Write a `[reduce]`-configured stream profile plus its family profile, with
+/// the family pointed at a separate server so the family `whoami` the daemon
+/// child makes can be controlled independently of the stream identity the
+/// parent CLI validates.
+fn write_reduce_pair(env: &TestEnv, family_name: &str, family_server_url: &str) {
+    let stream = Profile {
+        name: env.profile_name.clone(),
+        role: "bravo-devlead".to_string(),
+        scope: "lanytehq".to_string(),
+        provider: chanvoy_core::Provider::Mattermost,
+        bot_username: "agent-bravo-devlead".to_string(),
+        team_name: "org-lanytehq".to_string(),
+        server_url: env.server_url(),
+        env_name: env.token_env_name.clone(),
+        env_file: None,
+        credential_mode: chanvoy_core::CredentialMode::EnvName,
+        capability_class: chanvoy_core::CapabilityClass::Standard,
+        monitored_channels: Vec::new(),
+        ipc: None,
+        reduce: Some(chanvoy_core::ReducePolicy {
+            use_profile: family_name.to_string(),
+        }),
+    };
+    let family = Profile {
+        name: family_name.to_string(),
+        server_url: family_server_url.to_string(),
+        bot_username: "agent-bravo-family".to_string(),
+        reduce: None,
+        ..stream.clone()
+    };
+    let dir = env.chanvoy_config_dir().join("profiles");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for profile in [&stream, &family] {
+        std::fs::write(
+            dir.join(format!("{}.toml", profile.name)),
+            toml::to_string_pretty(profile).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+/// devrev P1 — a `daemon start` reported as failed must leave nothing alive.
+///
+/// The readiness-timeout path used to return an error while its child was
+/// still starting. That child may not have written a pid or socket yet, so the
+/// next `daemon start` finds nothing to stop and spawns a second one —
+/// two-daemons-one-profile, the condition the lifecycle code exists to
+/// prevent. A failed start must be terminal.
+///
+/// The hang is deterministic, not timing-luck: the stream profile carries a
+/// reduce policy whose family profile lives on a second mock server that
+/// delays `whoami` well past the startup budget. The daemon child blocks in
+/// `build_reduce_writer` — before bind, before consuming the handoff — while
+/// the parent's own stream-identity validation against the primary mock
+/// succeeds normally.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon() {
+    let env = TestEnv::new("chan-task-001-start-hung-child").await;
+    let family_mock = MockServer::start().await;
+    let family_name = "chan-task-001-hung-family";
+    write_reduce_pair(&env, family_name, &family_mock.uri());
+    // Parent-side validation (stream identity) resolves promptly.
+    env.mock_baseline("bot-id-cts6", "agent-bravo-devlead", "team-id-456")
+        .await;
+    // Child-side family identity hangs past the readiness budget.
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "id": "family-id-cts6",
+                    "username": "agent-bravo-family",
+                    "is_bot": true,
+                    "nickname": null,
+                    "email": null,
+                }))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&family_mock)
+        .await;
+
+    let _guard = env.daemon_guard();
+    let out = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        !out.status.success(),
+        "a daemon that never becomes ready must fail the start; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("DaemonStartup") && stderr.contains("startup budget"),
+        "timeout must be classified as a startup failure; stderr={stderr}"
+    );
+
+    // TERMINAL-FAILURE PROOF: nothing from that spawn survives.
+    assert_eq!(
+        count_daemon_serve_processes(&env.profile_name),
+        0,
+        "a failed start must leave no live daemon child — an unowned child would \
+         make the next start spawn a second daemon for the same profile"
+    );
+    assert!(
+        read_daemon_pid(&env).is_none(),
+        "failed start must leave no pid file"
+    );
+    assert!(
+        !env.socket_path().exists(),
+        "failed start must leave no socket"
+    );
+    assert!(
+        !bootstrap_handoff_path(&env).exists(),
+        "failed start must leave no orphaned bootstrap handoff"
+    );
+
+    // RETRY PROOF: with the family identity answering promptly, the same
+    // command succeeds and produces exactly one daemon.
+    family_mock.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "family-id-cts6",
+            "username": "agent-bravo-family",
+            "is_bot": true,
+            "nickname": null,
+            "email": null,
+        })))
+        .mount(&family_mock)
+        .await;
+
+    let retry = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        retry.status.success(),
+        "retry after a terminal failed start must succeed; stderr={}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        count_daemon_serve_processes(&env.profile_name),
+        1,
+        "retry must produce exactly one daemon for the profile"
+    );
+    assert!(
+        run_chanvoy(&env, &["daemon", "status"])
+            .await
+            .status
+            .success(),
+        "the single retried daemon must answer a fresh invocation"
+    );
+
+    teardown_auto_setup_daemon(&env).await;
+}
+
+/// devrev P1 (rev 2) — residue must be swept when the child exits *after*
+/// binding its socket and writing its pid file.
+///
+/// This is the branch the rev-2 fix could not reach. `finalize_failed_spawn`
+/// read `child.id()` after `try_wait()` had already observed the exit, and
+/// tokio returns `None` from `id()` once a child has been polled to completion
+/// — so the pid-match guard never fired and the pid/socket files survived while
+/// the error text claimed they had been cleared.
+///
+/// Forcing point is deterministic and post-bind by construction: the daemon
+/// binds its socket and writes its pid file, and only *then* loads attention
+/// state, which hard-errors on malformed JSON. So the child is guaranteed to
+/// have created residue before dying.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_sweeps_residue_when_child_exits_after_binding() {
+    let env = TestEnv::new("chan-task-001-start-post-bind-exit").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-cts8", "agent-bravo-devlead", "team-id-456")
+        .await;
+    // Malformed attention state: read after bind + pid write, and a hard error.
+    std::fs::write(env.state_path(), "{ this is not valid json").expect("plant bad state");
+
+    let _guard = env.daemon_guard();
+    let out = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        !out.status.success(),
+        "a child that dies during startup must fail the start; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exited on its own"),
+        "the child died by itself here — the diagnostic must not claim we killed it; \
+         stderr={stderr}"
+    );
+
+    // The claim the diagnostic makes must be true.
+    assert_eq!(
+        count_daemon_serve_processes(&env.profile_name),
+        0,
+        "no daemon may survive a failed start"
+    );
+    assert!(
+        read_daemon_pid(&env).is_none(),
+        "pid file written by the dead child must be swept — this is the branch where \
+         `child.id()` returns None if the pid is not captured at spawn time"
+    );
+    assert!(
+        !env.socket_path().exists(),
+        "socket bound by the dead child must be swept"
+    );
+    assert!(
+        !bootstrap_handoff_path(&env).exists(),
+        "handoff must not survive a failed start"
+    );
+
+    // And the profile must be startable again once the cause is fixed, with no
+    // manual cleanup in between.
+    std::fs::remove_file(env.state_path()).expect("remove bad state");
+    let retry = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        retry.status.success(),
+        "start must succeed after the cause is removed, with no manual cleanup; stderr={}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        count_daemon_serve_processes(&env.profile_name),
+        1,
+        "exactly one daemon after recovery"
+    );
+
+    teardown_auto_setup_daemon(&env).await;
+}
+
+/// devrev P2 — the command-to-policy mapping for `daemon start`, proven at the
+/// CLI level.
+///
+/// Core resolver unit tests cover `ExplicitOnly` semantics but not which
+/// commands are mapped to it, which is the part that changed. Also pins the
+/// scope of the widening: read verbs must still resolve by fallback.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_requires_explicit_profile_selection() {
+    // Profile name must be `<role>-<scope>` so the env-exact rule can match.
+    let env = TestEnv::new("chan-task-001-policy-lanytehq").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-cts7", "agent-bravo-devlead", "team-id-456")
+        .await;
+    // An `active_profile` marker is the fallback that must NOT satisfy
+    // `daemon start`.
+    let marker = env.chanvoy_config_dir().join("active_profile");
+    std::fs::write(&marker, &env.profile_name).expect("write active marker");
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // `chanvoy_command` clears the environment, so this invocation has no
+    // explicit source at all: no --profile, no CHANVOY_PROFILE, no role/scope.
+    let implicit = env
+        .chanvoy_command()
+        .arg("daemon")
+        .arg("start")
+        .output()
+        .await
+        .expect("bare daemon start");
+    assert!(
+        !implicit.status.success(),
+        "bare `daemon start` must refuse to resolve via the active_profile marker"
+    );
+    let stderr = String::from_utf8_lossy(&implicit.stderr);
+    // Asserted against what actually reaches stderr. `main` renders errors with
+    // `Debug`, so the operator reads the variant name and fields — not the
+    // `Display` message. That is why this asserts `RequiresExplicit` + the
+    // available-profile list rather than the (corrected) prose.
+    //
+    // KNOWN GAP, pending a maintainer decision: because `Debug` is what shows,
+    // the operator still reads the word "Destructive" from the variant name
+    // `DestructiveRequiresExplicit`, which is the exact mis-description devrev
+    // flagged. Closing it needs either a `chanvoy-core` public-enum rename or
+    // switching `main` to `Display` rendering — both are surfaces that require
+    // maintainer sign-off, so this test locks in the behavior that is settled
+    // (the refusal itself) and deliberately does not assert wording that is
+    // still under decision.
+    assert!(
+        stderr.contains("RequiresExplicit"),
+        "refusal must come from the explicit-source requirement; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&env.profile_name),
+        "refusal must list the available profiles so the operator can name one; \
+         stderr={stderr}"
+    );
+    assert!(
+        !env.socket_path().exists() && read_daemon_pid(&env).is_none(),
+        "a refused resolution must not spawn anything"
+    );
+
+    // Env-exact identity (`<role>-<scope>` naming the existing profile) is an
+    // explicit source and must succeed.
+    let _guard = env.daemon_guard();
+    let env_exact = env
+        .chanvoy_command()
+        .env("LANYTE_AGENT_ROLE", "chan-task-001-policy")
+        .env("LANYTE_AGENT_SCOPE", "lanytehq")
+        .arg("daemon")
+        .arg("start")
+        .output()
+        .await
+        .expect("env-exact daemon start");
+    assert!(
+        env_exact.status.success(),
+        "sourced agent identity must satisfy the explicit-source requirement; stderr={}",
+        String::from_utf8_lossy(&env_exact.stderr)
+    );
+
+    // Single-running-daemon fallback must not satisfy it either — exactly one
+    // daemon is now running, which is what rule 4 would have resolved.
+    let implicit_again = env
+        .chanvoy_command()
+        .arg("daemon")
+        .arg("start")
+        .output()
+        .await
+        .expect("bare daemon start with one daemon running");
+    assert!(
+        !implicit_again.status.success(),
+        "bare `daemon start` must refuse the single-running-daemon fallback too"
+    );
+
+    // Scope check: the widening is per-command. A read verb still resolves via
+    // fallback against that same running daemon.
+    let read_verb = env
+        .chanvoy_command()
+        .arg("whoami")
+        .output()
+        .await
+        .expect("bare whoami");
+    assert!(
+        read_verb.status.success(),
+        "read verbs must keep the broader fallback chain; stderr={}",
+        String::from_utf8_lossy(&read_verb.stderr)
+    );
+
+    teardown_auto_setup_daemon(&env).await;
+}
+
+/// CHAN-TASK-001 AC — `daemon serve` stays attached.
+///
+/// Convergence is about the *background* path. `daemon serve` is the
+/// foreground diagnostic surface: it must remain in the invoking
+/// process's session so logs land on the operator's terminal and `Ctrl-C`
+/// works. A regression that detached it would silently remove the only
+/// way to watch a failing daemon start.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_serve_remains_attached_to_invoking_session() {
+    let env = TestEnv::new("chan-task-001-serve-attached").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-cts5", "agent-bravo-devlead", "team-id-456")
+        .await;
+
+    let child = spawn_daemon(&env).await;
+    let child_pid = child.id().expect("serve child pid");
+
+    // SAFETY: getsid/getpid are ordinary syscalls; unsafe is the FFI
+    // requirement only.
+    let (child_sid, own_sid) = unsafe {
+        (
+            libc::getsid(child_pid as i32),
+            libc::getsid(std::process::id() as i32),
+        )
+    };
+    assert!(child_sid > 0, "getsid(serve child) failed: {child_sid}");
+    assert_ne!(
+        child_sid as u32, child_pid,
+        "`daemon serve` must NOT become a session leader — it is the attached \
+         foreground diagnostic form; got sid={child_sid} pid={child_pid}"
+    );
+    assert_eq!(
+        child_sid, own_sid,
+        "`daemon serve` must stay in the invoking process's session"
+    );
+
+    let clean = stop_daemon_cleanly(&env, child).await;
+    assert!(clean, "foreground daemon should stop cleanly");
 }
 
 /// AC #3 — attention state is intact when reached from a "fresh
