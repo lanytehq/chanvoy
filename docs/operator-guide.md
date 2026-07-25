@@ -712,7 +712,7 @@ The full resolver contract, including policy semantics and per-rule rationale, l
 After a profile rename or deletion (e.g., a coordinated migration sweep), the `active_profile` marker may point at a profile that no longer exists. The resolver detects this and refuses with `ActiveProfileNotFound` rather than silently falling through to a different identity:
 
 ```
-Error: Resolver(ActiveProfileNotFound { name: "old-bare-name", ... })
+Error: the persistent active_profile marker points at 'old-bare-name' but no such profile exists (likely renamed or deleted); pass --profile, set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE, or run `chanvoy auto-setup` to refresh the marker. Available profiles: ["current-name"]
 ```
 
 Recovery: rerun `chanvoy auto-setup` to refresh the marker against your current sourced env. The diagnostic error is intentional — it surfaces the stale state instead of letting it propagate as silent mis-attribution.
