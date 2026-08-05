@@ -852,10 +852,33 @@ async fn dispatch_request(
                     &params.post_id,
                 )
                 .await?;
-            let mut messages = state.client.read_thread(&anchor.root_id).await?;
+            let mut messages = state
+                .client
+                .read_thread_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &anchor.root_id,
+                )
+                .await?;
             // `--latest` narrows the list; it does not change its type.
-            if params.latest && messages.len() > 1 {
-                messages = messages.split_off(messages.len() - 1);
+            //
+            // Select the genuine maximum rather than taking the tail.
+            // The thread ordering pins the root first no matter when it
+            // was written, so "the last element" means "the last reply",
+            // which is a different post from "the newest message" for
+            // any thread whose root carries a later timestamp than a
+            // reply. Ties break on id so the choice is stable across
+            // calls.
+            if params.latest {
+                if let Some(index) = messages
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| (a.create_at, &a.id).cmp(&(b.create_at, &b.id)))
+                    .map(|(index, _)| index)
+                {
+                    let latest = messages.swap_remove(index);
+                    messages = vec![latest];
+                }
             }
             Ok::<_, CoreError>(messages)
         })

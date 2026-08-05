@@ -40,6 +40,7 @@ check:
 
 test-integration:
 	cargo test --package chanvoy --test restart_harness -- --ignored --nocapture
+	cargo test --package chanvoy --test post_show_and_thread -- --ignored --nocapture
 
 fmt:
 	cargo fmt
@@ -103,6 +104,7 @@ pr-final: ensure-msrv version-check workflow-lint
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace --all-targets
 	cargo test --package chanvoy --test restart_harness -- --ignored
+	cargo test --package chanvoy --test post_show_and_thread -- --ignored
 	cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] pr-final gate passed"
 

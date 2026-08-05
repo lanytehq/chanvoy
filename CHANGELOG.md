@@ -22,11 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Human-readable reads now show the post id.** `chanvoy read` printed a
-  timestamp, an author, and a body, with no id anywhere — so an operator who
-  had not asked for `--json` could not cite a post to `show`, `thread`, or
-  `post --reply-to`. Every row now carries `id=<post-id>`, and replies also
-  carry `root=<root-id>`. `--json` output is unchanged.
+- **Human-readable reads now show the post id and the thread it belongs to.**
+  `chanvoy read` printed a timestamp, an author, and a body, with no id
+  anywhere — so an operator who had not asked for `--json` could not cite a
+  post to `show`, `thread`, or `post --reply-to`. Every row now carries
+  `id=<post-id>` and `root=<root-id>`, including top-level posts, where the
+  root repeats the post's own id. Both crumbs are on every row so a row can be
+  read without knowing that a post with no root is its own root. `--json`
+  output is unchanged.
+
+- **A daemon older than the verb you just used now says so.** Installing a new
+  chanvoy leaves any already-running daemon on its previous binary until it is
+  restarted, so a fresh CLI can call `show` or `thread` against a daemon that
+  has never heard of them. That surfaced as a JSON-RPC "method not found"
+  quoting an internal method name — neither of which is the verb the operator
+  typed, and neither of which says what to do. It now names the verb and the
+  two commands that resolve it: `chanvoy daemon stop`, then
+  `chanvoy auto-setup`. Other daemon failures are unaffected.
 
 - **Messages now carry the thread they belong to.** Every message on the read
   and push paths reports a thread root: its own id when the message is
@@ -60,7 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone, and every post in the response was then stamped with whatever channel
   the caller had claimed. A caller holding any post id could read that thread
   by naming any channel. The anchor post is now checked against the named
-  channel first, and a mismatch issues no thread request at all.
+  channel first, and a mismatch issues no thread request at all. Every post in
+  the thread response is checked too, not only the anchor: the credential the
+  bot reads with reaches more channels than the caller named, so a response
+  mixing the two is refused whole rather than returned in part. Nothing
+  downstream can re-check it — a post's channel is dropped on the way into a
+  message, and every result is stamped with the channel that was asked for.
+- **A truncated thread over the agent IPC surface now says it is truncated.**
+  The read limit was applied to the result while `has_more` was left unset, so
+  a thread cut short was indistinguishable from a complete one and a caller
+  reasoning about the conversation had no way to learn it had seen only the
+  front of it. `has_more` now reports whether anything was withheld.
 - **Message authors are real names again, instead of "unknown".** Posts carry
   only a user id, and the code read an author-name field the server does not
   send on a post, so every message in every listing was attributed to

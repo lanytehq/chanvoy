@@ -696,6 +696,52 @@ pub struct ReadThreadParams {
     pub team: Option<String>,
 }
 
+#[cfg(test)]
+mod read_thread_params_tests {
+    use super::ReadThreadParams;
+
+    /// The optional fields have to be genuinely optional on the wire.
+    ///
+    /// A caller older than `--latest` — or any peer that never learned
+    /// about it — sends only the channel and the post id. Without the
+    /// defaults that request fails to parse and the whole verb is
+    /// unavailable across a version skew, rather than degrading to its
+    /// original behavior. The values matter as much as the parse: a
+    /// `latest` that defaulted to `true` would silently turn every
+    /// legacy thread read into a one-message read, and a `team` that
+    /// defaulted to anything but `None` would move the read off the
+    /// profile's primary team without the caller asking.
+    #[test]
+    fn omitted_optional_fields_default_to_the_original_behavior() {
+        let params: ReadThreadParams =
+            serde_json::from_str(r#"{"channel":"bravo-team","post_id":"post-1"}"#)
+                .expect("a request without the optional fields must still parse");
+
+        assert_eq!(params.channel, "bravo-team");
+        assert_eq!(params.post_id, "post-1");
+        assert!(
+            !params.latest,
+            "an unstated --latest means the whole thread, not its last message"
+        );
+        assert_eq!(
+            params.team, None,
+            "an unstated team means the profile's own resolution chain"
+        );
+    }
+
+    /// The defaults must not be shadowing values that were sent.
+    #[test]
+    fn stated_optional_fields_are_carried_through() {
+        let params: ReadThreadParams = serde_json::from_str(
+            r#"{"channel":"bravo-team","post_id":"post-1","latest":true,"team":"org-otherhq"}"#,
+        )
+        .expect("a fully specified request parses");
+
+        assert!(params.latest);
+        assert_eq!(params.team.as_deref(), Some("org-otherhq"));
+    }
+}
+
 /// PER-024 primitive 2: parameters for `chanvoy react <channel>
 /// <post_id> <emoji>`. Channel context is positional (required) for
 /// multi-provider portability — Slack's reactions API needs the
@@ -2688,6 +2734,19 @@ fn normalize_root_id(provider_root_id: &str, post_id: &str) -> String {
     }
 }
 
+/// Whether a post's channel satisfies the channel it was requested in.
+///
+/// An empty value on either side is refused rather than treated as a
+/// match. The provider always sends a channel on a post, so an empty
+/// one means the response is not what we believe it is — and this check
+/// is the only thing standing between a bare post id and a read, so it
+/// is the wrong place to extend the provider any benefit of the doubt.
+fn binding_holds(actual_channel_id: &str, expected_channel_id: &str) -> bool {
+    !actual_channel_id.is_empty()
+        && !expected_channel_id.is_empty()
+        && actual_channel_id == expected_channel_id
+}
+
 /// Insert a resolved author into the cache, evicting first by expiry
 /// and then by age so the map stays under `AUTHOR_CACHE_MAX_ENTRIES`.
 /// Free function so the bound can be exercised directly in tests
@@ -3893,7 +3952,12 @@ impl MattermostClient {
     /// returns exactly one. No post is ever dropped — a post whose
     /// author cannot be resolved still appears, carrying the author's
     /// user id in place of a name.
-    pub async fn read_thread(&self, root_post_id: &str) -> Result<Vec<Message>, CoreError> {
+    pub async fn read_thread_in_channel(
+        &self,
+        expected_channel_id: &str,
+        channel_name: &str,
+        root_post_id: &str,
+    ) -> Result<Vec<Message>, CoreError> {
         let response: PostsEnvelope = self
             .request(
                 "GET",
@@ -3907,6 +3971,24 @@ impl MattermostClient {
             });
         }
         let mut raw: Vec<RawPost> = response.posts.into_values().collect();
+        // Bind every post the provider returned, not only the anchor the
+        // caller was checked against.
+        //
+        // The bot's credential can see many channels; the channel the
+        // caller named is the narrower scope, and it is the one that
+        // governs this read. Nothing downstream can re-check it: the
+        // channel is dropped on the way into a message, and the peer
+        // surface stamps every result with the channel the caller asked
+        // for. Verifying here is what makes that label true rather than
+        // merely plausible. Costs no extra request.
+        for post in &raw {
+            if !binding_holds(&post.channel_id, expected_channel_id) {
+                return Err(CoreError::AnchorChannelMismatch {
+                    post_id: post.id.clone(),
+                    channel: channel_name.to_string(),
+                });
+            }
+        }
         // Root first, then replies by timestamp, tie-broken by id so the
         // order is stable across calls.
         //
@@ -4406,7 +4488,7 @@ impl MattermostClient {
             Err(error) => return Err(error),
         };
 
-        if post.channel_id != expected_channel_id {
+        if !binding_holds(&post.channel_id, expected_channel_id) {
             return Err(CoreError::AnchorChannelMismatch {
                 post_id: post_id.to_string(),
                 channel: channel_name.to_string(),

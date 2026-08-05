@@ -229,6 +229,7 @@ pub fn core_error_to_chat(error: CoreError, request_id: &str) -> ChatFrame {
         CoreError::AnchorNotFound(_) | CoreError::AnchorChannelMismatch { .. } => {
             (ChatErrorCode::NotFound, Some(false))
         }
+        // (message is unified for these two below — see `message`)
         CoreError::RequiresElevatedCapability => (ChatErrorCode::PermissionDenied, Some(false)),
         CoreError::Api { status, .. } => match *status {
             s if s == reqwest::StatusCode::UNAUTHORIZED || s == reqwest::StatusCode::FORBIDDEN => {
@@ -242,12 +243,40 @@ pub fn core_error_to_chat(error: CoreError, request_id: &str) -> ChatFrame {
         },
         _ => (ChatErrorCode::ProviderError, Some(true)),
     };
+    // A binding refusal reports the same text whether the post does not
+    // exist or exists in another channel. The two underlying messages
+    // differ, and a caller that could tell them apart would have an
+    // existence oracle over channels it cannot read: ask about a post
+    // id, and the wording says whether it is real. This surface is
+    // reached by peers, so the answer to "is that post in this channel"
+    // is a flat no either way.
+    //
+    // The operator-facing path deliberately does the opposite and names
+    // the owning channel — an operator running the CLI already holds the
+    // access that would make the distinction a leak.
+    let message = match &error {
+        CoreError::AnchorNotFound(post_id) | CoreError::AnchorChannelMismatch { post_id, .. } => {
+            binding_refusal_message(post_id)
+        }
+        other => other.to_string(),
+    };
     ChatFrame::Error {
         request_id: request_id.to_string(),
         error_code: code,
-        message: error.to_string(),
+        message,
         retryable,
     }
+}
+
+/// The single wording used for every binding refusal on the peer
+/// surface, so that "does not exist" and "exists elsewhere" cannot be
+/// told apart.
+///
+/// The post id is included because the caller supplied it — echoing it
+/// back reveals nothing and makes the refusal diagnosable. What is
+/// withheld is the distinction between the two causes.
+pub fn binding_refusal_message(post_id: &str) -> String {
+    format!("post {post_id} not found in the requested channel")
 }
 
 pub fn translate_m2_filter_to_260(filter: &SubscriptionFilter) -> IpcSubscriptionFilter {
@@ -718,6 +747,11 @@ impl IpcPeer {
                     match result {
                         Ok(messages) => {
                             let limit = limit.unwrap_or(50) as usize;
+                            // Same honesty rule as the thread branch: a
+                            // truncated list must say so, or a caller
+                            // cannot tell a complete channel read from
+                            // the first page of one.
+                            let total = messages.len();
                             let posts: Vec<PostSummary> = messages
                                 .into_iter()
                                 .take(limit)
@@ -727,7 +761,7 @@ impl IpcPeer {
                                 request_id,
                                 channel_id,
                                 posts,
-                                has_more: None,
+                                has_more: Some(total > limit),
                             }
                         }
                         Err(e) => core_error_to_chat(e, &request_id),
@@ -955,11 +989,24 @@ impl IpcPeer {
         };
         // The anchor's root is canonical, so naming any reply in the
         // thread reads the whole thread.
-        let messages = match self.client.read_thread(&anchor.root_id).await {
+        // This peer speaks in channel ids on both sides of the call, so
+        // the id doubles as the operator-facing name here too.
+        let messages = match self
+            .client
+            .read_thread_in_channel(&channel_id, &channel_id, &anchor.root_id)
+            .await
+        {
             Ok(messages) => messages,
             Err(e) => return core_error_to_chat(e, &request_id),
         };
         let limit = limit.unwrap_or(50) as usize;
+        // Whether the response is the whole thread has to be answered
+        // before the list is consumed. A truncated result that reports
+        // nothing about the truncation is indistinguishable from a
+        // complete one, and a caller reading a thread to decide what to
+        // reply to would be reasoning about a conversation it has only
+        // seen the front of.
+        let total = messages.len();
         let posts: Vec<PostSummary> = messages
             .into_iter()
             .take(limit)
@@ -976,7 +1023,7 @@ impl IpcPeer {
             request_id,
             channel_id,
             posts,
-            has_more: None,
+            has_more: Some(total > limit),
         }
     }
 
@@ -1053,6 +1100,7 @@ mod tests {
     /// post exists somewhere the caller cannot see.
     #[test]
     fn a_binding_refusal_is_terminal_and_indistinguishable_from_not_found() {
+        let mut seen: Vec<String> = Vec::new();
         for err in [
             CoreError::AnchorNotFound("p-1".to_string()),
             CoreError::AnchorChannelMismatch {
@@ -1060,11 +1108,16 @@ mod tests {
                 channel: "somewhere-else".to_string(),
             },
         ] {
+            // The two underlying errors genuinely differ in wording; the
+            // point of the test is that the peer surface does not pass
+            // that difference on.
+            let raw = err.to_string();
             let frame = core_error_to_chat(err, "test-bind");
             match frame {
                 ChatFrame::Error {
                     error_code,
                     retryable,
+                    message,
                     ..
                 } => {
                     assert_eq!(error_code, ChatErrorCode::NotFound);
@@ -1073,10 +1126,24 @@ mod tests {
                         Some(false),
                         "a post cannot move into the requested channel on a retry"
                     );
+                    assert_ne!(
+                        message, raw,
+                        "the underlying wording must not reach the peer verbatim"
+                    );
+                    assert!(
+                        !message.contains("somewhere-else"),
+                        "a refusal must not name the channel the post really lives in"
+                    );
+                    seen.push(message);
                 }
                 _ => panic!("expected error frame"),
             }
         }
+        assert_eq!(
+            seen[0], seen[1],
+            "a missing post and a post in another channel must be reported \
+             identically, or the difference is an existence oracle"
+        );
     }
 
     /// An empty thread body is permanent, so it must not be advertised
@@ -1794,10 +1861,18 @@ mod tests {
                 .await;
 
             match &frame {
-                ChatFrame::Error { message, .. } => assert!(
-                    message.contains(ROOT_ID) && message.contains(CALLER_CHANNEL),
-                    "refusal names the post and the channel it is not in: {message}"
-                ),
+                // The refusal echoes the caller's own post id and nothing
+                // else. It must NOT reveal which channel the post really
+                // lives in, and must read identically to a refusal for a
+                // post that does not exist at all — otherwise a peer can
+                // probe for posts in channels it cannot read.
+                ChatFrame::Error { message, .. } => {
+                    assert_eq!(message, &binding_refusal_message(ROOT_ID));
+                    assert!(
+                        !message.contains(OTHER_CHANNEL),
+                        "refusal must not name the channel the post really lives in: {message}"
+                    );
+                }
                 other => panic!("expected Error frame, got {other:?}"),
             }
             let rendered = serde_json::to_string(&frame).expect("serialize frame");
@@ -1863,6 +1938,164 @@ mod tests {
                 0,
                 "a missing anchor must issue no thread request at all"
             );
+        }
+
+        /// A thread whose anchor is in the caller's channel but whose
+        /// envelope also carries a post from elsewhere is refused, and
+        /// no summary is returned at all.
+        ///
+        /// The anchor bind does not cover this: it passes, the thread
+        /// request is genuinely made, and what comes back is a mix. The
+        /// peer's channel is the narrower scope — the bot's credential
+        /// reaches channels the peer never named — and every summary
+        /// this function builds is stamped with the peer's channel id,
+        /// so an unchecked post would be handed back labelled with a
+        /// channel it is not in. The refusal reads the same as any
+        /// other binding refusal, for the same reason: telling the two
+        /// apart would be an existence oracle.
+        #[tokio::test]
+        async fn a_thread_carrying_an_out_of_channel_post_is_refused_whole() {
+            let server = MockServer::start().await;
+            mount_post(
+                &server,
+                wire_post(ROOT_ID, CALLER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+            )
+            .await;
+            mount_thread(
+                &server,
+                ROOT_ID,
+                posts_envelope(vec![
+                    wire_post(ROOT_ID, CALLER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+                    wire_post(
+                        "stray-reply",
+                        OTHER_CHANNEL,
+                        "user-b",
+                        1_700_000_001_000,
+                        ROOT_ID,
+                    ),
+                ]),
+            )
+            .await;
+            mount_user(&server, "user-a", "alice").await;
+            mount_user(&server, "user-b", "bob").await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-mixed".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    ROOT_ID,
+                    None,
+                )
+                .await;
+
+            match &frame {
+                ChatFrame::Error { message, .. } => {
+                    assert_eq!(message, &binding_refusal_message("stray-reply"));
+                    assert!(
+                        !message.contains(OTHER_CHANNEL),
+                        "the refusal must not name where the stray post lives: {message}"
+                    );
+                }
+                other => panic!("expected Error frame, got {other:?}"),
+            }
+            let rendered = serde_json::to_string(&frame).expect("serialize frame");
+            assert!(
+                !rendered.contains("body of"),
+                "no body may survive the refusal, including the in-channel \
+                 root's: {rendered}"
+            );
+        }
+
+        /// A truncated thread says so, and a complete one says so too.
+        ///
+        /// `has_more` is the only thing distinguishing "this is the
+        /// conversation" from "this is the front of the conversation."
+        /// A peer reads a thread to decide what to say next; if a
+        /// truncated result is reported the same way as a complete one,
+        /// the peer answers a conversation it has only seen part of and
+        /// has no way to discover that. Both directions are asserted —
+        /// a field hard-coded to `true` is as useless as one hard-coded
+        /// to `false`.
+        #[tokio::test]
+        async fn a_truncated_thread_is_reported_as_truncated() {
+            let server = MockServer::start().await;
+            mount_post(
+                &server,
+                wire_post(ROOT_ID, CALLER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+            )
+            .await;
+            mount_thread(
+                &server,
+                ROOT_ID,
+                posts_envelope(vec![
+                    wire_post(ROOT_ID, CALLER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+                    wire_post(
+                        "reply-1",
+                        CALLER_CHANNEL,
+                        "user-b",
+                        1_700_000_001_000,
+                        ROOT_ID,
+                    ),
+                    wire_post(
+                        "reply-2",
+                        CALLER_CHANNEL,
+                        "user-b",
+                        1_700_000_002_000,
+                        ROOT_ID,
+                    ),
+                ]),
+            )
+            .await;
+            mount_user(&server, "user-a", "alice").await;
+            mount_user(&server, "user-b", "bob").await;
+            let peer = peer_against(&server.uri());
+
+            // A limit below the thread length: two of three posts.
+            let frame = peer
+                .thread_read_response(
+                    "req-truncated".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    ROOT_ID,
+                    Some(2),
+                )
+                .await;
+            match frame {
+                ChatFrame::ReadResponse {
+                    posts, has_more, ..
+                } => {
+                    assert_eq!(posts.len(), 2, "the limit is applied");
+                    assert_eq!(
+                        has_more,
+                        Some(true),
+                        "a thread cut short by the limit must not look complete"
+                    );
+                }
+                other => panic!("expected ReadResponse, got {other:?}"),
+            }
+
+            // A limit at or above the thread length: nothing withheld.
+            let frame = peer
+                .thread_read_response(
+                    "req-complete".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    ROOT_ID,
+                    Some(3),
+                )
+                .await;
+            match frame {
+                ChatFrame::ReadResponse {
+                    posts, has_more, ..
+                } => {
+                    assert_eq!(posts.len(), 3);
+                    assert_eq!(
+                        has_more,
+                        Some(false),
+                        "a complete thread must not be advertised as truncated"
+                    );
+                }
+                other => panic!("expected ReadResponse, got {other:?}"),
+            }
         }
     }
 }

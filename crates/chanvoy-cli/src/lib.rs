@@ -40,11 +40,52 @@ pub enum CliError {
     DaemonStartup { profile: String, detail: String },
     #[error(transparent)]
     Resolver(chanvoy_core::ResolverError),
+    /// A running daemon that predates the verb the operator just used.
+    ///
+    /// Installing a new chanvoy unlinks the old binary rather than
+    /// overwriting it, so a daemon that was already running keeps
+    /// serving from its own copy until someone restarts it. The operator
+    /// then has a CLI that knows a verb talking to a daemon that does
+    /// not, and the honest wire answer is a JSON-RPC "method not found".
+    /// Left unmapped that surfaces as `rpc error -32601: unknown method
+    /// get_post` — a numeric code and an internal method name, neither
+    /// of which is the operator's verb and neither of which says what to
+    /// do. The action is always the same, so name it.
+    #[error(
+        "the running daemon does not support `{verb}`; it was started from an \
+         earlier chanvoy and keeps that binary until it is restarted. Cycle it \
+         with `chanvoy daemon stop` then `chanvoy auto-setup`, and run the \
+         command again."
+    )]
+    DaemonPredatesVerb { verb: String },
 }
 
 impl From<chanvoy_core::ResolverError> for CliError {
     fn from(value: chanvoy_core::ResolverError) -> Self {
         CliError::Resolver(value)
+    }
+}
+
+/// JSON-RPC "method not found". A daemon that has never heard of the
+/// method the CLI just called answers with this and nothing else.
+const RPC_UNKNOWN_METHOD: i64 = -32601;
+
+/// Turn "unknown method" into the one instruction that resolves it.
+///
+/// Applied only at the call sites for verbs new enough to outrun a
+/// long-lived daemon, so `verb` is the operator's spelling rather than
+/// the internal method name. Every other failure passes through
+/// untouched — this must not become a catch-all that recommends a
+/// daemon restart for unrelated causes.
+fn map_daemon_predates_verb(error: DaemonError, verb: &str) -> CliError {
+    match &error {
+        DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        } => CliError::DaemonPredatesVerb {
+            verb: verb.to_string(),
+        },
+        _ => error.into(),
     }
 }
 
@@ -826,13 +867,15 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
             cli.json,
             &daemon_client(&profile)
                 .get_post(&args.channel, &args.post_id, args.team.clone())
-                .await?,
+                .await
+                .map_err(|error| map_daemon_predates_verb(error, "show"))?,
         ),
         CommandSet::Thread(args) => print_value(
             cli.json,
             &daemon_client(&profile)
                 .read_thread(&args.channel, &args.post_id, args.latest, args.team.clone())
-                .await?,
+                .await
+                .map_err(|error| map_daemon_predates_verb(error, "thread"))?,
         ),
         CommandSet::Ack(args) => print_value(
             cli.json,
@@ -3367,11 +3410,23 @@ fn ws_state_label(s: WsConnectionState) -> &'static str {
 /// The post id is on every row so an operator reading without `--json`
 /// can hand a citation straight to `show`, `thread`, or `post
 /// --reply-to`. It is the full id, not a shortened one, because it has
-/// to be copy-pasteable. `root=` appears only on replies — on a root it
-/// would just repeat the id.
+/// to be copy-pasteable.
+///
+/// `root=` is on every row too, including top-level posts, where it
+/// repeats the post's own id. The repetition is the point: `--reply-to`
+/// takes a thread root, and a row with no `root=` leaves the operator
+/// to infer that the id doubles as the root. Reading a row must not
+/// require knowing that rule — the row states which thread it belongs
+/// to, and a top-level post belongs to its own. This matches the
+/// `--json` shape, where `root_id` is populated on every message.
+///
+/// The one omission is a root that is genuinely unknown, which arrives
+/// as an empty string from a daemon older than the field. `root=` with
+/// nothing after it would read as a citable value; leaving it off says
+/// what is true, which is that this row cannot tell you.
 fn format_message(message: &Message) -> String {
     let mut crumb = format!("id={}", message.id);
-    if !message.root_id.is_empty() && message.root_id != message.id {
+    if !message.root_id.is_empty() {
         crumb.push_str(&format!(" root={}", message.root_id));
     }
     format!(
@@ -3408,6 +3463,63 @@ mod tests {
     /// `env::remove_var` calls would otherwise race with each other and
     /// with any test that reads the same vars.
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A CLI that knows `show` / `thread` talking to a daemon that does
+    /// not gets an actionable instruction, not a JSON-RPC code.
+    ///
+    /// This is a normal state after `make install`: the new binary is
+    /// on PATH while the daemon still runs the old one. The message has
+    /// to name the operator's verb and the exact commands that fix it,
+    /// and it must not still be quoting the wire error underneath.
+    #[test]
+    fn an_unknown_method_from_an_old_daemon_names_the_daemon_restart() {
+        for verb in ["show", "thread"] {
+            let wire = DaemonError::Rpc {
+                code: -32601,
+                message: "unknown method get_post".to_string(),
+            };
+            let rendered = map_daemon_predates_verb(wire, verb).to_string();
+
+            assert!(
+                rendered.contains(&format!("`{verb}`")),
+                "the message names the verb the operator typed: {rendered}"
+            );
+            assert!(
+                rendered.contains("chanvoy daemon stop") && rendered.contains("chanvoy auto-setup"),
+                "the message names both commands that resolve it: {rendered}"
+            );
+            assert!(
+                !rendered.contains("-32601") && !rendered.contains("unknown method"),
+                "the raw wire error must not survive the mapping: {rendered}"
+            );
+        }
+    }
+
+    /// The mapping is narrow. Any other daemon failure keeps its own
+    /// diagnostic — a refused post, a missing channel, or a dead socket
+    /// must never be reported as "restart the daemon".
+    #[test]
+    fn other_daemon_failures_are_not_reported_as_a_stale_daemon() {
+        for error in [
+            DaemonError::Rpc {
+                code: -32000,
+                message: "anchor post p-1 is not in channel bravo-team".to_string(),
+            },
+            DaemonError::NotRunning("/run/chanvoy/profile.sock".to_string()),
+        ] {
+            let original = error.to_string();
+            let rendered = map_daemon_predates_verb(error, "show").to_string();
+
+            assert_eq!(
+                rendered, original,
+                "an unrelated failure must pass through unchanged"
+            );
+            assert!(
+                !rendered.contains("chanvoy auto-setup"),
+                "restarting the daemon is not the advice here: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn format_last_active_buckets() {

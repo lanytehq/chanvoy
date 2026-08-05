@@ -48,9 +48,21 @@ fn build_client(mock_url: &str) -> MattermostClient {
 /// One post object in the shape Mattermost actually sends: no author
 /// name anywhere on it.
 fn wire_post(id: &str, user_id: &str, create_at: i64, root_id: &str) -> serde_json::Value {
+    wire_post_in_channel(id, CHANNEL_ID, user_id, create_at, root_id)
+}
+
+/// `wire_post` with the channel spelled out, for the cases where the
+/// point is that a post is *not* in the channel under test.
+fn wire_post_in_channel(
+    id: &str,
+    channel_id: &str,
+    user_id: &str,
+    create_at: i64,
+    root_id: &str,
+) -> serde_json::Value {
     json!({
         "id": id,
-        "channel_id": CHANNEL_ID,
+        "channel_id": channel_id,
         "user_id": user_id,
         "message": format!("body of {id}"),
         "create_at": create_at,
@@ -138,7 +150,10 @@ async fn thread_returns_root_and_every_reply() {
     mount_user(&server, "user-c", "carol").await;
     let client = build_client(&server.uri());
 
-    let messages = client.read_thread(ROOT_ID).await.expect("read_thread");
+    let messages = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect("read_thread_in_channel");
 
     assert_eq!(
         messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
@@ -178,7 +193,10 @@ async fn the_root_leads_the_thread_even_when_a_reply_ties_its_timestamp() {
     mount_user(&server, "user-b", "bob").await;
     let client = build_client(&server.uri());
 
-    let messages = client.read_thread(ROOT_ID).await.expect("read_thread");
+    let messages = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect("read_thread_in_channel");
 
     assert_eq!(
         messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
@@ -201,7 +219,10 @@ async fn thread_with_no_replies_returns_one_message() {
     mount_user(&server, "user-a", "alice").await;
     let client = build_client(&server.uri());
 
-    let messages = client.read_thread(ROOT_ID).await.expect("read_thread");
+    let messages = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect("read_thread_in_channel");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].id, ROOT_ID);
     assert_eq!(
@@ -220,13 +241,78 @@ async fn empty_thread_body_is_an_error() {
     let client = build_client(&server.uri());
 
     let err = client
-        .read_thread(ROOT_ID)
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
         .await
         .expect_err("an empty thread body must not read as success");
     let rendered = err.to_string();
     assert!(
         rendered.contains(ROOT_ID),
         "diagnostic names the thread it failed on: {rendered}"
+    );
+}
+
+/// A thread envelope whose root is in the requested channel but which
+/// also carries a post from somewhere else is refused outright, and
+/// nothing from it is returned — not even the in-channel root.
+///
+/// The caller's channel is a narrower scope than the bot's credential:
+/// the bot can read many channels, the caller asked about one. Binding
+/// only the anchor would leave the rest of the envelope unchecked,
+/// which is exactly the shape a provider bug or a crafted root id could
+/// exploit — a legitimate anchor, and replies from a channel the caller
+/// never named. Partial trust in an envelope is not a usable middle
+/// ground here, because the channel is dropped on the way into a
+/// `Message` and no later layer can tell which posts were checked.
+#[tokio::test]
+async fn a_thread_carrying_a_post_from_another_channel_is_refused_whole() {
+    let server = MockServer::start().await;
+    let stray_channel = "channel-id-somewhere-else";
+    mount_thread(
+        &server,
+        ROOT_ID,
+        posts_envelope(vec![
+            // The root is genuinely in the requested channel.
+            wire_post(ROOT_ID, "user-a", 1_700_000_000_000, ""),
+            // The reply is not.
+            wire_post_in_channel(
+                "stray-reply",
+                stray_channel,
+                "user-b",
+                1_700_000_001_000,
+                ROOT_ID,
+            ),
+        ]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    mount_user(&server, "user-b", "bob").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect_err("a mixed-channel thread envelope must not read as success");
+
+    match &error {
+        chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            assert_eq!(
+                post_id, "stray-reply",
+                "the refusal names the post that did not belong"
+            );
+            assert_eq!(channel, "the-channel");
+        }
+        other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+    }
+    let rendered = error.to_string();
+    for body in ["body of root-post", "body of stray-reply"] {
+        assert!(
+            !rendered.contains(body),
+            "no post body may survive the refusal, including the root's: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains(stray_channel),
+        "the refusal must not name the channel the stray post came from: {rendered}"
     );
 }
 
@@ -260,7 +346,10 @@ async fn author_lookup_failures_fall_back_to_the_user_id() {
         mount_user(&server, "user-b", "bob").await;
         let client = build_client(&server.uri());
 
-        let messages = client.read_thread(ROOT_ID).await.expect("read_thread");
+        let messages = client
+            .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+            .await
+            .expect("read_thread_in_channel");
 
         assert_eq!(messages.len(), 2, "a failed lookup never drops a post");
         assert_eq!(
@@ -307,7 +396,10 @@ async fn a_failed_lookup_is_not_cached() {
     mount_user_failure(&server, "user-a", ResponseTemplate::new(503)).await;
     let client = build_client(&server.uri());
 
-    let first = client.read_thread(ROOT_ID).await.expect("read_thread");
+    let first = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect("read_thread_in_channel");
     assert_eq!(
         first[0].username, "user-a",
         "fallback while the lookup fails"
@@ -323,7 +415,10 @@ async fn a_failed_lookup_is_not_cached() {
     .await;
     mount_user(&server, "user-a", "alice").await;
 
-    let second = client.read_thread(ROOT_ID).await.expect("read_thread");
+    let second = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect("read_thread_in_channel");
     assert_eq!(
         second[0].username, "alice",
         "the failure must not have pinned the fallback for the cache window"

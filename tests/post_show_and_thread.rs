@@ -23,7 +23,10 @@
 
 mod common;
 
-use common::{read_attention_state_bytes, run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
+use common::{
+    read_attention_state, read_attention_state_bytes, run_chanvoy, spawn_daemon,
+    stop_daemon_cleanly, TestEnv,
+};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -31,6 +34,13 @@ use wiremock::{Mock, ResponseTemplate};
 const CHANNEL: &str = "bravo-team";
 const CHANNEL_ID: &str = "chan-id-show-thread";
 const OTHER_CHANNEL_ID: &str = "chan-id-out-of-reach";
+/// A second team the bot also belongs to, carrying a channel of the
+/// same slug as `CHANNEL` under a different channel id. Cross-team
+/// resolution is only testable against a team that is not the profile's
+/// primary one.
+const OTHER_TEAM_ID: &str = "team-id-999";
+const OTHER_TEAM_SLUG: &str = "org-otherhq";
+const OTHER_TEAM_CHANNEL_ID: &str = "chan-id-other-team";
 
 /// A body marker distinctive enough that a leak assertion cannot pass
 /// by accident.
@@ -104,13 +114,16 @@ async fn mount_user(env: &TestEnv, user_id: &str, username: &str) {
 }
 
 /// `/users/me/teams`, needed by the explicit `<team>/<channel>` and
-/// `--team` resolution paths.
-async fn mount_my_teams(env: &TestEnv, team_id: &str) {
+/// `--team` resolution paths. Takes the full membership list so a test
+/// can express "member of these, not that one".
+async fn mount_my_teams(env: &TestEnv, teams: &[(&str, &str)]) {
+    let body: Vec<Value> = teams
+        .iter()
+        .map(|(id, name)| json!({"id": id, "name": name, "display_name": name}))
+        .collect();
     Mock::given(method("GET"))
         .and(path("/api/v4/users/me/teams"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {"id": team_id, "name": "org-lanytehq", "display_name": "lanytehq"},
-        ])))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&env.mock)
         .await;
 }
@@ -597,6 +610,118 @@ async fn thread_with_a_mismatched_channel_makes_no_thread_request() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
+/// A thread whose anchor is legitimately in the named channel, but
+/// whose envelope also carries a reply from a channel the operator did
+/// not name, is refused whole — including the in-channel root.
+///
+/// This is the case the anchor bind alone does not cover. The bot's
+/// credential reaches every channel it is a member of; the channel the
+/// operator named is the narrower scope, and it is the one that governs
+/// the read. An envelope that mixes the two is not a thread the
+/// operator asked for, and there is no honest way to hand back "the
+/// part you were allowed to see": once a post becomes a `Message` its
+/// channel is gone, so a partial result would be labelled with the
+/// requested channel and be wrong about it.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_with_an_out_of_channel_reply_is_refused_whole() {
+    let env = TestEnv::new("thread-mixed-envelope").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tme", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    // The anchor is in the requested channel, so the bind on it passes
+    // and the thread request is genuinely issued.
+    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
+    let stray = wire_post(
+        "stray-reply",
+        OTHER_CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "root-1",
+    );
+    mount_post(&env, root.clone()).await;
+    mount_thread(&env, "root-1", vec![root, stray]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "root-1"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a thread carrying an out-of-channel post must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    for id in ["root-1", "stray-reply"] {
+        assert!(
+            !rendered.contains(&body_of(id)),
+            "no body from the envelope may reach the operator, including the \
+             in-channel root's: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains(OTHER_CHANNEL_ID),
+        "the refusal must not name the channel the stray post came from: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// `--latest` is the newest message, not the last element of the list.
+///
+/// The thread ordering pins the root first no matter what its timestamp
+/// says, so on a thread whose root is newer than its reply the two
+/// answers differ: the tail is the reply, the newest message is the
+/// root. A root can legitimately carry the later timestamp — a post
+/// edited after it was replied to, or a backdated import — and an
+/// operator asking for the latest message wants the latest message.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_latest_is_the_newest_message_even_when_the_root_is_newest() {
+    let env = TestEnv::new("thread-latest-backdated").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tlb", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    // The root's timestamp is LATER than its reply's. Root-first
+    // ordering still puts the root at index 0, so the tail of the list
+    // is the reply — the wrong answer.
+    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_009_000, "");
+    let reply = wire_post("reply-1", CHANNEL_ID, "user-b", 1_700_000_001_000, "root-1");
+    mount_post(&env, root.clone()).await;
+    mount_thread(&env, "root-1", vec![root, reply]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "root-1", "--latest"]).await;
+    assert!(
+        out.status.success(),
+        "thread --latest must exit 0; output={}",
+        combined_output(&out)
+    );
+
+    let value: Value = serde_json::from_str(&stdout_of(&out)).expect("parses");
+    let array = value
+        .as_array()
+        .unwrap_or_else(|| panic!("--latest must not change the JSON type: {value}"));
+    assert_eq!(array.len(), 1, "--latest is one element, got {value}");
+    assert_eq!(
+        array[0]["id"], "root-1",
+        "the newest message here is the root; taking the tail of a \
+         root-pinned list returns the reply instead: {value}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
 // ----------------------------------------------------------------------
 // Cursor neutrality
 // ----------------------------------------------------------------------
@@ -618,8 +743,28 @@ async fn show_and_thread_do_not_advance_the_cursor() {
     mount_user(&env, "user-a", "alice").await;
     mount_user(&env, "user-b", "bob").await;
 
+    // Seed a real cursor first. Without this the state file does not
+    // exist, every comparison is `None == None`, and the test can only
+    // catch a verb that CREATES state — never one that mutates an
+    // existing entry, which is what every real cursor writer does.
+    env.mock_post_create("seed-post-1").await;
     let daemon = spawn_daemon(&env).await;
-    let pre_state = read_attention_state_bytes(&env);
+    let seed = run_chanvoy(&env, &["post", CHANNEL, "seed"]).await;
+    assert!(
+        seed.status.success(),
+        "seeding post must succeed; output={}",
+        combined_output(&seed)
+    );
+
+    let pre_state =
+        read_attention_state_bytes(&env).expect("a cursor exists after the seeding post");
+    let parsed = read_attention_state(&env).expect("state parses");
+    assert!(
+        parsed.channels.keys().any(|key| key.ends_with(CHANNEL)),
+        "the seeded channel must have a cursor entry, or there is nothing for a \
+         read to accidentally advance; keys={:?}",
+        parsed.channels.keys().collect::<Vec<_>>()
+    );
 
     for args in [
         vec!["show", CHANNEL, "root-1"],
@@ -633,8 +778,8 @@ async fn show_and_thread_do_not_advance_the_cursor() {
             combined_output(&out)
         );
         assert_eq!(
-            pre_state,
-            read_attention_state_bytes(&env),
+            Some(&pre_state),
+            read_attention_state_bytes(&env).as_ref(),
             "{args:?} is a read and must not mutate attention state"
         );
     }
@@ -647,11 +792,12 @@ async fn show_and_thread_do_not_advance_the_cursor() {
 // ----------------------------------------------------------------------
 
 /// Without `--json` an operator still gets a citation they can hand
-/// straight back to `show` / `thread`. `root=` appears only where it
-/// says something the id does not.
+/// straight back to `show` / `thread` / `post --reply-to`. Every row
+/// carries both crumbs: its own id, and the thread it belongs to —
+/// which for a top-level post is itself.
 #[tokio::test]
 #[ignore = "integration: run via make test-integration"]
-async fn read_human_output_carries_the_post_id_and_a_root_only_on_replies() {
+async fn read_human_output_carries_the_post_id_and_a_root_on_every_row() {
     let env = TestEnv::new("read-id-crumb").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     env.mock_baseline("bot-id-crumb", "agent-bravo-devlead", "team-id-456")
@@ -688,14 +834,18 @@ async fn read_human_output_carries_the_post_id_and_a_root_only_on_replies() {
         "every row carries its full post id: {rendered}"
     );
     assert!(
-        rendered.contains("root=root-1"),
+        rendered.contains("id=root-1 root=root-1"),
+        "a top-level row names itself as its own thread, so an operator \
+         never has to infer which id `--reply-to` wants: {rendered}"
+    );
+    assert!(
+        rendered.contains("id=reply-1 root=root-1"),
         "a reply names the thread it belongs to: {rendered}"
     );
     assert_eq!(
         rendered.matches("root=").count(),
-        1,
-        "only the reply carries a root crumb; a root would just repeat \
-         its own id: {rendered}"
+        2,
+        "both rows carry a root crumb — the root's is not omitted: {rendered}"
     );
 
     let _ = stop_daemon_cleanly(&env, daemon).await;
@@ -705,62 +855,156 @@ async fn read_human_output_carries_the_post_id_and_a_root_only_on_replies() {
 // Clap surface
 // ----------------------------------------------------------------------
 
-/// Both cross-team spellings reach the same channel, and `--latest`
-/// parses on `thread`.
+/// Both cross-team spellings select a *different* team from the
+/// profile's primary one, and a team the bot is not in is refused.
+///
+/// The fixture gives two teams a channel of the same slug, each holding
+/// a differently-marked post. That duplicate slug is the whole point:
+/// with a single team, or with the primary team as the only membership,
+/// `<team>/` and `--team` can be deleted outright and every assertion
+/// still passes, because primary-team resolution lands on the same
+/// channel either way. Here the two spellings must reach the second
+/// team's channel — and its post — or the read is bound against the
+/// primary team's channel id and refused.
 #[tokio::test]
 #[ignore = "integration: run via make test-integration"]
-async fn team_syntax_and_team_flag_both_resolve_and_latest_parses() {
+async fn team_syntax_and_team_flag_select_a_non_primary_team() {
     let env = TestEnv::new("show-thread-clap").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     env.mock_baseline("bot-id-clap", "agent-bravo-devlead", "team-id-456")
         .await;
-    mount_my_teams(&env, "team-id-456").await;
+    mount_my_teams(
+        &env,
+        &[
+            ("team-id-456", "org-lanytehq"),
+            (OTHER_TEAM_ID, OTHER_TEAM_SLUG),
+        ],
+    )
+    .await;
+    // Same channel slug in both teams, different channel ids.
     env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
-    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
-    mount_post(&env, root.clone()).await;
-    mount_thread(&env, "root-1", vec![root]).await;
+    env.mock_channel_lookup_for_team(OTHER_TEAM_ID, CHANNEL, OTHER_TEAM_CHANNEL_ID)
+        .await;
+
+    let primary_root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
+    let other_root = wire_post(
+        "other-root-1",
+        OTHER_TEAM_CHANNEL_ID,
+        "user-b",
+        1_700_000_000_000,
+        "",
+    );
+    mount_post(&env, primary_root.clone()).await;
+    mount_post(&env, other_root.clone()).await;
+    mount_thread(&env, "other-root-1", vec![other_root]).await;
     mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
 
     let daemon = spawn_daemon(&env).await;
 
+    // `<team>/<channel>` reaches the second team's channel, and the post
+    // that lives there.
     let qualified = run_chanvoy(
         &env,
-        &["--json", "show", "org-lanytehq/bravo-team", "root-1"],
+        &[
+            "--json",
+            "show",
+            &format!("{OTHER_TEAM_SLUG}/{CHANNEL}"),
+            "other-root-1",
+        ],
     )
     .await;
     assert!(
         qualified.status.success(),
-        "<team>/<channel> must resolve on show; output={}",
+        "<team>/<channel> must resolve against the named team, not the \
+         primary one; output={}",
         combined_output(&qualified)
     );
+    let value: Value = serde_json::from_str(&stdout_of(&qualified)).expect("parses");
+    assert_eq!(value["id"], "other-root-1");
     assert_eq!(
-        serde_json::from_str::<Value>(&stdout_of(&qualified)).expect("parses")["id"],
-        "root-1"
+        value["message"],
+        body_of("other-root-1"),
+        "the body is the second team's post, not the primary team's: {value}"
     );
 
+    // `--team` does the same, and `--latest` still parses alongside it.
     let flagged = run_chanvoy(
         &env,
         &[
             "--json",
             "thread",
             CHANNEL,
-            "root-1",
+            "other-root-1",
             "--latest",
             "--team",
-            "org-lanytehq",
+            OTHER_TEAM_SLUG,
         ],
     )
     .await;
     assert!(
         flagged.status.success(),
-        "--team and --latest must both parse on thread; output={}",
+        "--team must select the named team and --latest must parse \
+         alongside it; output={}",
         combined_output(&flagged)
     );
     let value: Value = serde_json::from_str(&stdout_of(&flagged)).expect("parses");
+    let array = value
+        .as_array()
+        .unwrap_or_else(|| panic!("--latest must not change the JSON type: {value}"));
     assert_eq!(
-        value.as_array().map(|a| a.len()),
-        Some(1),
+        array.len(),
+        1,
         "--latest on a one-post thread is still a one-element array: {value}"
+    );
+    assert_eq!(array[0]["id"], "other-root-1");
+
+    // The duplicate slug is not a shortcut between teams: naming the
+    // primary team's channel reaches the primary team's channel, so the
+    // other team's post is refused there.
+    let crossed = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "show",
+            &format!("org-lanytehq/{CHANNEL}"),
+            "other-root-1",
+        ],
+    )
+    .await;
+    assert!(
+        !crossed.status.success(),
+        "a post from the other team's same-named channel must not resolve \
+         through the primary team; output={}",
+        combined_output(&crossed)
+    );
+    assert!(
+        !combined_output(&crossed).contains(&body_of("other-root-1")),
+        "no body may leak across the duplicate slug: {}",
+        combined_output(&crossed)
+    );
+
+    // A team the bot is not a member of is refused by name, and the
+    // refusal is about the team rather than the channel or the post.
+    let stranger = run_chanvoy(
+        &env,
+        &["--json", "show", "org-not-a-member/bravo-team", "root-1"],
+    )
+    .await;
+    assert!(
+        !stranger.status.success(),
+        "a team outside the bot's membership must be refused; output={}",
+        combined_output(&stranger)
+    );
+    let rendered = combined_output(&stranger);
+    assert!(
+        rendered.contains("org-not-a-member"),
+        "the refusal names the team that was asked for: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&body_of("root-1")),
+        "a wrong-team read must not fall back to a team that does have \
+         the channel: {rendered}"
     );
 
     let _ = stop_daemon_cleanly(&env, daemon).await;

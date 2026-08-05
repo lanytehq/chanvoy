@@ -414,7 +414,7 @@ async fn replay_channel_pinned() {
     .await;
 }
 
-/// `read_thread` hits `GET /posts/{root_post_id}/thread` (covers
+/// `read_thread_in_channel` hits `GET /posts/{root_post_id}/thread` (covers
 /// `post_thread`) and resolves each distinct author through
 /// `GET /users/{user_id}` (covers `user_by_id`).
 ///
@@ -438,9 +438,9 @@ async fn replay_post_thread() {
     let client = build_client(&server.uri());
 
     let messages = client
-        .read_thread(ROOT_POST_ID)
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_POST_ID)
         .await
-        .expect("read_thread parses");
+        .expect("read_thread_in_channel parses");
 
     assert_eq!(
         messages.len(),
