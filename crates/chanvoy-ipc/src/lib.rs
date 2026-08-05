@@ -206,13 +206,24 @@ pub struct AuditEvent {
     pub severity: Option<String>,
 }
 
-/// Re-state a thread failure against the post id the caller supplied.
+/// Rebuild a thread failure so that nothing of the provider's survives.
 ///
-/// A thread read anchors on the post the caller named and then runs
+/// A thread read anchors on whatever post the caller named, then runs
 /// against that post's thread root. When a reply was named, the root is
-/// derived — quoting it in a refusal would disclose an identifier the
-/// caller never supplied. Only the identifier changes; the failure does
-/// not.
+/// derived — so anything quoting it would hand the caller an identifier
+/// they never supplied and could not otherwise obtain.
+///
+/// The identifier is not the only thing that changes. Modelled failures
+/// keep their kind and are restated against the caller's post. Everything
+/// else is deliberately *converted* to a constructed gateway-status
+/// failure, because a provider's own error body, or a transport error
+/// carrying the URL it was fetching, both quote that derived root. The
+/// status is preserved where there is one, since that is what tells a
+/// caller whether to retry; the provider's prose never is.
+///
+/// Nothing returned from here was received from anywhere: every arm
+/// builds its value, including the fallthrough. Forwarding the original
+/// is what leaked twice.
 fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> CoreError {
     match error {
         CoreError::AnchorChannelMismatch { channel, .. } => CoreError::AnchorChannelMismatch {
@@ -1774,6 +1785,95 @@ mod tests {
                 .iter()
                 .filter(|req| req.url.path().ends_with("/thread"))
                 .count()
+        }
+
+        async fn author_lookups(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .expect("wiremock received_requests")
+                .iter()
+                .filter(|req| req.url.path().starts_with("/api/v4/users/"))
+                .count()
+        }
+
+        /// The gateway refuses a point response that is not the post it
+        /// asked for.
+        ///
+        /// Composition through the shared core check makes this hold
+        /// today; the point of pinning it here is that the gateway
+        /// contract should not depend on that composition surviving a
+        /// future extraction or reordering. A substituted post is worse
+        /// here than a wrong-channel one: its root would be taken as
+        /// canonical and an unrelated conversation fetched under the
+        /// caller's channel label.
+        #[tokio::test]
+        async fn a_point_response_for_a_different_post_is_refused_by_the_gateway() {
+            let server = MockServer::start().await;
+            // Asked for ROOT_ID; the provider answers with a different
+            // post, correctly in the caller's channel, rooted elsewhere.
+            Mock::given(http_method("GET"))
+                .and(http_path(format!("/api/v4/posts/{ROOT_ID}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(wire_post(
+                    "substituted-post",
+                    CALLER_CHANNEL,
+                    "user-b",
+                    1_700_000_009_000,
+                    "foreign-root",
+                )))
+                .mount(&server)
+                .await;
+            mount_user(&server, "user-b", "bob").await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-substituted".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    ROOT_ID,
+                    None,
+                )
+                .await;
+
+            match &frame {
+                ChatFrame::Error {
+                    error_code,
+                    retryable,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(*error_code, ChatErrorCode::NotFound);
+                    assert_eq!(
+                        *retryable,
+                        Some(false),
+                        "the provider will not answer differently on a retry"
+                    );
+                    assert_eq!(message, &binding_refusal_message(ROOT_ID));
+                }
+                other => panic!("expected Error frame, got {other:?}"),
+            }
+
+            let rendered = serde_json::to_string(&frame).expect("serialize frame");
+            for leaked in [
+                "substituted-post",
+                "foreign-root",
+                "body of substituted-post",
+            ] {
+                assert!(
+                    !rendered.contains(leaked),
+                    "nothing of the substituted post may reach the caller: {leaked} in {rendered}"
+                );
+            }
+            assert_eq!(
+                thread_requests(&server).await,
+                0,
+                "a substituted point response must stop the read before any thread is fetched"
+            );
+            assert_eq!(
+                author_lookups(&server).await,
+                0,
+                "and before any author is resolved"
+            );
         }
 
         /// A thread that lives in the caller's channel reads normally,

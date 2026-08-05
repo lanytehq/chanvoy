@@ -1333,13 +1333,24 @@ async fn dispatch_request(
     }
 }
 
-/// Re-state a thread failure against the post id the caller supplied.
+/// Rebuild a thread failure so that nothing of the provider's survives.
 ///
-/// A thread read is anchored on whatever post the caller named, then run
-/// against that post's thread root. When the caller named a reply, the
-/// root is derived — so a refusal that quoted it would disclose an id the
-/// caller never supplied and could not otherwise obtain. Only the
-/// identifier in the failure changes; the kind of failure does not.
+/// A thread read anchors on whatever post the caller named, then runs
+/// against that post's thread root. When a reply was named, the root is
+/// derived — so anything quoting it would hand the caller an identifier
+/// they never supplied and could not otherwise obtain.
+///
+/// The identifier is not the only thing that changes. Modelled failures
+/// keep their kind and are restated against the caller's post. Everything
+/// else is deliberately *converted* to a constructed gateway-status
+/// failure, because a provider's own error body, or a transport error
+/// carrying the URL it was fetching, both quote that derived root. The
+/// status is preserved where there is one, since that is what tells a
+/// caller whether to retry; the provider's prose never is.
+///
+/// Nothing returned from here was received from anywhere: every arm
+/// builds its value, including the fallthrough. Forwarding the original
+/// is what leaked twice.
 fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> CoreError {
     match error {
         CoreError::AnchorChannelMismatch { channel, .. } => CoreError::AnchorChannelMismatch {
