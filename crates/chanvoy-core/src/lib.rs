@@ -2586,6 +2586,18 @@ pub const AUTHOR_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 /// people a long-running daemon has ever seen.
 pub const AUTHOR_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// How long a single author lookup may take before chanvoy gives up on
+/// it and reports the user id instead.
+///
+/// Author resolution is a courtesy on top of a read: the read already
+/// has everything it needs except a display name. Without a deadline
+/// the fallback is only reachable when the provider *refuses* — a
+/// provider that accepts the connection and then stalls would hang the
+/// read that triggered it, and every `read` and `wait` goes through
+/// this path. Bounding the wait is what makes "falls back to the user
+/// id" true in all cases rather than only the polite ones.
+pub const AUTHOR_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 struct AuthorCacheEntry {
     username: String,
@@ -2814,6 +2826,16 @@ impl MattermostClient {
         Ok(out)
     }
 
+    /// The credential this client authenticates with.
+    ///
+    /// Exposed so that surfaces which need the same identity derive it
+    /// from the client rather than reading the token source a second
+    /// time. Two reads can straddle a rotation and authenticate as
+    /// different identities.
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Resolve a single author name, preferring the shared cache.
     /// Falls back to the literal user id when the provider cannot tell
     /// us the name — an id an operator can look up beats a placeholder
@@ -2879,14 +2901,32 @@ impl MattermostClient {
     /// stays short and deliberately carries no response body, since a
     /// user record holds more about a person than chanvoy needs.
     async fn fetch_username(&self, user_id: &str) -> Option<String> {
+        self.fetch_username_within(user_id, AUTHOR_RESOLVE_TIMEOUT)
+            .await
+    }
+
+    /// The body of a single author lookup, with the deadline passed in
+    /// so a test can prove the elapsed path without waiting out the
+    /// production timeout.
+    async fn fetch_username_within(&self, user_id: &str, deadline: Duration) -> Option<String> {
         #[derive(Deserialize)]
         struct RawUser {
             username: String,
         }
-        match self
-            .request::<RawUser, Value>("GET", &format!("/users/{user_id}"), None)
-            .await
-        {
+        let endpoint = format!("/users/{user_id}");
+        let lookup = self.request::<RawUser, Value>("GET", &endpoint, None);
+        let outcome = match tokio::time::timeout(deadline, lookup).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                warn!(
+                    user_id,
+                    timeout_secs = deadline.as_secs(),
+                    "author name lookup timed out; falling back to the user id"
+                );
+                return None;
+            }
+        };
+        match outcome {
             Ok(user) => Some(user.username),
             Err(err) => {
                 let reason = match &err {
@@ -4575,9 +4615,11 @@ pub struct MattermostWs {
 }
 
 impl MattermostWs {
+    /// The websocket credential is taken from `client` rather than
+    /// accepted as a parameter, so the websocket and the
+    /// request-response surface cannot be handed different identities.
     pub fn new(
         profile: &Profile,
-        token: String,
         client: MattermostClient,
         event_bus: Arc<EventBus>,
         my_user_id: String,
@@ -4590,7 +4632,7 @@ impl MattermostWs {
         let ws_url = format!("{ws_url}/api/v4/websocket");
         Self {
             ws_url,
-            token,
+            token: client.token().to_string(),
             event_bus,
             ws_state: Arc::new(WsState::new()),
             profile_name: profile.name.clone(),
@@ -7072,6 +7114,272 @@ monitored_channels = ["per-003", "per-004"]
     /// covers the γ hybrid resolver's primary-first / fallback /
     /// ambiguity / no-match / explicit-override branches plus the
     /// SOP-MM-015 regression case dispatch flagged 2026-04-28.
+    /// The websocket parser boundary, driven with provider-shaped
+    /// `posted` payloads.
+    ///
+    /// These exist because the earlier regressions all started after
+    /// parsing, from an already-correct payload — so none of them could
+    /// catch the parser failing to read the provider's root, which is
+    /// exactly the defect that occurred. The assertions here are on what
+    /// comes out of the event bus, so the parse is genuinely covered.
+    /// Author-cache behavior through the client, rather than arithmetic
+    /// on the insertion helper. An expired entry has to actually cause a
+    /// refresh, and a stalled provider has to actually reach the
+    /// fallback — neither is observable from the helper alone.
+    mod author_resolution {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn seat_profile(server_url: &str) -> Profile {
+            Profile {
+                name: "seat".to_string(),
+                role: "seat".to_string(),
+                scope: "scope".to_string(),
+                provider: Provider::Mattermost,
+                bot_username: "agent-seat".to_string(),
+                team_name: "org-team".to_string(),
+                server_url: server_url.to_string(),
+                env_name: "LANYTE_MM_TOKEN".to_string(),
+                env_file: None,
+                credential_mode: CredentialMode::EnvName,
+                capability_class: CapabilityClass::Standard,
+                monitored_channels: Vec::new(),
+                ipc: None,
+                reduce: None,
+            }
+        }
+
+        /// A cached name is re-fetched once its entry has aged out, and
+        /// the caller sees the new name — a rename becomes visible
+        /// without restarting the daemon.
+        #[tokio::test]
+        async fn an_expired_entry_is_refreshed_from_the_provider() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/u-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "u-1", "username": "renamed"
+                })))
+                .mount(&server)
+                .await;
+            let profile = seat_profile(&server.uri());
+            let client = MattermostClient::new(&profile, "t".to_string()).unwrap();
+
+            // Seed an entry that is already past its useful life.
+            {
+                let mut guard = client.author_cache.write().await;
+                guard.insert(
+                    "u-1".to_string(),
+                    AuthorCacheEntry {
+                        username: "stale-name".to_string(),
+                        fetched_at: std::time::Instant::now() - AUTHOR_CACHE_TTL,
+                    },
+                );
+            }
+
+            let name = client.author_username("u-1").await;
+            assert_eq!(
+                name, "renamed",
+                "an aged-out entry must be refreshed, not served stale"
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "exactly one refresh for the expired entry"
+            );
+
+            // The refreshed value is now cached: no second request.
+            let again = client.author_username("u-1").await;
+            assert_eq!(again, "renamed");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "the refreshed entry serves the next call from cache"
+            );
+        }
+
+        /// A provider that accepts the connection and then stalls must
+        /// still reach the user-id fallback.
+        ///
+        /// This is the case the refusal-shaped tests cannot reach: a
+        /// connection-refused or a 500 returns promptly, so the fallback
+        /// was only ever proven for a provider that fails politely. An
+        /// accepted-and-silent connection would otherwise hang every
+        /// read and wait that hydrates a message.
+        #[tokio::test]
+        async fn a_stalled_lookup_falls_back_to_the_user_id() {
+            let server = MockServer::start().await;
+            // Accepted, then silent for far longer than the deadline.
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/u-1"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .set_body_json(serde_json::json!({"id": "u-1", "username": "never"})),
+                )
+                .mount(&server)
+                .await;
+            let profile = seat_profile(&server.uri());
+            let client = MattermostClient::new(&profile, "t".to_string()).unwrap();
+
+            // A short deadline stands in for the production constant so
+            // the test proves the elapsed path in milliseconds.
+            let started = std::time::Instant::now();
+            let resolved = client
+                .fetch_username_within("u-1", Duration::from_millis(50))
+                .await;
+            assert!(
+                resolved.is_none(),
+                "a stalled lookup must give up rather than wait for a response that is not coming"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the deadline must actually bound the wait"
+            );
+        }
+
+        /// The production constant is the one actually applied, so the
+        /// test seam above cannot drift away from real behavior.
+        #[test]
+        fn the_author_deadline_is_bounded_and_short() {
+            assert!(
+                AUTHOR_RESOLVE_TIMEOUT <= Duration::from_secs(10),
+                "author resolution is a courtesy on top of a read; it must not \
+                 dominate the read's latency"
+            );
+        }
+    }
+
+    mod push_parser {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn ws_profile(server_url: &str) -> Profile {
+            Profile {
+                name: "seat".to_string(),
+                role: "seat".to_string(),
+                scope: "scope".to_string(),
+                provider: Provider::Mattermost,
+                bot_username: "agent-seat".to_string(),
+                team_name: "org-team".to_string(),
+                server_url: server_url.to_string(),
+                env_name: "LANYTE_MM_TOKEN".to_string(),
+                env_file: None,
+                credential_mode: CredentialMode::EnvName,
+                capability_class: CapabilityClass::Standard,
+                monitored_channels: vec!["general".to_string()],
+                ipc: None,
+                reduce: None,
+            }
+        }
+
+        async fn mock_channel_and_user(server: &MockServer) {
+            Mock::given(method("GET"))
+                .and(path("/api/v4/teams/name/org-team"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "team-1", "name": "org-team"
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me/teams/team-1/channels"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": "ch-1", "name": "general", "display_name": "General",
+                        "type": "O", "last_post_at": 0
+                    }])),
+                )
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/u-sender"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "u-sender", "username": "alice"
+                })))
+                .mount(server)
+                .await;
+        }
+
+        /// Drive a reply-shaped payload through the parser and assert
+        /// the provider's root survives to the emitted event.
+        #[tokio::test]
+        async fn a_pushed_reply_keeps_the_providers_thread_root() {
+            let server = MockServer::start().await;
+            mock_channel_and_user(&server).await;
+            let profile = ws_profile(&server.uri());
+            let client = MattermostClient::new(&profile, "t".to_string()).unwrap();
+            let bus = Arc::new(EventBus::new(16));
+            let mut rx = bus.subscribe();
+            let ws = MattermostWs::new(&profile, client, Arc::clone(&bus), "u-me".to_string());
+
+            // Provider shape: the post's own id differs from its root.
+            let data = serde_json::json!({
+                "post": serde_json::to_string(&serde_json::json!({
+                    "id": "reply-9",
+                    "channel_id": "ch-1",
+                    "user_id": "u-sender",
+                    "message": "a reply",
+                    "create_at": 1_700_000_000_000i64,
+                    "root_id": "root-1",
+                }))
+                .unwrap(),
+            });
+            ws.handle_post_event(&data).await;
+
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must be emitted; a silent parser would otherwise hang here")
+                .expect("event bus delivered");
+            let DaemonEventPayloadInner::Inbound(payload) = &event.payload else {
+                panic!("expected an inbound payload");
+            };
+            assert_eq!(payload.post_id, "reply-9");
+            assert_eq!(
+                payload.root_id, "root-1",
+                "the parser must read the provider's root, not the post's own id"
+            );
+            assert_eq!(payload.sender_username, "alice");
+        }
+
+        /// A top-level payload arrives with an empty provider root and
+        /// must be normalized to its own id, so every pushed event names
+        /// a usable reply target.
+        #[tokio::test]
+        async fn a_pushed_top_level_post_reports_itself_as_the_root() {
+            let server = MockServer::start().await;
+            mock_channel_and_user(&server).await;
+            let profile = ws_profile(&server.uri());
+            let client = MattermostClient::new(&profile, "t".to_string()).unwrap();
+            let bus = Arc::new(EventBus::new(16));
+            let mut rx = bus.subscribe();
+            let ws = MattermostWs::new(&profile, client, Arc::clone(&bus), "u-me".to_string());
+
+            let data = serde_json::json!({
+                "post": serde_json::to_string(&serde_json::json!({
+                    "id": "post-1",
+                    "channel_id": "ch-1",
+                    "user_id": "u-sender",
+                    "message": "top level",
+                    "create_at": 1_700_000_000_000i64,
+                    "root_id": "",
+                }))
+                .unwrap(),
+            });
+            ws.handle_post_event(&data).await;
+
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("an event must be emitted; a silent parser would otherwise hang here")
+                .expect("event bus delivered");
+            let DaemonEventPayloadInner::Inbound(payload) = &event.payload else {
+                panic!("expected an inbound payload");
+            };
+            assert_eq!(payload.root_id, "post-1");
+        }
+    }
+
     mod per_019_resolver {
         use super::*;
         use wiremock::matchers::{method, path};

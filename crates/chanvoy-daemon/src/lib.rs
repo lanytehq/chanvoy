@@ -222,8 +222,13 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     if socket_path.exists() {
         fs::remove_file(&socket_path)?;
     }
+    // Loaded exactly once and reused for every surface this daemon
+    // brings up. Reading it a second time later would let a rotation
+    // between the two reads pair a request-response client
+    // authenticated as one identity with a websocket authenticated by
+    // another — and the drift probe only ever inspects the first.
     let token = load_token(&profile)?;
-    let client = MattermostClient::new(&profile, token)?;
+    let client = MattermostClient::new(&profile, token.clone())?;
 
     // PER-035: if this profile carries a reduction policy, build the
     // family-identity writer up-front. Loud failure on a missing target
@@ -380,15 +385,15 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
 
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::watch::channel(false);
     {
-        let token_for_ws = load_token(&profile)?;
         // Same-profile client, shared by clone (see the IPC peer above)
         // so the websocket pipeline reads author names out of the same
-        // cache the request-response paths fill.
+        // cache the request-response paths fill — and authenticates
+        // with that client's credential, which is why no token is
+        // passed here.
         let client_for_ws = state.client.clone();
         let event_bus = Arc::clone(&event_bus);
         let ws = Arc::new(MattermostWs::new(
             &profile,
-            token_for_ws,
             client_for_ws,
             event_bus,
             state.my_user_id.clone(),
@@ -2502,6 +2507,37 @@ mod compat_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon reads the profile's credential exactly once.
+    ///
+    /// Reading it a second time for another surface can straddle a
+    /// rotation and leave the websocket authenticated as one identity
+    /// while the request-response client is another — and the drift
+    /// probe only inspects the first. The websocket now derives its
+    /// credential from the shared client, so a split is unrepresentable
+    /// rather than merely avoided; this guards the remaining way to
+    /// reintroduce it, which is a second load in `start`.
+    ///
+    /// The reduction writer's own load is deliberately excluded: it is
+    /// a different profile and a different identity by design.
+    #[test]
+    fn the_profile_credential_is_loaded_exactly_once() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub async fn start(")
+            .expect("start function present");
+        // Stop at the test module: this test's own source mentions the
+        // pattern it searches for, and counting those would make the
+        // assertion about itself rather than about `start`.
+        let end = source.find("\nmod tests {").expect("test module present");
+        let body = &source[start..end];
+        let loads = body.matches("load_token(&profile)").count();
+        assert_eq!(
+            loads, 1,
+            "the profile credential must be loaded once and reused; a second \
+             load can pair surfaces with different identities"
+        );
+    }
 
     #[test]
     fn stale_daemon_cursor_degrades_to_nonfatal_probe() {
