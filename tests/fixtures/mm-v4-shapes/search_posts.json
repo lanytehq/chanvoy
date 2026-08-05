@@ -1,13 +1,21 @@
 {
-  "order": ["post-id-stable"],
+  "order": ["post-id-stable", "older-post-id-stable"],
   "posts": {
     "post-id-stable": {
       "id": "post-id-stable",
       "channel_id": "channel-id-stable",
       "user_id": "user-id-stable",
-      "username": "bot-stable",
       "message": "fixture canonical body for POST /teams/{team_id}/posts/search response",
-      "create_at": 1700000000000
+      "create_at": 1700000000000,
+      "root_id": ""
+    },
+    "older-post-id-stable": {
+      "id": "older-post-id-stable",
+      "channel_id": "channel-id-stable",
+      "user_id": "user-id-stable",
+      "message": "fixture lower-ranked but older search hit",
+      "create_at": 1600000000000,
+      "root_id": ""
     }
   },
   "matches": {}

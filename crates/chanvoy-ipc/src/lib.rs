@@ -210,6 +210,13 @@ pub fn core_error_to_chat(error: CoreError, request_id: &str) -> ChatFrame {
     let (code, retryable) = match &error {
         CoreError::WaitTimeout(_) => (ChatErrorCode::NotFound, Some(false)),
         CoreError::ProfileNotFound(_) => (ChatErrorCode::NotFound, Some(false)),
+        // Every cause of an empty thread body is permanent: the post was
+        // deleted, it sits in a channel this identity cannot read, or the
+        // id is not a post id. Falling through to the retryable default
+        // would tell an automated caller to retry a read that can never
+        // succeed — and this surface is consumed by agents, which honor
+        // that flag literally.
+        CoreError::EmptyThread { .. } => (ChatErrorCode::NotFound, Some(false)),
         CoreError::RequiresElevatedCapability => (ChatErrorCode::PermissionDenied, Some(false)),
         CoreError::Api { status, .. } => match *status {
             s if s == reqwest::StatusCode::UNAUTHORIZED || s == reqwest::StatusCode::FORBIDDEN => {
@@ -289,7 +296,12 @@ pub fn daemon_event_to_chat_notification(
                 author: p.sender_username.clone(),
                 created_at: format_rfc3339(p.create_at),
                 message: p.message.clone(),
-                thread_root_id: None,
+                // Same non-empty rule as the read path. Push events are
+                // how a subscribed caller learns a message exists, so
+                // dropping the thread root here would leave it with no
+                // way to reply without a second round trip — and no way
+                // at all to reply correctly to a reply.
+                thread_root_id: non_empty_root(&p.root_id),
             }),
             mentions_bot: Some(p.mentioned),
             actor: Some(p.sender_id.clone()),
@@ -365,7 +377,28 @@ fn message_to_post_summary(msg: &Message, channel_id: &str) -> PostSummary {
         author: msg.username.clone(),
         created_at: format_rfc3339(msg.create_at),
         message: msg.message.clone(),
-        thread_root_id: None,
+        thread_root_id: thread_root_of(msg),
+    }
+}
+
+/// The thread a message belongs to, or `None` when we genuinely do not
+/// know. A message read from a current chanvoy always names its thread
+/// (a top-level post names itself); an empty value only happens on a
+/// message that came from an older daemon, and reporting that as
+/// `None` is more honest than inventing a root.
+fn thread_root_of(msg: &Message) -> Option<String> {
+    non_empty_root(&msg.root_id)
+}
+
+/// A thread root is absent only when it is genuinely empty, which now
+/// means the value came from an older daemon that did not report one.
+/// Shared by the read and push paths so the two cannot disagree about
+/// what "no thread root" means.
+fn non_empty_root(root_id: &str) -> Option<String> {
+    if root_id.is_empty() {
+        None
+    } else {
+        Some(root_id.to_string())
     }
 }
 
@@ -670,12 +703,12 @@ impl IpcPeer {
                                 .into_iter()
                                 .take(limit)
                                 .map(|m| PostSummary {
-                                    post_id: m.id,
+                                    post_id: m.id.clone(),
                                     channel_id: channel_id.clone(),
-                                    author: m.username,
+                                    author: m.username.clone(),
                                     created_at: format_rfc3339(m.create_at),
-                                    message: m.message,
-                                    thread_root_id: Some(root_id.clone()),
+                                    message: m.message.clone(),
+                                    thread_root_id: thread_root_of(&m),
                                 })
                                 .collect();
                             ChatFrame::ReadResponse {
@@ -969,6 +1002,32 @@ mod tests {
         }
     }
 
+    /// An empty thread body is permanent, so it must not be advertised
+    /// as retryable. Automated callers honor that flag literally, and a
+    /// read that can never succeed would be retried forever.
+    #[test]
+    fn an_empty_thread_is_a_terminal_not_found_not_a_retryable_provider_error() {
+        let err = CoreError::EmptyThread {
+            root_id: "root-1".to_string(),
+        };
+        let frame = core_error_to_chat(err, "test-empty-thread");
+        match frame {
+            ChatFrame::Error {
+                error_code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(error_code, ChatErrorCode::NotFound);
+                assert_eq!(
+                    retryable,
+                    Some(false),
+                    "retrying an empty thread cannot ever change the answer"
+                );
+            }
+            _ => panic!("expected error frame"),
+        }
+    }
+
     #[test]
     fn core_error_maps_api_404() {
         let err = CoreError::Api {
@@ -1083,6 +1142,84 @@ mod tests {
         assert_eq!(frame, parsed);
     }
 
+    /// A pushed reply must arrive carrying the thread it belongs to.
+    ///
+    /// The regression this guards is narrow and easy to reintroduce:
+    /// the root is normalized upstream and carried correctly on the
+    /// read path, then dropped here, at the one boundary a subscribed
+    /// caller actually receives live events on. A caller that then
+    /// replies using the post id is rejected by the provider, because
+    /// a reply cannot be the target of another reply — so the failure
+    /// surfaces at write time, far from this function.
+    #[test]
+    fn a_pushed_reply_carries_its_thread_root() {
+        let event = DaemonEvent {
+            seq: 7,
+            kind: DaemonEventKind::InboundMessage,
+            payload: DaemonEventPayloadInner::Inbound(chanvoy_core::InboundEventPayload {
+                profile: "test".to_string(),
+                provider: chanvoy_core::Provider::Mattermost,
+                channel_id: "ch1".to_string(),
+                channel_name: "general".to_string(),
+                post_id: "reply-9".to_string(),
+                root_id: "root-1".to_string(),
+                sender_id: "u1".to_string(),
+                sender_username: "alice".to_string(),
+                message: "a reply".to_string(),
+                create_at: 1000,
+                received_at: 1001,
+                mentioned: false,
+            }),
+        };
+        let frame = daemon_event_to_chat_notification(&event, "sub-1").expect("notification frame");
+        let ChatFrame::EventNotification { post, .. } = frame else {
+            panic!("expected an event notification");
+        };
+        let post = post.expect("notification carries a post summary");
+        assert_eq!(
+            post.thread_root_id,
+            Some("root-1".to_string()),
+            "a pushed reply must name the thread root, not its own id and not nothing"
+        );
+        assert_ne!(
+            post.thread_root_id,
+            Some(post.post_id.clone()),
+            "a reply must not be reported as its own thread root"
+        );
+    }
+
+    /// A pushed top-level post is the root of its own thread, so it
+    /// still names a usable reply target rather than nothing.
+    #[test]
+    fn a_pushed_top_level_post_is_its_own_thread_root() {
+        let event = DaemonEvent {
+            seq: 8,
+            kind: DaemonEventKind::InboundMessage,
+            payload: DaemonEventPayloadInner::Inbound(chanvoy_core::InboundEventPayload {
+                profile: "test".to_string(),
+                provider: chanvoy_core::Provider::Mattermost,
+                channel_id: "ch1".to_string(),
+                channel_name: "general".to_string(),
+                post_id: "post-1".to_string(),
+                root_id: "post-1".to_string(),
+                sender_id: "u1".to_string(),
+                sender_username: "alice".to_string(),
+                message: "top level".to_string(),
+                create_at: 1000,
+                received_at: 1001,
+                mentioned: false,
+            }),
+        };
+        let frame = daemon_event_to_chat_notification(&event, "sub-1").expect("notification frame");
+        let ChatFrame::EventNotification { post, .. } = frame else {
+            panic!("expected an event notification");
+        };
+        assert_eq!(
+            post.expect("post summary").thread_root_id,
+            Some("post-1".to_string())
+        );
+    }
+
     #[test]
     fn ipc_filter_matches_all_event_kinds() {
         let event = DaemonEvent {
@@ -1094,6 +1231,7 @@ mod tests {
                 channel_id: "ch1".to_string(),
                 channel_name: "general".to_string(),
                 post_id: "p1".to_string(),
+                root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
                 sender_username: "alice".to_string(),
                 message: "hi".to_string(),
@@ -1121,6 +1259,7 @@ mod tests {
                 channel_id: "ch1".to_string(),
                 channel_name: "general".to_string(),
                 post_id: "p1".to_string(),
+                root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
                 sender_username: "alice".to_string(),
                 message: "hi".to_string(),
@@ -1148,6 +1287,7 @@ mod tests {
                 channel_id: "ch1".to_string(),
                 channel_name: "general".to_string(),
                 post_id: "p1".to_string(),
+                root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
                 sender_username: "alice".to_string(),
                 message: "hi".to_string(),
@@ -1181,6 +1321,7 @@ mod tests {
                 channel_id: "ch1".to_string(),
                 channel_name: "general".to_string(),
                 post_id: "p1".to_string(),
+                root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
                 sender_username: "alice".to_string(),
                 message: "hi".to_string(),

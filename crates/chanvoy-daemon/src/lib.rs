@@ -307,8 +307,10 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             enabled: true,
             gateway_socket,
         }) if !gateway_socket.is_empty() => {
-            let token_for_ipc = load_token(&profile)?;
-            let client_for_ipc = MattermostClient::new(&profile, token_for_ipc)?;
+            // Clone rather than build a second client: clones share the
+            // client's caches, so the IPC surface and the local socket
+            // surface resolve teams and authors from the same place.
+            let client_for_ipc = client.clone();
             let ipc_peer = Arc::new(IpcPeer::new(
                 &profile,
                 client_for_ipc,
@@ -379,7 +381,10 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let token_for_ws = load_token(&profile)?;
-        let client_for_ws = MattermostClient::new(&profile, token_for_ws.clone())?;
+        // Same-profile client, shared by clone (see the IPC peer above)
+        // so the websocket pipeline reads author names out of the same
+        // cache the request-response paths fill.
+        let client_for_ws = state.client.clone();
         let event_bus = Arc::clone(&event_bus);
         let ws = Arc::new(MattermostWs::new(
             &profile,
@@ -1387,6 +1392,13 @@ async fn wait_push_backed(
                                 username: p.sender_username.clone(),
                                 message: p.message.clone(),
                                 create_at: p.create_at,
+                                // The real thread root, carried through
+                                // from the push event. A caller can
+                                // reply to this message directly; a
+                                // fabricated self-root would be wrong
+                                // for every reply and the provider
+                                // rejects a reply aimed at a reply.
+                                root_id: p.root_id.clone(),
                             }],
                         });
                     }
@@ -2521,6 +2533,7 @@ mod tests {
                 channel_id: "ch1".to_string(),
                 channel_name: channel_name.to_string(),
                 post_id: "p1".to_string(),
+                root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
                 sender_username: "alice".to_string(),
                 message: if mentioned {
@@ -2602,6 +2615,7 @@ mod tests {
                 channel_id: channel_id.to_string(),
                 channel_name: channel_name.to_string(),
                 post_id: post_id.to_string(),
+                root_id: post_id.to_string(),
                 sender_id: "u-other".to_string(),
                 sender_username: "alice".to_string(),
                 message: "hello".to_string(),

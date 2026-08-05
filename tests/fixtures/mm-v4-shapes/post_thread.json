@@ -1,12 +1,33 @@
 {
-  "order": ["root-post-id-stable"],
+  "order": [
+    "root-post-id-stable",
+    "reply-b-post-id-stable",
+    "reply-a-post-id-stable"
+  ],
   "posts": {
     "root-post-id-stable": {
       "id": "root-post-id-stable",
       "channel_id": "channel-id-stable",
       "user_id": "user-id-stable",
       "message": "fixture canonical body for /posts/{root_post_id}/thread",
-      "create_at": 1700000000000
+      "create_at": 1700000000000,
+      "root_id": ""
+    },
+    "reply-a-post-id-stable": {
+      "id": "reply-a-post-id-stable",
+      "channel_id": "channel-id-stable",
+      "user_id": "user-id-stable",
+      "message": "fixture first reply under the thread root",
+      "create_at": 1700000001000,
+      "root_id": "root-post-id-stable"
+    },
+    "reply-b-post-id-stable": {
+      "id": "reply-b-post-id-stable",
+      "channel_id": "channel-id-stable",
+      "user_id": "user-id-stable",
+      "message": "fixture second reply under the thread root",
+      "create_at": 1700000002000,
+      "root_id": "root-post-id-stable"
     }
   }
 }

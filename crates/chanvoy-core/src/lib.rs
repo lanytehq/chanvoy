@@ -13,7 +13,7 @@ pub use bootstrap::{
     BootstrapState, BOOTSTRAP_MAX_AGE_SECS, BOOTSTRAP_NONCE_ENV,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -226,6 +226,17 @@ pub struct Message {
     pub username: String,
     pub message: String,
     pub create_at: i64,
+    /// Thread the message belongs to. A top-level post carries its own
+    /// id here; a reply carries the id of the post that started the
+    /// thread. Never empty on messages produced by chanvoy.
+    ///
+    /// `#[serde(default)]` is deliberate and load-bearing: a freshly
+    /// installed CLI must still be able to read responses from an
+    /// older daemon that is still running and does not send this
+    /// field. Such messages deserialize with an empty `root_id`,
+    /// which callers treat as "thread unknown".
+    #[serde(default)]
+    pub root_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -439,6 +450,16 @@ pub struct InboundEventPayload {
     pub channel_id: String,
     pub channel_name: String,
     pub post_id: String,
+    /// The thread this post belongs to: the post's own id when it is
+    /// top-level, the thread's root id when it is a reply. Carried on
+    /// the push path so a caller can reply to a pushed message without
+    /// a second round trip — replying to a reply is rejected by the
+    /// provider, so the distinction is load-bearing, not cosmetic.
+    ///
+    /// Defaulted for tolerance of events produced before this field
+    /// existed; normalized to a non-empty value on the way in.
+    #[serde(default)]
+    pub root_id: String,
     pub sender_id: String,
     pub sender_username: String,
     pub message: String,
@@ -1610,6 +1631,17 @@ pub enum CoreError {
     AnchorChannelMismatch { post_id: String, channel: String },
     #[error("no prior authored post found in channel {channel} for {username}")]
     NoPriorAuthoredPost { channel: String, username: String },
+    /// A thread read came back with zero posts. Every thread contains at
+    /// least its own root, so an empty body means the provider could not
+    /// give us the thread rather than that the thread is empty — surface
+    /// it loudly instead of returning a successful empty list that reads
+    /// to an operator as "nothing was said here".
+    #[error(
+        "thread {root_id} came back empty. A thread always contains at least its root post, \
+         so this means the post was deleted, the id belongs to a channel this bot cannot \
+         read, or the id is not a post id. Check the post id and the bot's channel access."
+    )]
+    EmptyThread { root_id: String },
     #[error("no stored cursor exists for channel {channel}")]
     NoStoredCursor { channel: String },
     #[error("operation requires elevated capability")]
@@ -2541,6 +2573,118 @@ struct TeamCacheEntry {
     fetched_at: std::time::Instant,
 }
 
+/// How long a resolved author name stays usable before chanvoy asks the
+/// provider again. Matches the team-list window above: long enough to
+/// amortize the lookup across a working session, short enough that a
+/// rename becomes visible without restarting the daemon.
+pub const AUTHOR_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Hard ceiling on cached author entries. A busy channel can surface a
+/// long tail of one-off authors, so the cache is bounded rather than
+/// unbounded-with-a-TTL: expired entries are dropped first, then the
+/// oldest entries, so memory cannot grow with the number of distinct
+/// people a long-running daemon has ever seen.
+pub const AUTHOR_CACHE_MAX_ENTRIES: usize = 1024;
+
+#[derive(Debug, Clone)]
+struct AuthorCacheEntry {
+    username: String,
+    fetched_at: std::time::Instant,
+}
+
+/// The provider's post shape, as chanvoy consumes it. Every read path
+/// (channel reads, pinned, most-recent, search, thread) decodes into
+/// this one type so a shape fix lands in a single place.
+///
+/// Note what is *not* here: the provider does not send an author name
+/// on a post, only `user_id`. Anything that wants a display name has to
+/// resolve it separately.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RawPost {
+    pub id: String,
+    /// Owning channel. Defaulted because the thread and search shapes
+    /// do not always carry it. Decoded but not yet read by any read
+    /// path, so the field is retained as part of the canonical shape
+    /// rather than dropped and re-added.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub channel_id: String,
+    pub user_id: String,
+    pub message: String,
+    pub create_at: i64,
+    /// Empty for a top-level post; the thread's root id for a reply.
+    /// Normalized to the post's own id on the way into a `Message`.
+    #[serde(default)]
+    pub root_id: String,
+}
+
+/// The provider's envelope for any list-of-posts response: a ranked
+/// `order` array plus a map of posts keyed by id.
+///
+/// Both fields default. `posts` is the load-bearing one — the provider
+/// omits the key entirely for a channel with no pinned posts, and a
+/// non-defaulted field would turn that into a decode failure.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct PostsEnvelope {
+    #[serde(default)]
+    pub order: Vec<String>,
+    #[serde(default)]
+    pub posts: BTreeMap<String, RawPost>,
+}
+
+/// The thread a post belongs to, as chanvoy reports it.
+///
+/// The provider sends an empty root for a top-level post. Chanvoy
+/// reports the post's own id instead, so that every message names a
+/// usable reply target and callers never have to special-case an empty
+/// string. Replying to a reply is rejected by the provider, so a caller
+/// that blindly reused a post id would fail on exactly the replies this
+/// value exists to disambiguate.
+///
+/// Used by both the request-response read path and the push path so the
+/// two cannot drift.
+fn normalize_root_id(provider_root_id: &str, post_id: &str) -> String {
+    if provider_root_id.is_empty() {
+        post_id.to_string()
+    } else {
+        provider_root_id.to_string()
+    }
+}
+
+/// Insert a resolved author into the cache, evicting first by expiry
+/// and then by age so the map stays under `AUTHOR_CACHE_MAX_ENTRIES`.
+/// Free function so the bound can be exercised directly in tests
+/// without a live client.
+fn insert_author_entry(
+    cache: &mut HashMap<String, AuthorCacheEntry>,
+    user_id: String,
+    username: String,
+    now: std::time::Instant,
+) {
+    if !cache.contains_key(&user_id) && cache.len() >= AUTHOR_CACHE_MAX_ENTRIES {
+        cache.retain(|_, entry| now.duration_since(entry.fetched_at) < AUTHOR_CACHE_TTL);
+        while cache.len() >= AUTHOR_CACHE_MAX_ENTRIES {
+            let oldest = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    cache.remove(&key);
+                }
+                None => break,
+            }
+        }
+    }
+    cache.insert(
+        user_id,
+        AuthorCacheEntry {
+            username,
+            fetched_at: now,
+        },
+    );
+}
+
 #[derive(Clone)]
 pub struct MattermostClient {
     base_url: String,
@@ -2550,6 +2694,12 @@ pub struct MattermostClient {
     /// PER-019: cached bot team membership. None until first fetch.
     /// Shared across clones so all daemon contexts see the same cache.
     team_cache: Arc<tokio::sync::RwLock<Option<TeamCacheEntry>>>,
+    /// Resolved author names keyed by user id, so a channel read does
+    /// not re-ask the provider for the same handful of people on every
+    /// call. Keyed by user id and nothing else — no credential material
+    /// ever enters this map. Shared across clones for the same reason
+    /// the team cache is: every daemon context should see one cache.
+    author_cache: Arc<tokio::sync::RwLock<HashMap<String, AuthorCacheEntry>>>,
 }
 
 impl MattermostClient {
@@ -2563,6 +2713,7 @@ impl MattermostClient {
             token,
             client,
             team_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            author_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -2663,6 +2814,136 @@ impl MattermostClient {
         Ok(out)
     }
 
+    /// Resolve a single author name, preferring the shared cache.
+    /// Falls back to the literal user id when the provider cannot tell
+    /// us the name — an id an operator can look up beats a placeholder
+    /// that pretends to be a person.
+    pub async fn author_username(&self, user_id: &str) -> String {
+        let mut wanted = BTreeSet::new();
+        wanted.insert(user_id.to_string());
+        self.resolve_authors(&wanted)
+            .await
+            .get(user_id)
+            .cloned()
+            .unwrap_or_else(|| user_id.to_string())
+    }
+
+    /// Resolve display names for a set of author ids.
+    ///
+    /// The cache lock is never held across a network call: we take the
+    /// read lock to collect hits, drop it, fetch the misses, then take
+    /// the write lock to record what we learned. Only successes are
+    /// cached — a transient provider failure must not pin a fallback
+    /// name for the whole cache window.
+    ///
+    /// Ids that could not be resolved are simply absent from the
+    /// returned map; callers substitute the id itself.
+    async fn resolve_authors(&self, user_ids: &BTreeSet<String>) -> HashMap<String, String> {
+        let mut resolved: HashMap<String, String> = HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        {
+            let guard = self.author_cache.read().await;
+            for user_id in user_ids {
+                match guard.get(user_id) {
+                    Some(entry) if entry.fetched_at.elapsed() < AUTHOR_CACHE_TTL => {
+                        resolved.insert(user_id.clone(), entry.username.clone());
+                    }
+                    _ => missing.push(user_id.clone()),
+                }
+            }
+        }
+        if missing.is_empty() {
+            return resolved;
+        }
+
+        let mut fetched: Vec<(String, String)> = Vec::with_capacity(missing.len());
+        for user_id in missing {
+            if let Some(username) = self.fetch_username(&user_id).await {
+                fetched.push((user_id, username));
+            }
+        }
+        if fetched.is_empty() {
+            return resolved;
+        }
+
+        let now = std::time::Instant::now();
+        let mut guard = self.author_cache.write().await;
+        for (user_id, username) in fetched {
+            insert_author_entry(&mut guard, user_id.clone(), username.clone(), now);
+            resolved.insert(user_id, username);
+        }
+        resolved
+    }
+
+    /// One author lookup. Returns `None` on any failure; the diagnostic
+    /// stays short and deliberately carries no response body, since a
+    /// user record holds more about a person than chanvoy needs.
+    async fn fetch_username(&self, user_id: &str) -> Option<String> {
+        #[derive(Deserialize)]
+        struct RawUser {
+            username: String,
+        }
+        match self
+            .request::<RawUser, Value>("GET", &format!("/users/{user_id}"), None)
+            .await
+        {
+            Ok(user) => Some(user.username),
+            Err(err) => {
+                let reason = match &err {
+                    CoreError::Api { status, .. } => format!("status {status}"),
+                    CoreError::Http(_) => "transport failure".to_string(),
+                    _ => "decode failure".to_string(),
+                };
+                warn!(
+                    user_id,
+                    reason, "could not resolve author name; falling back to the user id"
+                );
+                None
+            }
+        }
+    }
+
+    /// Turn provider posts into messages, resolving each distinct
+    /// author once for the whole batch.
+    ///
+    /// Order-preserving by contract: the output is in the same order as
+    /// the input and this function never sorts. Callers own their
+    /// ordering — search results stay in the provider's ranked order,
+    /// channel reads sort chronologically.
+    async fn hydrate_posts(&self, posts: Vec<RawPost>) -> Vec<Message> {
+        let wanted: BTreeSet<String> = posts.iter().map(|p| p.user_id.clone()).collect();
+        let authors = self.resolve_authors(&wanted).await;
+        posts
+            .into_iter()
+            .map(|post| {
+                let username = authors
+                    .get(&post.user_id)
+                    .cloned()
+                    .unwrap_or_else(|| post.user_id.clone());
+                let root_id = normalize_root_id(&post.root_id, &post.id);
+                Message {
+                    id: post.id,
+                    user_id: post.user_id,
+                    username,
+                    message: post.message,
+                    create_at: post.create_at,
+                    root_id,
+                }
+            })
+            .collect()
+    }
+
+    /// Chronological order with a deterministic tie-break, used by
+    /// every channel-shaped read so equal timestamps do not shuffle
+    /// between calls.
+    fn sort_chronologically(messages: &mut [Message]) {
+        messages.sort_by(|left, right| {
+            left.create_at
+                .cmp(&right.create_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+
     pub async fn read_channel(
         &self,
         channel_name: &str,
@@ -2671,37 +2952,17 @@ impl MattermostClient {
     ) -> Result<Vec<Message>, CoreError> {
         let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
         let since = minutes_ago_millis(since_minutes);
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct PostsResponse {
-            posts: BTreeMap<String, RawPost>,
-        }
-        let response: PostsResponse = self
+        let response: PostsEnvelope = self
             .request(
                 "GET",
                 &format!("/channels/{channel_id}/posts?since={since}&per_page=30"),
                 None::<Value>,
             )
             .await?;
-        let mut posts: Vec<Message> = response
-            .posts
-            .into_values()
-            .map(|post| Message {
-                id: post.id,
-                user_id: post.user_id,
-                username: post.username.unwrap_or_else(|| "unknown".to_string()),
-                message: post.message,
-                create_at: post.create_at,
-            })
-            .collect();
-        posts.sort_by_key(|message| message.create_at);
+        let mut posts = self
+            .hydrate_posts(response.posts.into_values().collect())
+            .await;
+        Self::sort_chronologically(&mut posts);
         Ok(posts)
     }
 
@@ -2715,25 +2976,11 @@ impl MattermostClient {
         self.assert_post_in_channel(&channel_id, channel_name, after_post_id)
             .await?;
 
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            username: Option<String>,
-        }
-
-        #[derive(Deserialize)]
-        struct PostsResponse {
-            posts: BTreeMap<String, RawPost>,
-        }
-
         let mut page = 0;
         let mut messages = Vec::new();
 
         loop {
-            let response: PostsResponse = self
+            let response: PostsEnvelope = self
                 .request(
                     "GET",
                     &format!(
@@ -2743,23 +2990,15 @@ impl MattermostClient {
                 )
                 .await?;
 
-            let mut page_messages: Vec<Message> = response
-                .posts
-                .into_values()
-                .map(|post| Message {
-                    id: post.id,
-                    user_id: post.user_id,
-                    username: post.username.unwrap_or_else(|| "unknown".to_string()),
-                    message: post.message,
-                    create_at: post.create_at,
-                })
-                .collect();
+            let mut page_messages = self
+                .hydrate_posts(response.posts.into_values().collect())
+                .await;
 
             if page_messages.is_empty() {
                 break;
             }
 
-            page_messages.sort_by_key(|message| message.create_at);
+            Self::sort_chronologically(&mut page_messages);
             let page_len = page_messages.len();
             messages.extend(page_messages);
 
@@ -2770,11 +3009,7 @@ impl MattermostClient {
             page += 1;
         }
 
-        messages.sort_by(|left, right| {
-            left.create_at
-                .cmp(&right.create_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        Self::sort_chronologically(&mut messages);
 
         Ok(messages)
     }
@@ -3070,37 +3305,17 @@ impl MattermostClient {
         channel_id: &str,
         since_millis: i64,
     ) -> Result<Vec<Message>, CoreError> {
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct PostsResponse {
-            posts: BTreeMap<String, RawPost>,
-        }
-        let response: PostsResponse = self
+        let response: PostsEnvelope = self
             .request(
                 "GET",
                 &format!("/channels/{channel_id}/posts?since={since_millis}&per_page=30"),
                 None::<Value>,
             )
             .await?;
-        let mut posts: Vec<Message> = response
-            .posts
-            .into_values()
-            .map(|post| Message {
-                id: post.id,
-                user_id: post.user_id,
-                username: post.username.unwrap_or_else(|| "unknown".to_string()),
-                message: post.message,
-                create_at: post.create_at,
-            })
-            .collect();
-        posts.sort_by_key(|message| message.create_at);
+        let mut posts = self
+            .hydrate_posts(response.posts.into_values().collect())
+            .await;
+        Self::sort_chronologically(&mut posts);
         Ok(posts)
     }
 
@@ -3139,38 +3354,19 @@ impl MattermostClient {
         team: Option<&str>,
     ) -> Result<Vec<Message>, CoreError> {
         let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct PostsResponse {
-            #[serde(default)]
-            posts: BTreeMap<String, RawPost>,
-        }
-        let response: PostsResponse = self
+        // A channel with nothing pinned comes back without a `posts`
+        // key at all, which the envelope's defaulting handles.
+        let response: PostsEnvelope = self
             .request(
                 "GET",
                 &format!("/channels/{channel_id}/pinned"),
                 None::<Value>,
             )
             .await?;
-        let mut posts: Vec<Message> = response
-            .posts
-            .into_values()
-            .map(|post| Message {
-                id: post.id,
-                user_id: post.user_id,
-                username: post.username.unwrap_or_else(|| "unknown".to_string()),
-                message: post.message,
-                create_at: post.create_at,
-            })
-            .collect();
-        posts.sort_by_key(|message| message.create_at);
+        let mut posts = self
+            .hydrate_posts(response.posts.into_values().collect())
+            .await;
+        Self::sort_chronologically(&mut posts);
         Ok(posts)
     }
 
@@ -3186,37 +3382,17 @@ impl MattermostClient {
         team: Option<&str>,
     ) -> Result<Vec<Message>, CoreError> {
         let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct PostsResponse {
-            posts: BTreeMap<String, RawPost>,
-        }
-        let response: PostsResponse = self
+        let response: PostsEnvelope = self
             .request(
                 "GET",
                 &format!("/channels/{channel_id}/posts?per_page={limit}"),
                 None::<Value>,
             )
             .await?;
-        let mut posts: Vec<Message> = response
-            .posts
-            .into_values()
-            .map(|post| Message {
-                id: post.id,
-                user_id: post.user_id,
-                username: post.username.unwrap_or_else(|| "unknown".to_string()),
-                message: post.message,
-                create_at: post.create_at,
-            })
-            .collect();
-        posts.sort_by_key(|message| message.create_at);
+        let mut posts = self
+            .hydrate_posts(response.posts.into_values().collect())
+            .await;
+        Self::sort_chronologically(&mut posts);
         Ok(posts)
     }
 
@@ -3283,24 +3459,7 @@ impl MattermostClient {
             terms: &'a str,
             is_or_search: bool,
         }
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            #[serde(default)]
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct SearchResponse {
-            #[serde(default)]
-            order: Vec<String>,
-            #[serde(default)]
-            posts: BTreeMap<String, RawPost>,
-        }
-
-        let response: SearchResponse = self
+        let response: PostsEnvelope = self
             .request(
                 "POST",
                 &format!("/teams/{}/posts/search", resolved.team_id),
@@ -3313,23 +3472,17 @@ impl MattermostClient {
 
         // MM returns `order` (post ids in ranked order) plus a `posts`
         // map keyed by id. Walk `order` to preserve MM's ranking,
-        // then truncate to the operator's `--limit`.
+        // then truncate to the operator's `--limit`. Hydration keeps
+        // this order — search results must never be re-sorted, or the
+        // operator loses the ranking they asked for.
         let limit = limit as usize;
-        let mut posts = Vec::with_capacity(response.order.len().min(limit));
+        let mut ranked = Vec::with_capacity(response.order.len().min(limit));
         for id in response.order.iter().take(limit) {
             if let Some(raw) = response.posts.get(id) {
-                posts.push(Message {
-                    id: raw.id.clone(),
-                    user_id: raw.user_id.clone(),
-                    username: raw
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    message: raw.message.clone(),
-                    create_at: raw.create_at,
-                });
+                ranked.push(raw.clone());
             }
         }
+        let posts = self.hydrate_posts(ranked).await;
 
         Ok(SearchResult {
             team: resolved.team_name,
@@ -3670,41 +3823,47 @@ impl MattermostClient {
         })
     }
 
+    /// Read a whole thread: the root post plus every reply, so a thread
+    /// with N replies returns N+1 messages and a thread with no replies
+    /// returns exactly one. No post is ever dropped — a post whose
+    /// author cannot be resolved still appears, carrying the author's
+    /// user id in place of a name.
     pub async fn read_thread(&self, root_post_id: &str) -> Result<Vec<Message>, CoreError> {
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct ThreadResponse {
-            posts: BTreeMap<String, RawPost>,
-        }
-        let response: ThreadResponse = self
+        let response: PostsEnvelope = self
             .request(
                 "GET",
                 &format!("/posts/{root_post_id}/thread"),
                 None::<Value>,
             )
             .await?;
-        let mut posts: Vec<Message> = response
-            .posts
-            .into_values()
-            .filter_map(|p| {
-                p.username.map(|username| Message {
-                    id: p.id,
-                    user_id: p.user_id,
-                    username,
-                    message: p.message,
-                    create_at: p.create_at,
-                })
-            })
-            .collect();
-        posts.sort_by_key(|m| m.create_at);
-        Ok(posts)
+        if response.posts.is_empty() {
+            return Err(CoreError::EmptyThread {
+                root_id: root_post_id.to_string(),
+            });
+        }
+        let mut raw: Vec<RawPost> = response.posts.into_values().collect();
+        // Root first, then replies by timestamp, tie-broken by id so the
+        // order is stable across calls.
+        //
+        // The root is pinned explicitly rather than left to fall out of
+        // the timestamp comparison. Sorting on time alone gets the root
+        // first only because it is normally the oldest post; a reply
+        // written in the same millisecond whose id sorts lower would
+        // displace it, and "the first item is the root" is a property
+        // callers rely on.
+        //
+        // Deliberately NOT the envelope's `order` array: that array is
+        // not guaranteed to be chronological, and the contract here is
+        // root-first chronological. Do not "fix" this back to `order`.
+        raw.sort_by(|left, right| {
+            let left_is_root = left.id == root_post_id;
+            let right_is_root = right.id == root_post_id;
+            right_is_root
+                .cmp(&left_is_root)
+                .then_with(|| left.create_at.cmp(&right.create_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(self.hydrate_posts(raw).await)
     }
 
     async fn team_id(&self) -> Result<String, CoreError> {
@@ -4025,37 +4184,17 @@ impl MattermostClient {
         channel_id: &str,
         per_page: u64,
     ) -> Result<Vec<Message>, CoreError> {
-        #[derive(Deserialize)]
-        struct RawPost {
-            id: String,
-            user_id: String,
-            message: String,
-            create_at: i64,
-            username: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct PostsResponse {
-            posts: BTreeMap<String, RawPost>,
-        }
-        let response: PostsResponse = self
+        let response: PostsEnvelope = self
             .request(
                 "GET",
                 &format!("/channels/{channel_id}/posts?per_page={per_page}"),
                 None::<Value>,
             )
             .await?;
-        let mut posts: Vec<Message> = response
-            .posts
-            .into_values()
-            .map(|post| Message {
-                id: post.id,
-                user_id: post.user_id,
-                username: post.username.unwrap_or_else(|| "unknown".to_string()),
-                message: post.message,
-                create_at: post.create_at,
-            })
-            .collect();
-        posts.sort_by_key(|message| message.create_at);
+        let mut posts = self
+            .hydrate_posts(response.posts.into_values().collect())
+            .await;
+        Self::sort_chronologically(&mut posts);
         Ok(posts)
     }
 
@@ -4714,6 +4853,11 @@ impl MattermostWs {
             .unwrap_or("")
             .to_string();
         let create_at = post.get("create_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        let raw_root_id = post
+            .get("root_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         if sender_id == self.my_user_id {
             return;
@@ -4722,6 +4866,8 @@ impl MattermostWs {
         if post_id.is_empty() || channel_id.is_empty() {
             return;
         }
+
+        let root_id = normalize_root_id(&raw_root_id, &post_id);
 
         {
             let mut seen = self.seen_posts.lock().await;
@@ -4755,6 +4901,7 @@ impl MattermostWs {
                     channel_id,
                     channel_name,
                     post_id,
+                    root_id,
                     sender_id,
                     sender_username,
                     message,
@@ -4774,6 +4921,7 @@ impl MattermostWs {
                     channel_id,
                     channel_name,
                     post_id,
+                    root_id,
                     sender_id,
                     sender_username,
                     message,
@@ -4836,6 +4984,8 @@ impl MattermostWs {
                         channel_id: channel_id.clone(),
                         channel_name: channel_name.clone(),
                         post_id: msg.id,
+                        // Already normalized by the read path.
+                        root_id: msg.root_id,
                         sender_id: msg.user_id,
                         sender_username: msg.username,
                         message: msg.message,
@@ -4874,6 +5024,10 @@ impl MattermostWs {
             .store(false, Ordering::Relaxed);
     }
 
+    // TODO: this fetches the bot's entire channel list on every inbound
+    // event just to turn one channel id into a name. It should go
+    // through a shared, bounded channel-name cache on the client the
+    // same way author names now do.
     async fn resolve_channel_name(&self, channel_id: &str) -> String {
         let channels = self.client.list_channels().await.unwrap_or_default();
         channels
@@ -4883,18 +5037,11 @@ impl MattermostWs {
             .unwrap_or_else(|| channel_id.to_string())
     }
 
+    /// Author name for an inbound push event. Delegates to the shared
+    /// client helper so pushed messages and messages read back over
+    /// REST can never disagree about who wrote something.
     async fn resolve_username(&self, user_id: &str) -> String {
-        #[derive(Deserialize)]
-        struct UserResp {
-            username: String,
-        }
-        let result: Result<UserResp, _> = self
-            .client
-            .request_raw("GET", &format!("/users/{user_id}"), None::<Value>)
-            .await;
-        result
-            .map(|u| u.username)
-            .unwrap_or_else(|_| "unknown".to_string())
+        self.client.author_username(user_id).await
     }
 }
 
@@ -5001,6 +5148,201 @@ mod tests {
     use std::sync::Mutex;
 
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // ------------------------------------------------------------------
+    // Thread-root normalization. One rule, shared by the read path and
+    // the push path, so a caller can always use the reported root as a
+    // reply target.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn top_level_post_is_its_own_thread_root() {
+        assert_eq!(normalize_root_id("", "post-1"), "post-1");
+    }
+
+    #[test]
+    fn a_reply_keeps_the_thread_root_and_does_not_claim_to_be_one() {
+        // The regression this guards: reporting a reply's own id as its
+        // root. That reads as a valid reply target but the provider
+        // rejects a reply aimed at a reply, so the failure surfaces far
+        // from here — at write time, in the caller.
+        assert_eq!(normalize_root_id("root-1", "reply-9"), "root-1");
+        assert_ne!(normalize_root_id("root-1", "reply-9"), "reply-9");
+    }
+
+    // ------------------------------------------------------------------
+    // Chronological ordering and its tie rule.
+    //
+    // The tie-break cannot be observed through a single provider
+    // response: those arrive in a map keyed by post id, so equally
+    // timestamped posts are already in ascending id order and a stable
+    // sort leaves them there. It becomes observable when results from
+    // more than one page are merged, which is why it is exercised
+    // against the sort directly rather than through a mocked read.
+    // ------------------------------------------------------------------
+
+    fn message_at(id: &str, create_at: i64) -> Message {
+        Message {
+            id: id.to_string(),
+            user_id: "u".to_string(),
+            username: "alice".to_string(),
+            message: "body".to_string(),
+            create_at,
+            root_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn equal_timestamps_are_broken_by_id_not_by_arrival_order() {
+        let mut messages = vec![
+            message_at("zeta", 1_000),
+            message_at("alpha", 1_000),
+            message_at("beta", 1_000),
+        ];
+        MattermostClient::sort_chronologically(&mut messages);
+        assert_eq!(
+            messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "beta", "zeta"],
+            "posts sharing a timestamp order by id, so a merge of two \
+             pages cannot shuffle between calls"
+        );
+    }
+
+    #[test]
+    fn ordering_is_by_time_first_and_id_only_as_a_tie_break() {
+        let mut messages = vec![
+            message_at("alpha", 3_000),
+            message_at("zeta", 1_000),
+            message_at("beta", 2_000),
+        ];
+        MattermostClient::sort_chronologically(&mut messages);
+        assert_eq!(
+            messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["zeta", "beta", "alpha"],
+            "time wins over id; id is only consulted for ties"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Author-cache bounds. Exercised against the insertion helper
+    // directly so the eviction rules can be checked without a clock or
+    // a network.
+    // ------------------------------------------------------------------
+
+    fn author_cache_of(
+        entries: &[(&str, std::time::Instant)],
+    ) -> HashMap<String, AuthorCacheEntry> {
+        entries
+            .iter()
+            .map(|(user_id, fetched_at)| {
+                (
+                    (*user_id).to_string(),
+                    AuthorCacheEntry {
+                        username: format!("name-of-{user_id}"),
+                        fetched_at: *fetched_at,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn author_cache_never_grows_past_its_bound() {
+        let base = std::time::Instant::now();
+        let mut cache = HashMap::new();
+        for index in 0..(AUTHOR_CACHE_MAX_ENTRIES * 2) {
+            insert_author_entry(
+                &mut cache,
+                format!("user-{index}"),
+                format!("name-{index}"),
+                base + Duration::from_millis(index as u64),
+            );
+            assert!(
+                cache.len() <= AUTHOR_CACHE_MAX_ENTRIES,
+                "cache exceeded its bound at insert {index}: {}",
+                cache.len()
+            );
+        }
+    }
+
+    #[test]
+    fn author_cache_drops_expired_entries_before_live_ones() {
+        let base = std::time::Instant::now();
+        let stale_at = base;
+        let fresh_at = base + AUTHOR_CACHE_TTL;
+        let mut entries: Vec<(String, std::time::Instant)> = Vec::new();
+        for index in 0..(AUTHOR_CACHE_MAX_ENTRIES - 1) {
+            entries.push((format!("stale-{index}"), stale_at));
+        }
+        entries.push(("still-fresh".to_string(), fresh_at));
+        let borrowed: Vec<(&str, std::time::Instant)> =
+            entries.iter().map(|(id, at)| (id.as_str(), *at)).collect();
+        let mut cache = author_cache_of(&borrowed);
+        assert_eq!(cache.len(), AUTHOR_CACHE_MAX_ENTRIES);
+
+        // Now is past the TTL for every stale entry but not for the
+        // fresh one.
+        let now = fresh_at + Duration::from_secs(1);
+        insert_author_entry(&mut cache, "newcomer".to_string(), "new".to_string(), now);
+
+        assert!(cache.contains_key("newcomer"));
+        assert!(
+            cache.contains_key("still-fresh"),
+            "a live entry must not be evicted while expired ones remain"
+        );
+        assert!(
+            !cache.contains_key("stale-0"),
+            "expired entries are the first to go"
+        );
+    }
+
+    #[test]
+    fn author_cache_drops_the_oldest_when_nothing_has_expired() {
+        let base = std::time::Instant::now();
+        let entries: Vec<(String, std::time::Instant)> = (0..AUTHOR_CACHE_MAX_ENTRIES)
+            .map(|index| {
+                (
+                    format!("user-{index}"),
+                    base + Duration::from_millis(index as u64),
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&str, std::time::Instant)> =
+            entries.iter().map(|(id, at)| (id.as_str(), *at)).collect();
+        let mut cache = author_cache_of(&borrowed);
+
+        let now = base + Duration::from_millis(AUTHOR_CACHE_MAX_ENTRIES as u64);
+        insert_author_entry(&mut cache, "newcomer".to_string(), "new".to_string(), now);
+
+        assert_eq!(cache.len(), AUTHOR_CACHE_MAX_ENTRIES);
+        assert!(cache.contains_key("newcomer"));
+        assert!(
+            !cache.contains_key("user-0"),
+            "the oldest entry is the one evicted"
+        );
+        assert!(cache.contains_key("user-1"), "newer entries are retained");
+    }
+
+    #[test]
+    fn refreshing_a_cached_author_does_not_evict_anything() {
+        let base = std::time::Instant::now();
+        let entries: Vec<(String, std::time::Instant)> = (0..AUTHOR_CACHE_MAX_ENTRIES)
+            .map(|index| (format!("user-{index}"), base))
+            .collect();
+        let borrowed: Vec<(&str, std::time::Instant)> =
+            entries.iter().map(|(id, at)| (id.as_str(), *at)).collect();
+        let mut cache = author_cache_of(&borrowed);
+
+        insert_author_entry(
+            &mut cache,
+            "user-0".to_string(),
+            "renamed".to_string(),
+            base + Duration::from_millis(1),
+        );
+
+        assert_eq!(cache.len(), AUTHOR_CACHE_MAX_ENTRIES);
+        assert_eq!(cache["user-0"].username, "renamed");
+    }
 
     #[test]
     fn parses_env_file_lines() {
@@ -5305,6 +5647,7 @@ monitored_channels = ["per-003", "per-004"]
                 channel_id: "ch123".to_string(),
                 channel_name: "per-004".to_string(),
                 post_id: "post456".to_string(),
+                root_id: "post456".to_string(),
                 sender_id: "user789".to_string(),
                 sender_username: "agent-dispatch".to_string(),
                 message: "hello".to_string(),
@@ -5408,6 +5751,7 @@ monitored_channels = ["per-003", "per-004"]
                 channel_id: "ch1".to_string(),
                 channel_name: "per-004".to_string(),
                 post_id: "p1".to_string(),
+                root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
                 sender_username: "alice".to_string(),
                 message: "hello".to_string(),
@@ -5433,6 +5777,7 @@ monitored_channels = ["per-003", "per-004"]
                 channel_id: "ch2".to_string(),
                 channel_name: "bravo-team".to_string(),
                 post_id: "p2".to_string(),
+                root_id: "root-p0".to_string(),
                 sender_id: "u2".to_string(),
                 sender_username: "bob".to_string(),
                 message: "@agent-bravo-devlead review".to_string(),

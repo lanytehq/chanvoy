@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Messages now carry the thread they belong to.** Every message on the read
+  and push paths reports a thread root: its own id when the message is
+  top-level, the thread's root id when it is a reply. This is needed to reply
+  at all — the server rejects a reply aimed at another reply — so previously a
+  caller citing a post had no way to tell which ids were valid reply targets.
+  `--json` output gains a `root_id` field on every message; existing fields are
+  unchanged.
+
 - **Errors now print their message instead of their internal shape.** The CLI
   returned errors from `main`, which makes Rust print the `Debug`
   representation — so operators saw
@@ -27,6 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Message authors are real names again, instead of "unknown".** Posts carry
+  only a user id, and the code read an author-name field the server does not
+  send on a post, so every message in every listing was attributed to
+  `unknown`. Names are now resolved from the user id through a shared cache.
+  When a name genuinely cannot be resolved the author is reported as the
+  literal user id — something an operator can look up — rather than a
+  placeholder that reads like a person's name.
+- **Reading a thread no longer returns an empty thread.** Thread reads filtered
+  posts through that same absent author-name field, so every post was discarded
+  and the read reported success with nothing in it. A thread with a root and N
+  replies now returns N+1 messages. A thread response that genuinely contains
+  no posts is now reported as an error rather than as a plausible-looking empty
+  result, since the causes are permanent — a deleted post, an unreadable
+  channel, or an id that is not a post.
 - **`daemon start` now starts a daemon that outlives the command that
   started it.** It previously spawned the daemon without detaching it
   into its own session and without the parent-side identity handoff, so

@@ -383,12 +383,27 @@ async fn replay_channel_pinned() {
         "channel_pinned",
     )
     .await;
+    // The author lookup is mounted so this exercises real resolution.
+    // Without it the read still "parses" while every author silently
+    // falls back to the user id, which is exactly how a broken lookup
+    // used to pass unnoticed.
+    mount_fixture(&server, "GET", &format!("/users/{USER_ID}"), "user_by_id").await;
     let client = build_client(&server.uri());
 
-    let _ = client
+    let pinned = client
         .read_channel_pinned(CHANNEL_NAME, None)
         .await
         .expect("read_channel_pinned parses");
+
+    assert_eq!(pinned.len(), 1, "the pinned fixture has one post");
+    assert_eq!(
+        pinned[0].username, "username-stable",
+        "pinned reads must resolve the author, not fall back to the user id"
+    );
+    assert_eq!(
+        pinned[0].root_id, pinned[0].id,
+        "a pinned top-level post is the root of its own thread"
+    );
 
     assert_request_to(
         &server,
@@ -400,7 +415,15 @@ async fn replay_channel_pinned() {
 }
 
 /// `read_thread` hits `GET /posts/{root_post_id}/thread` (covers
-/// `post_thread`).
+/// `post_thread`) and resolves each distinct author through
+/// `GET /users/{user_id}` (covers `user_by_id`).
+///
+/// This also guards the thread-completeness contract. The fixture is
+/// live-shaped — its posts carry no author name, exactly like a real
+/// Mattermost thread response — and it holds a root plus two replies.
+/// A regression that drops nameless posts (which is how a thread read
+/// silently returned nothing for a long time) fails here on the count,
+/// not on a vague "parses" assertion.
 #[tokio::test]
 async fn replay_post_thread() {
     let server = MockServer::start().await;
@@ -411,12 +434,39 @@ async fn replay_post_thread() {
         "post_thread",
     )
     .await;
+    mount_fixture(&server, "GET", &format!("/users/{USER_ID}"), "user_by_id").await;
     let client = build_client(&server.uri());
 
-    let _ = client
+    let messages = client
         .read_thread(ROOT_POST_ID)
         .await
         .expect("read_thread parses");
+
+    assert_eq!(
+        messages.len(),
+        3,
+        "root + 2 replies must all be returned; got {:?}",
+        messages.iter().map(|m| &m.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec![
+            ROOT_POST_ID,
+            "reply-a-post-id-stable",
+            "reply-b-post-id-stable"
+        ],
+        "thread is root-first chronological, not fixture map order"
+    );
+    // The root is its own thread root; replies name the root.
+    assert_eq!(messages[0].root_id, ROOT_POST_ID);
+    assert_eq!(messages[1].root_id, ROOT_POST_ID);
+    assert_eq!(messages[2].root_id, ROOT_POST_ID);
+    for message in &messages {
+        assert_eq!(
+            message.username, USERNAME,
+            "author name comes from the user lookup, not the post body"
+        );
+    }
 
     assert_request_to(
         &server,
@@ -425,6 +475,7 @@ async fn replay_post_thread() {
         "post_thread",
     )
     .await;
+    assert_request_to(&server, "GET", &format!("/users/{USER_ID}"), "user_by_id").await;
 }
 
 /// `post_message` hits `POST /posts` (covers `create_post`). Also
@@ -704,18 +755,35 @@ async fn replay_create_direct_channel() {
 
 /// `search_channel` hits `POST /teams/{team_id}/posts/search` (covers
 /// `search_posts`).
+///
+/// Also guards result ordering. The fixture's two hits are ranked
+/// newest-first while the older one sorts first both alphabetically
+/// and chronologically, so anything that re-sorts search results —
+/// including a shared mapper that assumes chronological output —
+/// flips this assertion.
 #[tokio::test]
 async fn replay_search_posts() {
     let server = MockServer::start().await;
     mount_resolver_baseline(&server).await;
+    mount_fixture(&server, "GET", &format!("/users/{USER_ID}"), "user_by_id").await;
     let search_path = format!("/teams/{TEAM_ID}/posts/search");
     mount_fixture(&server, "POST", &search_path, "search_posts").await;
     let client = build_client(&server.uri());
 
-    let _ = client
+    let result = client
         .search_channel(CHANNEL_NAME, "fixture-query", 5, None, None, None)
         .await
         .expect("search_channel parses");
+
+    assert_eq!(
+        result
+            .posts
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![POST_ID, "older-post-id-stable"],
+        "search results stay in the provider's ranked order"
+    );
 
     assert_request_to(&server, "POST", &search_path, "search_posts").await;
 }
@@ -760,6 +828,10 @@ fn coverage_map() -> BTreeMap<&'static str, Vec<&'static str>> {
         ),
         ("post_thread", vec!["replay_post_thread"]),
         (
+            "user_by_id",
+            vec!["replay_post_thread", "replay_channel_pinned"],
+        ),
+        (
             "user_by_username",
             vec![
                 "replay_add_channel_member_and_user_by_username",
@@ -795,25 +867,16 @@ fn coverage_map() -> BTreeMap<&'static str, Vec<&'static str>> {
 /// Endpoints whose call sites are reachable only through private
 /// chanvoy-core paths (e.g., WebSocket-handler internals) and cannot
 /// be driven from an integration test without exposing additional
-/// surface area. The coverage gate treats these as covered for v0.2.2
-/// with the rationale recorded here; the URL template is reviewed
-/// manually against the cited call site.
+/// surface area. The coverage gate treats these as covered with the
+/// rationale recorded here; the URL template is reviewed manually
+/// against the cited call site.
 ///
-/// Future brief candidate: expose a test-only hook to drive these
-/// internal handlers through a recorded mock so the URL contract gets
-/// CI guard parity with the rest of the surface.
+/// Currently empty. The last entry was the user lookup, which used to
+/// be reachable only from inside the websocket handler; author
+/// resolution is now part of the ordinary read path and is covered by
+/// a real replay test.
 fn documented_gaps() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([(
-        "user_by_id",
-        "Hit only via the private `WsHandler::resolve_username` helper \
-             (crates/chanvoy-core/src/lib.rs around line 4453) when the WebSocket \
-             pipeline annotates a notification with the sender's username. The \
-             call uses `request_raw` and soft-fails to `\"unknown\"` on error, \
-             so a URL regression would silently degrade UX rather than fail \
-             loudly — review the call site manually on any change to \
-             notification handling. v0.2.3+ candidate: expose a test hook so \
-             this contract gets CI parity with the rest of the manifest.",
-    )])
+    BTreeMap::new()
 }
 
 /// AC #11 coverage gate. Fails if any manifest entry has no replay
