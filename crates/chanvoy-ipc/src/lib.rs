@@ -223,7 +223,25 @@ fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> 
         CoreError::EmptyThread { .. } => CoreError::EmptyThread {
             root_id: requested_post_id.to_string(),
         },
-        other => other,
+        // Provider answered, but its body is its own text and may quote
+        // the derived root. Keep the status — that is what decides
+        // whether a caller should retry — and drop the body.
+        CoreError::Api { status, .. } => CoreError::Api {
+            status,
+            message: format!("could not read the thread for post {requested_post_id}"),
+        },
+        // Everything else is discarded rather than forwarded.
+        //
+        // This arm exists because the previous version forwarded the
+        // original error, and a transport failure renders the URL it was
+        // fetching — which after the derivation is the derived root.
+        // Enumerating the leaky variants is what produced that bug: the
+        // surface ends up defined by the cases not thought of. Nothing
+        // reaches a caller from here that was not built here.
+        _ => CoreError::Api {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            message: format!("could not read the thread for post {requested_post_id}"),
+        },
     }
 }
 
@@ -2309,6 +2327,318 @@ mod tests {
                 }
                 other => panic!("expected ReadResponse, got {other:?}"),
             }
+        }
+
+        /// The provider refuses the derived thread and says so in its
+        /// own words — which quote the id it was asked about.
+        ///
+        /// That body is the provider's text, not ours, and after the
+        /// derivation the id it names is the root the caller never
+        /// supplied. It is dropped. What survives is the status, and
+        /// only the status: it is what tells an automated caller
+        /// whether to try again, and a transient outage that came back
+        /// as a terminal refusal would strand a caller that would have
+        /// succeeded on a retry. Both directions are checked, because a
+        /// sanitiser that collapsed every provider failure into one
+        /// classification would satisfy the disclosure half of this
+        /// test on its own.
+        #[tokio::test]
+        async fn a_provider_failure_on_the_derived_thread_is_reported_without_quoting_it() {
+            let cited_reply = "the-reply-the-caller-cited";
+            let derived_root = "the-root-the-caller-never-named";
+            let provider_body = format!("upstream is unwell while reading thread {derived_root}");
+
+            for (status, expected_code, expected_retryable) in [
+                (500_u16, ChatErrorCode::ProviderError, true),
+                (404_u16, ChatErrorCode::NotFound, false),
+            ] {
+                let server = MockServer::start().await;
+                mount_post(
+                    &server,
+                    wire_post(
+                        cited_reply,
+                        CALLER_CHANNEL,
+                        "user-b",
+                        1_700_000_001_000,
+                        derived_root,
+                    ),
+                )
+                .await;
+                mount_user(&server, "user-b", "bob").await;
+                Mock::given(http_method("GET"))
+                    .and(http_path(format!("/api/v4/posts/{derived_root}/thread")))
+                    .respond_with(
+                        ResponseTemplate::new(status).set_body_string(provider_body.clone()),
+                    )
+                    .mount(&server)
+                    .await;
+                let peer = peer_against(&server.uri());
+
+                let frame = peer
+                    .thread_read_response(
+                        format!("req-provider-{status}"),
+                        CALLER_CHANNEL.to_string(),
+                        cited_reply,
+                        None,
+                    )
+                    .await;
+
+                match &frame {
+                    ChatFrame::Error {
+                        error_code,
+                        retryable,
+                        message,
+                        ..
+                    } => {
+                        assert_eq!(
+                            error_code, &expected_code,
+                            "status {status} must keep its classification through the \
+                             re-statement: {frame:?}"
+                        );
+                        assert_eq!(
+                            *retryable,
+                            Some(expected_retryable),
+                            "status {status} must keep its retryability: withholding the \
+                             provider's words must not turn a transient outage into a \
+                             terminal refusal, nor the reverse: {frame:?}"
+                        );
+                        assert!(
+                            message.contains(cited_reply),
+                            "the failure is reported against the id the caller sent: {message}"
+                        );
+                    }
+                    other => panic!("expected Error frame, got {other:?}"),
+                }
+                let rendered = serde_json::to_string(&frame).expect("serialize frame");
+                assert!(
+                    !rendered.contains(derived_root),
+                    "the derived root must not reach the caller anywhere in the \
+                     frame: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("upstream is unwell"),
+                    "the provider's own body is its text about an id the caller never \
+                     supplied, and must not be forwarded: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("/posts/"),
+                    "no fragment of the URL the request was made against may be \
+                     rendered: {rendered}"
+                );
+            }
+        }
+
+        /// The thread request fails at the transport layer rather than
+        /// coming back with a status.
+        ///
+        /// This is the case a variant-by-variant sanitiser misses. A
+        /// reqwest failure renders the URL it was fetching, and after
+        /// the derivation that URL contains the derived root — so an
+        /// error forwarded from here discloses the id through wording
+        /// nobody wrote deliberately.
+        #[tokio::test]
+        async fn a_transport_failure_on_the_derived_thread_is_reported_without_naming_it() {
+            let cited_reply = "the-reply-the-caller-cited";
+            let derived_root = "the-root-the-caller-never-named";
+            let server = MockServer::start().await;
+            mount_post(
+                &server,
+                wire_post(
+                    cited_reply,
+                    CALLER_CHANNEL,
+                    "user-b",
+                    1_700_000_001_000,
+                    derived_root,
+                ),
+            )
+            .await;
+            mount_user(&server, "user-b", "bob").await;
+            // Mounted and answerable: the front end is what stops the
+            // request, so the fixture is not quietly testing a 404.
+            mount_thread(
+                &server,
+                derived_root,
+                posts_envelope(vec![wire_post(
+                    derived_root,
+                    CALLER_CHANNEL,
+                    "user-a",
+                    1_700_000_000_000,
+                    "",
+                )]),
+            )
+            .await;
+            let front_end = HangUpOnThread::in_front_of(*server.address());
+            let peer = peer_against(&front_end.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-transport".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    cited_reply,
+                    None,
+                )
+                .await;
+
+            match &frame {
+                ChatFrame::Error {
+                    error_code,
+                    retryable,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(
+                        error_code,
+                        &ChatErrorCode::ProviderError,
+                        "a provider that hung up is a provider failure: {frame:?}"
+                    );
+                    assert_eq!(
+                        *retryable,
+                        Some(true),
+                        "a connection that dropped may well succeed on a retry: {frame:?}"
+                    );
+                    assert!(
+                        message.contains(cited_reply),
+                        "the failure is reported against the id the caller sent: {message}"
+                    );
+                }
+                other => panic!("expected Error frame, got {other:?}"),
+            }
+            let rendered = serde_json::to_string(&frame).expect("serialize frame");
+            assert!(
+                !rendered.contains(derived_root),
+                "the derived root must not reach the caller anywhere in the frame: {rendered}"
+            );
+            assert!(
+                !rendered.contains("/posts/"),
+                "a transport error renders the URL it was fetching; no fragment of it \
+                 may reach the caller: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&front_end.uri()),
+                "nor may the provider address: {rendered}"
+            );
+        }
+
+        /// A front end that answers everything the mock provider
+        /// answers, except a thread request: that one it accepts and
+        /// then hangs up on without writing a status line.
+        ///
+        /// Shutting the provider down instead would fail the anchor
+        /// fetch too, and the derived root would never be reached —
+        /// leaving nothing to disclose and a test that proves nothing.
+        /// Standing in front of it lets the anchor succeed and only the
+        /// thread request fail, which is the shape the caller-visible
+        /// wording is being checked against.
+        struct HangUpOnThread {
+            addr: std::net::SocketAddr,
+            shutdown: Arc<AtomicBool>,
+            accept_loop: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl HangUpOnThread {
+            fn in_front_of(upstream: std::net::SocketAddr) -> Self {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind front end");
+                let addr = listener.local_addr().expect("front end address");
+                listener
+                    .set_nonblocking(true)
+                    .expect("front end accept loop must be interruptible");
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let stop = Arc::clone(&shutdown);
+                let accept_loop = std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                std::thread::spawn(move || forward_unless_thread(stream, upstream));
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                Self {
+                    addr,
+                    shutdown,
+                    accept_loop: Some(accept_loop),
+                }
+            }
+
+            fn uri(&self) -> String {
+                format!("http://{}", self.addr)
+            }
+        }
+
+        impl Drop for HangUpOnThread {
+            fn drop(&mut self) {
+                self.shutdown.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.accept_loop.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+
+        /// One connection: read the request head, hang up on a thread
+        /// request, otherwise relay it upstream and stream the answer
+        /// back verbatim.
+        fn forward_unless_thread(mut client: std::net::TcpStream, upstream: std::net::SocketAddr) {
+            use std::io::Write;
+
+            // `accept` may hand back a non-blocking socket on some
+            // platforms; the relay below is written blocking.
+            let _ = client.set_nonblocking(false);
+            let Some((head, path)) = read_request_head(&mut client) else {
+                return;
+            };
+            if path.split('?').next().unwrap_or(&path).ends_with("/thread") {
+                return;
+            }
+            let Ok(mut server) = std::net::TcpStream::connect(upstream) else {
+                return;
+            };
+            // One request per connection: asking upstream to close means
+            // the relay below terminates on EOF, and means the client
+            // opens a fresh connection for the thread request rather
+            // than reusing a pooled one.
+            let relayed = head
+                .lines()
+                .filter(|line| {
+                    !line.to_ascii_lowercase().starts_with("connection:")
+                        && !line.to_ascii_lowercase().starts_with("proxy-connection:")
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            if server
+                .write_all(format!("{relayed}\r\nConnection: close\r\n\r\n").as_bytes())
+                .is_err()
+            {
+                return;
+            }
+            let _ = std::io::copy(&mut server, &mut client);
+            let _ = client.flush();
+        }
+
+        /// Read up to the blank line that ends an HTTP request head.
+        /// Returns the head without its terminating blank line, and the
+        /// request target. Requests with bodies are not relayed — the
+        /// reads under test are all GETs.
+        fn read_request_head(client: &mut std::net::TcpStream) -> Option<(String, String)> {
+            use std::io::Read;
+
+            let mut head: Vec<u8> = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match client.read(&mut byte) {
+                    Ok(0) | Err(_) => return None,
+                    Ok(_) => head.push(byte[0]),
+                }
+                if head.len() > 16 * 1024 {
+                    return None;
+                }
+            }
+            let text = String::from_utf8_lossy(&head).to_string();
+            let path = text.lines().next()?.split_whitespace().nth(1)?.to_string();
+            Some((text.trim_end().to_string(), path))
         }
     }
 

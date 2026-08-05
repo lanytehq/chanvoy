@@ -4576,6 +4576,19 @@ impl MattermostClient {
             Err(error) => return Err(error),
         };
 
+        // The provider was asked for one specific post. A response
+        // carrying a different one is not an answer to the question, and
+        // trusting it would let a malformed reply substitute someone
+        // else's post: `show` would return that post's body under a
+        // successful fetch, and a thread read would take its root and
+        // fetch an entirely different conversation. Checked before the
+        // channel, before hydration, before anything is believed.
+        if post.id != post_id {
+            return Err(CoreError::AnchorChannelMismatch {
+                post_id: post_id.to_string(),
+                channel: channel_name.to_string(),
+            });
+        }
         if !binding_holds(&post.channel_id, expected_channel_id) {
             return Err(CoreError::AnchorChannelMismatch {
                 post_id: post_id.to_string(),

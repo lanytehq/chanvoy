@@ -1350,7 +1350,25 @@ fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> 
         CoreError::EmptyThread { .. } => CoreError::EmptyThread {
             root_id: requested_post_id.to_string(),
         },
-        other => other,
+        // Provider answered, but its body is its own text and may quote
+        // the derived root. Keep the status — that is what decides
+        // whether a caller should retry — and drop the body.
+        CoreError::Api { status, .. } => CoreError::Api {
+            status,
+            message: format!("could not read the thread for post {requested_post_id}"),
+        },
+        // Everything else is discarded rather than forwarded.
+        //
+        // This arm exists because the previous version forwarded the
+        // original error, and a transport failure renders the URL it was
+        // fetching — which after the derivation is the derived root.
+        // Enumerating the leaky variants is what produced that bug: the
+        // surface ends up defined by the cases not thought of. Nothing
+        // reaches a caller from here that was not built here.
+        _ => CoreError::Api {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            message: format!("could not read the thread for post {requested_post_id}"),
+        },
     }
 }
 

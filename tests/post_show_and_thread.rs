@@ -85,6 +85,16 @@ async fn mount_post(env: &TestEnv, post: Value) {
         .await;
 }
 
+/// `GET /posts/{requested_id}` answering with some *other* post. The
+/// provider is claiming that the post the operator named is this one.
+async fn mount_post_at(env: &TestEnv, requested_id: &str, answered_with: Value) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/posts/{requested_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answered_with))
+        .mount(&env.mock)
+        .await;
+}
+
 async fn mount_missing_post(env: &TestEnv, post_id: &str) {
     Mock::given(method("GET"))
         .and(path(format!("/api/v4/posts/{post_id}")))
@@ -137,6 +147,24 @@ async fn thread_requests(env: &TestEnv) -> usize {
         .unwrap_or_default()
         .iter()
         .filter(|req| req.url.path().ends_with("/thread"))
+        .count()
+}
+
+/// How many author lookups the provider was asked for. `/users/me` and
+/// its sub-paths are the daemon's own identity traffic — whoami at bind
+/// and the probe on every `daemon status` — and are not hydration.
+async fn author_lookups(env: &TestEnv) -> usize {
+    env.mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|req| {
+            let path = req.url.path();
+            path.starts_with("/api/v4/users/")
+                && path != "/api/v4/users/me"
+                && !path.starts_with("/api/v4/users/me/")
+        })
         .count()
 }
 
@@ -278,6 +306,80 @@ mod point_fetch {
             0,
             "the channel check runs before hydration; an author lookup \
              would mean a body was already being built"
+        );
+    }
+
+    /// The provider answers the point-fetch with a well-formed post in
+    /// the right channel that is simply not the post that was asked
+    /// for. It is refused, in terms of the id the caller supplied.
+    ///
+    /// A 200 is not on its own an answer to the question: the question
+    /// was about one specific post. Believing the response would let a
+    /// substituted reply stand in for someone else's post — `show`
+    /// would hand back that post's body under a successful fetch, and a
+    /// thread read would take its root and fetch a conversation nobody
+    /// named. The channel binding does not catch it, because the
+    /// substitute is in the caller's channel.
+    #[tokio::test]
+    async fn a_post_that_is_not_the_one_requested_is_refused_before_it_is_hydrated() {
+        let server = MockServer::start().await;
+        // Asked for `requested-post`; answered with `substituted-post`,
+        // in the caller's own channel and otherwise well-formed.
+        Mock::given(method("GET"))
+            .and(path("/api/v4/posts/requested-post"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(wire_post(
+                "substituted-post",
+                CHANNEL_ID,
+                "user-a",
+                1_700_000_000_000,
+                "someone-elses-root",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/user-a"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "user-a", "username": "alice"})),
+            )
+            .mount(&server)
+            .await;
+        let client = build_client(&server.uri());
+
+        let error = client
+            .get_post_in_channel(CHANNEL_ID, "the-channel", "requested-post")
+            .await
+            .expect_err("a post that is not the one asked for must not be returned");
+
+        match &error {
+            CoreError::AnchorChannelMismatch { post_id, channel } => {
+                assert_eq!(
+                    post_id, "requested-post",
+                    "the refusal names the id the caller supplied"
+                );
+                assert_eq!(channel, "the-channel");
+            }
+            other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("substituted-post"),
+            "the substituted post's id is provider-supplied and must not be \
+             handed back: {rendered}"
+        );
+        assert!(
+            !rendered.contains("someone-elses-root"),
+            "nor the thread it claims to belong to: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&body_of("substituted-post")),
+            "nor any part of its body: {rendered}"
+        );
+        assert_eq!(
+            author_lookups(&server).await,
+            0,
+            "the identity check runs before hydration; an author lookup would \
+             mean the substituted post was already being believed"
         );
     }
 
@@ -443,6 +545,71 @@ async fn show_refuses_a_missing_post() {
     assert!(
         rendered.contains("no-such-post"),
         "the refusal names the post: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// The provider answers the operator's post id with a different post —
+/// well-formed, and in the very channel the operator named. `show`
+/// refuses and prints nothing.
+///
+/// The channel bind cannot catch this one: the substitute passes it.
+/// Without an identity check the operator asks for one post and is
+/// handed another under a successful fetch, with no sign in the output
+/// that the answer is about a different post from the question.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn show_refuses_a_post_that_is_not_the_one_requested() {
+    let env = TestEnv::new("show-substituted-post").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-ssub", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post_at(
+        &env,
+        "requested-post",
+        wire_post(
+            "substituted-post",
+            CHANNEL_ID,
+            "user-a",
+            1_700_000_000_000,
+            "someone-elses-root",
+        ),
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "show", CHANNEL, "requested-post"]).await;
+
+    assert!(
+        !out.status.success(),
+        "show must refuse a post that is not the one asked for; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("requested-post"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("substituted-post"),
+        "the substituted post's id is provider-supplied and must not reach the \
+         operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains("someone-elses-root"),
+        "nor the thread it claims to belong to: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&body_of("substituted-post")),
+        "no part of the substituted post's body may reach the operator: {rendered}"
     );
 
     let _ = stop_daemon_cleanly(&env, daemon).await;
@@ -679,6 +846,94 @@ async fn thread_with_an_out_of_channel_reply_is_refused_whole() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
+/// The same substitution under `thread`, where believing the answer
+/// costs more: the substituted post's root is what the thread request
+/// would be made against, so a trusted substitution reads an entirely
+/// different conversation and labels it with the id the operator typed.
+///
+/// The refusal is asserted on the absence of both downstream requests.
+/// A check that ran after the fetch would produce the same error while
+/// the read had already happened.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_refuses_a_substituted_post_before_reading_or_hydrating_anything() {
+    let env = TestEnv::new("thread-substituted-post").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tsub", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let substituted = wire_post(
+        "substituted-post",
+        CHANNEL_ID,
+        "user-a",
+        1_700_000_001_000,
+        "someone-elses-root",
+    );
+    mount_post_at(&env, "requested-post", substituted.clone()).await;
+    // The conversation the substitution points at. Mounted and
+    // answerable on purpose: the point is that it is never asked for.
+    mount_thread(
+        &env,
+        "someone-elses-root",
+        vec![
+            wire_post(
+                "someone-elses-root",
+                CHANNEL_ID,
+                "user-b",
+                1_700_000_000_000,
+                "",
+            ),
+            substituted,
+        ],
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "requested-post"]).await;
+
+    assert!(
+        !out.status.success(),
+        "thread must refuse a post that is not the one asked for; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("requested-post"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    for leaked in ["substituted-post", "someone-elses-root"] {
+        assert!(
+            !rendered.contains(leaked),
+            "no provider-supplied id may reach the operator: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&body_of(leaked)),
+            "no provider-supplied body may reach the operator: {rendered}"
+        );
+    }
+    assert_eq!(
+        thread_requests(&env).await,
+        0,
+        "the substituted post's root must never be read: a thread request here \
+         means a conversation the operator did not name was fetched"
+    );
+    assert_eq!(
+        author_lookups(&env).await,
+        0,
+        "no hydration either — an author lookup means the substituted post was \
+         already being believed"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
 // ----------------------------------------------------------------------
 // A refusal names the id the operator typed, and only that one
 // ----------------------------------------------------------------------
@@ -895,6 +1150,294 @@ async fn thread_by_reply_id_reports_an_empty_thread_against_the_reply() {
     );
 
     let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// The provider refuses the derived thread with a status, and says so
+/// in its own words — words that quote the id it was asked about.
+///
+/// After the derivation that id is the root the operator never named,
+/// so the provider's body cannot be relayed. The status is a different
+/// matter: it is the operator's only clue whether the read is worth
+/// trying again, and it survives.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_a_provider_failure_without_disclosing_the_derived_root() {
+    let env = TestEnv::new("thread-reply-provider-error").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-trp", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post(
+        &env,
+        wire_post(
+            "cited-reply",
+            CHANNEL_ID,
+            "user-b",
+            1_700_000_001_000,
+            "canonical-root",
+        ),
+    )
+    .await;
+    // The provider's own text about the request it failed — which, at
+    // this point in the read, is a request about the derived root.
+    Mock::given(method("GET"))
+        .and(path("/api/v4/posts/canonical-root/thread"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("upstream is unwell while reading thread canonical-root"),
+        )
+        .mount(&env.mock)
+        .await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a provider failure on the thread read must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the failure is reported against the id the operator typed: {rendered}"
+    );
+    assert!(
+        rendered.contains("500"),
+        "the provider's status is the operator's only clue whether a retry is \
+         worth making, and must survive the re-statement: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root was never supplied by the operator and must not be \
+         handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("upstream is unwell"),
+        "the provider's body is its own text about an id the operator never \
+         named, and must not be relayed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/posts/"),
+        "no fragment of the URL the request was made against may be \
+         rendered: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// The thread request fails at the transport layer instead of coming
+/// back with a status.
+///
+/// A reqwest failure renders the URL it was fetching, and after the
+/// derivation that URL contains the derived root — so an error
+/// forwarded from here discloses the id through wording nobody chose.
+/// This is the shape a variant-by-variant sanitiser misses, because
+/// nothing about a transport error looks like it is carrying a post id.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_a_transport_failure_without_disclosing_the_derived_root() {
+    let env = TestEnv::new("thread-reply-transport-error").await;
+    let front_end = HangUpOnThread::in_front_of(*env.mock.address());
+    // The daemon talks to the front end; the front end talks to the
+    // mock, so every mount below is reached as usual — except the
+    // thread request, which never gets there.
+    env.write_profile_against_server("agent-bravo-devlead", "org-lanytehq", &front_end.uri());
+    env.mock_baseline("bot-id-trt", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let cited_reply = wire_post(
+        "cited-reply",
+        CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "canonical-root",
+    );
+    mount_post(&env, cited_reply.clone()).await;
+    // Mounted and answerable: the front end is what stops the request,
+    // so this is not quietly a test of an unmounted route.
+    mount_thread(
+        &env,
+        "canonical-root",
+        vec![
+            wire_post(
+                "canonical-root",
+                CHANNEL_ID,
+                "user-a",
+                1_700_000_000_000,
+                "",
+            ),
+            cited_reply,
+        ],
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a transport failure on the thread read must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the failure is reported against the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root must not be handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/posts/"),
+        "a transport error renders the URL it was fetching; no fragment of it \
+         may reach the operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&front_end.uri()),
+        "nor may the provider address: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// A front end that relays everything to the mock provider except a
+/// thread request: that one it accepts and then hangs up on, without
+/// writing a status line.
+///
+/// Shutting the provider down instead would fail the anchor fetch too,
+/// and the derived root would never be reached — leaving nothing to
+/// disclose and a test that proves nothing. Standing in front of it
+/// lets the anchor succeed and only the thread request fail, which is
+/// the case the operator-visible wording is being checked against.
+struct HangUpOnThread {
+    addr: std::net::SocketAddr,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accept_loop: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HangUpOnThread {
+    fn in_front_of(upstream: std::net::SocketAddr) -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind front end");
+        let addr = listener.local_addr().expect("front end address");
+        listener
+            .set_nonblocking(true)
+            .expect("front end accept loop must be interruptible");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+        let accept_loop = std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        std::thread::spawn(move || forward_unless_thread(stream, upstream));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            shutdown,
+            accept_loop: Some(accept_loop),
+        }
+    }
+
+    fn uri(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for HangUpOnThread {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.accept_loop.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// One connection: read the request head, hang up on a thread request,
+/// otherwise relay it upstream and stream the answer back verbatim.
+fn forward_unless_thread(mut client: std::net::TcpStream, upstream: std::net::SocketAddr) {
+    use std::io::Write;
+
+    // `accept` may hand back a non-blocking socket on some platforms;
+    // the relay below is written blocking.
+    let _ = client.set_nonblocking(false);
+    let Some((head, path)) = read_request_head(&mut client) else {
+        return;
+    };
+    if path.split('?').next().unwrap_or(&path).ends_with("/thread") {
+        return;
+    }
+    let Ok(mut server) = std::net::TcpStream::connect(upstream) else {
+        return;
+    };
+    // One request per connection: asking upstream to close means the
+    // relay below terminates on EOF, and means the client opens a fresh
+    // connection for the thread request rather than reusing a pooled
+    // one that is about to be hung up on.
+    let relayed = head
+        .lines()
+        .filter(|line| {
+            !line.to_ascii_lowercase().starts_with("connection:")
+                && !line.to_ascii_lowercase().starts_with("proxy-connection:")
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    if server
+        .write_all(format!("{relayed}\r\nConnection: close\r\n\r\n").as_bytes())
+        .is_err()
+    {
+        return;
+    }
+    let _ = std::io::copy(&mut server, &mut client);
+    let _ = client.flush();
+}
+
+/// Read up to the blank line that ends an HTTP request head. Returns
+/// the head without its terminating blank line, and the request target.
+/// Requests with bodies are not relayed — the reads under test are all
+/// GETs.
+fn read_request_head(client: &mut std::net::TcpStream) -> Option<(String, String)> {
+    use std::io::Read;
+
+    let mut head: Vec<u8> = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match client.read(&mut byte) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => head.push(byte[0]),
+        }
+        if head.len() > 16 * 1024 {
+            return None;
+        }
+    }
+    let text = String::from_utf8_lossy(&head).to_string();
+    let path = text.lines().next()?.split_whitespace().nth(1)?.to_string();
+    Some((text.trim_end().to_string(), path))
 }
 
 /// `--latest` is the newest message, not the last element of the list.

@@ -167,6 +167,37 @@ impl TestEnv {
         team_name: &str,
         monitored_channels: &[&str],
     ) {
+        self.write_profile_against(
+            bot_username,
+            team_name,
+            monitored_channels,
+            &self.server_url(),
+        );
+    }
+
+    /// Write the default profile pointed at an arbitrary provider URL
+    /// instead of the harness's mock server directly.
+    ///
+    /// Used by tests that stand a fault-injecting front end in front of
+    /// the mock so a specific request can be made to fail at the
+    /// transport layer — something wiremock, which always answers with
+    /// a status, cannot express.
+    pub fn write_profile_against_server(
+        &self,
+        bot_username: &str,
+        team_name: &str,
+        server_url: &str,
+    ) {
+        self.write_profile_against(bot_username, team_name, &[], server_url);
+    }
+
+    fn write_profile_against(
+        &self,
+        bot_username: &str,
+        team_name: &str,
+        monitored_channels: &[&str],
+        server_url: &str,
+    ) {
         let profile = Profile {
             name: self.profile_name.clone(),
             role: "bravo-devlead".to_string(),
@@ -174,7 +205,7 @@ impl TestEnv {
             provider: chanvoy_core::Provider::Mattermost,
             bot_username: bot_username.to_string(),
             team_name: team_name.to_string(),
-            server_url: self.server_url(),
+            server_url: server_url.to_string(),
             env_name: self.token_env_name.clone(),
             env_file: None,
             credential_mode: chanvoy_core::CredentialMode::EnvName,
