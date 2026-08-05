@@ -1711,7 +1711,7 @@ pub enum CoreError {
     /// unscoped read the replacement exists to prevent. It refuses
     /// instead, and says what to call.
     #[error(
-        "read_thread was removed because it could not verify which channel a          thread belonged to; call read_thread_in_channel(expected_channel_id,          channel_name, root_post_id) instead"
+        "read_thread was removed: it could not verify which channel a thread belonged to. Call read_thread_in_channel(expected_channel_id, channel_name, root_post_id) instead."
     )]
     UnboundThreadReadRemoved,
     /// A thread read came back with zero posts. Every thread contains at
@@ -3968,16 +3968,14 @@ impl MattermostClient {
         })
     }
 
-    /// Read a whole thread: the root post plus every reply, so a thread
-    /// with N replies returns N+1 messages and a thread with no replies
-    /// returns exactly one. No post is ever dropped — a post whose
-    /// author cannot be resolved still appears, carrying the author's
-    /// user id in place of a name.
     /// Removed: an unbound thread read.
     ///
-    /// Retained as an exported symbol so that code compiled against the
-    /// previous release still builds and gets a deprecation warning
-    /// rather than a hard compile error. It always refuses: silently
+    /// Retained as an exported symbol so that a *call* to it still
+    /// builds, with a deprecation warning rather than a hard compile
+    /// error. That does not make the release a drop-in recompile:
+    /// `CoreError` gained a variant in the same change, so code that
+    /// matches exhaustively on it still has to add a wildcard arm
+    /// before it will build. It always refuses: silently
     /// forwarding to the bound read would require inventing a channel,
     /// which would recreate the unscoped read this was removed for.
     #[deprecated(
@@ -4001,10 +3999,32 @@ impl MattermostClient {
                 None::<Value>,
             )
             .await?;
+        // Every refusal below names the id the CALLER supplied, never an
+        // id the provider returned. A stray post's id is not the caller's
+        // to learn: echoing it back would disclose the existence and
+        // identity of a post outside the channel they named, which is the
+        // narrower form of the existence oracle this binding prevents.
+        let refuse = |channel_name: &str| CoreError::AnchorChannelMismatch {
+            post_id: root_post_id.to_string(),
+            channel: channel_name.to_string(),
+        };
         if response.posts.is_empty() {
             return Err(CoreError::EmptyThread {
                 root_id: root_post_id.to_string(),
             });
+        }
+        // Validate against the keyed map, not a bare list of values.
+        //
+        // The key is the provider's own claim about a post's id. Throwing
+        // the keys away first means two distinct keys can carry the same
+        // post id, and the checks below — which key off the id — then see
+        // one canonical root and wave its duplicate through as a second
+        // root. Disagreement between a key and the post it holds means the
+        // response is not what it says it is.
+        for (key, post) in &response.posts {
+            if key != &post.id {
+                return Err(refuse(channel_name));
+            }
         }
         let mut raw: Vec<RawPost> = response.posts.into_values().collect();
         // Bind every post the provider returned, not only the anchor the
@@ -4017,17 +4037,6 @@ impl MattermostClient {
         // surface stamps every result with the channel the caller asked
         // for. Verifying here is what makes that label true rather than
         // merely plausible. Costs no extra request.
-        // Every refusal below names the id the CALLER supplied, never an
-        // id the provider returned. A stray post's id is not the
-        // caller's to learn: echoing it back would disclose the
-        // existence and identity of a post outside the channel they
-        // named, which is the narrower disclosure version of the
-        // existence oracle this binding exists to prevent.
-        let refuse = |channel_name: &str| CoreError::AnchorChannelMismatch {
-            post_id: root_post_id.to_string(),
-            channel: channel_name.to_string(),
-        };
-
         for post in &raw {
             if !binding_holds(&post.channel_id, expected_channel_id) {
                 return Err(refuse(channel_name));
@@ -4047,11 +4056,17 @@ impl MattermostClient {
         // or carrying a post from a different conversation, is returned
         // and labelled as the requested thread — and `--latest` can then
         // select a post that was never part of it.
-        let root = raw
-            .iter()
-            .find(|post| post.id == root_post_id)
-            .ok_or_else(|| refuse(channel_name))?;
-        if !root.root_id.is_empty() && root.root_id != root_post_id {
+        // Exactly one record may claim to be the requested post, and it
+        // must be top-level. The provider sends an empty root on a
+        // top-level post; a record naming itself as its own root is not a
+        // shape the provider produces, so accepting it would only ever
+        // admit something malformed.
+        let mut roots = raw.iter().filter(|post| post.id == root_post_id);
+        let root = roots.next().ok_or_else(|| refuse(channel_name))?;
+        if roots.next().is_some() {
+            return Err(refuse(channel_name));
+        }
+        if !root.root_id.is_empty() {
             return Err(refuse(channel_name));
         }
         for post in &raw {

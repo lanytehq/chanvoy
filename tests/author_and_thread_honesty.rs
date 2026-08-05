@@ -82,6 +82,23 @@ fn posts_envelope(posts: Vec<serde_json::Value>) -> serde_json::Value {
     json!({ "order": order, "posts": map })
 }
 
+/// A thread envelope whose map keys are chosen by the caller rather
+/// than derived from the posts.
+///
+/// `posts_envelope` keys every post by its own id, which is what a
+/// well-behaved provider does — and which makes it impossible to
+/// express the malformed shapes below. Nothing downstream may assume
+/// the two agree just because the happy-path fixture builder makes them
+/// agree.
+fn keyed_envelope(entries: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
+    let order: Vec<String> = entries.iter().map(|(key, _)| (*key).to_string()).collect();
+    let map: serde_json::Map<String, serde_json::Value> = entries
+        .into_iter()
+        .map(|(key, post)| (key.to_string(), post))
+        .collect();
+    json!({ "order": order, "posts": map })
+}
+
 async fn mount_thread(server: &MockServer, root_id: &str, body: serde_json::Value) {
     Mock::given(method("GET"))
         .and(path(format!("/api/v4/posts/{root_id}/thread")))
@@ -503,12 +520,171 @@ async fn a_requested_root_that_is_itself_a_reply_is_refused() {
     );
 }
 
+/// An envelope whose map key disagrees with the id of the post it holds
+/// is refused.
+///
+/// The provider hands threads back as a map keyed by post id, so the
+/// key is the provider's own claim about what it is sending. A response
+/// where the two disagree is not the response it says it is, and every
+/// check downstream reads the post's `id` field — the half of the pair
+/// a crafted response controls freely.
+#[tokio::test]
+async fn a_thread_envelope_whose_key_disagrees_with_its_post_is_refused() {
+    let server = MockServer::start().await;
+    let wrong_key = "key-that-is-not-this-posts-id";
+    // The post itself is beyond reproach: right channel, right id, and
+    // genuinely top-level. Only the key it arrived under is wrong.
+    mount_thread(
+        &server,
+        ROOT_ID,
+        keyed_envelope(vec![(
+            wrong_key,
+            wire_post(ROOT_ID, "user-a", 1_700_000_000_000, ""),
+        )]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect_err("an envelope whose keys do not match its posts must not read as success");
+
+    match &error {
+        chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            assert_eq!(post_id, ROOT_ID, "the refusal names the caller's own id");
+            assert_eq!(channel, "the-channel");
+        }
+        other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains(wrong_key),
+        "the provider's key is not the caller's to learn: {rendered}"
+    );
+    assert!(
+        !rendered.contains("body of"),
+        "no post body may survive the refusal: {rendered}"
+    );
+}
+
+/// Two distinct keys both carrying a post that claims to be the
+/// requested root is refused.
+///
+/// This is the shape that gets through if the keys are discarded before
+/// anything is checked: from a bare list of values there is one
+/// canonical root and a second record indistinguishable from it, and a
+/// check that stops at the first match waves the duplicate through. The
+/// thread would then be hydrated with an extra post that the caller has
+/// no way to tell from the real root — same id, different body.
+#[tokio::test]
+async fn a_thread_envelope_with_two_records_claiming_the_root_is_refused() {
+    let server = MockServer::start().await;
+    // One key is honest. The second carries a different post under a
+    // different key while claiming the requested root's id.
+    let smuggled = json!({
+        "id": ROOT_ID,
+        "channel_id": CHANNEL_ID,
+        "user_id": "user-b",
+        "message": "SMUGGLED-BODY",
+        "create_at": 1_700_000_005_000_i64,
+        "root_id": "",
+    });
+    mount_thread(
+        &server,
+        ROOT_ID,
+        keyed_envelope(vec![
+            (ROOT_ID, wire_post(ROOT_ID, "user-a", 1_700_000_000_000, "")),
+            ("a-second-key-for-the-same-id", smuggled),
+        ]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    mount_user(&server, "user-b", "bob").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect_err("two records claiming the same root must not read as success");
+
+    match &error {
+        chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            assert_eq!(post_id, ROOT_ID, "the refusal names the caller's own id");
+            assert_eq!(channel, "the-channel");
+        }
+        other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("SMUGGLED-BODY"),
+        "the smuggled body may not reach the caller: {rendered}"
+    );
+    assert!(
+        !rendered.contains("a-second-key-for-the-same-id"),
+        "the provider's key is not the caller's to learn: {rendered}"
+    );
+    assert!(
+        !rendered.contains("body of"),
+        "no post body may survive the refusal: {rendered}"
+    );
+}
+
+/// A requested root that names *itself* as its thread root is refused.
+///
+/// A top-level post arrives from the provider with an empty root; the
+/// self-naming form is normalization this crate performs on the way
+/// out, never a shape the provider sends in. Accepting it as "top-level
+/// enough" means the only records that shape can ever admit are
+/// malformed ones — and it re-opens the reply-requested-as-a-root case,
+/// where the answer handed back is a thread whose root is not the id it
+/// was asked for.
+#[tokio::test]
+async fn a_requested_root_that_names_itself_as_its_root_is_refused() {
+    let server = MockServer::start().await;
+    mount_thread(
+        &server,
+        ROOT_ID,
+        posts_envelope(vec![wire_post(
+            ROOT_ID,
+            "user-a",
+            1_700_000_000_000,
+            // The provider sends "" here for a top-level post.
+            ROOT_ID,
+        )]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect_err("a self-rooted record must not read as success");
+
+    match &error {
+        chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            assert_eq!(post_id, ROOT_ID, "the refusal names the caller's own id");
+            assert_eq!(channel, "the-channel");
+        }
+        other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+    }
+    assert!(
+        !error.to_string().contains("body of"),
+        "no post body may survive the refusal: {error}"
+    );
+}
+
 /// The removed unbound thread read refuses without asking the provider
 /// anything at all.
 ///
-/// It is kept as an exported symbol so code built against the previous
-/// release still compiles, with a deprecation warning instead of a hard
-/// break. Refusing is the whole behaviour: forwarding to the bound read
+/// It is kept as an exported symbol so a *call* to it still compiles,
+/// with a deprecation warning instead of a hard break — which is not the
+/// same as the release being a drop-in recompile, since `CoreError`
+/// gained a variant in the same change and an exhaustive match on it
+/// still has to be updated. Refusing is the whole behaviour: forwarding
+/// to the bound read
 /// would mean inventing a channel, which is the unscoped read it was
 /// removed for. Asserting on the error alone would still pass if it
 /// fetched the thread and then threw the result away, so the request
@@ -550,6 +726,35 @@ async fn the_removed_unbound_thread_read_refuses_without_touching_the_provider()
             .len(),
         0,
         "the removed read must issue no request of any kind"
+    );
+}
+
+/// The guidance the removed read prints is a sentence a caller can
+/// read, not a reflowed source literal.
+///
+/// It is the only thing a caller who hit the removal gets, so it has to
+/// name the replacement — and it has to survive the trip through the
+/// formatter intact. A multi-line literal whose continuations are
+/// collapsed leaves runs of padding spaces embedded in the string; the
+/// message still "contains" the replacement's name and still passes a
+/// contains-check, while rendering to the caller as a sentence with
+/// gaps punched through it.
+#[test]
+fn the_removed_reads_guidance_is_one_readable_sentence() {
+    let rendered = chanvoy_core::CoreError::UnboundThreadReadRemoved.to_string();
+
+    assert!(
+        rendered.contains("read_thread_in_channel"),
+        "the guidance names the call that replaces it: {rendered}"
+    );
+    assert!(
+        !rendered.contains("  "),
+        "no run of two or more spaces may survive into the rendered \
+         message — that is source indentation, not wording: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains('\n'),
+        "the guidance is one line: {rendered:?}"
     );
 }
 

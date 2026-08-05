@@ -22,6 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The `CoreError` type gained a variant, which will stop some code from
+  compiling.** This affects Rust code that depends on the `chanvoy-core`
+  library; it does not affect the `chanvoy` command line, its output, its exit
+  codes, or its files. If your code has a `match` on a `CoreError` that lists
+  every variant by name and has no catch-all arm, that `match` no longer covers
+  every case and the compiler will reject it, naming the variant it has not
+  seen before. The fix is to add a catch-all arm — `_ => { ... }` — which also
+  keeps the `match` compiling the next time a variant is added. Code that only
+  prints a `CoreError`, passes one along, or matches a few variants it already
+  has a catch-all for needs no change.
+
+  The unbound thread read, `read_thread`, is still exported and still compiles,
+  now marked deprecated and always refusing. Keeping that name available does
+  not by itself make this release a drop-in recompile: the added variant is a
+  separate break, and both need handling before code that matches exhaustively
+  on `CoreError` will build again.
+
 - **Human-readable reads now show the post id and the thread it belongs to.**
   `chanvoy read` printed a timestamp, an author, and a body, with no id
   anywhere — so an operator who had not asked for `--json` could not cite a

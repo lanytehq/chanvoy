@@ -206,6 +206,27 @@ pub struct AuditEvent {
     pub severity: Option<String>,
 }
 
+/// Re-state a thread failure against the post id the caller supplied.
+///
+/// A thread read anchors on the post the caller named and then runs
+/// against that post's thread root. When a reply was named, the root is
+/// derived — quoting it in a refusal would disclose an identifier the
+/// caller never supplied. Only the identifier changes; the failure does
+/// not.
+fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> CoreError {
+    match error {
+        CoreError::AnchorChannelMismatch { channel, .. } => CoreError::AnchorChannelMismatch {
+            post_id: requested_post_id.to_string(),
+            channel,
+        },
+        CoreError::AnchorNotFound(_) => CoreError::AnchorNotFound(requested_post_id.to_string()),
+        CoreError::EmptyThread { .. } => CoreError::EmptyThread {
+            root_id: requested_post_id.to_string(),
+        },
+        other => other,
+    }
+}
+
 pub fn core_error_to_chat(error: CoreError, request_id: &str) -> ChatFrame {
     let (code, retryable) = match &error {
         CoreError::WaitTimeout(_) => (ChatErrorCode::NotFound, Some(false)),
@@ -1027,7 +1048,12 @@ impl IpcPeer {
             .await
         {
             Ok(messages) => messages,
-            Err(e) => return core_error_to_chat(e, &request_id),
+            // Re-stated against the id the caller sent. The root was
+            // derived from it, so a caller that named a reply never
+            // supplied the root and must not be handed it back.
+            Err(e) => {
+                return core_error_to_chat(restate_against_requested_post(e, root_id), &request_id)
+            }
         };
         let limit = limit.unwrap_or(50) as usize;
         // Whether the response is the whole thread has to be answered
@@ -2048,6 +2074,152 @@ mod tests {
             );
         }
 
+        /// A caller who named a reply is refused in terms of the reply,
+        /// never in terms of the root derived from it.
+        ///
+        /// The root is this function's own work: it comes off the
+        /// anchor, and a caller who cited a reply neither supplied it
+        /// nor has any way to obtain it. Quoting it in a refusal turns
+        /// a failed read into a lookup — hand over a reply id, get back
+        /// the id of the post that started the conversation, whether or
+        /// not the read was allowed to proceed. The refusal reads
+        /// exactly as it would for the id the caller actually sent.
+        #[tokio::test]
+        async fn a_malformed_thread_named_by_a_reply_is_refused_in_terms_of_the_reply() {
+            let server = MockServer::start().await;
+            let cited_reply = "the-reply-the-caller-cited";
+            let derived_root = "the-root-the-caller-never-named";
+            mount_post(
+                &server,
+                wire_post(
+                    cited_reply,
+                    CALLER_CHANNEL,
+                    "user-b",
+                    1_700_000_001_000,
+                    derived_root,
+                ),
+            )
+            .await;
+            // The thread is fetched against the derived root and comes
+            // back mixed, so the refusal is raised deep inside the
+            // thread read — where the only id in scope is the derived
+            // one.
+            mount_thread(
+                &server,
+                derived_root,
+                posts_envelope(vec![
+                    wire_post(
+                        derived_root,
+                        CALLER_CHANNEL,
+                        "user-a",
+                        1_700_000_000_000,
+                        "",
+                    ),
+                    wire_post(
+                        "stray-reply",
+                        OTHER_CHANNEL,
+                        "user-c",
+                        1_700_000_002_000,
+                        derived_root,
+                    ),
+                ]),
+            )
+            .await;
+            mount_user(&server, "user-a", "alice").await;
+            mount_user(&server, "user-b", "bob").await;
+            mount_user(&server, "user-c", "carol").await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-reply-refusal".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    cited_reply,
+                    None,
+                )
+                .await;
+
+            match &frame {
+                ChatFrame::Error { message, .. } => {
+                    assert_eq!(message, &binding_refusal_message(cited_reply));
+                    assert!(
+                        !message.contains(derived_root),
+                        "the derived root was never supplied by the caller and must \
+                         not be handed back: {message}"
+                    );
+                }
+                other => panic!("expected Error frame, got {other:?}"),
+            }
+            let rendered = serde_json::to_string(&frame).expect("serialize frame");
+            assert!(
+                !rendered.contains(derived_root),
+                "the derived root must not reach the caller anywhere in the frame: {rendered}"
+            );
+            assert!(
+                !rendered.contains("stray-reply") && !rendered.contains(OTHER_CHANNEL),
+                "no provider-supplied id or channel may reach the caller: {rendered}"
+            );
+            assert!(
+                !rendered.contains("body of"),
+                "no post body may survive the refusal: {rendered}"
+            );
+        }
+
+        /// The same holds when the thread comes back empty: an empty
+        /// thread reached through a reply is reported against the reply.
+        ///
+        /// This failure is raised on a different path from the binding
+        /// refusal above and carries a different wording, so it is a
+        /// separate chance to leak the same derived id.
+        #[tokio::test]
+        async fn an_empty_thread_named_by_a_reply_is_reported_against_the_reply() {
+            let server = MockServer::start().await;
+            let cited_reply = "the-reply-the-caller-cited";
+            let derived_root = "the-root-the-caller-never-named";
+            mount_post(
+                &server,
+                wire_post(
+                    cited_reply,
+                    CALLER_CHANNEL,
+                    "user-b",
+                    1_700_000_001_000,
+                    derived_root,
+                ),
+            )
+            .await;
+            mount_thread(
+                &server,
+                derived_root,
+                serde_json::json!({"order": [], "posts": {}}),
+            )
+            .await;
+            mount_user(&server, "user-b", "bob").await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-empty-by-reply".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    cited_reply,
+                    None,
+                )
+                .await;
+
+            match &frame {
+                ChatFrame::Error { message, .. } => {
+                    assert!(
+                        message.contains(cited_reply),
+                        "the diagnostic names the id the caller supplied: {message}"
+                    );
+                    assert!(
+                        !message.contains(derived_root),
+                        "the derived root must not be disclosed: {message}"
+                    );
+                }
+                other => panic!("expected Error frame, got {other:?}"),
+            }
+        }
+
         /// A truncated thread says so, and a complete one says so too.
         ///
         /// `has_more` is the only thing distinguishing "this is the
@@ -2149,11 +2321,23 @@ mod tests {
             mount_user, peer_against, posts_envelope, wire_post, CALLER_CHANNEL,
         };
         use super::*;
-        use wiremock::matchers::{method as http_method, path as http_path};
+        use wiremock::matchers::{
+            method as http_method, path as http_path, query_param as http_query_param,
+        };
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         /// A window of `count` posts, all by one author, in the caller's
         /// channel, ordered in time.
+        ///
+        /// The mock binds `per_page`, not just the path. The
+        /// completeness rule below decides "full page" by comparing the
+        /// count it received against `CHANNEL_WINDOW_PAGE_SIZE`, which
+        /// is only meaningful if that constant is also the page size the
+        /// transport asked the provider for. Matching on the path alone
+        /// leaves the two free to drift apart while every assertion
+        /// still passes: a transport asking for a different page size —
+        /// or none at all — would be answered by this mock regardless.
+        /// Bound here, that drift stops matching and the tests fail.
         async fn mount_window(server: &MockServer, count: usize) {
             let posts: Vec<serde_json::Value> = (0..count)
                 .map(|n| {
@@ -2170,6 +2354,10 @@ mod tests {
                 .and(http_path(format!(
                     "/api/v4/channels/{CALLER_CHANNEL}/posts"
                 )))
+                .and(http_query_param(
+                    "per_page",
+                    chanvoy_core::CHANNEL_WINDOW_PAGE_SIZE.to_string(),
+                ))
                 .respond_with(ResponseTemplate::new(200).set_body_json(posts_envelope(posts)))
                 .mount(server)
                 .await;

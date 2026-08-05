@@ -679,6 +679,224 @@ async fn thread_with_an_out_of_channel_reply_is_refused_whole() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
+// ----------------------------------------------------------------------
+// A refusal names the id the operator typed, and only that one
+// ----------------------------------------------------------------------
+//
+// `thread` accepts a reply id and reads the whole thread, which means
+// the root it actually fetches against is derived here rather than
+// supplied by the operator. Every failure raised past that point knows
+// only the derived root — so unless it is re-stated, citing a reply and
+// getting a refusal hands back the id of the post that started the
+// conversation. That is a lookup the operator did not ask for and, on a
+// thread they turn out not to be allowed to read, did not earn.
+
+/// A reply id, a malformed thread envelope, and a refusal that names
+/// the reply and nothing else.
+///
+/// The envelope carries a post from a channel the operator never named,
+/// so the refusal is raised inside the thread read — the point furthest
+/// from the id the operator typed.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_without_disclosing_the_derived_root() {
+    let env = TestEnv::new("thread-reply-refusal").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-trf", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    // The operator cites the reply. Its root is the canonical one, and
+    // the operator has no way to know it.
+    let cited_reply = wire_post(
+        "cited-reply",
+        CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "canonical-root",
+    );
+    let canonical_root = wire_post(
+        "canonical-root",
+        CHANNEL_ID,
+        "user-a",
+        1_700_000_000_000,
+        "",
+    );
+    let stray = wire_post(
+        "stray-post",
+        OTHER_CHANNEL_ID,
+        "user-c",
+        1_700_000_002_000,
+        "canonical-root",
+    );
+    mount_post(&env, cited_reply.clone()).await;
+    // The anchor bind passes, so the thread request is genuinely made —
+    // against the derived root, which is where the mixed envelope lives.
+    mount_thread(
+        &env,
+        "canonical-root",
+        vec![canonical_root, cited_reply, stray],
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+    mount_user(&env, "user-c", "carol").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a malformed thread envelope must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root was never supplied by the operator and must not \
+         be handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("stray-post"),
+        "a provider-supplied post id must not reach the operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains(OTHER_CHANNEL_ID),
+        "the refusal must not name the channel the stray post came from: {rendered}"
+    );
+    for id in ["canonical-root", "cited-reply", "stray-post"] {
+        assert!(
+            !rendered.contains(&body_of(id)),
+            "no body from the envelope may reach the operator: {rendered}"
+        );
+    }
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// Same contract on the other malformed shape: an envelope that is
+/// entirely in the right channel but simply does not contain the
+/// canonical root.
+///
+/// Nothing here fails the channel bind, so this is refused for a
+/// different reason and through a different branch — and has to be just
+/// as quiet about the derived root.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_a_rootless_envelope_naming_only_the_reply() {
+    let env = TestEnv::new("thread-reply-rootless").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-trr2", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let cited_reply = wire_post(
+        "cited-reply",
+        CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "canonical-root",
+    );
+    let sibling = wire_post(
+        "sibling-reply",
+        CHANNEL_ID,
+        "user-c",
+        1_700_000_002_000,
+        "canonical-root",
+    );
+    mount_post(&env, cited_reply.clone()).await;
+    // Replies only: every post passes the channel bind and names the
+    // right thread, but the root itself is absent.
+    mount_thread(&env, "canonical-root", vec![cited_reply, sibling]).await;
+    mount_user(&env, "user-b", "bob").await;
+    mount_user(&env, "user-c", "carol").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "an envelope missing the canonical root must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root must not be handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("sibling-reply"),
+        "a provider-supplied post id must not reach the operator: {rendered}"
+    );
+    for id in ["cited-reply", "sibling-reply"] {
+        assert!(
+            !rendered.contains(&body_of(id)),
+            "no body from the envelope may reach the operator: {rendered}"
+        );
+    }
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// An empty thread reached through a reply id is reported against the
+/// reply.
+///
+/// This one fails on a different path again, with its own wording, so
+/// it is a third independent chance to leak the derived root.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_reports_an_empty_thread_against_the_reply() {
+    let env = TestEnv::new("thread-reply-empty").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tre", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post(
+        &env,
+        wire_post(
+            "cited-reply",
+            CHANNEL_ID,
+            "user-b",
+            1_700_000_001_000,
+            "canonical-root",
+        ),
+    )
+    .await;
+    mount_thread(&env, "canonical-root", vec![]).await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "an empty thread body must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the diagnostic names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root must not be handed back: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
 /// `--latest` is the newest message, not the last element of the list.
 ///
 /// The thread ordering pins the root first no matter what its timestamp

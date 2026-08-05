@@ -852,6 +852,10 @@ async fn dispatch_request(
                     &params.post_id,
                 )
                 .await?;
+            // Failures are re-stated against the id the caller actually
+            // supplied. The root was derived here, not asked for: a
+            // caller who cited a reply never named it, and echoing it
+            // back would hand them an id they had no way to know.
             let mut messages = state
                 .client
                 .read_thread_in_channel(
@@ -859,7 +863,8 @@ async fn dispatch_request(
                     &resolved.channel_name,
                     &anchor.root_id,
                 )
-                .await?;
+                .await
+                .map_err(|error| restate_against_requested_post(error, &params.post_id))?;
             // `--latest` narrows the list; it does not change its type.
             //
             // Select the genuine maximum rather than taking the tail.
@@ -1325,6 +1330,27 @@ async fn dispatch_request(
     match response {
         Ok(value) => rpc_result(request.id, value),
         Err(error) => rpc_error(request.id, error_code(&error), error.to_string()),
+    }
+}
+
+/// Re-state a thread failure against the post id the caller supplied.
+///
+/// A thread read is anchored on whatever post the caller named, then run
+/// against that post's thread root. When the caller named a reply, the
+/// root is derived — so a refusal that quoted it would disclose an id the
+/// caller never supplied and could not otherwise obtain. Only the
+/// identifier in the failure changes; the kind of failure does not.
+fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> CoreError {
+    match error {
+        CoreError::AnchorChannelMismatch { channel, .. } => CoreError::AnchorChannelMismatch {
+            post_id: requested_post_id.to_string(),
+            channel,
+        },
+        CoreError::AnchorNotFound(_) => CoreError::AnchorNotFound(requested_post_id.to_string()),
+        CoreError::EmptyThread { .. } => CoreError::EmptyThread {
+            root_id: requested_post_id.to_string(),
+        },
+        other => other,
     }
 }
 
