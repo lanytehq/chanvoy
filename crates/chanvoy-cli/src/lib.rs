@@ -84,6 +84,16 @@ enum CommandSet {
     /// effects. Uses the cross-team channel resolver; accepts
     /// <team>/<channel> syntax and the --team flag.
     Pinned(PinnedArgs),
+    /// Fetch a single post by id from a named channel. Refuses if the
+    /// post is not in that channel, before returning any of its
+    /// content. Pure read, no cursor side effects. Accepts
+    /// <team>/<channel> syntax and the --team flag.
+    Show(ShowArgs),
+    /// Read a whole thread — the root post plus every reply. The id may
+    /// be the root's or any reply's; both read the same thread. Pure
+    /// read, no cursor side effects. Accepts <team>/<channel> syntax
+    /// and the --team flag.
+    Thread(ThreadArgs),
     /// Advance the attention cursor to the channel's current latest
     /// post without fetching content. Uses the cross-team channel
     /// resolver; accepts <team>/<channel> syntax.
@@ -443,6 +453,36 @@ struct PinArgs {
 }
 
 #[derive(Debug, Args)]
+struct ShowArgs {
+    /// Channel context (positional, required). Accepts
+    /// `<team>/<channel>` syntax for cross-team resolution.
+    channel: String,
+    /// Post ID to fetch. Format matches `chanvoy post`'s returned ID
+    /// and the `id=` crumb on `chanvoy read`'s output.
+    post_id: String,
+    /// Explicit team override for cross-team channel resolution.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ThreadArgs {
+    /// Channel context (positional, required). Accepts
+    /// `<team>/<channel>` syntax for cross-team resolution.
+    channel: String,
+    /// Any post ID in the thread — the root or a reply. The thread is
+    /// the same either way.
+    post_id: String,
+    /// Return only the most recent message in the thread. The output
+    /// is still a list; `--json` still emits an array.
+    #[arg(long)]
+    latest: bool,
+    /// Explicit team override for cross-team channel resolution.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct DmSendArgs {
     username: String,
     /// Message body. Optional: omit and use `--message-file <path>`, or
@@ -780,6 +820,18 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
             cli.json,
             &daemon_client(&profile)
                 .pinned_channel(&args.channel, args.team.clone())
+                .await?,
+        ),
+        CommandSet::Show(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .get_post(&args.channel, &args.post_id, args.team.clone())
+                .await?,
+        ),
+        CommandSet::Thread(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .read_thread(&args.channel, &args.post_id, args.latest, args.team.clone())
                 .await?,
         ),
         CommandSet::Ack(args) => print_value(
@@ -3086,6 +3138,12 @@ impl HumanReadable for Vec<DmConversation> {
     }
 }
 
+impl HumanReadable for Message {
+    fn to_human_string(&self) -> String {
+        format_message(self)
+    }
+}
+
 impl HumanReadable for Vec<Message> {
     fn to_human_string(&self) -> String {
         self.iter()
@@ -3306,11 +3364,21 @@ fn ws_state_label(s: WsConnectionState) -> &'static str {
     }
 }
 
+/// The post id is on every row so an operator reading without `--json`
+/// can hand a citation straight to `show`, `thread`, or `post
+/// --reply-to`. It is the full id, not a shortened one, because it has
+/// to be copy-pasteable. `root=` appears only on replies — on a root it
+/// would just repeat the id.
 fn format_message(message: &Message) -> String {
+    let mut crumb = format!("id={}", message.id);
+    if !message.root_id.is_empty() && message.root_id != message.id {
+        crumb.push_str(&format!(" root={}", message.root_id));
+    }
     format!(
-        "{} [{}]\n{}\n---",
+        "{} [{}] {}\n{}\n---",
         format_timestamp(message.create_at),
         message.username,
+        crumb,
         message.message
     )
 }

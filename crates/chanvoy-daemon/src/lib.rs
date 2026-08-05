@@ -11,13 +11,13 @@ use chanvoy_core::{
     store_attention_state, AckChannelParams, AckResult, AddMemberParams, ArchiveChannelParams,
     AttentionShowParams, AttentionState, CapabilityClass, Channel, CheckChannelParams, CheckResult,
     CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
-    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig,
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs,
-    NotificationsParams, NotifyParams, PinParams, PinResult, PinnedChannelParams,
+    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, GetPostParams,
+    IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient,
+    MattermostWs, NotificationsParams, NotifyParams, PinParams, PinResult, PinnedChannelParams,
     PostMessageParams, Profile, ProfileStatus, Provider, ReactParams, ReactionResult,
-    ReadChannelParams, ReadDirectMessageParams, SearchParams, SearchResult, ShutdownResult,
-    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult, UnreactParams,
-    UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
+    ReadChannelParams, ReadDirectMessageParams, ReadThreadParams, SearchParams, SearchResult,
+    ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult,
+    UnreactParams, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -814,6 +814,53 @@ async fn dispatch_request(
             .await
             .map(to_value)
         }
+        "get_post" => parse_and_call(&request.params, |params: GetPostParams| async move {
+            // Pure read. Resolution first so the post is bound against
+            // the channel id the operator's channel argument actually
+            // named, then one point-fetch that refuses before it
+            // returns a body if the post lives elsewhere.
+            let resolved = state
+                .client
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            state
+                .client
+                .get_post_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &params.post_id,
+                )
+                .await
+        })
+        .await
+        .map(to_value),
+        "read_thread" => parse_and_call(&request.params, |params: ReadThreadParams| async move {
+            // Pure read. The anchor point-fetch does double duty: it is
+            // the channel binding (no thread request is issued at all if
+            // it refuses) and it is where the canonical root comes from,
+            // which is what lets an operator name any reply in the
+            // thread rather than having to know the root.
+            let resolved = state
+                .client
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            let anchor = state
+                .client
+                .get_post_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &params.post_id,
+                )
+                .await?;
+            let mut messages = state.client.read_thread(&anchor.root_id).await?;
+            // `--latest` narrows the list; it does not change its type.
+            if params.latest && messages.len() > 1 {
+                messages = messages.split_off(messages.len() - 1);
+            }
+            Ok::<_, CoreError>(messages)
+        })
+        .await
+        .map(to_value),
         "ack_channel" => parse_and_call(&request.params, |params: AckChannelParams| async move {
             let team = params.team.as_deref();
             // Resolve up-front so the result carries the operator-visible
@@ -2250,6 +2297,45 @@ impl DaemonClient {
                 limit,
                 from,
                 since_secs,
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// Fetch one post from a named channel. Pure read.
+    pub async fn get_post(
+        &self,
+        channel: &str,
+        post_id: &str,
+        team: Option<String>,
+    ) -> Result<chanvoy_core::Message, DaemonError> {
+        self.call(
+            "get_post",
+            serde_json::to_value(GetPostParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// Read the thread a post belongs to. `post_id` may be the root or
+    /// any reply. Pure read; always returns a list.
+    pub async fn read_thread(
+        &self,
+        channel: &str,
+        post_id: &str,
+        latest: bool,
+        team: Option<String>,
+    ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
+        self.call(
+            "read_thread",
+            serde_json::to_value(ReadThreadParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
+                latest,
                 team,
             })?,
         )

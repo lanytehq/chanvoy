@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`chanvoy show <channel> <post-id>`** fetches a single post. The channel is
+  required and the post is bound to it: a post that lives in another channel is
+  refused before any of its content is returned, so a post id on its own is not
+  authority to read a post. `--json` emits one object.
+- **`chanvoy thread <channel> <post-id>`** reads a whole thread — the root post
+  plus every reply. The id may be the root's or any reply's; both read the same
+  thread, so a citation taken from the middle of a conversation works without
+  the operator having to find the root first. `--latest` narrows the result to
+  the most recent message. `--json` emits an array in both cases, including
+  with `--latest`, so a flag never changes the shape of the output.
+
 ### Changed
+
+- **Human-readable reads now show the post id.** `chanvoy read` printed a
+  timestamp, an author, and a body, with no id anywhere — so an operator who
+  had not asked for `--json` could not cite a post to `show`, `thread`, or
+  `post --reply-to`. Every row now carries `id=<post-id>`, and replies also
+  carry `root=<root-id>`. `--json` output is unchanged.
 
 - **Messages now carry the thread they belong to.** Every message on the read
   and push paths reports a thread root: its own id when the message is
@@ -35,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A thread read over the agent IPC surface is now bound to the channel it
+  names.** The request carries a channel id and a thread root id, but only the
+  root id was used: the thread was fetched on the strength of the post id
+  alone, and every post in the response was then stamped with whatever channel
+  the caller had claimed. A caller holding any post id could read that thread
+  by naming any channel. The anchor post is now checked against the named
+  channel first, and a mismatch issues no thread request at all.
 - **Message authors are real names again, instead of "unknown".** Posts carry
   only a user id, and the code read an author-name field the server does not
   send on a post, so every message in every listing was attributed to

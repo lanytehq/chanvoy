@@ -217,6 +217,18 @@ pub fn core_error_to_chat(error: CoreError, request_id: &str) -> ChatFrame {
         // succeed — and this surface is consumed by agents, which honor
         // that flag literally.
         CoreError::EmptyThread { .. } => (ChatErrorCode::NotFound, Some(false)),
+        // A post that does not exist, and a post that exists in some
+        // other channel, are both permanent answers to the question
+        // that was asked. Retrying changes neither.
+        //
+        // Both report not-found rather than distinguishing the two:
+        // "this post is not in this channel" is the honest answer to
+        // the caller's question, and it does not confirm the existence
+        // of a post the caller named a channel it may not be able to
+        // read.
+        CoreError::AnchorNotFound(_) | CoreError::AnchorChannelMismatch { .. } => {
+            (ChatErrorCode::NotFound, Some(false))
+        }
         CoreError::RequiresElevatedCapability => (ChatErrorCode::PermissionDenied, Some(false)),
         CoreError::Api { status, .. } => match *status {
             s if s == reqwest::StatusCode::UNAUTHORIZED || s == reqwest::StatusCode::FORBIDDEN => {
@@ -695,31 +707,8 @@ impl IpcPeer {
                 }
                 let _ = &delegation_id;
                 let response = if let Some(root_id) = &thread_root_id {
-                    let result = self.client.read_thread(root_id).await;
-                    match result {
-                        Ok(messages) => {
-                            let limit = limit.unwrap_or(50) as usize;
-                            let posts: Vec<PostSummary> = messages
-                                .into_iter()
-                                .take(limit)
-                                .map(|m| PostSummary {
-                                    post_id: m.id.clone(),
-                                    channel_id: channel_id.clone(),
-                                    author: m.username.clone(),
-                                    created_at: format_rfc3339(m.create_at),
-                                    message: m.message.clone(),
-                                    thread_root_id: thread_root_of(&m),
-                                })
-                                .collect();
-                            ChatFrame::ReadResponse {
-                                request_id,
-                                channel_id,
-                                posts,
-                                has_more: None,
-                            }
-                        }
-                        Err(e) => core_error_to_chat(e, &request_id),
-                    }
+                    self.thread_read_response(request_id, channel_id, root_id, limit)
+                        .await
                 } else {
                     let since = chanvoy_core::now_unix_millis() - (30 * 60 * 1000);
                     let result = self
@@ -935,6 +924,62 @@ impl IpcPeer {
         }
     }
 
+    /// The thread branch of a read request.
+    ///
+    /// The anchor point-fetch is what binds the thread to the channel
+    /// the caller named. Without it the channel id on the request is
+    /// decoration — the thread would be read on the strength of the
+    /// post id alone, and every summary would then be stamped with
+    /// whatever channel the caller claimed, which is a read of any
+    /// thread the bot can see. A refusal here issues no thread request
+    /// at all.
+    ///
+    /// Separate from `handle_frame` so that contract can be exercised
+    /// without standing up a peer transport.
+    async fn thread_read_response(
+        &self,
+        request_id: String,
+        channel_id: String,
+        root_id: &str,
+        limit: Option<u32>,
+    ) -> ChatFrame {
+        // This peer speaks in channel ids, so the id doubles as the
+        // operator-facing channel name in a refusal.
+        let anchor = match self
+            .client
+            .get_post_in_channel(&channel_id, &channel_id, root_id)
+            .await
+        {
+            Ok(anchor) => anchor,
+            Err(e) => return core_error_to_chat(e, &request_id),
+        };
+        // The anchor's root is canonical, so naming any reply in the
+        // thread reads the whole thread.
+        let messages = match self.client.read_thread(&anchor.root_id).await {
+            Ok(messages) => messages,
+            Err(e) => return core_error_to_chat(e, &request_id),
+        };
+        let limit = limit.unwrap_or(50) as usize;
+        let posts: Vec<PostSummary> = messages
+            .into_iter()
+            .take(limit)
+            .map(|m| PostSummary {
+                post_id: m.id.clone(),
+                channel_id: channel_id.clone(),
+                author: m.username.clone(),
+                created_at: format_rfc3339(m.create_at),
+                message: m.message.clone(),
+                thread_root_id: thread_root_of(&m),
+            })
+            .collect();
+        ChatFrame::ReadResponse {
+            request_id,
+            channel_id,
+            posts,
+            has_more: None,
+        }
+    }
+
     async fn send_response(
         &self,
         tx: &AsyncPeerTx,
@@ -999,6 +1044,38 @@ mod tests {
                 assert_eq!(retryable, Some(false));
             }
             _ => panic!("expected error frame"),
+        }
+    }
+
+    /// A channel-binding refusal is permanent, and must not invite a
+    /// retry. It is also reported as not-found rather than as a
+    /// distinct mismatch, so a refusal does not confirm that the named
+    /// post exists somewhere the caller cannot see.
+    #[test]
+    fn a_binding_refusal_is_terminal_and_indistinguishable_from_not_found() {
+        for err in [
+            CoreError::AnchorNotFound("p-1".to_string()),
+            CoreError::AnchorChannelMismatch {
+                post_id: "p-1".to_string(),
+                channel: "somewhere-else".to_string(),
+            },
+        ] {
+            let frame = core_error_to_chat(err, "test-bind");
+            match frame {
+                ChatFrame::Error {
+                    error_code,
+                    retryable,
+                    ..
+                } => {
+                    assert_eq!(error_code, ChatErrorCode::NotFound);
+                    assert_eq!(
+                        retryable,
+                        Some(false),
+                        "a post cannot move into the requested channel on a retry"
+                    );
+                }
+                _ => panic!("expected error frame"),
+            }
         }
     }
 
@@ -1446,5 +1523,346 @@ mod tests {
         assert!(json.contains("identity_drift"), "json={json}");
         let parsed: ChatFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(frame, parsed);
+    }
+
+    // ------------------------------------------------------------------
+    // Thread reads are bound to the channel the caller named
+    // ------------------------------------------------------------------
+
+    mod thread_read {
+        use super::*;
+        use chanvoy_core::{CapabilityClass, CredentialMode, Provider};
+        use wiremock::matchers::{method as http_method, path as http_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const CALLER_CHANNEL: &str = "channel-the-caller-named";
+        const OTHER_CHANNEL: &str = "channel-the-caller-may-not-read";
+        const ROOT_ID: &str = "thread-root";
+
+        fn peer_against(mock_url: &str) -> IpcPeer {
+            let profile = Profile {
+                name: "thread-read".to_string(),
+                role: "bravo-devlead".to_string(),
+                scope: "lanytehq".to_string(),
+                provider: Provider::Mattermost,
+                bot_username: "bot-stable".to_string(),
+                team_name: "team-slug-stable".to_string(),
+                server_url: mock_url.to_string(),
+                env_name: "LANYTE_MM_TOKEN".to_string(),
+                env_file: None,
+                credential_mode: CredentialMode::EnvName,
+                capability_class: CapabilityClass::Standard,
+                monitored_channels: vec![],
+                ipc: None,
+                reduce: None,
+            };
+            let client = MattermostClient::new(&profile, "fixture-token".to_string())
+                .expect("build MattermostClient");
+            IpcPeer::new(
+                &profile,
+                client,
+                Arc::new(EventBus::new(16)),
+                "unused-gateway-socket".to_string(),
+                Arc::new(AtomicBool::new(false)),
+            )
+        }
+
+        /// One post in the shape the provider actually sends.
+        fn wire_post(
+            id: &str,
+            channel_id: &str,
+            user_id: &str,
+            create_at: i64,
+            root_id: &str,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "channel_id": channel_id,
+                "user_id": user_id,
+                "message": format!("body of {id}"),
+                "create_at": create_at,
+                "root_id": root_id,
+            })
+        }
+
+        fn posts_envelope(posts: Vec<serde_json::Value>) -> serde_json::Value {
+            let order: Vec<String> = posts
+                .iter()
+                .map(|p| p["id"].as_str().unwrap().to_string())
+                .collect();
+            let map: serde_json::Map<String, serde_json::Value> = posts
+                .into_iter()
+                .map(|p| (p["id"].as_str().unwrap().to_string(), p))
+                .collect();
+            serde_json::json!({ "order": order, "posts": map })
+        }
+
+        async fn mount_post(server: &MockServer, post: serde_json::Value) {
+            let id = post["id"].as_str().unwrap().to_string();
+            Mock::given(http_method("GET"))
+                .and(http_path(format!("/api/v4/posts/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(post))
+                .mount(server)
+                .await;
+        }
+
+        async fn mount_thread(server: &MockServer, root_id: &str, body: serde_json::Value) {
+            Mock::given(http_method("GET"))
+                .and(http_path(format!("/api/v4/posts/{root_id}/thread")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+
+        async fn mount_user(server: &MockServer, user_id: &str, username: &str) {
+            Mock::given(http_method("GET"))
+                .and(http_path(format!("/api/v4/users/{user_id}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"id": user_id, "username": username})),
+                )
+                .mount(server)
+                .await;
+        }
+
+        async fn thread_requests(server: &MockServer) -> usize {
+            server
+                .received_requests()
+                .await
+                .expect("wiremock received_requests")
+                .iter()
+                .filter(|req| req.url.path().ends_with("/thread"))
+                .count()
+        }
+
+        /// A thread that lives in the caller's channel reads normally,
+        /// and every summary names the thread it belongs to.
+        #[tokio::test]
+        async fn a_thread_in_the_named_channel_reads_and_every_post_names_its_thread() {
+            let server = MockServer::start().await;
+            mount_post(
+                &server,
+                wire_post(ROOT_ID, CALLER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+            )
+            .await;
+            mount_thread(
+                &server,
+                ROOT_ID,
+                posts_envelope(vec![
+                    wire_post(ROOT_ID, CALLER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+                    wire_post(
+                        "reply-1",
+                        CALLER_CHANNEL,
+                        "user-b",
+                        1_700_000_001_000,
+                        ROOT_ID,
+                    ),
+                ]),
+            )
+            .await;
+            mount_user(&server, "user-a", "alice").await;
+            mount_user(&server, "user-b", "bob").await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-ok".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    ROOT_ID,
+                    None,
+                )
+                .await;
+
+            match frame {
+                ChatFrame::ReadResponse {
+                    request_id,
+                    channel_id,
+                    posts,
+                    ..
+                } => {
+                    assert_eq!(request_id, "req-ok");
+                    assert_eq!(channel_id, CALLER_CHANNEL);
+                    assert_eq!(
+                        posts.iter().map(|p| p.post_id.as_str()).collect::<Vec<_>>(),
+                        vec![ROOT_ID, "reply-1"]
+                    );
+                    assert_eq!(
+                        posts.iter().map(|p| p.author.as_str()).collect::<Vec<_>>(),
+                        vec!["alice", "bob"]
+                    );
+                    for post in &posts {
+                        assert_eq!(
+                            post.thread_root_id.as_deref(),
+                            Some(ROOT_ID),
+                            "every summary names the thread it is part of: {post:?}"
+                        );
+                    }
+                }
+                other => panic!("expected ReadResponse, got {other:?}"),
+            }
+        }
+
+        /// Naming a reply reads the same thread as naming the root — the
+        /// anchor's root is what the thread request is made against.
+        #[tokio::test]
+        async fn naming_a_reply_reads_the_whole_thread() {
+            let server = MockServer::start().await;
+            let reply = wire_post(
+                "reply-1",
+                CALLER_CHANNEL,
+                "user-b",
+                1_700_000_001_000,
+                ROOT_ID,
+            );
+            mount_post(&server, reply).await;
+            mount_thread(
+                &server,
+                ROOT_ID,
+                posts_envelope(vec![
+                    wire_post(ROOT_ID, CALLER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+                    wire_post(
+                        "reply-1",
+                        CALLER_CHANNEL,
+                        "user-b",
+                        1_700_000_001_000,
+                        ROOT_ID,
+                    ),
+                ]),
+            )
+            .await;
+            // Deliberately NOT mounted: /posts/reply-1/thread. Asking
+            // the provider for the thread of the id the caller passed,
+            // rather than the canonical root, 404s and fails this test.
+            mount_user(&server, "user-a", "alice").await;
+            mount_user(&server, "user-b", "bob").await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-reply".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    "reply-1",
+                    None,
+                )
+                .await;
+
+            match frame {
+                ChatFrame::ReadResponse { posts, .. } => assert_eq!(
+                    posts.iter().map(|p| p.post_id.as_str()).collect::<Vec<_>>(),
+                    vec![ROOT_ID, "reply-1"],
+                    "a reply id reads the same thread its root does"
+                ),
+                other => panic!("expected ReadResponse, got {other:?}"),
+            }
+        }
+
+        /// A post that lives in another channel is refused, and the
+        /// thread is never asked for. Asserting only on the error would
+        /// pass even if the bind ran after the fetch.
+        #[tokio::test]
+        async fn a_thread_in_another_channel_is_refused_before_any_thread_request() {
+            let server = MockServer::start().await;
+            mount_post(
+                &server,
+                wire_post(ROOT_ID, OTHER_CHANNEL, "user-a", 1_700_000_000_000, ""),
+            )
+            .await;
+            // Mounted and answerable on purpose: the point is that it is
+            // never called, not that calling it would fail.
+            mount_thread(
+                &server,
+                ROOT_ID,
+                posts_envelope(vec![wire_post(
+                    ROOT_ID,
+                    OTHER_CHANNEL,
+                    "user-a",
+                    1_700_000_000_000,
+                    "",
+                )]),
+            )
+            .await;
+            mount_user(&server, "user-a", "alice").await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-mismatch".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    ROOT_ID,
+                    None,
+                )
+                .await;
+
+            match &frame {
+                ChatFrame::Error { message, .. } => assert!(
+                    message.contains(ROOT_ID) && message.contains(CALLER_CHANNEL),
+                    "refusal names the post and the channel it is not in: {message}"
+                ),
+                other => panic!("expected Error frame, got {other:?}"),
+            }
+            let rendered = serde_json::to_string(&frame).expect("serialize frame");
+            assert!(
+                !rendered.contains("body of"),
+                "no post body may leak on a refusal: {rendered}"
+            );
+            assert_eq!(
+                thread_requests(&server).await,
+                0,
+                "a cross-channel thread read must issue no thread request at all"
+            );
+        }
+
+        /// A post that does not exist is refused, and again nothing is
+        /// asked of the thread endpoint.
+        #[tokio::test]
+        async fn a_missing_anchor_is_refused_before_any_thread_request() {
+            let server = MockServer::start().await;
+            Mock::given(http_method("GET"))
+                .and(http_path(format!("/api/v4/posts/{ROOT_ID}")))
+                .respond_with(
+                    ResponseTemplate::new(404)
+                        .set_body_json(serde_json::json!({"status_code": 404})),
+                )
+                .mount(&server)
+                .await;
+            mount_thread(
+                &server,
+                ROOT_ID,
+                posts_envelope(vec![wire_post(
+                    ROOT_ID,
+                    CALLER_CHANNEL,
+                    "user-a",
+                    1_700_000_000_000,
+                    "",
+                )]),
+            )
+            .await;
+            let peer = peer_against(&server.uri());
+
+            let frame = peer
+                .thread_read_response(
+                    "req-missing".to_string(),
+                    CALLER_CHANNEL.to_string(),
+                    ROOT_ID,
+                    None,
+                )
+                .await;
+
+            match &frame {
+                // Code and retryability are whatever `core_error_to_chat`
+                // already assigns an anchor failure; this test is about
+                // the refusal happening at all, and happening first.
+                ChatFrame::Error { message, .. } => assert!(
+                    message.contains(ROOT_ID),
+                    "refusal names the post it could not find: {message}"
+                ),
+                other => panic!("expected Error frame, got {other:?}"),
+            }
+            assert_eq!(
+                thread_requests(&server).await,
+                0,
+                "a missing anchor must issue no thread request at all"
+            );
+        }
     }
 }

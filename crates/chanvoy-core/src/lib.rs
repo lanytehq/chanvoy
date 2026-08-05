@@ -670,6 +670,32 @@ pub struct PinnedChannelParams {
     pub team: Option<String>,
 }
 
+/// Parameters for fetching one post by id. Pure read; the channel is
+/// required so the post can be bound to a channel the caller named
+/// before any body is returned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetPostParams {
+    pub channel: String,
+    pub post_id: String,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// Parameters for reading a thread. `post_id` may name either the
+/// thread's root or any reply in it — the canonical root is derived
+/// from the anchor post. Pure read; no cursor side effects.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadThreadParams {
+    pub channel: String,
+    pub post_id: String,
+    /// Keep only the final message of the thread. The response stays a
+    /// list either way.
+    #[serde(default)]
+    pub latest: bool,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
 /// PER-024 primitive 2: parameters for `chanvoy react <channel>
 /// <post_id> <emoji>`. Channel context is positional (required) for
 /// multi-provider portability — Slack's reactions API needs the
@@ -2615,11 +2641,10 @@ struct AuthorCacheEntry {
 pub(crate) struct RawPost {
     pub id: String,
     /// Owning channel. Defaulted because the thread and search shapes
-    /// do not always carry it. Decoded but not yet read by any read
-    /// path, so the field is retained as part of the canonical shape
-    /// rather than dropped and re-added.
+    /// do not always carry it. Read by the point-fetch path, which
+    /// compares it against the channel the caller named before it will
+    /// hand back a body.
     #[serde(default)]
-    #[allow(dead_code)]
     pub channel_id: String,
     pub user_id: String,
     pub message: String,
@@ -4349,6 +4374,51 @@ impl MattermostClient {
         }
 
         Ok(())
+    }
+
+    /// Fetch one post, bound to the channel the caller named.
+    ///
+    /// The binding is the point of this call: the channel comparison
+    /// runs on the decoded post **before** anything is hydrated or
+    /// returned, so a post that lives somewhere else never yields a
+    /// body to the caller. Same two refusals as
+    /// `assert_post_in_channel` — a missing post is `AnchorNotFound`,
+    /// a post in another channel is `AnchorChannelMismatch`.
+    ///
+    /// One round-trip. Hydration goes through the shared
+    /// `hydrate_posts` path so the author name and the thread-root
+    /// normalization are identical to every other read.
+    pub async fn get_post_in_channel(
+        &self,
+        expected_channel_id: &str,
+        channel_name: &str,
+        post_id: &str,
+    ) -> Result<Message, CoreError> {
+        let post: RawPost = match self
+            .request("GET", &format!("/posts/{post_id}"), None::<Value>)
+            .await
+        {
+            Ok(post) => post,
+            Err(CoreError::Api {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }) => return Err(CoreError::AnchorNotFound(post_id.to_string())),
+            Err(error) => return Err(error),
+        };
+
+        if post.channel_id != expected_channel_id {
+            return Err(CoreError::AnchorChannelMismatch {
+                post_id: post_id.to_string(),
+                channel: channel_name.to_string(),
+            });
+        }
+
+        let mut hydrated = self.hydrate_posts(vec![post]).await;
+        // `hydrate_posts` is one-for-one and order-preserving, so the
+        // single input post is always here.
+        hydrated
+            .pop()
+            .ok_or_else(|| CoreError::AnchorNotFound(post_id.to_string()))
     }
 
     /// PER-034: like `assert_post_in_channel`, but returns the

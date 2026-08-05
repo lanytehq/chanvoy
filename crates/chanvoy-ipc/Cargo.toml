@@ -25,3 +25,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Already in the workspace lock (root dev-dependency); declared here so
+# the peer's read handlers can be driven against a mocked provider.
+wiremock = "0.6"
