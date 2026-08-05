@@ -32,6 +32,14 @@ use common::{
     stop_daemon_cleanly, TestEnv,
 };
 
+/// Cursors are keyed by team-qualified channel name, so a channel of
+/// the same name on two teams cannot collide in attention state. A
+/// command still takes the bare name — resolution qualifies it — so the
+/// argument and the state key deliberately differ.
+fn cursor_key(channel: &str) -> String {
+    format!("org-lanytehq/{channel}")
+}
+
 /// `attention list` on a daemon with no tracked channels surfaces an
 /// empty channels list + `no_anchor` mentions, JSON and text both.
 #[tokio::test]
@@ -95,7 +103,10 @@ async fn attention_list_and_show_after_post() {
     let channels = list["channels"].as_array().expect("channels array");
     assert_eq!(channels.len(), 1, "exactly one tracked channel after post");
     let entry = &channels[0];
-    assert_eq!(entry["channel"].as_str(), Some("bravo-team"));
+    assert_eq!(
+        entry["channel"].as_str(),
+        Some(cursor_key("bravo-team").as_str())
+    );
     assert_eq!(entry["source"].as_str(), Some("post_cursor"));
     assert_eq!(entry["newest_seen"].as_str(), Some("post-id-b2-xyz"));
     assert!(
@@ -158,9 +169,16 @@ async fn attention_list_includes_monitored_but_uncursored_channels() {
         3,
         "expected all three channels (bravo-team, per-008 monitored-uncursored; per-009 cursored); got {channels:?}"
     );
+    // Keyed on the bare channel name regardless of team qualification —
+    // this test is about which channels appear (monitored ∪ cursored),
+    // not how the key is spelled. Qualification itself is asserted in
+    // `attention_list_and_show_after_post`.
     let by_name: std::collections::BTreeMap<&str, &serde_json::Value> = channels
         .iter()
-        .map(|c| (c["channel"].as_str().unwrap(), c))
+        .map(|c| {
+            let full = c["channel"].as_str().unwrap();
+            (full.rsplit('/').next().unwrap_or(full), c)
+        })
         .collect();
     assert_eq!(
         by_name["bravo-team"]["source"].as_str(),
@@ -286,7 +304,9 @@ async fn attention_commands_do_not_mutate_state_file() {
         read_attention_state_bytes(&env).expect("state file exists after seed post");
     let parsed_before = read_attention_state(&env).expect("state parses");
     assert!(
-        parsed_before.channels.contains_key("bravo-team"),
+        parsed_before
+            .channels
+            .contains_key(cursor_key("bravo-team").as_str()),
         "pre-snapshot has the seeded channel cursor"
     );
 
@@ -385,9 +405,10 @@ async fn attention_list_text_output_renders() {
     // Find the bravo-team row and verify the last column (CHECKED) is
     // no longer "—". Parse by splitting on the row prefix and checking
     // the tail contains a year-shaped timestamp ("2026-").
+    let row_prefix = format!("{} ", cursor_key("bravo-team"));
     let row = stdout_after
         .lines()
-        .find(|line| line.starts_with("bravo-team "))
+        .find(|line| line.starts_with(&row_prefix))
         .unwrap_or_else(|| panic!("bravo-team row missing from text list; stdout={stdout_after}"));
     assert!(
         row.contains("2026-"),
