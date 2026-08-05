@@ -4492,4 +4492,48 @@ mod tests {
         let body = read_message_from_reader_capped(false, &b"ok body\n"[..], 1024).unwrap();
         assert_eq!(body, "ok body\n");
     }
+
+    /// A message whose thread root is unknown renders no `root=` crumb
+    /// at all, rather than an empty one.
+    ///
+    /// An empty root arrives from a daemon started before the field
+    /// existed, which is a normal state right after an install: the new
+    /// binary is in place, the old daemon is still serving. `root=` with
+    /// nothing after it reads as a value the operator can paste into
+    /// `--reply-to`, and pasting it would post to the wrong place.
+    /// Omitting the crumb says the true thing, which is that this row
+    /// cannot answer the question.
+    #[test]
+    fn a_message_with_no_thread_root_renders_no_root_crumb() {
+        let unknown_root = Message {
+            id: "post-1".to_string(),
+            user_id: "user-a".to_string(),
+            username: "alice".to_string(),
+            message: "sent by an older daemon".to_string(),
+            create_at: 1_700_000_000_000,
+            root_id: String::new(),
+        };
+
+        let rendered = format_message(&unknown_root);
+        assert!(
+            rendered.contains("id=post-1"),
+            "the post id is still citable: {rendered}"
+        );
+        assert!(
+            !rendered.contains("root="),
+            "an unknown thread root must not render as an empty, paste-able \
+             crumb: {rendered}"
+        );
+
+        // The contrast case, so this test cannot be satisfied by
+        // deleting the crumb outright: a known root is still stated.
+        let known_root = Message {
+            root_id: "thread-root".to_string(),
+            ..unknown_root
+        };
+        assert!(
+            format_message(&known_root).contains("root=thread-root"),
+            "a known thread root is named on the row"
+        );
+    }
 }

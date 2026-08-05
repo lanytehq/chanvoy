@@ -667,6 +667,11 @@ async fn thread_with_an_out_of_channel_reply_is_refused_whole() {
         );
     }
     assert!(
+        !rendered.contains("stray-reply"),
+        "the offending post's id is provider-supplied, not the caller's, and \
+         must not reach the operator: {rendered}"
+    );
+    assert!(
         !rendered.contains(OTHER_CHANNEL_ID),
         "the refusal must not name the channel the stray post came from: {rendered}"
     );

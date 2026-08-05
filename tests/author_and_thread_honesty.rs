@@ -295,15 +295,27 @@ async fn a_thread_carrying_a_post_from_another_channel_is_refused_whole() {
 
     match &error {
         chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            // The refusal names the id the CALLER asked about, never the
+            // stray post's. That id was not theirs to learn: disclosing
+            // it would confirm the existence and identity of a post
+            // outside the channel they named.
             assert_eq!(
+                post_id, ROOT_ID,
+                "the refusal names the requested anchor, not the offending post"
+            );
+            assert_ne!(
                 post_id, "stray-reply",
-                "the refusal names the post that did not belong"
+                "a provider-returned id must not reach the caller"
             );
             assert_eq!(channel, "the-channel");
         }
         other => panic!("expected AnchorChannelMismatch, got {other:?}"),
     }
     let rendered = error.to_string();
+    assert!(
+        !rendered.contains("stray-reply"),
+        "the offending post's id must not appear anywhere in the refusal: {rendered}"
+    );
     for body in ["body of root-post", "body of stray-reply"] {
         assert!(
             !rendered.contains(body),
@@ -313,6 +325,231 @@ async fn a_thread_carrying_a_post_from_another_channel_is_refused_whole() {
     assert!(
         !rendered.contains(stray_channel),
         "the refusal must not name the channel the stray post came from: {rendered}"
+    );
+}
+
+/// An envelope entirely inside the requested channel, but with no post
+/// carrying the requested id, is refused rather than returned.
+///
+/// Every post in it passes the channel bind, so the channel check alone
+/// cannot see this. What comes back is a set of replies whose root was
+/// not included — plausible thread-shaped data that is not the thread
+/// that was asked for. Returned, it would be labelled with the
+/// requested root anyway, and a caller selecting the latest post in
+/// "the thread" would select a post from a conversation it never named.
+#[tokio::test]
+async fn a_thread_envelope_without_the_requested_root_is_refused() {
+    let server = MockServer::start().await;
+    // Both posts name ROOT_ID as their thread root, so the per-post
+    // "belongs to this thread" check passes on each of them. Only the
+    // requested root's own absence is wrong here.
+    mount_thread(
+        &server,
+        ROOT_ID,
+        posts_envelope(vec![
+            wire_post("reply-1", "user-a", 1_700_000_001_000, ROOT_ID),
+            wire_post("reply-2", "user-b", 1_700_000_002_000, ROOT_ID),
+        ]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    mount_user(&server, "user-b", "bob").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect_err("an envelope missing the requested root must not read as success");
+
+    match &error {
+        chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            assert_eq!(
+                post_id, ROOT_ID,
+                "the refusal names the root the caller asked for"
+            );
+            assert_eq!(channel, "the-channel");
+        }
+        other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+    }
+    let rendered = error.to_string();
+    for provider_id in ["reply-1", "reply-2"] {
+        assert!(
+            !rendered.contains(provider_id),
+            "no provider-returned post id may reach the caller: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("body of"),
+        "no post body may survive the refusal: {rendered}"
+    );
+}
+
+/// An envelope in the right channel that carries a post rooted in a
+/// different conversation is refused whole.
+///
+/// Same channel is not the same thread. The requested root is present
+/// and genuinely top-level, so neither the channel bind nor the
+/// root-shape check sees anything wrong — the stray post is only
+/// detectable by the root it names.
+#[tokio::test]
+async fn a_thread_carrying_a_post_from_another_conversation_is_refused() {
+    let server = MockServer::start().await;
+    let other_root = "root-of-a-different-conversation";
+    mount_thread(
+        &server,
+        ROOT_ID,
+        posts_envelope(vec![
+            wire_post(ROOT_ID, "user-a", 1_700_000_000_000, ""),
+            // Same channel, correct-looking reply, wrong conversation.
+            wire_post("foreign-reply", "user-b", 1_700_000_001_000, other_root),
+        ]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    mount_user(&server, "user-b", "bob").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect_err("a post from another thread must not read as success");
+
+    match &error {
+        chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            assert_eq!(
+                post_id, ROOT_ID,
+                "the refusal names the requested root, not the offending post"
+            );
+            assert_ne!(
+                post_id, "foreign-reply",
+                "a provider-returned id must not reach the caller"
+            );
+            assert_eq!(channel, "the-channel");
+        }
+        other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("foreign-reply"),
+        "the offending post's id must not appear in the refusal: {rendered}"
+    );
+    assert!(
+        !rendered.contains(other_root),
+        "the refusal must not name the conversation the stray post came from: {rendered}"
+    );
+    assert!(
+        !rendered.contains("body of"),
+        "no post body may survive the refusal: {rendered}"
+    );
+}
+
+/// A requested "root" that is itself a reply is refused.
+///
+/// The provider answers a thread request made against a reply with the
+/// whole thread, so the envelope is well-formed and in the right
+/// channel. But the caller named a post that is not the thread's root,
+/// and everything downstream treats the first element as the root —
+/// hydrating this would hand back a thread whose root is not the id it
+/// was requested under. The caller is told to ask against the canonical
+/// root instead of being quietly given a differently-shaped answer.
+#[tokio::test]
+async fn a_requested_root_that_is_itself_a_reply_is_refused() {
+    let server = MockServer::start().await;
+    let elder_root = "the-post-this-one-replies-to";
+    // Only one post, so the "every other post names this root" check
+    // has nothing to look at: the sole thing wrong is that the
+    // requested post is a reply.
+    mount_thread(
+        &server,
+        ROOT_ID,
+        posts_envelope(vec![wire_post(
+            ROOT_ID,
+            "user-a",
+            1_700_000_001_000,
+            elder_root,
+        )]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread_in_channel(CHANNEL_ID, "the-channel", ROOT_ID)
+        .await
+        .expect_err("a reply requested as a root must not read as success");
+
+    match &error {
+        chanvoy_core::CoreError::AnchorChannelMismatch { post_id, channel } => {
+            assert_eq!(
+                post_id, ROOT_ID,
+                "the refusal names the id the caller supplied"
+            );
+            assert_ne!(
+                post_id, elder_root,
+                "the real root is provider-supplied and must not be echoed back"
+            );
+            assert_eq!(channel, "the-channel");
+        }
+        other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+    }
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains(elder_root),
+        "the refusal must not disclose the thread the post really belongs to: {rendered}"
+    );
+    assert!(
+        !rendered.contains("body of"),
+        "no post body may survive the refusal: {rendered}"
+    );
+}
+
+/// The removed unbound thread read refuses without asking the provider
+/// anything at all.
+///
+/// It is kept as an exported symbol so code built against the previous
+/// release still compiles, with a deprecation warning instead of a hard
+/// break. Refusing is the whole behaviour: forwarding to the bound read
+/// would mean inventing a channel, which is the unscoped read it was
+/// removed for. Asserting on the error alone would still pass if it
+/// fetched the thread and then threw the result away, so the request
+/// count is asserted too — that is the part that matters.
+#[tokio::test]
+#[allow(deprecated)]
+async fn the_removed_unbound_thread_read_refuses_without_touching_the_provider() {
+    let server = MockServer::start().await;
+    // Mounted and answerable on purpose: the point is that it is never
+    // called, not that calling it would fail.
+    mount_thread(
+        &server,
+        ROOT_ID,
+        posts_envelope(vec![wire_post(ROOT_ID, "user-a", 1_700_000_000_000, "")]),
+    )
+    .await;
+    mount_user(&server, "user-a", "alice").await;
+    let client = build_client(&server.uri());
+
+    let error = client
+        .read_thread(ROOT_ID)
+        .await
+        .expect_err("the removed read must not return posts");
+    assert!(
+        matches!(error, chanvoy_core::CoreError::UnboundThreadReadRemoved),
+        "expected UnboundThreadReadRemoved, got {error:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("read_thread_in_channel"),
+        "the refusal says what to call instead: {rendered}"
+    );
+
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("wiremock received_requests")
+            .len(),
+        0,
+        "the removed read must issue no request of any kind"
     );
 }
 

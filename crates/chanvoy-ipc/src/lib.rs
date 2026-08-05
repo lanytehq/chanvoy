@@ -739,33 +739,8 @@ impl IpcPeer {
                     self.thread_read_response(request_id, channel_id, root_id, limit)
                         .await
                 } else {
-                    let since = chanvoy_core::now_unix_millis() - (30 * 60 * 1000);
-                    let result = self
-                        .client
-                        .read_channel_by_id_since_millis(&channel_id, since)
-                        .await;
-                    match result {
-                        Ok(messages) => {
-                            let limit = limit.unwrap_or(50) as usize;
-                            // Same honesty rule as the thread branch: a
-                            // truncated list must say so, or a caller
-                            // cannot tell a complete channel read from
-                            // the first page of one.
-                            let total = messages.len();
-                            let posts: Vec<PostSummary> = messages
-                                .into_iter()
-                                .take(limit)
-                                .map(|m| message_to_post_summary(&m, &channel_id))
-                                .collect();
-                            ChatFrame::ReadResponse {
-                                request_id,
-                                channel_id,
-                                posts,
-                                has_more: Some(total > limit),
-                            }
-                        }
-                        Err(e) => core_error_to_chat(e, &request_id),
-                    }
+                    self.channel_read_response(request_id, channel_id, limit)
+                        .await
                 };
                 let _ = self.send_response(tx, &response).await;
             }
@@ -955,6 +930,61 @@ impl IpcPeer {
                 let _ = self.send_response(tx, &response).await;
             }
             _ => {}
+        }
+    }
+
+    /// The ordinary (non-thread) branch of a read request: a time
+    /// window over one channel.
+    ///
+    /// Separate from `handle_frame` for the same reason
+    /// `thread_read_response` is — the completeness contract below has
+    /// to be exercisable without standing up a peer transport.
+    async fn channel_read_response(
+        &self,
+        request_id: String,
+        channel_id: String,
+        limit: Option<u32>,
+    ) -> ChatFrame {
+        let since = chanvoy_core::now_unix_millis() - (30 * 60 * 1000);
+        let result = self
+            .client
+            .read_channel_by_id_since_millis(&channel_id, since)
+            .await;
+        match result {
+            Ok(messages) => {
+                let limit = limit.unwrap_or(50) as usize;
+                let total = messages.len();
+                // Completeness here is three-valued, because the
+                // provider has already had its say.
+                //
+                // A window read asks for one page. If it came back
+                // full, posts may exist beyond it that this response
+                // never saw — so `false` would be a claim we cannot
+                // support, and the honest answer is that we do not
+                // know. Reporting `Some(false)` off `total > limit`
+                // alone was wrong for exactly this reason: with a limit
+                // above the page size, a truncated window reported
+                // itself complete.
+                let has_more = if total > limit {
+                    Some(true)
+                } else if total >= chanvoy_core::CHANNEL_WINDOW_PAGE_SIZE {
+                    None
+                } else {
+                    Some(false)
+                };
+                let posts: Vec<PostSummary> = messages
+                    .into_iter()
+                    .take(limit)
+                    .map(|m| message_to_post_summary(&m, &channel_id))
+                    .collect();
+                ChatFrame::ReadResponse {
+                    request_id,
+                    channel_id,
+                    posts,
+                    has_more,
+                }
+            }
+            Err(e) => core_error_to_chat(e, &request_id),
         }
     }
 
@@ -1602,11 +1632,11 @@ mod tests {
         use wiremock::matchers::{method as http_method, path as http_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        const CALLER_CHANNEL: &str = "channel-the-caller-named";
+        pub(super) const CALLER_CHANNEL: &str = "channel-the-caller-named";
         const OTHER_CHANNEL: &str = "channel-the-caller-may-not-read";
         const ROOT_ID: &str = "thread-root";
 
-        fn peer_against(mock_url: &str) -> IpcPeer {
+        pub(super) fn peer_against(mock_url: &str) -> IpcPeer {
             let profile = Profile {
                 name: "thread-read".to_string(),
                 role: "bravo-devlead".to_string(),
@@ -1635,7 +1665,7 @@ mod tests {
         }
 
         /// One post in the shape the provider actually sends.
-        fn wire_post(
+        pub(super) fn wire_post(
             id: &str,
             channel_id: &str,
             user_id: &str,
@@ -1652,7 +1682,7 @@ mod tests {
             })
         }
 
-        fn posts_envelope(posts: Vec<serde_json::Value>) -> serde_json::Value {
+        pub(super) fn posts_envelope(posts: Vec<serde_json::Value>) -> serde_json::Value {
             let order: Vec<String> = posts
                 .iter()
                 .map(|p| p["id"].as_str().unwrap().to_string())
@@ -1681,7 +1711,7 @@ mod tests {
                 .await;
         }
 
-        async fn mount_user(server: &MockServer, user_id: &str, username: &str) {
+        pub(super) async fn mount_user(server: &MockServer, user_id: &str, username: &str) {
             Mock::given(http_method("GET"))
                 .and(http_path(format!("/api/v4/users/{user_id}")))
                 .respond_with(
@@ -1991,7 +2021,18 @@ mod tests {
 
             match &frame {
                 ChatFrame::Error { message, .. } => {
-                    assert_eq!(message, &binding_refusal_message("stray-reply"));
+                    // The refusal names the root the caller asked for.
+                    // The stray post's id is provider-supplied and is
+                    // not the caller's to learn: echoing it back would
+                    // confirm the existence and identity of a post
+                    // outside the channel they named, which is the
+                    // narrower disclosure form of the existence oracle
+                    // this bind exists to prevent.
+                    assert_eq!(message, &binding_refusal_message(ROOT_ID));
+                    assert!(
+                        !message.contains("stray-reply"),
+                        "the offending post's id must not reach the caller: {message}"
+                    );
                     assert!(
                         !message.contains(OTHER_CHANNEL),
                         "the refusal must not name where the stray post lives: {message}"
@@ -2096,6 +2137,120 @@ mod tests {
                 }
                 other => panic!("expected ReadResponse, got {other:?}"),
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // An ordinary channel read says what it does not know
+    // ------------------------------------------------------------------
+
+    mod channel_window_read {
+        use super::thread_read::{
+            mount_user, peer_against, posts_envelope, wire_post, CALLER_CHANNEL,
+        };
+        use super::*;
+        use wiremock::matchers::{method as http_method, path as http_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A window of `count` posts, all by one author, in the caller's
+        /// channel, ordered in time.
+        async fn mount_window(server: &MockServer, count: usize) {
+            let posts: Vec<serde_json::Value> = (0..count)
+                .map(|n| {
+                    wire_post(
+                        &format!("post-{n:02}"),
+                        CALLER_CHANNEL,
+                        "user-a",
+                        1_700_000_000_000 + n as i64 * 1_000,
+                        "",
+                    )
+                })
+                .collect();
+            Mock::given(http_method("GET"))
+                .and(http_path(format!(
+                    "/api/v4/channels/{CALLER_CHANNEL}/posts"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(posts_envelope(posts)))
+                .mount(server)
+                .await;
+            mount_user(server, "user-a", "alice").await;
+        }
+
+        async fn read_window(count: usize, limit: Option<u32>) -> ChatFrame {
+            let server = MockServer::start().await;
+            mount_window(&server, count).await;
+            let peer = peer_against(&server.uri());
+            peer.channel_read_response("req-window".to_string(), CALLER_CHANNEL.to_string(), limit)
+                .await
+        }
+
+        fn completeness_of(frame: ChatFrame) -> (usize, Option<bool>) {
+            match frame {
+                ChatFrame::ReadResponse {
+                    posts, has_more, ..
+                } => (posts.len(), has_more),
+                other => panic!("expected ReadResponse, got {other:?}"),
+            }
+        }
+
+        /// A window that comes back exactly full reports its
+        /// completeness as unknown, not as complete.
+        ///
+        /// One read asks the provider for one page. A page that arrives
+        /// full is the one case where the count carries no information:
+        /// a channel with exactly that many posts in the window and a
+        /// channel with hundreds look identical from here. The limit is
+        /// above the page size, so nothing was withheld by this layer —
+        /// but "we withheld nothing" is not "there is nothing more," and
+        /// answering `false` states the second while only knowing the
+        /// first. A peer that reads a channel to decide what to say
+        /// next would treat the front of a busy channel as the whole of
+        /// a quiet one, with no way to find out.
+        #[tokio::test]
+        async fn a_window_that_came_back_full_reports_completeness_as_unknown() {
+            let (returned, has_more) =
+                completeness_of(read_window(chanvoy_core::CHANNEL_WINDOW_PAGE_SIZE, None).await);
+
+            assert_eq!(
+                returned,
+                chanvoy_core::CHANNEL_WINDOW_PAGE_SIZE,
+                "the default limit is above the page size, so nothing is dropped here"
+            );
+            assert_eq!(
+                has_more, None,
+                "a full page cannot be told from a truncated one, and must not \
+                 be reported as complete"
+            );
+        }
+
+        /// A window that came back short of a page, and short of the
+        /// limit, genuinely is everything there was.
+        ///
+        /// The provider stopped before its page size, which is the one
+        /// piece of evidence that there was nothing more to send.
+        #[tokio::test]
+        async fn a_window_short_of_a_page_is_reported_complete() {
+            let (returned, has_more) = completeness_of(read_window(5, None).await);
+
+            assert_eq!(returned, 5);
+            assert_eq!(
+                has_more,
+                Some(false),
+                "a short page under the limit is the whole window"
+            );
+        }
+
+        /// A window cut short by the caller's own limit says so.
+        #[tokio::test]
+        async fn a_window_cut_short_by_the_limit_is_reported_truncated() {
+            let (returned, has_more) = completeness_of(read_window(5, Some(2)).await);
+
+            assert_eq!(returned, 2, "the limit is applied");
+            assert_eq!(
+                has_more,
+                Some(true),
+                "posts this layer withheld itself must be declared"
+            );
         }
     }
 }

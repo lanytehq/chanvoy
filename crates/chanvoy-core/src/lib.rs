@@ -1703,6 +1703,17 @@ pub enum CoreError {
     AnchorChannelMismatch { post_id: String, channel: String },
     #[error("no prior authored post found in channel {channel} for {username}")]
     NoPriorAuthoredPost { channel: String, username: String },
+    /// A caller reached the removed unbound thread read.
+    ///
+    /// The replacement takes the channel the read is scoped to. The old
+    /// entry point cannot be forwarded to it, because forwarding would
+    /// have to invent a channel and would reinstate precisely the
+    /// unscoped read the replacement exists to prevent. It refuses
+    /// instead, and says what to call.
+    #[error(
+        "read_thread was removed because it could not verify which channel a          thread belonged to; call read_thread_in_channel(expected_channel_id,          channel_name, root_post_id) instead"
+    )]
+    UnboundThreadReadRemoved,
     /// A thread read came back with zero posts. Every thread contains at
     /// least its own root, so an empty body means the provider could not
     /// give us the thread rather than that the thread is empty — surface
@@ -2734,6 +2745,14 @@ fn normalize_root_id(provider_root_id: &str, post_id: &str) -> String {
     }
 }
 
+/// How many posts one time-window channel read asks the provider for.
+///
+/// A single page. A caller that receives exactly this many cannot tell
+/// a complete window from a truncated one, so completeness must be
+/// reported as unknown rather than guessed at — see the peer surface's
+/// truncation reporting.
+pub const CHANNEL_WINDOW_PAGE_SIZE: usize = 30;
+
 /// Whether a post's channel satisfies the channel it was requested in.
 ///
 /// An empty value on either side is refused rather than treated as a
@@ -3432,7 +3451,9 @@ impl MattermostClient {
         let response: PostsEnvelope = self
             .request(
                 "GET",
-                &format!("/channels/{channel_id}/posts?since={since_millis}&per_page=30"),
+                &format!(
+                    "/channels/{channel_id}/posts?since={since_millis}&per_page={CHANNEL_WINDOW_PAGE_SIZE}"
+                ),
                 None::<Value>,
             )
             .await?;
@@ -3952,6 +3973,21 @@ impl MattermostClient {
     /// returns exactly one. No post is ever dropped — a post whose
     /// author cannot be resolved still appears, carrying the author's
     /// user id in place of a name.
+    /// Removed: an unbound thread read.
+    ///
+    /// Retained as an exported symbol so that code compiled against the
+    /// previous release still builds and gets a deprecation warning
+    /// rather than a hard compile error. It always refuses: silently
+    /// forwarding to the bound read would require inventing a channel,
+    /// which would recreate the unscoped read this was removed for.
+    #[deprecated(
+        since = "0.2.2",
+        note = "use read_thread_in_channel: a thread read must be scoped to the channel it was requested in"
+    )]
+    pub async fn read_thread(&self, _root_post_id: &str) -> Result<Vec<Message>, CoreError> {
+        Err(CoreError::UnboundThreadReadRemoved)
+    }
+
     pub async fn read_thread_in_channel(
         &self,
         expected_channel_id: &str,
@@ -3981,12 +4017,49 @@ impl MattermostClient {
         // surface stamps every result with the channel the caller asked
         // for. Verifying here is what makes that label true rather than
         // merely plausible. Costs no extra request.
+        // Every refusal below names the id the CALLER supplied, never an
+        // id the provider returned. A stray post's id is not the
+        // caller's to learn: echoing it back would disclose the
+        // existence and identity of a post outside the channel they
+        // named, which is the narrower disclosure version of the
+        // existence oracle this binding exists to prevent.
+        let refuse = |channel_name: &str| CoreError::AnchorChannelMismatch {
+            post_id: root_post_id.to_string(),
+            channel: channel_name.to_string(),
+        };
+
         for post in &raw {
             if !binding_holds(&post.channel_id, expected_channel_id) {
-                return Err(CoreError::AnchorChannelMismatch {
-                    post_id: post.id.clone(),
-                    channel: channel_name.to_string(),
-                });
+                return Err(refuse(channel_name));
+            }
+        }
+
+        // Same channel is not the same conversation. Prove the envelope
+        // really is the thread that was asked for, before any of it is
+        // hydrated or returned:
+        //
+        //   - the requested post is present at all;
+        //   - it is the thread's root, not a reply that happens to sit
+        //     in the envelope;
+        //   - every other post names that root as its own.
+        //
+        // Without this an in-channel envelope missing the requested root,
+        // or carrying a post from a different conversation, is returned
+        // and labelled as the requested thread — and `--latest` can then
+        // select a post that was never part of it.
+        let root = raw
+            .iter()
+            .find(|post| post.id == root_post_id)
+            .ok_or_else(|| refuse(channel_name))?;
+        if !root.root_id.is_empty() && root.root_id != root_post_id {
+            return Err(refuse(channel_name));
+        }
+        for post in &raw {
+            if post.id == root_post_id {
+                continue;
+            }
+            if post.root_id != root_post_id {
+                return Err(refuse(channel_name));
             }
         }
         // Root first, then replies by timestamp, tie-broken by id so the
