@@ -13,7 +13,7 @@ Release model: **manual signing** as the v0.2.2 baseline.
 - Signing keys never touch CI.
 
 GHA-automated signing using a separate automation-variant key is
-deliberately deferred to v0.2.3+.
+deliberately deferred to a later release.
 
 Canonical release sequence (top-to-bottom; each numbered section
 below corresponds to one step):
@@ -24,7 +24,7 @@ git tag → git push     → GHA produces draft
 make release-download  → release-sign → release-verify
 make release-upload    → release-undraft
 #release-chanvoy-vXYZ announcement → #ops-updates announcement
-(v0.2.2 only) public-flip: repo visibility PRIVATE → PUBLIC
+(first public release only) public-flip: repo visibility PRIVATE → PUBLIC
 ```
 
 ---
@@ -175,16 +175,28 @@ Post the operational notification to `#ops-updates`. Pin per the
 chanvoy version-notes pin convention (unpin the prior version's note
 first; see `reference_chanvoy_version_pin_convention.md`).
 
-## 10. Public-flip terminal action (v0.2.2 only)
+## 10. Public-flip terminal action (first public release only)
 
-After §8 + §9 are out, flip the repo visibility from PRIVATE → PUBLIC.
-This is the LAST action of the cycle.
+**Applies when the repo is still PRIVATE**, whichever release that turns
+out to be. Check current visibility rather than matching a version
+number — this step was previously pinned to a specific version, and a
+release that superseded that version would have skipped a required
+terminal action:
+
+```bash
+gh repo view lanytehq/chanvoy --json visibility -q .visibility
+```
+
+If it already reports `PUBLIC`, this section is a no-op; skip to the
+end of the cycle. If it reports `PRIVATE`, then after §8 + §9 are out,
+flip the repo visibility from PRIVATE → PUBLIC. This is the LAST action
+of the cycle.
 
 ```bash
 gh repo edit lanytehq/chanvoy --visibility public
 ```
 
-For v0.2.3+ this step is omitted (repo is already public).
+Once the repo is public this step is omitted on every later release.
 
 ---
 

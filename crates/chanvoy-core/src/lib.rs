@@ -1640,7 +1640,14 @@ pub struct MattermostConfig {
     pub bot_token: Option<String>,
 }
 
+/// Errors from the core client.
+///
+/// Marked `#[non_exhaustive]`: this is a growing operational taxonomy,
+/// not a closed state machine, and every future addition would otherwise
+/// be a source-breaking change for anyone matching on it exhaustively.
+/// Callers must carry a catch-all arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreError {
     #[error("missing credential source {0}")]
     MissingCredential(String),
@@ -3979,7 +3986,7 @@ impl MattermostClient {
     /// forwarding to the bound read would require inventing a channel,
     /// which would recreate the unscoped read this was removed for.
     #[deprecated(
-        since = "0.2.2",
+        since = "0.3.0",
         note = "use read_thread_in_channel: a thread read must be scoped to the channel it was requested in"
     )]
     pub async fn read_thread(&self, _root_post_id: &str) -> Result<Vec<Message>, CoreError> {

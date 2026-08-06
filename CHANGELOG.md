@@ -5,7 +5,29 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - unreleased
+
+### Migration
+
+- **The error type is now open to extension, and this release is the boundary
+  where that lands.** `CoreError` carries `#[non_exhaustive]`, so code matching
+  on it must include a catch-all arm (`_ => { ... }`). Two error cases were also
+  added, for a thread request that comes back with no posts and for the removed
+  unbound thread read.
+
+  Rust treats adding a variant to an exhaustive public enum as a breaking change
+  even though nothing was removed, so this is a deliberate version boundary
+  rather than a patch. Marking the type non-exhaustive now means later
+  **variants** will not be — this is an operational taxonomy that will keep
+  growing.
+
+- **Upgrading, for everyone else.** There is no on-disk or state migration, exit
+  codes are unchanged, and a binary distribution needs no source rebuild. Three
+  things are worth checking, all covered in the entries above: a daemon keeps
+  the binary it was started from and must be cycled before the new verbs work;
+  default `read` rows and error text on stderr both changed, so strict parsers
+  of either should be reviewed; and messages gain a `root_id` field in JSON,
+  which is additive.
 
 ### Added
 
@@ -22,10 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The `CoreError` type gained a variant, which will stop some code from
+- **The `CoreError` type gained two variants, which will stop some code from
   compiling.** This affects Rust code that depends on the `chanvoy-core`
-  library; it does not affect the `chanvoy` command line, its output, its exit
-  codes, or its files. If your code has a `match` on a `CoreError` that lists
+  library. It requires no on-disk or state migration and no change to exit
+  codes, and a binary distribution needs no source rebuild. (Human output and
+  stderr text did change in this release — see the entries below — so strict
+  parsers of either are worth reviewing.) If your code has a `match` on a
+  `CoreError` that lists
   every variant by name and has no catch-all arm, that `match` no longer covers
   every case and the compiler will reject it, naming the variant it has not
   seen before. The fix is to add a catch-all arm — `_ => { ... }` — which also
@@ -35,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The unbound thread read, `read_thread`, is still exported and still compiles,
   now marked deprecated and always refusing. Keeping that name available does
-  not by itself make this release a drop-in recompile: the added variant is a
+  not by itself make this release a drop-in recompile: the added variants are a
   separate break, and both need handling before code that matches exhaustively
   on `CoreError` will build again.
 
@@ -45,8 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post to `show`, `thread`, or `post --reply-to`. Every row now carries
   `id=<post-id>` and `root=<root-id>`, including top-level posts, where the
   root repeats the post's own id. Both crumbs are on every row so a row can be
-  read without knowing that a post with no root is its own root. `--json`
-  output is unchanged.
+  read without knowing that a post with no root is its own root. The crumbs are
+  human output only; they are not how the same information appears in `--json`,
+  where it is a field on the message object (see the thread-orientation entry
+  below).
 
 - **A daemon older than the verb you just used now says so.** Installing a new
   chanvoy leaves any already-running daemon on its previous binary until it is
@@ -62,8 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   top-level, the thread's root id when it is a reply. This is needed to reply
   at all — the server rejects a reply aimed at another reply — so previously a
   caller citing a post had no way to tell which ids were valid reply targets.
-  `--json` output gains a `root_id` field on every message; existing fields are
-  unchanged.
+  In `--json`, the output type is unchanged — a read still returns what it
+  returned before — and every existing field on a message keeps its name and
+  meaning. Each message object gains one field, `root_id`. A consumer that
+  reads fields by name is unaffected; one that requires an exact set of keys
+  will see the new one.
 
 - **Errors now print their message instead of their internal shape.** The CLI
   returned errors from `main`, which makes Rust print the `Debug`
@@ -838,7 +868,8 @@ session-survival, hash-chained reconnect-health surface. Pre-this-changelog
 shipping history is captured in git log and the per-task briefs under
 `lanyte-productbook-internal/content/projmgmt/peers/`.
 
-[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lanytehq/chanvoy/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/lanytehq/chanvoy/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lanytehq/chanvoy/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/lanytehq/chanvoy/compare/v0.1.0...v0.1.1
