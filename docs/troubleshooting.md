@@ -23,6 +23,7 @@ follow the recovery steps. Symptoms are listed roughly in
 - [Sandbox: permission denied reading or binding the socket](#sandbox-permission-denied-reading-or-binding-the-socket)
 - [Stale socket file blocks daemon start](#stale-socket-file-blocks-daemon-start)
 - [`daemon start` succeeded but the next command says the daemon is gone](#daemon-start-succeeded-but-the-next-command-says-the-daemon-is-gone)
+- [The running daemon does not support a verb](#the-running-daemon-does-not-support-a-verb)
 - ["bare --limit rejected"](#bare---limit-rejected)
 - [Diagnostic harness for unmatched symptoms](#diagnostic-harness)
 
@@ -377,6 +378,44 @@ its daemon back; pick `auto-setup` when you also want the profile
 re-synthesized from the current environment.
 
 **Reference:** [operator-guide.md §Daemon Lifecycle](./operator-guide.md#daemon-lifecycle).
+
+---
+
+## The running daemon does not support a verb
+
+**Symptom**
+
+```
+the running daemon does not support `show`; it was started from an
+earlier chanvoy and keeps that binary until it is restarted. Cycle it
+with `chanvoy daemon stop` then `chanvoy auto-setup`, and run the
+command again.
+```
+
+**Cause**
+
+The command you ran and the daemon it talked to are different versions.
+A daemon keeps running the binary it was started from, so installing a
+newer chanvoy does not change the daemon already serving your profile.
+Commands the newer binary knows about are unknown to the older daemon.
+
+This is most visible right after an upgrade, and on shared machines
+where a daemon may have been started days earlier by another session.
+
+**Fix**
+
+```bash
+chanvoy daemon stop
+chanvoy auto-setup
+```
+
+Then run the command again.
+
+**Note**
+
+Every agent using that profile shares the daemon, so a restart
+interrupts them briefly. That is expected, and is why the release notes
+call out restarting the daemon as an upgrade step.
 
 ---
 

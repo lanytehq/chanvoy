@@ -99,7 +99,7 @@ Verify:
 
 ```bash
 chanvoy --version
-# → chanvoy 0.2.x
+# → chanvoy 0.3.x
 ```
 
 ---

@@ -2,6 +2,22 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.3.0 (unreleased)
+
+**Post rehydration, thread orientation, and author honesty — with a deliberate source-compatibility boundary** — a cited post is now reachable. Several verbs already took a post id, but none of them would show you the post; the one read verb that accepted an id was the resume flag, which excludes the post it names. Two verbs close that, and two long-standing integrity bugs in reading are fixed alongside them.
+
+- **`chanvoy show <channel> <post-id>`** — reopen one cited post. The post is bound to the named channel and refused before any content is returned if it lives elsewhere. `--json` emits one object.
+- **`chanvoy thread <channel> <root-or-post-id> [--latest]`** — read a whole conversation. Accepts the root's id or any reply's, so a citation from the middle of a thread works without finding the root first. `--json` emits an array in both modes, including with `--latest` (a one-element array), so a flag never changes the output type. Both verbs are pure reads and never touch the attention cursor.
+- **Citable human output** — default `read` rows carry `id=<post-id>`, plus `root=<root-id>` wherever a thread root is known, so a post id can be handed straight to `show`, `thread`, or `post --reply-to` without re-running with `--json`. Every message on the read and push paths now reports its thread root; `--json` gains an additive `root_id` field.
+- **Author names restored** — posts carry only a user id and the code read an author-name field the server does not send, so every message read as `unknown`. Names now resolve from the user id through a shared cache; an unresolvable author is reported as the literal user id rather than a placeholder that reads like a person.
+- **Threads come back** — thread reads filtered on that same absent field and discarded every post, reporting success with nothing in it. A root plus N replies now returns N+1 messages. A genuinely empty thread response is an error, not a plausible-looking empty result.
+- **Channel-bound thread reads over the agent IPC surface** — the thread was previously fetched on the post id alone and stamped with whatever channel the caller claimed. The anchor is now checked first (a mismatch issues no thread request at all), every post in the response is checked, and a truncated read reports `has_more` instead of being indistinguishable from a complete one.
+- **Durable `daemon start`** — it now detaches into its own session with the parent-side identity handoff, so the daemon outlives the command that started it; a start reported as failed no longer leaves a daemon running.
+- **Operator-legible errors** — errors print their message instead of an internal debug shape, and a daemon older than the verb you just used names the verb and the two commands that fix it (`chanvoy daemon stop`, then `chanvoy auto-setup`).
+- **Compatibility**: source-breaking for Rust code building against `chanvoy-core` — `CoreError` is now `#[non_exhaustive]` and gained two variants, and `MattermostClient::read_thread` is deprecated and always refuses (use `read_thread_in_channel`). No on-disk or state migration; exit codes unchanged; a binary distribution needs no source rebuild. Cycle the daemon before using the new verbs, and review strict parsers of human output or stderr — default `read` rows and error text both changed. Messages gain an additive `root_id` in JSON.
+
+See `docs/releases/v0.3.0.md` for full notes.
+
 ## v0.2.1 (May 2026)
 
 **Session-start ergonomics, conversation shape, discovery, and onboarding** — a new agent walking into a long-running channel can run the four-line ritual without scrolling history; multi-reviewer review cycles get cleaner via threaded replies + reactions; channel discovery (search + traffic-aware listing) lands; every chanvoy verb that touches a channel is now cross-team aware. Plus a major onboarding doc surface expansion.

@@ -221,6 +221,8 @@ Cursor-based local-mode workflow primitives:
 - `chanvoy check <channel> [--after <post-id>]`
 - `chanvoy ack <channel>` (advance cursor without fetching content)
 - `chanvoy pinned <channel>` (pure read of pinned posts)
+- `chanvoy show <channel> <post-id>` (pure read of one cited post)
+- `chanvoy thread <channel> <post-id> [--latest]` (pure read of one conversation)
 - `chanvoy notifications --unread`
 
 Current semantics:
@@ -231,6 +233,8 @@ Current semantics:
 - `read --advance` advances the cursor to the latest post **returned** by this read (mode-independent rule); no-op when zero posts returned
 - `check` is a pure probe and does not advance stored channel state
 - `pinned` is a pure read; never advances any cursor
+- `show` is a pure read; never advances any cursor
+- `thread` is a pure read, with and without `--latest`; never advances any cursor
 - `ack <channel>` advances the cursor to the channel's **current** latest post id without surfacing content; no-op success when channel has no posts
 - `notifications --unread` is a pure probe and does not advance mention state
 - `check <channel>` without `--after` uses the stored daemon cursor when available
@@ -249,6 +253,174 @@ Current inspectability gap worth tracking:
 
 - there is not yet a first-class `doctor` or `status` surface for showing the current stored attention state file and cursor values
 - operators can inspect the per-profile JSON state file directly under the config root for now
+
+## Reopening A Cited Post (`show` / `thread`)
+
+Two pure reads take a post id and give you the post back:
+
+```bash
+chanvoy show   <channel> <post-id>          [--team <slug>] [--json]
+chanvoy thread <channel> <root-or-post-id>  [--latest] [--team <slug>] [--json]
+```
+
+`show` returns one post. `thread` returns the whole conversation —
+the root post plus every reply.
+
+Both take the channel as a required positional. Channel resolution is
+the standard cross-team resolver: `<team>/<channel>` syntax and the
+`--team <slug>` flag both work, and the primary-team-first fallback
+chain applies when neither is given.
+
+### `chanvoy show`
+
+```bash
+chanvoy show bravo-team <post-id>
+# 2026-08-05 14:02:11 [alice] id=<post-id> root=<root-id>
+# the body of the post
+# ---
+
+chanvoy show <team>/<channel> <post-id> --json
+```
+
+`--json` emits **one object** — a single message, not a list.
+
+### `chanvoy thread`
+
+```bash
+# The whole conversation, root first
+chanvoy thread bravo-team <post-id>
+
+# Only the most recent message in it
+chanvoy thread bravo-team <post-id> --latest
+```
+
+**The id may be the root's or any reply's.** Both read the same
+thread. Chanvoy point-fetches the post you named, takes the thread
+root from it, and reads the thread from there — so a citation copied
+out of the middle of a conversation works without you first having to
+work out which ids are roots.
+
+Ordering is the root first, then replies oldest-to-newest, ties broken
+by post id so repeated calls agree.
+
+`--latest` narrows the result to the single most recent message —
+newest by timestamp, ties broken by id. That is not always the last
+element of the full list: the root is pinned first regardless of its
+timestamp, so on a thread whose root carries the later timestamp
+(an edited or backdated root) the newest message *is* the root.
+
+**`--json` emits an array in both modes.** With `--latest` it is a
+one-element array. A flag never changes the type of the output, so a
+consumer can parse the same shape either way.
+
+### Channel binding (both verbs)
+
+A post id on its own is not authority to read a post. Both verbs prove
+the post belongs to the channel you named **before** any of its content
+is returned:
+
+- A post that lives in another channel is refused, and none of its body
+  reaches you.
+- On `thread`, a mismatched anchor issues **no thread request at all** —
+  the refusal happens before the conversation is fetched.
+- A provider answer that is a *different* post from the one asked for is
+  refused rather than returned under a successful-looking fetch.
+- On `thread`, every post in the response is checked, not only the
+  anchor: the bot's credential reaches more channels than the one you
+  named, so a response mixing the two is refused whole rather than
+  returned in part.
+
+Refusals name the id **you** supplied. When you cite a reply, the root
+is derived on your behalf and is never echoed back — you never named it,
+so chanvoy does not hand you an id you had no way to know.
+
+A thread request that genuinely comes back with no posts is reported as
+an error, not as a plausible-looking empty result: a thread always
+contains at least its root, so an empty answer means a deleted post, an
+unreadable channel, or an id that is not a post.
+
+### Cursor neutrality
+
+`show` and `thread` are pure reads. Neither advances or otherwise
+mutates the attention cursor, with or without `--latest`. Reopening a
+cited post does not mark its channel read — a `check` after a `show`
+still reports whatever was unread before it.
+
+### Citations in `read` output (`id=` / `root=`)
+
+Default (non-`--json`) `read` output carries the crumbs the two verbs
+need:
+
+```
+2026-08-05 14:02:11 [alice] id=<post-id> root=<root-id>
+the body of the post
+---
+```
+
+- `id=<post-id>` is on **every** row. It is the full id, not a
+  shortened one, so it is copy-pasteable straight into `show`,
+  `thread`, or `post --reply-to`.
+- `root=<root-id>` is on every row where a thread root is known —
+  including top-level posts, where it repeats the post's own id. The
+  repetition is deliberate: reading a row must not require knowing the
+  rule that a post with no root is its own root.
+- `post --reply-to` takes a **thread root**, and `root=` is that value.
+  (Mattermost rejects a reply aimed at another reply, so a reply's own
+  id is not a valid reply target.)
+- The one case with no `root=` crumb is a root that is genuinely
+  unknown, which only arrives from a daemon older than the field.
+  `root=` with nothing after it would read as a citable value; leaving
+  it off says what is true, which is that the row cannot tell you.
+
+In `--json` the output type is unchanged — a read returns what it always
+returned — and every existing field keeps its name and meaning. Each
+message object carries one added field, `root_id`.
+
+The crumbs are human output and are not JSON keys, but each maps to one:
+
+| Human crumb | JSON field |
+| --- | --- |
+| `id=` | `id`, which was always there |
+| `root=` | `root_id`, added by this release |
+
+A consumer that reads fields by name is unaffected. One that asserts an
+exact set of keys will see `root_id` and should be updated.
+
+### Discovery workflow, end to end
+
+```bash
+# 1. Read the channel. Every row now names itself.
+chanvoy read bravo-team --since 4h
+# 2026-08-05 14:02:11 [alice] id=<post-id> root=<root-id>
+# ...
+
+# 2. Reopen what you were cited, or the conversation around it.
+chanvoy show bravo-team <post-id>
+chanvoy thread bravo-team <post-id>
+chanvoy thread bravo-team <post-id> --latest   # just where it got to
+
+# 3. Reply into that thread, using the root the crumb gave you.
+chanvoy post bravo-team "fixed in <commit>" --reply-to <root-id>
+```
+
+Steps 1 and 2 are pure reads; only step 3 moves the channel cursor.
+
+### If the daemon predates the verb
+
+Installing a new chanvoy leaves any already-running daemon on its
+previous binary until it is restarted, so a current CLI can call `show`
+or `thread` against a daemon that has never heard of them. Chanvoy names
+the verb and the fix rather than reporting an internal wire error:
+
+```
+the running daemon does not support `show`; it was started from an
+earlier chanvoy and keeps that binary until it is restarted. Cycle it
+with `chanvoy daemon stop` then `chanvoy auto-setup`, and run the
+command again.
+```
+
+Other daemon failures are unaffected — this message is only produced
+for a verb the running daemon does not know.
 
 ## Conversation Primitives
 
@@ -320,8 +492,10 @@ chanvoy post review-channel "fixed in 54661a7" --reply-to <parent-id>
 # → posted: <reply-id>
 ```
 
-`--reply-to` accepts the post id returned by a prior `chanvoy post` or
-`chanvoy read --json`. Channel resolution is unchanged (the cross-team
+`--reply-to` takes a thread root: the post id returned by a prior
+`chanvoy post`, the `root_id` field in `chanvoy read --json`, or the
+`root=` crumb on default `read` output (see "Reopening A Cited Post"
+above). Channel resolution is unchanged (the cross-team
 resolver applies; `<team>/<channel>` works on `--reply-to` calls too).
 The validation order is **resolve channel → verify parent on resolved
 channel → write**, so a parent post id from a different channel is
