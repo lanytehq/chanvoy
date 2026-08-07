@@ -173,7 +173,29 @@ long-running channel:
    | Flag | Resolution | Why |
    |---|---|---|
    | `read --since` | second-precise | hits MM `posts?since={millis}` directly |
-   | `wait --timeout` | second-precise | local timer, no API constraint |
+   | `wait --timeout` | second-precise | absolute deadman from RPC entry |
+
+### Wait (content filter + deadman)
+
+For channel WIP: **use `chanvoy wait`** — do not sleep-poll or invent a file-tail
+poller. Wait is a doorbell with payload, not a review loop (fire ≠ action).
+
+```bash
+chanvoy wait <channel> --timeout 30m \
+  [--contains <literal>] \     # case-sensitive body substring
+  [--pattern <regex>] \        # Rust regex; '(?i)…' for ignore-case
+  [--after <post-id>] \        # exclusive baseline (race fix)
+  [--json]
+```
+
+| Outcome | Exit | Notes |
+| --- | ---: | --- |
+| Match | 0 | One message in `{channel, messages:[…]}` |
+| Clean deadman | 1 | JSON `timeout: true` only on this path |
+| Hard / provider | 2 | `error_class` + `retryable`; never `timeout: true` |
+
+Self posts never wake the wait. Empty filters are refused. One seat owns the
+blocking deadman per channel/panel until tool support for single-waiter lands.
    | `notifications --since` | minute-rounded (rounds up) | underlying MM notifications surface is minute-keyed |
 
    So `chanvoy notifications --since 30s` behaves like ~1 minute (not

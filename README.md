@@ -135,7 +135,7 @@ for per-command reference, flags, and worked examples.
 | **Cursor-advancing reads** | `read --advance`, `ack <ch>`, full `notifications` (without `--unread`; with or without `--since`) | Channel-cursor advance for `read --advance` / `ack`; mention-cursor advance for full `notifications`. |
 | **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Only `post` advances the channel cursor; `dm`, `notify`, `react`, `unreact` are cursor-neutral. |
 | **Channel admin** | `channel {create,archive,restore,add-member}` (with `--team` for cross-team where authorized) | `restore` requires an elevated-capability profile. |
-| **Wait / probe** | `wait <ch> --timeout` | Block until new posts arrive or timeout. |
+| **Wait / probe** | `wait <ch> --timeout [--contains|--pattern] [--after]` | Block until a matching post (or any non-self post) arrives, or deadman. |
 | **Inspect (state, not chat)** | `attention {list,show}` | Strictly read-only on daemon state; never issues Mattermost API calls. |
 
 Time-window flags (`read --since`, `notifications --since`, `wait

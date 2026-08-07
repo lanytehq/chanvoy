@@ -259,6 +259,8 @@ fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> 
 pub fn core_error_to_chat(error: CoreError, request_id: &str) -> ChatFrame {
     let (code, retryable) = match &error {
         CoreError::WaitTimeout(_) => (ChatErrorCode::NotFound, Some(false)),
+        CoreError::WaitFilterInvalid(_) => (ChatErrorCode::InvalidRequest, Some(false)),
+        CoreError::WaitProviderDegraded { .. } => (ChatErrorCode::ProviderError, Some(true)),
         CoreError::ProfileNotFound(_) => (ChatErrorCode::NotFound, Some(false)),
         // Every cause of an empty thread body is permanent: the post was
         // deleted, it sits in a channel this identity cannot read, or the

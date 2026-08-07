@@ -21,13 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **variants** will not be — this is an operational taxonomy that will keep
   growing.
 
-- **Upgrading, for everyone else.** There is no on-disk or state migration, exit
-  codes are unchanged, and a binary distribution needs no source rebuild. Three
-  things are worth checking, all covered in the entries above: a daemon keeps
-  the binary it was started from and must be cycled before the new verbs work;
-  default `read` rows and error text on stderr both changed, so strict parsers
-  of either should be reviewed; and messages gain a `root_id` field in JSON,
-  which is additive.
+- **Upgrading, for everyone else.** There is no on-disk or state migration for
+  profiles or attention state, and a binary distribution needs no source rebuild
+  for ordinary operators. Things worth checking: a daemon keeps the binary it
+  was started from and must be cycled before new verbs and the enhanced wait
+  path work; default `read` rows and error text on stderr both changed; messages
+  gain a `root_id` field in JSON (additive); **`wait` always returns at most one
+  message** (including unfiltered REST/lag paths that previously could return a
+  multi-post window); and wait hard failures exit **2** with structured JSON
+  (`error_class`, `retryable`) rather than looking like a clean timeout.
 
 ### Added
 
@@ -41,22 +43,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the operator having to find the root first. `--latest` narrows the result to
   the most recent message. `--json` emits an array in both cases, including
   with `--latest`, so a flag never changes the shape of the output.
+- **`chanvoy wait` content filter, exclusive baseline, and deadman contract.**
+  For channel WIP, use `chanvoy wait` — do not sleep-poll or hand-roll a poller.
+  New flags: `--contains` (case-sensitive body substring), `--pattern` (Rust
+  regex over body; use `(?i)…` when case should not matter), and `--after
+  <post-id>` (exclusive baseline). Match exits **0** with one message payload
+  (`{channel, messages:[one]}`); clean deadman exits **1** with
+  `timeout: true` only on that path; hard/config and provider-exhausted failures
+  exit **2** and never set `timeout: true`. Filters refuse empty values and
+  oversize/invalid patterns before the wait arms. The daemon method
+  `wait_channel_v2` is the capability gate (cycle the daemon after install).
 
 ### Changed
 
-- **The `CoreError` type gained two variants, which will stop some code from
-  compiling.** This affects Rust code that depends on the `chanvoy-core`
-  library. It requires no on-disk or state migration and no change to exit
-  codes, and a binary distribution needs no source rebuild. (Human output and
-  stderr text did change in this release — see the entries below — so strict
-  parsers of either are worth reviewing.) If your code has a `match` on a
-  `CoreError` that lists
-  every variant by name and has no catch-all arm, that `match` no longer covers
-  every case and the compiler will reject it, naming the variant it has not
-  seen before. The fix is to add a catch-all arm — `_ => { ... }` — which also
-  keeps the `match` compiling the next time a variant is added. Code that only
-  prints a `CoreError`, passes one along, or matches a few variants it already
-  has a catch-all for needs no change.
+- **The `CoreError` type gained additional variants, which will stop some code
+  from compiling.** This affects Rust code that depends on the `chanvoy-core`
+  library. Variants in this release include empty-thread and unbound-thread
+  removals from the rehydrate cut, plus wait filter-invalid and
+  provider-degraded cases from the wait cut. It requires no on-disk or state
+  migration. (Human output and stderr text also changed — see the entries
+  below.) If your code has a `match` on a `CoreError` that lists every variant
+  by name and has no catch-all arm, that `match` no longer covers every case and
+  the compiler will reject it. The fix is to add a catch-all arm —
+  `_ => { ... }` — which also keeps the `match` compiling the next time a
+  variant is added.
 
   The unbound thread read, `read_thread`, is still exported and still compiles,
   now marked deprecated and always refusing. Keeping that name available does

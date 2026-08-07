@@ -1548,6 +1548,29 @@ pub struct WaitChannelParams {
     pub team: Option<String>,
 }
 
+/// PER-038: enhanced wait RPC. Method name is the capability gate an
+/// old daemon cannot ignore (`wait_channel_v2`). Carries content filter
+/// and exclusive baseline anchor; timeout is always second-resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitChannelV2Params {
+    pub channel: String,
+    pub timeout_secs: u64,
+    /// PER-019: optional `--team <slug>` override.
+    #[serde(default)]
+    pub team: Option<String>,
+    /// Literal body substring (case-sensitive). Empty is refused.
+    #[serde(default)]
+    pub contains: Option<String>,
+    /// Rust `regex` pattern over body only. Empty is refused. Source
+    /// capped at 256 UTF-8 bytes; compiled size capped at 64 KiB.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Exclusive baseline post id: only posts strictly after this id
+    /// can wake the wait.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateChannelParams {
     pub name: String,
@@ -1738,6 +1761,16 @@ pub enum CoreError {
     RequiresElevatedCapability,
     #[error("timeout waiting for channel {0}")]
     WaitTimeout(String),
+    /// PER-038: wait input/config hard failure (bad filter, empty
+    /// needle, foreign/missing/substituted anchor). Never a deadman:
+    /// agents reconfigure rather than re-arm with backoff alone.
+    #[error("wait input error: {0}")]
+    WaitFilterInvalid(String),
+    /// PER-038: observation failed until the absolute wait deadline
+    /// (retryable provider 429/5xx/transport). Distinct from clean
+    /// deadman: never reports `timeout:true` at the CLI.
+    #[error("wait observation failed for channel {channel}: {message}")]
+    WaitProviderDegraded { channel: String, message: String },
     #[error("profile {0} not found")]
     ProfileNotFound(String),
     /// PER-035: a profile's `reduce.use_profile` names a family profile
@@ -3125,7 +3158,20 @@ impl MattermostClient {
         let channel_id = self.resolve_channel(channel_name, team).await?.channel_id;
         self.assert_post_in_channel(&channel_id, channel_name, after_post_id)
             .await?;
+        self.posts_after_by_channel_id(&channel_id, after_post_id)
+            .await
+    }
 
+    /// Page posts strictly after `after_post_id` on an already-resolved
+    /// channel. Does **not** re-assert the anchor — callers that need
+    /// binding proof must call `assert_post_in_channel` first (once).
+    /// Used by PER-038 wait backfill and lag recovery so scans advance
+    /// over noise rather than re-fetching a fixed latest-N window.
+    pub async fn posts_after_by_channel_id(
+        &self,
+        channel_id: &str,
+        after_post_id: &str,
+    ) -> Result<Vec<Message>, CoreError> {
         let mut page = 0;
         let mut messages = Vec::new();
 

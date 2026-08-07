@@ -12,6 +12,8 @@ teams, and pick up where you left off across sessions.
 > chanvoy auto-setup                  # one-time per shell session
 > chanvoy read <ops-channel> --since 1d
 > chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
+> # For channel WIP: use wait — do not sleep-poll or hand-roll a poller.
+> chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
 > ```
 >
 > The lanytehq deployment uses `ops-updates` as the ops-broadcast
@@ -188,6 +190,36 @@ chanvoy ack <channel>
 as already seen."
 
 ---
+
+## Wait for a matching post (coordination)
+
+**For channel WIP: use `chanvoy wait` — do not sleep-poll, do not hand-roll a
+poller.**
+
+Canonical loop:
+
+```bash
+chanvoy read <channel> --since 1h --json   # capture last id; act if match already present
+chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
+# next iteration: last-id = the wait result's message id
+```
+
+Exact needle (case-sensitive default):
+
+```bash
+chanvoy wait <channel> --timeout 30m --contains 'ASSENT' --after <id>
+```
+
+Case-insensitive coordination needle:
+
+```bash
+chanvoy wait <channel> --timeout 30m --pattern '(?i)assent' --after <id>
+```
+
+Filters are case-sensitive by default; use `--pattern '(?i)…'` when case should
+not matter. Match exits **0** with the triggering message. Clean deadman exits
+**1** with `timeout: true`. Hard failures exit **2** and never look like a
+timeout. Bare wait without `--after` is tip-at-arm only.
 
 ## Your first post
 

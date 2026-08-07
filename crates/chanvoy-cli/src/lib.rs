@@ -390,14 +390,23 @@ struct CheckArgs {
 #[derive(Debug, Args)]
 struct WaitArgs {
     channel: String,
-    /// Timeout window for the wait. Bare integer = minutes (today's
-    /// default; default 10m). Accepts s/m/h/d suffixes.
+    /// Deadman timeout for the wait. Bare integer = minutes (default 10m).
+    /// Accepts s/m/h/d suffixes.
     #[arg(
         long,
         default_value = "10",
-        long_help = "Wait timeout. Bare integer = minutes (today's default; default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after)."
     )]
     timeout: String,
+    /// Literal body substring (case-sensitive). Safe onramp filter.
+    #[arg(long, value_name = "TEXT")]
+    contains: Option<String>,
+    /// Rust regex over message body. Invalid/oversize patterns refuse before wait.
+    #[arg(long, value_name = "REGEX")]
+    pattern: Option<String>,
+    /// Exclusive baseline post id: only posts after this id can wake the wait.
+    #[arg(long, value_name = "POST_ID")]
+    after: Option<String>,
     /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
@@ -814,49 +823,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 },
             )
         }
-        CommandSet::Wait(args) => {
-            let timeout_secs = parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes)
-                .map_err(CliError::Bootstrap)?;
-            if !cli.json {
-                eprintln!(
-                    "waiting for new message in #{} (timeout: {}s)...",
-                    args.channel, timeout_secs
-                );
-            }
-            match daemon_client(&profile)
-                .wait_channel(&args.channel, timeout_secs, args.team.clone())
-                .await
-            {
-                Ok(result) => {
-                    if !cli.json && !result.messages.is_empty() {
-                        eprintln!("--- new message ---");
-                    }
-                    print_value(cli.json, &result)
-                }
-                Err(DaemonError::Rpc {
-                    code: -32005,
-                    message,
-                }) => {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "timeout": true,
-                                "channel": args.channel,
-                                "message": message
-                            }))?
-                        );
-                    } else {
-                        eprintln!(
-                            "timeout: no new messages in #{} after {} seconds",
-                            args.channel, timeout_secs
-                        );
-                    }
-                    process::exit(1);
-                }
-                Err(error) => Err(error.into()),
-            }
-        }
+        CommandSet::Wait(args) => handle_wait(&profile, cli.json, args).await,
         CommandSet::Pinned(args) => print_value(
             cli.json,
             &daemon_client(&profile)
@@ -1223,6 +1190,186 @@ fn map_post_error(err: CliError, char_count: usize) -> CliError {
     } else {
         err
     }
+}
+
+/// PER-038 wait: always prefer `wait_channel_v2`. Advanced flags never
+/// fall back to legacy. Bare wait may fall back once on method-not-found
+/// so a new CLI still works against an old daemon for unfiltered waits.
+async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    let timeout_secs = parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes)
+        .map_err(CliError::Bootstrap)?;
+
+    let advanced = args.contains.is_some() || args.pattern.is_some() || args.after.is_some();
+
+    // Local refuse for empty filters so operators get a clear exit-2 path
+    // even before the daemon (and so CLI-only callers cannot send match-all).
+    if let Some(ref c) = args.contains {
+        if c.is_empty() {
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                "empty --contains is refused (not match-all)",
+            );
+        }
+    }
+    if let Some(ref p) = args.pattern {
+        if p.is_empty() {
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                "empty --pattern is refused (not match-all)",
+            );
+        }
+    }
+
+    if !json {
+        eprintln!(
+            "waiting for new message in #{} (timeout: {}s)...",
+            args.channel, timeout_secs
+        );
+    }
+
+    let client = daemon_client(profile);
+    let result = match client
+        .wait_channel_v2(
+            &args.channel,
+            timeout_secs,
+            args.team.clone(),
+            args.contains.clone(),
+            args.pattern.clone(),
+            args.after.clone(),
+        )
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) if advanced => {
+            return Err(CliError::DaemonPredatesVerb {
+                verb: "wait --contains/--pattern/--after".to_string(),
+            });
+        }
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) => {
+            // Bare wait only: one transparent fallback to legacy method.
+            client
+                .wait_channel(&args.channel, timeout_secs, args.team.clone())
+                .await
+        }
+        Err(other) => Err(other),
+    };
+
+    match result {
+        Ok(result) => {
+            // AC-W0: match path always carries one message payload.
+            if result.messages.is_empty() {
+                return exit_wait_hard(
+                    json,
+                    &args.channel,
+                    "input",
+                    false,
+                    "wait returned success with no message payload",
+                );
+            }
+            if !json {
+                eprintln!("--- new message ---");
+            }
+            // N→1: print only the first message object in the container.
+            let one = WaitResult {
+                channel: result.channel,
+                messages: vec![result.messages.into_iter().next().expect("non-empty")],
+            };
+            print_value(json, &one)
+        }
+        Err(DaemonError::Rpc {
+            code: -32005,
+            message,
+        }) => {
+            // Clean deadman only.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "timeout": true,
+                        "channel": args.channel,
+                        "message": message
+                    }))?
+                );
+            } else {
+                eprintln!(
+                    "timeout: true (no matching messages in #{} after {} seconds)",
+                    args.channel, timeout_secs
+                );
+            }
+            process::exit(1);
+        }
+        Err(DaemonError::Rpc {
+            code: -32007,
+            message,
+        }) => exit_wait_hard(json, &args.channel, "input", false, &message),
+        Err(DaemonError::Rpc {
+            code: -32008,
+            message,
+        }) => exit_wait_hard(json, &args.channel, "provider", true, &message),
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) => Err(CliError::DaemonPredatesVerb {
+            verb: "wait".to_string(),
+        }),
+        // Map common core errors that may arrive as generic -32000.
+        Err(DaemonError::Rpc {
+            code: -32000,
+            message,
+        }) if message.contains("wait input error")
+            || message.contains("WaitFilterInvalid")
+            || message.contains("empty --")
+            || message.contains("wait --after") =>
+        {
+            exit_wait_hard(json, &args.channel, "input", false, &message)
+        }
+        Err(DaemonError::Rpc {
+            code: -32000,
+            message,
+        }) if message.contains("wait observation failed")
+            || message.contains("WaitProviderDegraded") =>
+        {
+            exit_wait_hard(json, &args.channel, "provider", true, &message)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn exit_wait_hard(
+    json: bool,
+    channel: &str,
+    error_class: &str,
+    retryable: bool,
+    message: &str,
+) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "timeout": false,
+                "channel": channel,
+                "error_class": error_class,
+                "retryable": retryable,
+                "message": message
+            }))
+            .unwrap_or_else(|_| format!(r#"{{"timeout":false,"message":{message:?}}}"#))
+        );
+    } else {
+        eprintln!("wait error ({error_class}): {message}");
+    }
+    process::exit(EXIT_ENV_INPUT);
 }
 
 async fn handle_dm_raw(profile: &str, json: bool, args: Vec<String>) -> Result<(), CliError> {
