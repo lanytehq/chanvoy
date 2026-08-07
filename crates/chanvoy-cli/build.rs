@@ -37,11 +37,39 @@ fn main() {
         "cargo:rerun-if-changed={}",
         workspace_root.join("VERSION").display()
     );
-    // Best-effort: rebuild when HEAD moves (present in normal git checkouts).
-    let git_head = workspace_root.join(".git/HEAD");
-    if git_head.exists() {
-        println!("cargo:rerun-if-changed={}", git_head.display());
+    // Best-effort: rebuild when HEAD moves. Plain repos use `.git/HEAD`;
+    // linked worktrees use a `gitdir:` pointer — watch the real HEAD there
+    // or install can keep a stale Commit: pin from a prior tip.
+    for head in git_head_paths(&workspace_root) {
+        if head.exists() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
     }
+}
+
+/// Paths to git HEAD files that should invalidate host-identity env.
+fn git_head_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let git_meta = workspace_root.join(".git");
+    if git_meta.is_dir() {
+        out.push(git_meta.join("HEAD"));
+        return out;
+    }
+    if git_meta.is_file() {
+        // worktree: "gitdir: /path/to/.git/worktrees/<name>"
+        if let Ok(contents) = std::fs::read_to_string(&git_meta) {
+            for line in contents.lines() {
+                if let Some(dir) = line.strip_prefix("gitdir:") {
+                    let gitdir = PathBuf::from(dir.trim());
+                    out.push(gitdir.join("HEAD"));
+                    if let Some(parent) = gitdir.parent().and_then(|p| p.parent()) {
+                        out.push(parent.join("HEAD"));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn read_version(workspace_root: &Path) -> String {
