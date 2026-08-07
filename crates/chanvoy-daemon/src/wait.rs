@@ -322,6 +322,15 @@ async fn wait_push_path(
         &mut processed,
         after_eligible.as_ref(),
     );
+    // F2: initial posts_after(anchor) is exhaustive — drop proven non-members.
+    // (Only when an explicit after anchor was used; bare wait has no set.)
+    if after.is_some() {
+        drop_pending_non_members_after_success(
+            &mut bus_buffer,
+            &predicate,
+            after_eligible.as_ref(),
+        );
+    }
 
     // D5: advance exclusive cursor past initial backfill so live REST
     // does not re-page the entire backlog from the original anchor.
@@ -436,6 +445,12 @@ async fn wait_push_path(
                                     &mut processed,
                                     after_eligible.as_ref(),
                                 );
+                                // F2: successful exhaustive posts_after — drop non-members.
+                                drop_pending_non_members_after_success(
+                                    &mut bus_buffer,
+                                    &predicate,
+                                    after_eligible.as_ref(),
+                                );
                                 if let Some(last) = page.last() {
                                     scan_cursor = Some(last.id.clone());
                                     for m in page {
@@ -535,6 +550,12 @@ async fn wait_push_path(
                             &mut bus_buffer,
                             &predicate,
                             &mut processed,
+                            after_eligible.as_ref(),
+                        );
+                        // F2: successful exhaustive posts_after — drop non-members.
+                        drop_pending_non_members_after_success(
+                            &mut bus_buffer,
+                            &predicate,
                             after_eligible.as_ref(),
                         );
                         if let Some(last) = page.last() {
@@ -814,6 +835,47 @@ fn reconcile_bus_after_eval(
             }
             _ => {
                 // Control-plane / wrong-channel: drop without polluting processed.
+            }
+        }
+    }
+    *bus = keep;
+}
+
+/// F2: after a **successful** exhaustive `posts_after` scan, drop pending
+/// after-gated body-matches whose ids are still absent from `after_eligible`.
+/// Absence is authoritative non-membership for that scan. Does **not** mark
+/// them `processed`, so a later REST page that does return the id can still
+/// fire (concurrent race). Failed/timeout REST paths must not call this.
+/// Bare wait (`after_eligible == None`) is a no-op.
+fn drop_pending_non_members_after_success(
+    bus: &mut VecDeque<Arc<DaemonEvent>>,
+    predicate: &WaitPredicate,
+    after_eligible: Option<&HashSet<String>>,
+) {
+    let Some(eligible) = after_eligible else {
+        return;
+    };
+    let mut keep = VecDeque::new();
+    for event in bus.drain(..) {
+        match &event.payload {
+            DaemonEventPayloadInner::Inbound(p)
+                if p.channel_id == predicate.channel_id() && predicate.matches_inbound(p) =>
+            {
+                if eligible.contains(&p.post_id) {
+                    // Confirmed member still pending (should be rare after
+                    // first_match); keep for the next eval.
+                    keep.push_back(event);
+                }
+                // else: proven non-member for this complete scan — drop.
+            }
+            DaemonEventPayloadInner::Inbound(p) if p.channel_id == predicate.channel_id() => {
+                // Non-matching channel inbound: drop (same as reconcile).
+                let _ = p;
+            }
+            other => {
+                // Preserve unexpected payloads only if they were kept before;
+                // control-plane is not match material.
+                let _ = other;
             }
         }
     }
@@ -1240,10 +1302,10 @@ mod tests {
         );
     }
 
-    /// F1 negative: delayed pre-anchor matching bus event never fires even
-    /// after reconcile + later REST page that confirms other ids.
+    /// F1/F2: delayed pre-anchor matching bus event never fires; after a
+    /// successful complete after-scan it is dropped (not retained forever).
     #[test]
-    fn pre_anchor_bus_match_never_fires_after_reconcile() {
+    fn pre_anchor_bus_match_dropped_after_successful_scan() {
         let p = pred(Some("X"), None);
         let mut bus = VecDeque::new();
         bus.push_back(inbound_event("old", "X pre-anchor", 50));
@@ -1253,9 +1315,9 @@ mod tests {
         assert!(first_match_bus_then_rest(&[], &bus, &p, &processed, Some(&eligible)).is_none());
         reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
         assert!(!processed.contains("old"));
-        assert_eq!(bus.len(), 1, "pre-anchor match stays pending, not processed");
+        assert_eq!(bus.len(), 1, "pending until a successful complete scan");
 
-        // REST confirms a different post only.
+        // Successful exhaustive scan confirms only "other" — not "old".
         eligible.insert("other".into());
         let rest = vec![msg("other", "u", "no match body", 200)];
         assert!(
@@ -1263,11 +1325,48 @@ mod tests {
             "pre-anchor bus must not fire when REST never confirms its id"
         );
         reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
+        drop_pending_non_members_after_success(&mut bus, &p, Some(&eligible));
+        assert!(bus.is_empty(), "proven non-member must leave the buffer");
         assert!(
             !processed.contains("old"),
-            "still unconfirmed after-membership"
+            "non-member drop must not mark processed (REST race safety)"
         );
+    }
+
+    /// F2: failed/timeout REST must not drop pending after-gated matches.
+    #[test]
+    fn failed_scan_retains_pending_after_gated_matches() {
+        let p = pred(Some("X"), None);
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound_event("maybe", "X candidate", 150));
+        let eligible = HashSet::new();
+        let mut processed = HashSet::new();
+        reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
         assert_eq!(bus.len(), 1);
+        // Simulate failure path: reconcile only, no drop_pending_non_members.
+        reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
+        assert_eq!(bus.len(), 1, "must retain pending across failed REST");
+    }
+
+    /// F2: repeated delayed pre-anchor noise does not grow the buffer after
+    /// each successful complete scan.
+    #[test]
+    fn repeated_pre_anchor_noise_stays_bounded_after_success() {
+        let p = pred(Some("X"), None);
+        let mut bus = VecDeque::new();
+        let mut eligible = HashSet::new();
+        eligible.insert("real".into());
+        let mut processed = HashSet::new();
+        for i in 0..50 {
+            bus.push_back(inbound_event(&format!("old{i}"), "X noise", i));
+            reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
+            drop_pending_non_members_after_success(&mut bus, &p, Some(&eligible));
+        }
+        assert!(
+            bus.is_empty(),
+            "buffer must not retain pre-anchor noise across successful scans"
+        );
+        assert!(bus.len() < 5, "bounded after repeated noise");
     }
 
     /// Bare wait: non-match channel inbound is terminal and dropped.
