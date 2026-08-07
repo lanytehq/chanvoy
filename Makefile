@@ -85,9 +85,10 @@ install: build-release
 	@rm -f $(LOCAL_BIN)/chanvoy$(EXT)
 	@cp target/release/chanvoy$(EXT) $(LOCAL_BIN)/chanvoy$(EXT)
 	@echo "[ok] installed chanvoy to $(LOCAL_BIN)/chanvoy$(EXT)"
-	@echo "     note: if a chanvoy daemon was already running, it"
-	@echo "     keeps the previous binary until you restart it via"
-	@echo "     'chanvoy daemon stop' + 'chanvoy auto-setup'"
+	@echo "[!!] NEXT: cycle the daemon or filtered wait / new verbs will use the old binary:"
+	@echo "     chanvoy daemon stop && chanvoy auto-setup"
+	@echo "     chanvoy version --extended   # prove CLI pin (Commit: …)"
+	@echo "     note: a running daemon keeps the binary it was started from until restart."
 
 ensure-msrv:
 	@echo "Checking MSRV $(MSRV)..."

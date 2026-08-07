@@ -383,7 +383,16 @@ re-synthesized from the current environment.
 
 ## The running daemon does not support a verb
 
-**Symptom**
+**Symptom (filtered wait — most common after install)**
+
+```
+the running daemon does not support filtered wait
+(--contains/--pattern/--after); it was started from an earlier
+chanvoy. Cycle it with `chanvoy daemon stop` then `chanvoy auto-setup`,
+and run the command again.
+```
+
+**Symptom (new verbs such as `show` / `thread`)**
 
 ```
 the running daemon does not support `show`; it was started from an
@@ -397,16 +406,20 @@ command again.
 The command you ran and the daemon it talked to are different versions.
 A daemon keeps running the binary it was started from, so installing a
 newer chanvoy does not change the daemon already serving your profile.
-Commands the newer binary knows about are unknown to the older daemon.
+Commands and wait filters the newer binary knows about are unknown to
+the older daemon.
 
-This is most visible right after an upgrade, and on shared machines
-where a daemon may have been started days earlier by another session.
+This is most visible right after `make install` / an upgrade, and on
+shared machines where a daemon may have been started days earlier by
+another session. `chanvoy version --extended` shows the **CLI** pin only
+— not daemon generation.
 
 **Fix**
 
 ```bash
 chanvoy daemon stop
 chanvoy auto-setup
+chanvoy version --extended   # confirm CLI pin
 ```
 
 Then run the command again.

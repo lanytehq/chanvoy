@@ -213,6 +213,14 @@ observation to exhaustion inside the deadman, then arms an exclusive cursor.
 One seat owns the blocking deadman per channel/panel until tool support for
 single-waiter lands.
 
+Filtered flags (`--contains` / `--pattern` / `--after`) require a daemon that
+knows `wait_channel_v2`. If the CLI refuses with “does not support filtered
+wait”, cycle the daemon (`chanvoy daemon stop` then `chanvoy auto-setup`) —
+see [troubleshooting](./troubleshooting.md#the-running-daemon-does-not-support-a-verb).
+After `make install`, always cycle before trusting new wait features. Prefer
+unique dogfood markers (`PANEL-VERIFY-<seat>-<shortid>`) over bare vocabulary
+words on busy channels.
+
    **`notifications --unread` does not use `--since` for counting.**
    The unread branch counts mentions since the stored anchor cursor,
    not since a time window. The supplied `--since` value is still

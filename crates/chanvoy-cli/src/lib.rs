@@ -100,6 +100,7 @@ fn map_daemon_predates_verb(error: DaemonError, verb: &str) -> CliError {
 struct Cli {
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// Machine-readable stdout (JSON).
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -108,20 +109,32 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandSet {
+    /// Start/stop/status for the long-lived daemon process.
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    /// Create, list, and manage local profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
+    /// Bot identity for this profile.
     Whoami,
+    /// List channels the bot can see (optionally one team).
     Channels(ChannelsArgs),
+    /// List DM conversations.
     Dms,
+    /// List recent posts (time / id modes); pure observe unless --advance.
     Read(ReadArgs),
+    /// Exit 0 if the channel has new posts since the cursor; exit 1 if none.
     Check(CheckArgs),
+    /// Post a message; --reply-to for threads.
     Post(PostArgs),
+    /// Direct messages (send / read).
     #[command(subcommand)]
     Dm(DmCommand),
+    /// Notify another bot (mention payload).
     Notify(NotifyArgs),
+    /// List notifications / unread mentions.
     Notifications(ReadWindowArgs),
+    /// Block for a matching channel post (or any non-self post), or deadman; prefer --after + --contains.
     Wait(WaitArgs),
     /// Fetch a channel's pinned posts. Pure read, no cursor side
     /// effects. Uses the cross-team channel resolver; accepts
@@ -163,9 +176,10 @@ enum CommandSet {
     /// with a diagnostic on inline operator conflicts (`in:`,
     /// `from:`, `before:` / `after:`).
     Search(SearchArgs),
+    /// Create / archive / restore channels and membership.
     #[command(subcommand)]
     Channel(ChannelCommand),
-    /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
+    /// Refresh profile from env and ensure the daemon is healthy.
     AutoSetup(AutoSetupArgs),
     /// Inspect daemon-held attention state (cursors, staleness verdicts).
     /// Strictly read-only: never mutates daemon state, never issues
@@ -402,15 +416,14 @@ struct CheckArgs {
 #[derive(Debug, Args)]
 struct WaitArgs {
     channel: String,
-    /// Deadman timeout for the wait. Bare integer = minutes (default 10m).
-    /// Accepts s/m/h/d suffixes.
+    /// Deadman timeout (default 10m). Match exit 0; clean deadman 1; hard 2. Self-posts never wake.
     #[arg(
         long,
         default_value = "10",
-        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after)."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
     )]
     timeout: String,
-    /// Literal body substring (case-sensitive). Safe onramp filter.
+    /// Literal body substring (case-sensitive). Self-posts never match.
     #[arg(long, value_name = "TEXT")]
     contains: Option<String>,
     /// Rust regex over message body. Invalid/oversize patterns refuse before wait.

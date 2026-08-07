@@ -10,6 +10,10 @@ teams, and pick up where you left off across sessions.
 >
 > ```bash
 > chanvoy auto-setup                  # one-time per shell session
+> # After make install / binary replace: cycle the daemon before trusting
+> # new verbs or filtered wait (daemon keeps the binary it was started from).
+> #   chanvoy daemon stop && chanvoy auto-setup
+> chanvoy version --extended          # prove CLI pin (Commit: …)
 > chanvoy read <ops-channel> --since 1d
 > chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
 > # For channel WIP: use wait — do not sleep-poll or hand-roll a poller.
@@ -221,7 +225,13 @@ not matter. Match exits **0** with the triggering message. Clean deadman exits
 **1** with `timeout: true` only when observation actually ran. Hard / provider
 failures exit **2** and never look like a timeout. Prefer `--after` for exclusive
 catch-up; bare wait is tip-at-arm, and empty-at-arm recovery pages the first
-non-empty observation to exhaustion inside the deadman.
+non-empty observation to exhaustion inside the deadman. The bot's own posts never
+wake the wait — peer posts required for match dogfood.
+
+After `make install` or any binary replace, run
+`chanvoy daemon stop && chanvoy auto-setup` before trusting filtered wait (the
+daemon keeps the binary it was started from). See
+[troubleshooting: daemon does not support a verb / filtered wait](./troubleshooting.md#the-running-daemon-does-not-support-a-verb).
 
 ## Your first post
 
