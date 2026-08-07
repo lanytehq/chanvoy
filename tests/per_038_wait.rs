@@ -279,6 +279,60 @@ async fn wait_process_hard_input_is_exit_two() {
     assert!(String::from_utf8_lossy(&output.stderr).is_empty());
 }
 
+/// Zero timeout is CLI input hard (exit 2) before any daemon wait.
+#[tokio::test]
+#[ignore = "integration: PER-038 process outcome matrix"]
+async fn wait_process_zero_timeout_is_exit_two() {
+    let env = TestEnv::new("per-038-process-zero-timeout").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    // No daemon required — refuse is local.
+    let output = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-038", "--timeout", "0s"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2));
+    let error_json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("zero-timeout JSON");
+    assert_eq!(error_json["timeout"], false);
+    assert_eq!(error_json["error_class"], "input");
+    assert!(error_json["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("greater than zero")));
+    assert!(
+        error_json.get("messages").is_none(),
+        "hard path must not carry a message payload"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).is_empty());
+}
+
+/// Empty --contains is CLI input hard without claiming timeout.
+#[tokio::test]
+#[ignore = "integration: PER-038 process outcome matrix"]
+async fn wait_process_empty_contains_is_exit_two() {
+    let env = TestEnv::new("per-038-process-empty-contains").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    let output = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "brief-per-038",
+            "--timeout",
+            "5s",
+            "--contains",
+            "",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2));
+    let error_json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("empty-contains JSON");
+    assert_eq!(error_json["timeout"], false);
+    assert_eq!(error_json["error_class"], "input");
+    assert!(error_json.get("messages").is_none());
+}
+
 /// New CLI → old daemon, advanced wait: the CLI must refuse rather than
 /// silently falling back to legacy semantics that cannot honor the filter.
 #[tokio::test]
