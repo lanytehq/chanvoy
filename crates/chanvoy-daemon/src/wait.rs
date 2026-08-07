@@ -305,8 +305,14 @@ async fn wait_push_path(
     for m in &backfill_msgs {
         processed.insert(m.id.clone());
     }
-    mark_bus_processed(&bus_buffer, &predicate, &mut processed);
-    bus_buffer.clear();
+    // F1: under explicit --after, retain body-matching bus candidates that
+    // are not yet REST-confirmed; do not mark them processed.
+    reconcile_bus_after_eval(
+        &mut bus_buffer,
+        &predicate,
+        &mut processed,
+        after_eligible.as_ref(),
+    );
 
     // D5: advance exclusive cursor past initial backfill so live REST
     // does not re-page the entire backlog from the original anchor.
@@ -355,8 +361,12 @@ async fn wait_push_path(
                         ) {
                             return Ok(one_message_result(channel, hit));
                         }
-                        mark_bus_processed(&bus_buffer, &predicate, &mut processed);
-                        bus_buffer.clear();
+                        reconcile_bus_after_eval(
+                            &mut bus_buffer,
+                            &predicate,
+                            &mut processed,
+                            after_eligible.as_ref(),
+                        );
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Drain anything left, then REST recover — never
@@ -385,8 +395,12 @@ async fn wait_push_path(
                                 ) {
                                     return Ok(one_message_result(channel, hit));
                                 }
-                                mark_bus_processed(&bus_buffer, &predicate, &mut processed);
-                                bus_buffer.clear();
+                                reconcile_bus_after_eval(
+                                    &mut bus_buffer,
+                                    &predicate,
+                                    &mut processed,
+                                    after_eligible.as_ref(),
+                                );
                                 if let Some(last) = page.last() {
                                     scan_cursor = Some(last.id.clone());
                                     for m in page {
@@ -451,8 +465,12 @@ async fn wait_push_path(
                         ) {
                             return Ok(one_message_result(channel, hit));
                         }
-                        mark_bus_processed(&bus_buffer, &predicate, &mut processed);
-                        bus_buffer.clear();
+                        reconcile_bus_after_eval(
+                            &mut bus_buffer,
+                            &predicate,
+                            &mut processed,
+                            after_eligible.as_ref(),
+                        );
                         if let Some(last) = page.last() {
                             scan_cursor = Some(last.id.clone());
                             for m in page {
@@ -702,18 +720,38 @@ fn first_match_bus_then_rest(
     first_match(rest, predicate, processed)
 }
 
-fn mark_bus_processed(
-    bus: &VecDeque<Arc<DaemonEvent>>,
+/// After a non-firing eval, mark terminal bus candidates processed and drop
+/// them. Under explicit `--after`, body-matching posts that are not yet in
+/// `after_eligible` stay pending so a later REST confirmation can fire them
+/// exactly once (entarch/secrev F1). Bare wait treats all channel inbound as
+/// immediately terminal (post-sub bus is eligible without REST).
+fn reconcile_bus_after_eval(
+    bus: &mut VecDeque<Arc<DaemonEvent>>,
     predicate: &WaitPredicate,
     processed: &mut HashSet<String>,
+    after_eligible: Option<&HashSet<String>>,
 ) {
-    for event in bus {
-        if let DaemonEventPayloadInner::Inbound(p) = &event.payload {
-            if p.channel_id == predicate.channel_id() {
+    let mut keep = VecDeque::new();
+    for event in bus.drain(..) {
+        match &event.payload {
+            DaemonEventPayloadInner::Inbound(p) if p.channel_id == predicate.channel_id() => {
+                if processed.contains(&p.post_id) {
+                    continue;
+                }
+                let eligible = bus_id_after_eligible(after_eligible, &p.post_id);
+                if !eligible && predicate.matches_inbound(p) {
+                    // Pending F1 candidate: match body, after-membership unknown.
+                    keep.push_back(event);
+                    continue;
+                }
                 processed.insert(p.post_id.clone());
+            }
+            _ => {
+                // Control-plane / wrong-channel: drop without polluting processed.
             }
         }
     }
+    *bus = keep;
 }
 
 fn drain_bus(
@@ -780,9 +818,11 @@ async fn ws_connection_healthy(state: &AppState) -> bool {
 }
 
 /// Clean deadman only when observation actually worked (secrev/entarch B,
-/// devrev D3). Connection-state bus traffic is not evidence.
+/// devrev D3). Connection-state bus traffic is not evidence; a currently
+/// healthy WS with zero successful observes is still provider/hard, not
+/// clean silence (secrev D3 residual).
 async fn push_deadline_outcome(
-    state: &AppState,
+    _state: &AppState,
     channel: &str,
     clean_observe: bool,
     saw_healthy_inbound: bool,
@@ -794,16 +834,14 @@ async fn push_deadline_outcome(
             message: "deadline reached while provider observation was failing".into(),
         });
     }
-    // Honest silence requires a real observe path: healthy inbound and/or
-    // successful REST dual-observe. Control-plane events do not qualify.
+    // Honest silence requires a real observe path during the window:
+    // healthy inbound and/or successful REST. Do not fall through on
+    // "WS healthy *now*" without an observe success.
     if !saw_healthy_inbound && !saw_successful_rest {
-        let healthy_now = ws_connection_healthy(state).await;
-        if !healthy_now {
-            return Err(CoreError::WaitProviderDegraded {
-                channel: channel.to_string(),
-                message: "wait ended without a healthy push or REST observation".into(),
-            });
-        }
+        return Err(CoreError::WaitProviderDegraded {
+            channel: channel.to_string(),
+            message: "wait ended without a healthy push or REST observation".into(),
+        });
     }
     Err(CoreError::WaitTimeout(channel.to_string()))
 }
@@ -1061,6 +1099,91 @@ mod tests {
         let hit =
             first_match_bus_then_rest(&[], &bus, &p, &HashSet::new(), Some(&eligible)).unwrap();
         assert_eq!(hit.id, "new");
+    }
+
+    /// F1 live sequence: bus match before REST eligibility must not be
+    /// marked processed / dropped; REST confirm then fires exactly once.
+    #[test]
+    fn after_gated_bus_match_survives_reconcile_until_rest_confirms() {
+        let p = pred(Some("X"), None);
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound_event("new", "X post-anchor", 150));
+        let mut eligible = HashSet::new();
+        let mut processed = HashSet::new();
+
+        assert!(
+            first_match_bus_then_rest(&[], &bus, &p, &processed, Some(&eligible)).is_none(),
+            "unconfirmed after-gated match must not fire yet"
+        );
+        reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
+        assert!(
+            !processed.contains("new"),
+            "must not mark unconfirmed body-match processed"
+        );
+        assert_eq!(bus.len(), 1, "must retain pending candidate");
+
+        eligible.insert("new".into());
+        let hit = first_match_bus_then_rest(&[], &bus, &p, &processed, Some(&eligible))
+            .expect("REST-confirmed bus match must fire once");
+        assert_eq!(hit.id, "new");
+
+        // Same id via REST page must not double-fire after processed.
+        processed.insert(hit.id.clone());
+        reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
+        assert!(bus.is_empty());
+        assert!(
+            first_match_bus_then_rest(
+                &[msg("new", "u", "X post-anchor", 150)],
+                &bus,
+                &p,
+                &processed,
+                Some(&eligible),
+            )
+            .is_none(),
+            "must not fire a second time"
+        );
+    }
+
+    /// F1 negative: delayed pre-anchor matching bus event never fires even
+    /// after reconcile + later REST page that confirms other ids.
+    #[test]
+    fn pre_anchor_bus_match_never_fires_after_reconcile() {
+        let p = pred(Some("X"), None);
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound_event("old", "X pre-anchor", 50));
+        let mut eligible = HashSet::new();
+        let mut processed = HashSet::new();
+
+        assert!(first_match_bus_then_rest(&[], &bus, &p, &processed, Some(&eligible)).is_none());
+        reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
+        assert!(!processed.contains("old"));
+        assert_eq!(bus.len(), 1, "pre-anchor match stays pending, not processed");
+
+        // REST confirms a different post only.
+        eligible.insert("other".into());
+        let rest = vec![msg("other", "u", "no match body", 200)];
+        assert!(
+            first_match_bus_then_rest(&rest, &bus, &p, &processed, Some(&eligible)).is_none(),
+            "pre-anchor bus must not fire when REST never confirms its id"
+        );
+        reconcile_bus_after_eval(&mut bus, &p, &mut processed, Some(&eligible));
+        assert!(
+            !processed.contains("old"),
+            "still unconfirmed after-membership"
+        );
+        assert_eq!(bus.len(), 1);
+    }
+
+    /// Bare wait: non-match channel inbound is terminal and dropped.
+    #[test]
+    fn bare_wait_reconcile_marks_channel_inbound_processed() {
+        let p = pred(Some("X"), None);
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound_event("p1", "nope", 1));
+        let mut processed = HashSet::new();
+        reconcile_bus_after_eval(&mut bus, &p, &mut processed, None);
+        assert!(processed.contains("p1"));
+        assert!(bus.is_empty());
     }
 
     #[test]
