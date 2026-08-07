@@ -49,8 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regex over body; use `(?i)…` when case should not matter), and `--after
   <post-id>` (exclusive baseline). Match exits **0** with one message payload
   (`{channel, messages:[one]}`); clean deadman exits **1** with
-  `timeout: true` only on that path; hard/config and provider-exhausted failures
-  exit **2** and never set `timeout: true`. Filters refuse empty values and
+  `timeout: true` only when observation actually ran; hard/config and
+  provider-exhausted (including stalled provider calls and an unhealthy push
+  path with no successful observe) exit **2** and never set `timeout: true`.
+  Prefer `--after` for catch-up; empty-at-arm recovery pages the first non-empty
+  observation to exhaustion inside the deadman. Filters refuse empty values and
   oversize/invalid patterns before the wait arms. The daemon method
   `wait_channel_v2` is the capability gate (cycle the daemon after install).
 

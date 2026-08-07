@@ -1,10 +1,11 @@
 //! PER-038 wait engine: content filter, exclusive baseline, absolute
 //! deadman, one-message result, shared predicate, provider retry.
 //!
-//! Causal order (entarch F3 / pre-build Q3): subscribe → establish
-//! anchor/tip → backfill through shared predicate → consume push with
-//! dedupe. Bare-wait membership is bus-arrival (and REST posts after the
-//! tip id), never `create_at` exclusivity.
+//! Causal order (entarch F3 / pre-build Q3 / R2): subscribe → drain while
+//! establishing anchor → backfill → merge bus+REST candidates under
+//! first-match → live push with dual REST when unhealthy. Bare-wait
+//! membership is bus-arrival (and REST posts after the tip id), never
+//! `create_at` exclusivity.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -12,11 +13,12 @@ use std::time::Duration;
 
 use chanvoy_core::{
     CoreError, DaemonEvent, DaemonEventPayloadInner, InboundEventPayload, Message, WaitResult,
+    WsConnectionState,
 };
 use regex::RegexBuilder;
 use reqwest::StatusCode;
 use tokio::sync::broadcast;
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep, timeout, Instant};
 
 use crate::AppState;
 
@@ -114,13 +116,10 @@ impl WaitPredicate {
         true
     }
 
-    /// Shared message predicate: correct channel (when known), not self, body filter.
     pub fn matches_message(&self, message: &Message) -> bool {
         message.user_id != self.my_user_id && self.body_matches(&message.message)
     }
 
-    /// Shared inbound-event predicate: resolved channel_id, not self, body filter.
-    /// Membership (post-arm / after-anchor) is decided by the engine, not here.
     pub fn matches_inbound(&self, payload: &InboundEventPayload) -> bool {
         payload.channel_id == self.channel_id
             && payload.sender_id != self.my_user_id
@@ -151,6 +150,14 @@ pub fn first_match<'a>(
         .collect();
     candidates.sort_by(|a, b| a.create_at.cmp(&b.create_at).then_with(|| a.id.cmp(&b.id)));
     candidates.first().map(|m| (*m).clone())
+}
+
+/// Earliest among already-collected candidate messages (for bus+REST merge).
+pub fn earliest_message(candidates: &[Message]) -> Option<Message> {
+    candidates
+        .iter()
+        .min_by(|a, b| a.create_at.cmp(&b.create_at).then_with(|| a.id.cmp(&b.id)))
+        .cloned()
 }
 
 fn is_retryable_provider(err: &CoreError) -> bool {
@@ -190,10 +197,6 @@ pub async fn wait_with_params(
 ) -> Result<WaitResult, CoreError> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
-    // Compile filters before channel resolution so bad patterns fail closed
-    // without a Mattermost round-trip (channel_id filled in after resolve).
-    // We compile against a placeholder channel_id then rebuild — cheaper than
-    // two validation paths; source validation is pure.
     WaitPredicate::compile("pending", "pending", contains, pattern)?;
 
     let channel_id = provider_retry(state, channel, deadline, || async {
@@ -227,40 +230,31 @@ async fn wait_push_path(
     after: Option<&str>,
     deadline: Instant,
 ) -> Result<WaitResult, CoreError> {
-    // 1. Subscribe first and buffer (no-replay EventBus contract).
     let mut rx = state.event_bus.subscribe();
     let mut bus_buffer: VecDeque<Arc<DaemonEvent>> = VecDeque::new();
 
-    // Drain anything already queued (should be empty for a fresh sub).
-    loop {
-        match rx.try_recv() {
-            Ok(ev) => bus_buffer.push_back(ev),
-            Err(broadcast::error::TryRecvError::Empty) => break,
-            Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                return Err(CoreError::WaitProviderDegraded {
-                    channel: channel.to_string(),
-                    message: "event bus lagged before wait baseline was established".into(),
-                });
-            }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                return Err(CoreError::WaitProviderDegraded {
-                    channel: channel.to_string(),
-                    message: "event bus closed".into(),
-                });
+    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+
+    // Establish baseline while continuously capturing bus events (R2 finding 2).
+    let (scan_after, rest_baseline) = {
+        let baseline = establish_baseline(state, channel, predicate.channel_id(), after, deadline);
+        tokio::pin!(baseline);
+        loop {
+            tokio::select! {
+                res = &mut baseline => break res?,
+                _ = sleep(Duration::from_millis(5)) => {
+                    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                }
             }
         }
-    }
+    };
 
-    // 2. Resolve anchor / bare tip (after subscribe).
-    // `rest_baseline` excludes pre-arm REST history only — never bus events
-    // (entarch Q3: snapshot ids must not suppress queued causal events).
-    let (scan_after, rest_baseline) =
-        establish_baseline(state, channel, predicate.channel_id(), after, deadline).await?;
     let mut processed: HashSet<String> = HashSet::new();
 
-    // 3. Backfill posts after baseline through shared predicate.
+    // Backfill while still draining the bus.
+    let mut backfill_msgs: Vec<Message> = Vec::new();
     if let Some(ref anchor) = scan_after {
-        let backfill = provider_retry(state, channel, deadline, || {
+        let fetch = provider_retry(state, channel, deadline, || {
             let a = anchor.clone();
             async move {
                 state
@@ -268,71 +262,149 @@ async fn wait_push_path(
                     .posts_after_by_channel_id(predicate.channel_id(), &a)
                     .await
             }
-        })
-        .await?;
-        let mut rest_exclude = rest_baseline.clone();
-        rest_exclude.extend(processed.iter().cloned());
-        if let Some(hit) = first_match(&backfill, predicate, &rest_exclude) {
-            return Ok(one_message_result(channel, hit));
-        }
-        for m in &backfill {
-            processed.insert(m.id.clone());
-        }
-    }
-
-    // 4. Evaluate buffered bus events (post-subscription by construction).
-    while let Some(event) = bus_buffer.pop_front() {
-        if let Some(hit) = evaluate_bus_event(&event, predicate, &processed) {
-            return Ok(one_message_result(channel, hit));
-        }
-        if let DaemonEventPayloadInner::Inbound(p) = &event.payload {
-            if p.channel_id == predicate.channel_id() {
-                processed.insert(p.post_id.clone());
+        });
+        tokio::pin!(fetch);
+        loop {
+            tokio::select! {
+                res = &mut fetch => {
+                    backfill_msgs = res?;
+                    break;
+                }
+                _ = sleep(Duration::from_millis(5)) => {
+                    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                }
             }
         }
     }
 
-    // 5. Live loop: push + lag recovery via forward page from scan cursor.
+    // Final drain, then first-match across backfill + bus (causal order).
+    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+    if let Some(hit) =
+        first_match_across_rest_and_bus(&backfill_msgs, &bus_buffer, predicate, &processed)
+    {
+        return Ok(one_message_result(channel, hit));
+    }
+    for m in &backfill_msgs {
+        processed.insert(m.id.clone());
+    }
+    mark_bus_processed(&bus_buffer, predicate, &mut processed);
+
     let mut scan_cursor = scan_after;
     let mut clean_observe = true;
+    let mut saw_push_event = false;
+    let mut saw_healthy_ws = ws_connection_healthy(state).await;
 
     loop {
         if Instant::now() >= deadline {
-            if clean_observe {
-                return Err(CoreError::WaitTimeout(channel.to_string()));
-            }
-            return Err(CoreError::WaitProviderDegraded {
-                channel: channel.to_string(),
-                message: "deadline reached while provider observation was failing".into(),
-            });
+            return push_deadline_outcome(
+                state,
+                channel,
+                clean_observe,
+                saw_push_event,
+                saw_healthy_ws,
+            )
+            .await;
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(event)) => {
-                clean_observe = true;
-                if let Some(hit) = evaluate_bus_event(&event, predicate, &processed) {
-                    return Ok(one_message_result(channel, hit));
-                }
-                if let DaemonEventPayloadInner::Inbound(p) = &event.payload {
-                    if p.channel_id == predicate.channel_id() {
-                        processed.insert(p.post_id.clone());
+        let idle = REST_IDLE.min(remaining);
+        // Dual-observe: REST poll on idle even when push is quiet / WS unhealthy.
+        tokio::select! {
+            recv = rx.recv() => {
+                match recv {
+                    Ok(event) => {
+                        saw_push_event = true;
+                        clean_observe = true;
+                        if ws_connection_healthy(state).await {
+                            saw_healthy_ws = true;
+                        }
+                        bus_buffer.push_back(event);
+                        if let Some(hit) = first_match_across_rest_and_bus(
+                            &[],
+                            &bus_buffer,
+                            predicate,
+                            &processed,
+                        ) {
+                            return Ok(one_message_result(channel, hit));
+                        }
+                        mark_bus_processed(&bus_buffer, predicate, &mut processed);
+                        bus_buffer.clear();
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        match lag_recover_page(
+                            state,
+                            channel,
+                            predicate,
+                            scan_cursor.as_deref(),
+                            deadline,
+                        )
+                        .await
+                        {
+                            Ok(page) => {
+                                clean_observe = true;
+                                let mut exclude = rest_baseline.clone();
+                                exclude.extend(processed.iter().cloned());
+                                if let Some(hit) = first_match(&page, predicate, &exclude) {
+                                    return Ok(one_message_result(channel, hit));
+                                }
+                                if let Some(last) = page.last() {
+                                    scan_cursor = Some(last.id.clone());
+                                    for m in page {
+                                        processed.insert(m.id);
+                                    }
+                                }
+                            }
+                            Err(CoreError::WaitProviderDegraded { .. })
+                            | Err(CoreError::WaitTimeout(_)) => {
+                                clean_observe = false;
+                            }
+                            Err(other) => return Err(other),
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(CoreError::WaitProviderDegraded {
+                            channel: channel.to_string(),
+                            message: "event bus closed during wait".into(),
+                        });
                     }
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                // Forward page through the shared predicate. Empty-cursor
-                // lag must evaluate the recovered tip page (not only set
-                // the cursor) or the post that arrived during lag is
-                // permanently skipped by posts_after (devrev r1).
-                match lag_recover_page(state, channel, predicate, scan_cursor.as_deref(), deadline)
+            _ = sleep(idle) => {
+                // Dual REST observe with shared predicate / cursor / deadline.
+                if Instant::now() >= deadline {
+                    return push_deadline_outcome(
+                        state,
+                        channel,
+                        clean_observe,
+                        saw_push_event,
+                        saw_healthy_ws,
+                    )
+                    .await;
+                }
+                if ws_connection_healthy(state).await {
+                    saw_healthy_ws = true;
+                }
+                let page = if let Some(ref cursor) = scan_cursor {
+                    provider_retry(state, channel, deadline, || {
+                        let c = cursor.clone();
+                        async move {
+                            state
+                                .client
+                                .posts_after_by_channel_id(predicate.channel_id(), &c)
+                                .await
+                        }
+                    })
                     .await
-                {
+                } else {
+                    // Empty-at-arm: page first non-empty observation to exhaustion.
+                    empty_at_arm_observation(state, channel, predicate, deadline).await
+                };
+                match page {
                     Ok(page) => {
                         clean_observe = true;
-                        let mut rest_exclude = rest_baseline.clone();
-                        rest_exclude.extend(processed.iter().cloned());
-                        if let Some(hit) = first_match(&page, predicate, &rest_exclude) {
+                        let mut exclude = rest_baseline.clone();
+                        exclude.extend(processed.iter().cloned());
+                        if let Some(hit) = first_match(&page, predicate, &exclude) {
                             return Ok(one_message_result(channel, hit));
                         }
                         if let Some(last) = page.last() {
@@ -345,23 +417,18 @@ async fn wait_push_path(
                     Err(CoreError::WaitProviderDegraded { .. }) => {
                         clean_observe = false;
                     }
+                    Err(CoreError::WaitTimeout(_)) => {
+                        return push_deadline_outcome(
+                            state,
+                            channel,
+                            clean_observe,
+                            saw_push_event,
+                            saw_healthy_ws,
+                        )
+                        .await;
+                    }
                     Err(other) => return Err(other),
                 }
-            }
-            Ok(Err(broadcast::error::RecvError::Closed)) => {
-                return Err(CoreError::WaitProviderDegraded {
-                    channel: channel.to_string(),
-                    message: "event bus closed during wait".into(),
-                });
-            }
-            Err(_) => {
-                if clean_observe {
-                    return Err(CoreError::WaitTimeout(channel.to_string()));
-                }
-                return Err(CoreError::WaitProviderDegraded {
-                    channel: channel.to_string(),
-                    message: "deadline reached while provider observation was failing".into(),
-                });
             }
         }
     }
@@ -378,7 +445,6 @@ async fn wait_rest_path(
         establish_baseline(state, channel, predicate.channel_id(), after, deadline).await?;
     let mut processed: HashSet<String> = HashSet::new();
 
-    // Initial backfill
     if let Some(ref anchor) = scan_cursor {
         let backfill = provider_retry(state, channel, deadline, || {
             let a = anchor.clone();
@@ -429,15 +495,7 @@ async fn wait_rest_path(
             })
             .await
         } else {
-            // Empty at arm: recover a wider latest window and evaluate it
-            // before advancing the cursor (same class as push lag recovery).
-            provider_retry(state, channel, deadline, || async {
-                state
-                    .client
-                    .latest_channel_messages_by_id(predicate.channel_id(), 200)
-                    .await
-            })
-            .await
+            empty_at_arm_observation(state, channel, predicate, deadline).await
         };
 
         match page_result {
@@ -480,11 +538,35 @@ async fn wait_rest_path(
     }
 }
 
-/// Establish exclusive baseline after subscription (push path) or at arm (REST).
-///
-/// Returns `(scan_cursor, rest_baseline)`:
-/// * `--after R`: prove R + channel bind; scan from R; baseline `{R}`.
-/// * bare: tip snapshot; scan from tip id; baseline = tip-page ids (REST only).
+/// Empty-at-arm: page first non-empty observation to exhaustion, return
+/// the full set for earliest-match selection (entarch/secrev R2 residual A).
+async fn empty_at_arm_observation(
+    state: &AppState,
+    channel: &str,
+    predicate: &WaitPredicate,
+    deadline: Instant,
+) -> Result<Vec<Message>, CoreError> {
+    // Probe latest(1) first so we do not walk a still-empty channel forever
+    // without yielding; then page all posts if non-empty.
+    let probe = provider_retry(state, channel, deadline, || async {
+        state
+            .client
+            .latest_channel_messages_by_id(predicate.channel_id(), 1)
+            .await
+    })
+    .await?;
+    if probe.is_empty() {
+        return Ok(Vec::new());
+    }
+    provider_retry(state, channel, deadline, || async {
+        state
+            .client
+            .all_channel_posts_by_id(predicate.channel_id())
+            .await
+    })
+    .await
+}
+
 async fn establish_baseline(
     state: &AppState,
     channel: &str,
@@ -542,22 +624,64 @@ fn map_anchor_err(err: CoreError, anchor_id: &str) -> CoreError {
     }
 }
 
-fn evaluate_bus_event(
-    event: &DaemonEvent,
+fn first_match_across_rest_and_bus(
+    rest: &[Message],
+    bus: &VecDeque<Arc<DaemonEvent>>,
     predicate: &WaitPredicate,
     processed: &HashSet<String>,
 ) -> Option<Message> {
-    match &event.payload {
-        DaemonEventPayloadInner::Inbound(p) if predicate.matches_inbound(p) => {
-            // `processed` is post-evaluation dedupe (already returned / already
-            // accepted from backfill). It is NOT the tip snapshot set — bus
-            // events remain eligible even when the tip page also saw the id.
-            if processed.contains(&p.post_id) {
-                return None;
-            }
-            Some(inbound_to_message(p))
+    let mut candidates: Vec<Message> = Vec::new();
+    for m in rest {
+        if !processed.contains(&m.id) && predicate.matches_message(m) {
+            candidates.push(m.clone());
         }
-        _ => None,
+    }
+    for event in bus {
+        if let DaemonEventPayloadInner::Inbound(p) = &event.payload {
+            if !processed.contains(&p.post_id) && predicate.matches_inbound(p) {
+                candidates.push(inbound_to_message(p));
+            }
+        }
+    }
+    earliest_message(&candidates)
+}
+
+fn mark_bus_processed(
+    bus: &VecDeque<Arc<DaemonEvent>>,
+    predicate: &WaitPredicate,
+    processed: &mut HashSet<String>,
+) {
+    for event in bus {
+        if let DaemonEventPayloadInner::Inbound(p) = &event.payload {
+            if p.channel_id == predicate.channel_id() {
+                processed.insert(p.post_id.clone());
+            }
+        }
+    }
+}
+
+fn drain_bus(
+    rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
+    bus_buffer: &mut VecDeque<Arc<DaemonEvent>>,
+    channel: &str,
+) -> Result<(), CoreError> {
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => bus_buffer.push_back(ev),
+            Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                return Err(CoreError::WaitProviderDegraded {
+                    channel: channel.to_string(),
+                    message: "event bus lagged during wait baseline".into(),
+                });
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                return Err(CoreError::WaitProviderDegraded {
+                    channel: channel.to_string(),
+                    message: "event bus closed".into(),
+                });
+            }
+        }
     }
 }
 
@@ -568,8 +692,6 @@ fn one_message_result(channel: &str, message: Message) -> WaitResult {
     }
 }
 
-/// Lag / empty-cursor recovery page: with a cursor, page after it; without,
-/// take a latest window and evaluate it (must not only stamp the tip).
 async fn lag_recover_page(
     state: &AppState,
     channel: &str,
@@ -589,14 +711,46 @@ async fn lag_recover_page(
         })
         .await
     } else {
-        provider_retry(state, channel, deadline, || async {
-            state
-                .client
-                .latest_channel_messages_by_id(predicate.channel_id(), 200)
-                .await
-        })
-        .await
+        empty_at_arm_observation(state, channel, predicate, deadline).await
     }
+}
+
+async fn ws_connection_healthy(state: &AppState) -> bool {
+    let ws = {
+        let guard = state.ws_state_holder.lock().await;
+        guard.clone()
+    };
+    let Some(ws) = ws else {
+        return false;
+    };
+    let state = *ws.connection_state.lock().await;
+    matches!(state, WsConnectionState::Healthy)
+}
+
+/// Clean deadman only when observation actually worked (secrev/entarch B).
+async fn push_deadline_outcome(
+    state: &AppState,
+    channel: &str,
+    clean_observe: bool,
+    saw_push_event: bool,
+    saw_healthy_ws: bool,
+) -> Result<WaitResult, CoreError> {
+    if !clean_observe {
+        return Err(CoreError::WaitProviderDegraded {
+            channel: channel.to_string(),
+            message: "deadline reached while provider observation was failing".into(),
+        });
+    }
+    let healthy_now = ws_connection_healthy(state).await;
+    // Never healthy for the arm and never saw a push event → failed
+    // observation, not honest silence.
+    if !saw_push_event && !saw_healthy_ws && !healthy_now {
+        return Err(CoreError::WaitProviderDegraded {
+            channel: channel.to_string(),
+            message: "wait ended without a healthy push observation path".into(),
+        });
+    }
+    Err(CoreError::WaitTimeout(channel.to_string()))
 }
 
 /// Pure deadline with no prior retryable failure is a clean deadman, not
@@ -624,7 +778,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, CoreError>>,
 {
-    let _ = state; // reserved for future Retry-After header plumbing
+    let _ = state;
     let mut delay = BACKOFF_BASE;
     let mut saw_retryable = false;
     loop {
@@ -635,10 +789,12 @@ where
                 Some("deadline reached before a successful observation".into()),
             ));
         }
-        match op().await {
-            Ok(v) => return Ok(v),
-            Err(err) if is_terminal_auth(&err) => return Err(err),
-            Err(err) if is_retryable_provider(&err) => {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Bound every attempt by remaining deadline (entarch R2 finding 1).
+        match timeout(remaining, op()).await {
+            Ok(Ok(v)) => return Ok(v),
+            Ok(Err(err)) if is_terminal_auth(&err) => return Err(err),
+            Ok(Err(err)) if is_retryable_provider(&err) => {
                 saw_retryable = true;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -651,7 +807,14 @@ where
                 sleep(delay.min(remaining).min(BACKOFF_CAP)).await;
                 delay = (delay * 2).min(BACKOFF_CAP);
             }
-            Err(err) => return Err(err),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                // Attempt itself overran remaining budget — not clean silence.
+                return Err(CoreError::WaitProviderDegraded {
+                    channel: channel.to_string(),
+                    message: "provider call stalled past wait deadline".into(),
+                });
+            }
         }
     }
 }
@@ -659,7 +822,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chanvoy_core::{InboundEventPayload, Provider};
+    use chanvoy_core::{DaemonEventKind, InboundEventPayload, Provider};
 
     fn pred(contains: Option<&str>, pattern: Option<&str>) -> WaitPredicate {
         WaitPredicate::compile("bot", "ch-1", contains, pattern).expect("compile")
@@ -674,6 +837,27 @@ mod tests {
             create_at,
             root_id: id.into(),
         }
+    }
+
+    fn inbound_event(post_id: &str, body: &str, create_at: i64) -> Arc<DaemonEvent> {
+        Arc::new(DaemonEvent {
+            seq: 1,
+            kind: DaemonEventKind::InboundMessage,
+            payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                profile: "t".into(),
+                provider: Provider::Mattermost,
+                channel_id: "ch-1".into(),
+                channel_name: "c".into(),
+                post_id: post_id.into(),
+                root_id: post_id.into(),
+                sender_id: "u".into(),
+                sender_username: "u".into(),
+                message: body.into(),
+                create_at,
+                received_at: create_at,
+                mentioned: false,
+            }),
+        })
     }
 
     #[test]
@@ -777,10 +961,7 @@ mod tests {
     #[test]
     fn pure_deadline_is_clean_deadman_not_provider() {
         let err = deadline_error("ops", false, None);
-        assert!(
-            matches!(err, CoreError::WaitTimeout(_)),
-            "no retryable failure → WaitTimeout, got {err:?}"
-        );
+        assert!(matches!(err, CoreError::WaitTimeout(_)));
     }
 
     #[test]
@@ -795,37 +976,23 @@ mod tests {
         }
     }
 
+    /// Seam: earlier bus match wins over later REST backfill match (R2 #2).
     #[test]
-    fn tip_id_in_rest_baseline_does_not_block_bus_eval() {
-        // rest_baseline is not passed to evaluate_bus_event — only processed.
+    fn earlier_bus_match_wins_over_later_rest_backfill() {
         let p = pred(Some("X"), None);
-        let processed = HashSet::new();
-        let event = DaemonEvent {
-            seq: 1,
-            kind: chanvoy_core::DaemonEventKind::InboundMessage,
-            payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
-                profile: "t".into(),
-                provider: Provider::Mattermost,
-                channel_id: "ch-1".into(),
-                channel_name: "c".into(),
-                post_id: "tip-also-on-bus".into(),
-                root_id: "tip-also-on-bus".into(),
-                sender_id: "u".into(),
-                sender_username: "u".into(),
-                message: "X here".into(),
-                create_at: 1,
-                received_at: 1,
-                mentioned: false,
-            }),
-        };
-        let hit = evaluate_bus_event(&event, &p, &processed).expect("bus eligible");
-        assert_eq!(hit.id, "tip-also-on-bus");
+        let rest = vec![msg("p2", "u", "X later", 200)];
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound_event("p1", "X earlier", 100));
+        let hit = first_match_across_rest_and_bus(&rest, &bus, &p, &HashSet::new()).unwrap();
+        assert_eq!(
+            hit.id, "p1",
+            "causal first match must prefer earlier bus event"
+        );
     }
 
     #[test]
     fn event_bus_has_no_replay_of_pre_subscribe_events() {
-        use chanvoy_core::{DaemonEvent, DaemonEventKind, EventBus};
-        use std::sync::Arc;
+        use chanvoy_core::EventBus;
 
         let bus = EventBus::new(16);
         bus.emit(DaemonEvent {
@@ -847,7 +1014,6 @@ mod tests {
             }),
         });
         let mut rx = bus.subscribe();
-        // Pre-subscribe event must not be delivered.
         assert!(matches!(
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -875,6 +1041,5 @@ mod tests {
             DaemonEventPayloadInner::Inbound(p) => assert_eq!(p.post_id, "post"),
             _ => panic!("expected inbound"),
         }
-        let _ = Arc::strong_count(&got);
     }
 }

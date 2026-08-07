@@ -174,11 +174,23 @@ long-running channel:
    |---|---|---|
    | `read --since` | second-precise | hits MM `posts?since={millis}` directly |
    | `wait --timeout` | second-precise | absolute deadman from RPC entry |
+   | `notifications --since` | minute-rounded (rounds up) | underlying MM notifications surface is minute-keyed |
+
+   So `chanvoy notifications --since 30s` behaves like ~1 minute (not
+   30 seconds); `chanvoy read --since 30s` is precise. Use `read` when
+   sub-minute precision matters.
 
 ### Wait (content filter + deadman)
 
 For channel WIP: **use `chanvoy wait`** — do not sleep-poll or invent a file-tail
 poller. Wait is a doorbell with payload, not a review loop (fire ≠ action).
+
+Prefer **read-before-wait** with an exclusive baseline:
+
+```bash
+chanvoy read <channel> --since 1h --json   # capture last id; act if already present
+chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
+```
 
 ```bash
 chanvoy wait <channel> --timeout 30m \
@@ -191,16 +203,15 @@ chanvoy wait <channel> --timeout 30m \
 | Outcome | Exit | Notes |
 | --- | ---: | --- |
 | Match | 0 | One message in `{channel, messages:[…]}` |
-| Clean deadman | 1 | JSON `timeout: true` only on this path |
+| Clean deadman | 1 | JSON `timeout: true` only when observation actually ran |
 | Hard / provider | 2 | `error_class` + `retryable`; never `timeout: true` |
 
-Self posts never wake the wait. Empty filters are refused. One seat owns the
-blocking deadman per channel/panel until tool support for single-waiter lands.
-   | `notifications --since` | minute-rounded (rounds up) | underlying MM notifications surface is minute-keyed |
-
-   So `chanvoy notifications --since 30s` behaves like ~1 minute (not
-   30 seconds); `chanvoy read --since 30s` is precise. Use `read` when
-   sub-minute precision matters.
+Filters are case-sensitive by default; use `--pattern '(?i)…'` when case should not
+matter. Self posts never wake the wait. Empty filters are refused. Bare wait
+without `--after` is tip-at-arm; empty-at-arm recovery pages the first non-empty
+observation to exhaustion inside the deadman, then arms an exclusive cursor.
+One seat owns the blocking deadman per channel/panel until tool support for
+single-waiter lands.
 
    **`notifications --unread` does not use `--since` for counting.**
    The unread branch counts mentions since the stored anchor cursor,

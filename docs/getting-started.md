@@ -218,8 +218,10 @@ chanvoy wait <channel> --timeout 30m --pattern '(?i)assent' --after <id>
 
 Filters are case-sensitive by default; use `--pattern '(?i)…'` when case should
 not matter. Match exits **0** with the triggering message. Clean deadman exits
-**1** with `timeout: true`. Hard failures exit **2** and never look like a
-timeout. Bare wait without `--after` is tip-at-arm only.
+**1** with `timeout: true` only when observation actually ran. Hard / provider
+failures exit **2** and never look like a timeout. Prefer `--after` for exclusive
+catch-up; bare wait is tip-at-arm, and empty-at-arm recovery pages the first
+non-empty observation to exhaustion inside the deadman.
 
 ## Your first post
 

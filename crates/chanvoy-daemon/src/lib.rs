@@ -1436,6 +1436,46 @@ fn error_code(error: &DaemonError) -> i64 {
     }
 }
 
+#[cfg(test)]
+mod wait_rpc_code_tests {
+    use super::*;
+
+    /// CLI maps −32005 → exit 1 timeout; −32007/−32008 → exit 2 hard.
+    #[test]
+    fn wait_outcome_rpc_codes_are_distinct() {
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitTimeout("ch".into()))),
+            -32005
+        );
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitFilterInvalid(
+                "bad".into()
+            ))),
+            -32007
+        );
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitProviderDegraded {
+                channel: "ch".into(),
+                message: "down".into(),
+            })),
+            -32008
+        );
+    }
+
+    #[test]
+    fn wait_channel_v2_params_require_timeout_secs() {
+        // Capability surface: v2 carries timeout_secs (not optional minutes-only).
+        let v = serde_json::json!({
+            "channel": "ops",
+            "timeout_secs": 60,
+            "contains": "ASSENT"
+        });
+        let p: WaitChannelV2Params = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(p.timeout_secs, 60);
+        assert_eq!(p.contains.as_deref(), Some("ASSENT"));
+    }
+}
+
 fn require_elevated_profile(profile: &Profile) -> Result<(), CoreError> {
     if matches!(profile.capability_class, CapabilityClass::Elevated) {
         Ok(())

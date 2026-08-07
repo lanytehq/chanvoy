@@ -3186,16 +3186,14 @@ impl MattermostClient {
                 )
                 .await?;
 
-            let mut page_messages = self
-                .hydrate_posts(response.posts.into_values().collect())
-                .await;
-
-            if page_messages.is_empty() {
+            let raw = Self::validated_posts_from_envelope(response, channel_id)?;
+            if raw.is_empty() {
                 break;
             }
 
+            let page_len = raw.len();
+            let mut page_messages = self.hydrate_posts(raw).await;
             Self::sort_chronologically(&mut page_messages);
-            let page_len = page_messages.len();
             messages.extend(page_messages);
 
             if page_len < 200 {
@@ -3208,6 +3206,35 @@ impl MattermostClient {
         Self::sort_chronologically(&mut messages);
 
         Ok(messages)
+    }
+
+    /// Refuse substituted or foreign candidates before hydrate/filter.
+    /// Map key must equal `post.id`. When `channel_id` is present on the
+    /// post it must match the resolved channel; empty channel_id is
+    /// tolerated only because some list shapes omit it (path is already
+    /// channel-scoped).
+    fn validated_posts_from_envelope(
+        envelope: PostsEnvelope,
+        expected_channel_id: &str,
+    ) -> Result<Vec<RawPost>, CoreError> {
+        let mut out = Vec::with_capacity(envelope.posts.len());
+        for (key, post) in envelope.posts {
+            if key != post.id {
+                return Err(CoreError::Api {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "provider returned a post whose map key does not match its id".into(),
+                });
+            }
+            if !post.channel_id.is_empty() && !binding_holds(&post.channel_id, expected_channel_id)
+            {
+                return Err(CoreError::Api {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: "provider returned a post bound to a different channel".into(),
+                });
+            }
+            out.push(post);
+        }
+        Ok(out)
     }
 
     pub async fn read_channel_since_last_mine(
@@ -4479,11 +4506,44 @@ impl MattermostClient {
                 None::<Value>,
             )
             .await?;
-        let mut posts = self
-            .hydrate_posts(response.posts.into_values().collect())
-            .await;
+        let raw = Self::validated_posts_from_envelope(response, channel_id)?;
+        let mut posts = self.hydrate_posts(raw).await;
         Self::sort_chronologically(&mut posts);
         Ok(posts)
+    }
+
+    /// Page every post currently in the channel (newest-first pages until
+    /// exhausted). Used by empty-at-arm wait recovery so the first non-empty
+    /// observation is complete inside the caller's deadline budget.
+    pub async fn all_channel_posts_by_id(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<Message>, CoreError> {
+        let mut page = 0u64;
+        let mut messages = Vec::new();
+        loop {
+            let response: PostsEnvelope = self
+                .request(
+                    "GET",
+                    &format!("/channels/{channel_id}/posts?page={page}&per_page=200"),
+                    None::<Value>,
+                )
+                .await?;
+            let raw = Self::validated_posts_from_envelope(response, channel_id)?;
+            if raw.is_empty() {
+                break;
+            }
+            let page_len = raw.len();
+            let mut page_messages = self.hydrate_posts(raw).await;
+            Self::sort_chronologically(&mut page_messages);
+            messages.extend(page_messages);
+            if page_len < 200 {
+                break;
+            }
+            page += 1;
+        }
+        Self::sort_chronologically(&mut messages);
+        Ok(messages)
     }
 
     /// PER-019 (secrev pin, PR #40 review): the post-search endpoint is
@@ -4574,6 +4634,7 @@ impl MattermostClient {
     ) -> Result<(), CoreError> {
         #[derive(Deserialize)]
         struct PostResponse {
+            id: String,
             channel_id: String,
         }
 
@@ -4589,7 +4650,15 @@ impl MattermostClient {
             Err(error) => return Err(error),
         };
 
-        if post.channel_id != expected_channel_id {
+        // Exact id bind before channel trust (PER-037 / PER-038 pre-build):
+        // a substituted body in the right channel must not pass.
+        if post.id != post_id {
+            return Err(CoreError::AnchorChannelMismatch {
+                post_id: post_id.to_string(),
+                channel: channel_name.to_string(),
+            });
+        }
+        if !binding_holds(&post.channel_id, expected_channel_id) {
             return Err(CoreError::AnchorChannelMismatch {
                 post_id: post_id.to_string(),
                 channel: channel_name.to_string(),
@@ -8075,6 +8144,7 @@ monitored_channels = ["per-003", "per-004"]
             Mock::given(method("GET"))
                 .and(path("/api/v4/posts/post-ops-1"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "post-ops-1",
                     "channel_id": "ch-ops-dup"
                 })))
                 .mount(&server)
