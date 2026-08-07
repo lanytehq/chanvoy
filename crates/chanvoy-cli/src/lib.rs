@@ -395,7 +395,7 @@ struct WaitArgs {
     #[arg(
         long,
         default_value = "10",
-        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after)."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after)."
     )]
     timeout: String,
     /// Literal body substring (case-sensitive). Safe onramp filter.
@@ -3667,6 +3667,7 @@ fn format_dm_timestamp(millis: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::ffi::OsStr;
     use std::sync::Mutex;
 
@@ -3675,6 +3676,24 @@ mod tests {
     /// `env::remove_var` calls would otherwise race with each other and
     /// with any test that reads the same vars.
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn wait_help_states_filter_source_and_compiled_regex_bounds() {
+        let mut cli = Cli::command();
+        let wait = cli
+            .find_subcommand_mut("wait")
+            .expect("wait subcommand is present");
+        let help = wait.render_long_help().to_string();
+
+        assert!(
+            help.contains("256 UTF-8 bytes"),
+            "wait help must state the source-size bound: {help}"
+        );
+        assert!(
+            help.contains("64 KiB"),
+            "wait help must state the compiled-regex bound: {help}"
+        );
+    }
 
     /// A CLI that knows `show` / `thread` talking to a daemon that does
     /// not gets an actionable instruction, not a JSON-RPC code.
