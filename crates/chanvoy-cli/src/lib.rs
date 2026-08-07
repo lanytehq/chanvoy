@@ -20,6 +20,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 use tokio::process::Command;
 
+mod host_build_info;
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -170,6 +172,16 @@ enum CommandSet {
     /// Mattermost API calls.
     #[command(subcommand)]
     Attention(AttentionCommand),
+    /// Print the installed binary version (semver). Use `--extended` for
+    /// commit, build time, rustc, and platform — identity for dirty dogfood.
+    Version(VersionArgs),
+}
+
+#[derive(Debug, Args)]
+struct VersionArgs {
+    /// Print host build identity: commit, built time, rustc, platform, dirty.
+    #[arg(long, short = 'e')]
+    extended: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -658,7 +670,36 @@ fn init_tracing() {
         .try_init();
 }
 
+fn handle_version(json: bool, args: VersionArgs) -> Result<(), CliError> {
+    let info = host_build_info::resolve();
+    if json {
+        let value = if args.extended {
+            serde_json::to_value(&info).map_err(|e| CliError::Bootstrap(e.to_string()))?
+        } else {
+            serde_json::json!({
+                "name": "chanvoy",
+                "version": info.version,
+            })
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| CliError::Bootstrap(e.to_string()))?
+        );
+        return Ok(());
+    }
+    if args.extended {
+        println!("{}", host_build_info::format_extended(&info));
+    } else {
+        println!("{}", host_build_info::format_basic(&info));
+    }
+    Ok(())
+}
+
 async fn execute(cli: Cli) -> Result<(), CliError> {
+    // Version needs no profile or daemon — identity of the local binary only.
+    if let CommandSet::Version(args) = cli.command {
+        return handle_version(cli.json, args);
+    }
     // auto-setup is the bootstrap / repair surface and must not depend on resolving
     // an existing persisted profile — a malformed unrelated profile would otherwise
     // block the very path meant to fix it. Dispatch before resolve_profile_name.
@@ -701,7 +742,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     };
     let profile = resolve_profile_name(cli.profile.as_deref(), policy)?;
     match cli.command {
-        CommandSet::AutoSetup(_) | CommandSet::Profile(_) => {
+        CommandSet::Version(_) | CommandSet::AutoSetup(_) | CommandSet::Profile(_) => {
             unreachable!("dispatched above")
         }
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
