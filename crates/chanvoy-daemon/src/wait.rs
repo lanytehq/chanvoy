@@ -154,14 +154,10 @@ pub fn first_match<'a>(
 
 fn is_retryable_provider(err: &CoreError) -> bool {
     match err {
-        CoreError::Api { status, .. } => matches!(
-            *status,
-            StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::INTERNAL_SERVER_ERROR
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        ),
+        // AC-W6 / devrev R3: all 5xx + 429 + transport, not a fixed 500/502/503/504 list.
+        CoreError::Api { status, .. } => {
+            *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+        }
         CoreError::Http(_) => true,
         _ => false,
     }
@@ -177,6 +173,16 @@ fn is_terminal_auth(err: &CoreError) -> bool {
     )
 }
 
+/// Refuse zero / empty wait windows before any subscribe or provider work.
+fn validate_wait_timeout_secs(timeout_secs: u64) -> Result<(), CoreError> {
+    if timeout_secs == 0 {
+        return Err(CoreError::WaitFilterInvalid(
+            "wait timeout must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Absolute deadline from RPC entry; covers resolve, anchor, backfill, retries, block.
 pub async fn wait_with_params(
     state: &AppState,
@@ -187,6 +193,9 @@ pub async fn wait_with_params(
     pattern: Option<&str>,
     after: Option<&str>,
 ) -> Result<WaitResult, CoreError> {
+    // Direct RPC and CLI share this path (devrev R3 #4): zero is input hard,
+    // never a clean deadman / WaitTimeout.
+    validate_wait_timeout_secs(timeout_secs)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     // Pure filter compile only (no provider). Monitored waits subscribe
@@ -369,18 +378,44 @@ async fn wait_push_path(
                         );
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Drain anything left, then REST recover — never
-                        // return REST without checking the bus first.
+                        // Drain anything left, then REST recover while still
+                        // draining the bus (devrev R3 #2).
                         let _ = drain_bus(&mut rx, &mut bus_buffer, channel);
-                        match lag_recover_page(
-                            state,
-                            channel,
-                            &predicate,
-                            scan_cursor.as_deref(),
-                            deadline,
-                        )
-                        .await
-                        {
+                        let cursor_snap = scan_cursor.clone();
+                        let page = {
+                            let recover = lag_recover_page(
+                                state,
+                                channel,
+                                &predicate,
+                                cursor_snap.as_deref(),
+                                deadline,
+                            );
+                            tokio::pin!(recover);
+                            loop {
+                                tokio::select! {
+                                    res = &mut recover => break res,
+                                    _ = sleep(Duration::from_millis(5)) => {
+                                        drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                                        if let Some(hit) = first_match_bus_then_rest(
+                                            &[],
+                                            &bus_buffer,
+                                            &predicate,
+                                            &processed,
+                                            after_eligible.as_ref(),
+                                        ) {
+                                            return Ok(one_message_result(channel, hit));
+                                        }
+                                        reconcile_bus_after_eval(
+                                            &mut bus_buffer,
+                                            &predicate,
+                                            &mut processed,
+                                            after_eligible.as_ref(),
+                                        );
+                                    }
+                                }
+                            }
+                        };
+                        match page {
                             Ok(page) => {
                                 note_after_eligible(&mut after_eligible, &page);
                                 saw_successful_rest = true;
@@ -434,20 +469,51 @@ async fn wait_push_path(
                     )
                     .await;
                 }
-                let page = if let Some(ref cursor) = scan_cursor {
-                    provider_retry(state, channel, deadline, || {
-                        let c = cursor.clone();
-                        let ch = pred_channel.clone();
-                        async move {
-                            state
-                                .client
-                                .posts_after_by_channel_id(&ch, &c)
+                // Continuous bus drain through the REST future (devrev R3 #2).
+                let cursor_snap = scan_cursor.clone();
+                let page = {
+                    let fetch_fut = async {
+                        if let Some(ref cursor) = cursor_snap {
+                            provider_retry(state, channel, deadline, || {
+                                let c = cursor.clone();
+                                let ch = pred_channel.clone();
+                                async move {
+                                    state
+                                        .client
+                                        .posts_after_by_channel_id(&ch, &c)
+                                        .await
+                                }
+                            })
+                            .await
+                        } else {
+                            empty_at_arm_observation(state, channel, &predicate, deadline)
                                 .await
                         }
-                    })
-                    .await
-                } else {
-                    empty_at_arm_observation(state, channel, &predicate, deadline).await
+                    };
+                    tokio::pin!(fetch_fut);
+                    loop {
+                        tokio::select! {
+                            res = &mut fetch_fut => break res,
+                            _ = sleep(Duration::from_millis(5)) => {
+                                drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                                if let Some(hit) = first_match_bus_then_rest(
+                                    &[],
+                                    &bus_buffer,
+                                    &predicate,
+                                    &processed,
+                                    after_eligible.as_ref(),
+                                ) {
+                                    return Ok(one_message_result(channel, hit));
+                                }
+                                reconcile_bus_after_eval(
+                                    &mut bus_buffer,
+                                    &predicate,
+                                    &mut processed,
+                                    after_eligible.as_ref(),
+                                );
+                            }
+                        }
+                    }
                 };
                 match page {
                     Ok(page) => {
@@ -1055,6 +1121,36 @@ mod tests {
     fn pure_deadline_is_clean_deadman_not_provider() {
         let err = deadline_error("ops", false, None);
         assert!(matches!(err, CoreError::WaitTimeout(_)));
+    }
+
+    #[test]
+    fn all_server_errors_and_429_are_retryable() {
+        for code in [429u16, 500, 501, 502, 503, 504, 507] {
+            let status = StatusCode::from_u16(code).expect("status");
+            let err = CoreError::Api {
+                status,
+                message: format!("probe {code}"),
+            };
+            assert!(
+                is_retryable_provider(&err),
+                "status {code} must be retryable under AC-W6"
+            );
+        }
+        let client_err = CoreError::Api {
+            status: StatusCode::BAD_REQUEST,
+            message: "no".into(),
+        };
+        assert!(!is_retryable_provider(&client_err));
+    }
+
+    #[test]
+    fn zero_timeout_is_filter_invalid_not_deadman() {
+        let err = validate_wait_timeout_secs(0).unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitFilterInvalid(_)),
+            "zero timeout must be input hard, got {err:?}"
+        );
+        assert!(validate_wait_timeout_secs(1).is_ok());
     }
 
     #[test]
