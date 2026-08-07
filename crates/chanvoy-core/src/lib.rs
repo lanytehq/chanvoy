@@ -3209,10 +3209,8 @@ impl MattermostClient {
     }
 
     /// Refuse substituted or foreign candidates before hydrate/filter.
-    /// Map key must equal `post.id`. When `channel_id` is present on the
-    /// post it must match the resolved channel; empty channel_id is
-    /// tolerated only because some list shapes omit it (path is already
-    /// channel-scoped).
+    /// Map key must equal `post.id`. Channel id must positively bind to the
+    /// resolved channel (empty is not path provenance — devrev R2).
     fn validated_posts_from_envelope(
         envelope: PostsEnvelope,
         expected_channel_id: &str,
@@ -3225,8 +3223,7 @@ impl MattermostClient {
                     message: "provider returned a post whose map key does not match its id".into(),
                 });
             }
-            if !post.channel_id.is_empty() && !binding_holds(&post.channel_id, expected_channel_id)
-            {
+            if !binding_holds(&post.channel_id, expected_channel_id) {
                 return Err(CoreError::Api {
                     status: StatusCode::BAD_GATEWAY,
                     message: "provider returned a post bound to a different channel".into(),
@@ -6410,6 +6407,7 @@ monitored_channels = ["per-003", "per-004"]
                             "message": "hi",
                             "create_at": 1_776_000_000_000_i64,
                             "username": "user-1",
+                            "channel_id": "ch-public-seeded",
                         }
                     }
                 })))

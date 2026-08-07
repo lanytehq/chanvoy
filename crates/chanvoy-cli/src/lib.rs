@@ -1196,13 +1196,31 @@ fn map_post_error(err: CliError, char_count: usize) -> CliError {
 /// fall back to legacy. Bare wait may fall back once on method-not-found
 /// so a new CLI still works against an old daemon for unfiltered waits.
 async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
-    let timeout_secs = parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes)
-        .map_err(CliError::Bootstrap)?;
+    let timeout_secs = match parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes) {
+        Ok(secs) => secs,
+        Err(err) => {
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                &format!("invalid --timeout: {err}"),
+            );
+        }
+    };
+    // D4: zero window is input hard — never a clean deadman.
+    if timeout_secs == 0 {
+        return exit_wait_hard(
+            json,
+            &args.channel,
+            "input",
+            false,
+            "wait --timeout must be greater than zero",
+        );
+    }
 
     let advanced = args.contains.is_some() || args.pattern.is_some() || args.after.is_some();
 
-    // Local refuse for empty filters so operators get a clear exit-2 path
-    // even before the daemon (and so CLI-only callers cannot send match-all).
     if let Some(ref c) = args.contains {
         if c.is_empty() {
             return exit_wait_hard(
@@ -1250,8 +1268,6 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             code: RPC_UNKNOWN_METHOD,
             ..
         }) if advanced => {
-            // Exit 2, not 1: must not collide with clean deadman for
-            // exit-code-only agents (devrev r1).
             return exit_wait_hard(
                 json,
                 &args.channel,
@@ -1267,7 +1283,6 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             code: RPC_UNKNOWN_METHOD,
             ..
         }) => {
-            // Bare wait only: one transparent fallback to legacy method.
             client
                 .wait_channel(&args.channel, timeout_secs, args.team.clone())
                 .await
@@ -1277,7 +1292,6 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
 
     match result {
         Ok(result) => {
-            // AC-W0: match path always carries one message payload.
             if result.messages.is_empty() {
                 return exit_wait_hard(
                     json,
@@ -1290,69 +1304,111 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             if !json {
                 eprintln!("--- new message ---");
             }
-            // N→1: print only the first message object in the container.
             let one = WaitResult {
                 channel: result.channel,
                 messages: vec![result.messages.into_iter().next().expect("non-empty")],
             };
             print_value(json, &one)
         }
-        Err(DaemonError::Rpc {
+        Err(err) => classify_wait_error(json, &args.channel, timeout_secs, err),
+    }
+}
+
+/// Wait-local exhaustive outcome classifier (devrev D4): deadman exit 1
+/// only for true timeout; every other failure is exit 2 with class.
+fn classify_wait_error(
+    json: bool,
+    channel: &str,
+    timeout_secs: u64,
+    err: DaemonError,
+) -> Result<(), CliError> {
+    match &err {
+        DaemonError::Rpc {
             code: -32005,
             message,
-        }) => {
-            // Clean deadman only.
+        } => {
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "timeout": true,
-                        "channel": args.channel,
+                        "channel": channel,
                         "message": message
-                    }))?
+                    }))
+                    .unwrap_or_else(|_| r#"{"timeout":true}"#.into())
                 );
             } else {
                 eprintln!(
-                    "timeout: true (no matching messages in #{} after {} seconds)",
-                    args.channel, timeout_secs
+                    "timeout: true (no matching messages in #{channel} after {timeout_secs} seconds)"
                 );
             }
             process::exit(1);
         }
-        Err(DaemonError::Rpc {
+        DaemonError::Rpc {
             code: -32007,
             message,
-        }) => exit_wait_hard(json, &args.channel, "input", false, &message),
-        Err(DaemonError::Rpc {
+        } => exit_wait_hard(json, channel, "input", false, message),
+        DaemonError::Rpc {
             code: -32008,
             message,
-        }) => exit_wait_hard(json, &args.channel, "provider", true, &message),
-        Err(DaemonError::Rpc {
+        } => exit_wait_hard(json, channel, "provider", true, message),
+        DaemonError::Rpc {
             code: RPC_UNKNOWN_METHOD,
             ..
-        }) => Err(CliError::DaemonPredatesVerb {
-            verb: "wait".to_string(),
-        }),
-        // Map common core errors that may arrive as generic -32000.
-        Err(DaemonError::Rpc {
+        } => exit_wait_hard(
+            json,
+            channel,
+            "input",
+            false,
+            "the running daemon does not support this wait method; cycle it with \
+             `chanvoy daemon stop` then `chanvoy auto-setup`",
+        ),
+        DaemonError::Rpc {
             code: -32000,
             message,
-        }) if message.contains("wait input error")
+        } if message.contains("wait input error")
             || message.contains("WaitFilterInvalid")
             || message.contains("empty --")
-            || message.contains("wait --after") =>
+            || message.contains("wait --after")
+            || message.contains("invalid --timeout")
+            || message.contains("AnchorNotFound")
+            || message.contains("AnchorChannelMismatch")
+            || message.contains("not found")
+            || message.contains("channel") && message.contains("refused") =>
         {
-            exit_wait_hard(json, &args.channel, "input", false, &message)
+            exit_wait_hard(json, channel, "input", false, message)
         }
-        Err(DaemonError::Rpc {
+        DaemonError::Rpc {
             code: -32000,
             message,
-        }) if message.contains("wait observation failed")
-            || message.contains("WaitProviderDegraded") =>
+        } if message.contains("wait observation failed")
+            || message.contains("WaitProviderDegraded")
+            || message.contains("stalled")
+            || message.contains("api error 5")
+            || message.contains("api error 429")
+            || message.contains("api error 401")
+            || message.contains("api error 403") =>
         {
-            exit_wait_hard(json, &args.channel, "provider", true, &message)
+            let retryable = !message.contains("401") && !message.contains("403");
+            let class = if message.contains("401") || message.contains("403") {
+                "input"
+            } else {
+                "provider"
+            };
+            exit_wait_hard(json, channel, class, retryable, message)
         }
-        Err(error) => Err(error.into()),
+        DaemonError::NotRunning(path) => exit_wait_hard(
+            json,
+            channel,
+            "provider",
+            true,
+            &format!("no chanvoy daemon is listening at {path}"),
+        ),
+        DaemonError::Rpc { message, .. } => {
+            // Any other RPC failure from wait is hard, never exit-1 deadman.
+            exit_wait_hard(json, channel, "provider", true, message)
+        }
+        other => exit_wait_hard(json, channel, "provider", true, &other.to_string()),
     }
 }
 

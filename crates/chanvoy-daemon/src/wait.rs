@@ -152,14 +152,6 @@ pub fn first_match<'a>(
     candidates.first().map(|m| (*m).clone())
 }
 
-/// Earliest among already-collected candidate messages (for bus+REST merge).
-pub fn earliest_message(candidates: &[Message]) -> Option<Message> {
-    candidates
-        .iter()
-        .min_by(|a, b| a.create_at.cmp(&b.create_at).then_with(|| a.id.cmp(&b.id)))
-        .cloned()
-}
-
 fn is_retryable_provider(err: &CoreError) -> bool {
     match err {
         CoreError::Api { status, .. } => matches!(
@@ -197,18 +189,9 @@ pub async fn wait_with_params(
 ) -> Result<WaitResult, CoreError> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
+    // Pure filter compile only (no provider). Monitored waits subscribe
+    // before the first provider await (devrev D1).
     WaitPredicate::compile("pending", "pending", contains, pattern)?;
-
-    let channel_id = provider_retry(state, channel, deadline, || async {
-        state
-            .client
-            .resolve_channel(channel, team)
-            .await
-            .map(|r| r.channel_id)
-    })
-    .await?;
-
-    let predicate = WaitPredicate::compile(&state.my_user_id, &channel_id, contains, pattern)?;
 
     let is_monitored = state
         .profile
@@ -217,27 +200,64 @@ pub async fn wait_with_params(
         .any(|m| m.eq_ignore_ascii_case(channel));
 
     if is_monitored {
-        wait_push_path(state, channel, &predicate, after, deadline).await
+        wait_push_path(state, channel, team, contains, pattern, after, deadline).await
     } else {
+        let channel_id = provider_retry(state, channel, deadline, || async {
+            state
+                .client
+                .resolve_channel(channel, team)
+                .await
+                .map(|r| r.channel_id)
+        })
+        .await?;
+        let predicate = WaitPredicate::compile(&state.my_user_id, &channel_id, contains, pattern)?;
         wait_rest_path(state, channel, &predicate, after, deadline).await
     }
 }
 
+/// Monitored path: **subscribe first**, then resolve/compile/anchor/backfill
+/// while draining the receiver (devrev D1 / AC-W3).
 async fn wait_push_path(
     state: &AppState,
     channel: &str,
-    predicate: &WaitPredicate,
+    team: Option<&str>,
+    contains: Option<&str>,
+    pattern: Option<&str>,
     after: Option<&str>,
     deadline: Instant,
 ) -> Result<WaitResult, CoreError> {
     let mut rx = state.event_bus.subscribe();
     let mut bus_buffer: VecDeque<Arc<DaemonEvent>> = VecDeque::new();
-
     drain_bus(&mut rx, &mut bus_buffer, channel)?;
 
-    // Establish baseline while continuously capturing bus events (R2 finding 2).
-    let (scan_after, rest_baseline) = {
-        let baseline = establish_baseline(state, channel, predicate.channel_id(), after, deadline);
+    // Resolve while continuously draining (subscribe already done).
+    let channel_id = {
+        let resolve = provider_retry(state, channel, deadline, || async {
+            state
+                .client
+                .resolve_channel(channel, team)
+                .await
+                .map(|r| r.channel_id)
+        });
+        tokio::pin!(resolve);
+        loop {
+            tokio::select! {
+                res = &mut resolve => break res?,
+                _ = sleep(Duration::from_millis(5)) => {
+                    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                }
+            }
+        }
+    };
+    let predicate = WaitPredicate::compile(&state.my_user_id, &channel_id, contains, pattern)?;
+    let pred_channel = predicate.channel_id().to_string();
+
+    // Explicit --after: bus may only fire posts confirmed in the provider
+    // `after` relation (devrev D2). None = bare wait (post-sub bus eligible).
+    let mut after_eligible: Option<HashSet<String>> = after.map(|_| HashSet::new());
+
+    let (scan_after, _rest_baseline) = {
+        let baseline = establish_baseline(state, channel, &pred_channel, after, deadline);
         tokio::pin!(baseline);
         loop {
             tokio::select! {
@@ -250,18 +270,12 @@ async fn wait_push_path(
     };
 
     let mut processed: HashSet<String> = HashSet::new();
-
-    // Backfill while still draining the bus.
     let mut backfill_msgs: Vec<Message> = Vec::new();
     if let Some(ref anchor) = scan_after {
         let fetch = provider_retry(state, channel, deadline, || {
             let a = anchor.clone();
-            async move {
-                state
-                    .client
-                    .posts_after_by_channel_id(predicate.channel_id(), &a)
-                    .await
-            }
+            let ch = pred_channel.clone();
+            async move { state.client.posts_after_by_channel_id(&ch, &a).await }
         });
         tokio::pin!(fetch);
         loop {
@@ -276,23 +290,35 @@ async fn wait_push_path(
             }
         }
     }
+    note_after_eligible(&mut after_eligible, &backfill_msgs);
 
-    // Final drain, then first-match across backfill + bus (causal order).
     drain_bus(&mut rx, &mut bus_buffer, channel)?;
-    if let Some(hit) =
-        first_match_across_rest_and_bus(&backfill_msgs, &bus_buffer, predicate, &processed)
-    {
+    if let Some(hit) = first_match_bus_then_rest(
+        &backfill_msgs,
+        &bus_buffer,
+        &predicate,
+        &processed,
+        after_eligible.as_ref(),
+    ) {
         return Ok(one_message_result(channel, hit));
     }
     for m in &backfill_msgs {
         processed.insert(m.id.clone());
     }
-    mark_bus_processed(&bus_buffer, predicate, &mut processed);
+    mark_bus_processed(&bus_buffer, &predicate, &mut processed);
+    bus_buffer.clear();
 
-    let mut scan_cursor = scan_after;
+    // D5: advance exclusive cursor past initial backfill so live REST
+    // does not re-page the entire backlog from the original anchor.
+    let mut scan_cursor = if let Some(last) = backfill_msgs.last() {
+        Some(last.id.clone())
+    } else {
+        scan_after
+    };
+
     let mut clean_observe = true;
-    let mut saw_push_event = false;
-    let mut saw_healthy_ws = ws_connection_healthy(state).await;
+    let mut saw_healthy_inbound = false;
+    let mut saw_successful_rest = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -300,53 +326,67 @@ async fn wait_push_path(
                 state,
                 channel,
                 clean_observe,
-                saw_push_event,
-                saw_healthy_ws,
+                saw_healthy_inbound,
+                saw_successful_rest,
             )
             .await;
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let idle = REST_IDLE.min(remaining);
-        // Dual-observe: REST poll on idle even when push is quiet / WS unhealthy.
         tokio::select! {
             recv = rx.recv() => {
                 match recv {
                     Ok(event) => {
-                        saw_push_event = true;
-                        clean_observe = true;
-                        if ws_connection_healthy(state).await {
-                            saw_healthy_ws = true;
+                        // D3: only healthy *inbound* observation counts.
+                        if let DaemonEventPayloadInner::Inbound(_) = &event.payload {
+                            if ws_connection_healthy(state).await {
+                                saw_healthy_inbound = true;
+                                clean_observe = true;
+                            }
                         }
                         bus_buffer.push_back(event);
-                        if let Some(hit) = first_match_across_rest_and_bus(
+                        if let Some(hit) = first_match_bus_then_rest(
                             &[],
                             &bus_buffer,
-                            predicate,
+                            &predicate,
                             &processed,
+                            after_eligible.as_ref(),
                         ) {
                             return Ok(one_message_result(channel, hit));
                         }
-                        mark_bus_processed(&bus_buffer, predicate, &mut processed);
+                        mark_bus_processed(&bus_buffer, &predicate, &mut processed);
                         bus_buffer.clear();
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Drain anything left, then REST recover — never
+                        // return REST without checking the bus first.
+                        let _ = drain_bus(&mut rx, &mut bus_buffer, channel);
                         match lag_recover_page(
                             state,
                             channel,
-                            predicate,
+                            &predicate,
                             scan_cursor.as_deref(),
                             deadline,
                         )
                         .await
                         {
                             Ok(page) => {
+                                note_after_eligible(&mut after_eligible, &page);
+                                saw_successful_rest = true;
                                 clean_observe = true;
-                                let mut exclude = rest_baseline.clone();
-                                exclude.extend(processed.iter().cloned());
-                                if let Some(hit) = first_match(&page, predicate, &exclude) {
+                                drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                                if let Some(hit) = first_match_bus_then_rest(
+                                    &page,
+                                    &bus_buffer,
+                                    &predicate,
+                                    &processed,
+                                    after_eligible.as_ref(),
+                                ) {
                                     return Ok(one_message_result(channel, hit));
                                 }
+                                mark_bus_processed(&bus_buffer, &predicate, &mut processed);
+                                bus_buffer.clear();
                                 if let Some(last) = page.last() {
                                     scan_cursor = Some(last.id.clone());
                                     for m in page {
@@ -370,43 +410,49 @@ async fn wait_push_path(
                 }
             }
             _ = sleep(idle) => {
-                // Dual REST observe with shared predicate / cursor / deadline.
                 if Instant::now() >= deadline {
                     return push_deadline_outcome(
                         state,
                         channel,
                         clean_observe,
-                        saw_push_event,
-                        saw_healthy_ws,
+                        saw_healthy_inbound,
+                        saw_successful_rest,
                     )
                     .await;
-                }
-                if ws_connection_healthy(state).await {
-                    saw_healthy_ws = true;
                 }
                 let page = if let Some(ref cursor) = scan_cursor {
                     provider_retry(state, channel, deadline, || {
                         let c = cursor.clone();
+                        let ch = pred_channel.clone();
                         async move {
                             state
                                 .client
-                                .posts_after_by_channel_id(predicate.channel_id(), &c)
+                                .posts_after_by_channel_id(&ch, &c)
                                 .await
                         }
                     })
                     .await
                 } else {
-                    // Empty-at-arm: page first non-empty observation to exhaustion.
-                    empty_at_arm_observation(state, channel, predicate, deadline).await
+                    empty_at_arm_observation(state, channel, &predicate, deadline).await
                 };
                 match page {
                     Ok(page) => {
+                        note_after_eligible(&mut after_eligible, &page);
+                        saw_successful_rest = true;
                         clean_observe = true;
-                        let mut exclude = rest_baseline.clone();
-                        exclude.extend(processed.iter().cloned());
-                        if let Some(hit) = first_match(&page, predicate, &exclude) {
+                        // Live REST must drain bus before firing (devrev).
+                        drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                        if let Some(hit) = first_match_bus_then_rest(
+                            &page,
+                            &bus_buffer,
+                            &predicate,
+                            &processed,
+                            after_eligible.as_ref(),
+                        ) {
                             return Ok(one_message_result(channel, hit));
                         }
+                        mark_bus_processed(&bus_buffer, &predicate, &mut processed);
+                        bus_buffer.clear();
                         if let Some(last) = page.last() {
                             scan_cursor = Some(last.id.clone());
                             for m in page {
@@ -422,8 +468,8 @@ async fn wait_push_path(
                             state,
                             channel,
                             clean_observe,
-                            saw_push_event,
-                            saw_healthy_ws,
+                            saw_healthy_inbound,
+                            saw_successful_rest,
                         )
                         .await;
                     }
@@ -448,12 +494,8 @@ async fn wait_rest_path(
     if let Some(ref anchor) = scan_cursor {
         let backfill = provider_retry(state, channel, deadline, || {
             let a = anchor.clone();
-            async move {
-                state
-                    .client
-                    .posts_after_by_channel_id(predicate.channel_id(), &a)
-                    .await
-            }
+            let ch = predicate.channel_id().to_string();
+            async move { state.client.posts_after_by_channel_id(&ch, &a).await }
         })
         .await?;
         let mut exclude = rest_baseline.clone();
@@ -486,12 +528,8 @@ async fn wait_rest_path(
         let page_result = if let Some(ref cursor) = scan_cursor {
             provider_retry(state, channel, deadline, || {
                 let c = cursor.clone();
-                async move {
-                    state
-                        .client
-                        .posts_after_by_channel_id(predicate.channel_id(), &c)
-                        .await
-                }
+                let ch = predicate.channel_id().to_string();
+                async move { state.client.posts_after_by_channel_id(&ch, &c).await }
             })
             .await
         } else {
@@ -624,26 +662,44 @@ fn map_anchor_err(err: CoreError, anchor_id: &str) -> CoreError {
     }
 }
 
-fn first_match_across_rest_and_bus(
+fn note_after_eligible(after_eligible: &mut Option<HashSet<String>>, page: &[Message]) {
+    if let Some(el) = after_eligible.as_mut() {
+        for m in page {
+            el.insert(m.id.clone());
+        }
+    }
+}
+
+fn bus_id_after_eligible(after_eligible: Option<&HashSet<String>>, post_id: &str) -> bool {
+    match after_eligible {
+        None => true,                     // bare wait: post-sub bus is eligible
+        Some(el) => el.contains(post_id), // explicit --after: REST-confirmed only
+    }
+}
+
+/// Prefer bus **arrival order**, then REST chronological first match.
+/// Does not reorder bus events by provider timestamps (devrev R2).
+fn first_match_bus_then_rest(
     rest: &[Message],
     bus: &VecDeque<Arc<DaemonEvent>>,
     predicate: &WaitPredicate,
     processed: &HashSet<String>,
+    after_eligible: Option<&HashSet<String>>,
 ) -> Option<Message> {
-    let mut candidates: Vec<Message> = Vec::new();
-    for m in rest {
-        if !processed.contains(&m.id) && predicate.matches_message(m) {
-            candidates.push(m.clone());
-        }
-    }
     for event in bus {
         if let DaemonEventPayloadInner::Inbound(p) = &event.payload {
-            if !processed.contains(&p.post_id) && predicate.matches_inbound(p) {
-                candidates.push(inbound_to_message(p));
+            if processed.contains(&p.post_id) {
+                continue;
+            }
+            if !bus_id_after_eligible(after_eligible, &p.post_id) {
+                continue;
+            }
+            if predicate.matches_inbound(p) {
+                return Some(inbound_to_message(p));
             }
         }
     }
-    earliest_message(&candidates)
+    first_match(rest, predicate, processed)
 }
 
 fn mark_bus_processed(
@@ -702,12 +758,8 @@ async fn lag_recover_page(
     if let Some(cursor) = scan_cursor {
         provider_retry(state, channel, deadline, || {
             let c = cursor.to_string();
-            async move {
-                state
-                    .client
-                    .posts_after_by_channel_id(predicate.channel_id(), &c)
-                    .await
-            }
+            let ch = predicate.channel_id().to_string();
+            async move { state.client.posts_after_by_channel_id(&ch, &c).await }
         })
         .await
     } else {
@@ -727,13 +779,14 @@ async fn ws_connection_healthy(state: &AppState) -> bool {
     matches!(state, WsConnectionState::Healthy)
 }
 
-/// Clean deadman only when observation actually worked (secrev/entarch B).
+/// Clean deadman only when observation actually worked (secrev/entarch B,
+/// devrev D3). Connection-state bus traffic is not evidence.
 async fn push_deadline_outcome(
     state: &AppState,
     channel: &str,
     clean_observe: bool,
-    saw_push_event: bool,
-    saw_healthy_ws: bool,
+    saw_healthy_inbound: bool,
+    saw_successful_rest: bool,
 ) -> Result<WaitResult, CoreError> {
     if !clean_observe {
         return Err(CoreError::WaitProviderDegraded {
@@ -741,14 +794,16 @@ async fn push_deadline_outcome(
             message: "deadline reached while provider observation was failing".into(),
         });
     }
-    let healthy_now = ws_connection_healthy(state).await;
-    // Never healthy for the arm and never saw a push event → failed
-    // observation, not honest silence.
-    if !saw_push_event && !saw_healthy_ws && !healthy_now {
-        return Err(CoreError::WaitProviderDegraded {
-            channel: channel.to_string(),
-            message: "wait ended without a healthy push observation path".into(),
-        });
+    // Honest silence requires a real observe path: healthy inbound and/or
+    // successful REST dual-observe. Control-plane events do not qualify.
+    if !saw_healthy_inbound && !saw_successful_rest {
+        let healthy_now = ws_connection_healthy(state).await;
+        if !healthy_now {
+            return Err(CoreError::WaitProviderDegraded {
+                channel: channel.to_string(),
+                message: "wait ended without a healthy push or REST observation".into(),
+            });
+        }
     }
     Err(CoreError::WaitTimeout(channel.to_string()))
 }
@@ -983,11 +1038,29 @@ mod tests {
         let rest = vec![msg("p2", "u", "X later", 200)];
         let mut bus = VecDeque::new();
         bus.push_back(inbound_event("p1", "X earlier", 100));
-        let hit = first_match_across_rest_and_bus(&rest, &bus, &p, &HashSet::new()).unwrap();
+        let hit = first_match_bus_then_rest(&rest, &bus, &p, &HashSet::new(), None).unwrap();
         assert_eq!(
             hit.id, "p1",
-            "causal first match must prefer earlier bus event"
+            "must prefer bus arrival over REST timestamp order"
         );
+    }
+
+    #[test]
+    fn explicit_after_blocks_bus_until_rest_confirms() {
+        let p = pred(Some("X"), None);
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound_event("old", "X pre-anchor", 50));
+        let eligible = HashSet::new();
+        assert!(
+            first_match_bus_then_rest(&[], &bus, &p, &HashSet::new(), Some(&eligible)).is_none(),
+            "pre-anchor bus must not fire under --after"
+        );
+        let mut eligible = HashSet::new();
+        eligible.insert("new".into());
+        bus.push_back(inbound_event("new", "X post-anchor", 150));
+        let hit =
+            first_match_bus_then_rest(&[], &bus, &p, &HashSet::new(), Some(&eligible)).unwrap();
+        assert_eq!(hit.id, "new");
     }
 
     #[test]
