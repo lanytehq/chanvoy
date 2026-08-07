@@ -321,55 +321,31 @@ async fn wait_push_path(
                 }
             }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                if let Some(ref cursor) = scan_cursor {
-                    match provider_retry(state, channel, deadline, || {
-                        let c = cursor.clone();
-                        async move {
-                            state
-                                .client
-                                .posts_after_by_channel_id(predicate.channel_id(), &c)
-                                .await
-                        }
-                    })
+                // Forward page through the shared predicate. Empty-cursor
+                // lag must evaluate the recovered tip page (not only set
+                // the cursor) or the post that arrived during lag is
+                // permanently skipped by posts_after (devrev r1).
+                match lag_recover_page(state, channel, predicate, scan_cursor.as_deref(), deadline)
                     .await
-                    {
-                        Ok(page) => {
-                            clean_observe = true;
-                            let mut rest_exclude = rest_baseline.clone();
-                            rest_exclude.extend(processed.iter().cloned());
-                            if let Some(hit) = first_match(&page, predicate, &rest_exclude) {
-                                return Ok(one_message_result(channel, hit));
-                            }
-                            if let Some(last) = page.last() {
-                                scan_cursor = Some(last.id.clone());
-                                for m in page {
-                                    processed.insert(m.id);
-                                }
+                {
+                    Ok(page) => {
+                        clean_observe = true;
+                        let mut rest_exclude = rest_baseline.clone();
+                        rest_exclude.extend(processed.iter().cloned());
+                        if let Some(hit) = first_match(&page, predicate, &rest_exclude) {
+                            return Ok(one_message_result(channel, hit));
+                        }
+                        if let Some(last) = page.last() {
+                            scan_cursor = Some(last.id.clone());
+                            for m in page {
+                                processed.insert(m.id);
                             }
                         }
-                        Err(CoreError::WaitProviderDegraded { .. }) => {
-                            clean_observe = false;
-                        }
-                        Err(other) => return Err(other),
                     }
-                } else {
-                    match provider_retry(state, channel, deadline, || async {
-                        state
-                            .client
-                            .latest_channel_messages_by_id(predicate.channel_id(), 1)
-                            .await
-                    })
-                    .await
-                    {
-                        Ok(tip) => {
-                            clean_observe = true;
-                            if let Some(last) = tip.last() {
-                                scan_cursor = Some(last.id.clone());
-                            }
-                        }
-                        Err(CoreError::WaitProviderDegraded { .. }) => clean_observe = false,
-                        Err(other) => return Err(other),
+                    Err(CoreError::WaitProviderDegraded { .. }) => {
+                        clean_observe = false;
                     }
+                    Err(other) => return Err(other),
                 }
             }
             Ok(Err(broadcast::error::RecvError::Closed)) => {
@@ -453,10 +429,12 @@ async fn wait_rest_path(
             })
             .await
         } else {
+            // Empty at arm: recover a wider latest window and evaluate it
+            // before advancing the cursor (same class as push lag recovery).
             provider_retry(state, channel, deadline, || async {
                 state
                     .client
-                    .latest_channel_messages_by_id(predicate.channel_id(), 30)
+                    .latest_channel_messages_by_id(predicate.channel_id(), 200)
                     .await
             })
             .await
@@ -590,6 +568,52 @@ fn one_message_result(channel: &str, message: Message) -> WaitResult {
     }
 }
 
+/// Lag / empty-cursor recovery page: with a cursor, page after it; without,
+/// take a latest window and evaluate it (must not only stamp the tip).
+async fn lag_recover_page(
+    state: &AppState,
+    channel: &str,
+    predicate: &WaitPredicate,
+    scan_cursor: Option<&str>,
+    deadline: Instant,
+) -> Result<Vec<Message>, CoreError> {
+    if let Some(cursor) = scan_cursor {
+        provider_retry(state, channel, deadline, || {
+            let c = cursor.to_string();
+            async move {
+                state
+                    .client
+                    .posts_after_by_channel_id(predicate.channel_id(), &c)
+                    .await
+            }
+        })
+        .await
+    } else {
+        provider_retry(state, channel, deadline, || async {
+            state
+                .client
+                .latest_channel_messages_by_id(predicate.channel_id(), 200)
+                .await
+        })
+        .await
+    }
+}
+
+/// Pure deadline with no prior retryable failure is a clean deadman, not
+/// provider degradation (devrev r1).
+fn deadline_error(channel: &str, saw_retryable: bool, detail: Option<String>) -> CoreError {
+    if saw_retryable {
+        CoreError::WaitProviderDegraded {
+            channel: channel.to_string(),
+            message: detail.unwrap_or_else(|| {
+                "deadline reached while provider observation was failing".into()
+            }),
+        }
+    } else {
+        CoreError::WaitTimeout(channel.to_string())
+    }
+}
+
 async fn provider_retry<T, F, Fut>(
     state: &AppState,
     channel: &str,
@@ -602,23 +626,27 @@ where
 {
     let _ = state; // reserved for future Retry-After header plumbing
     let mut delay = BACKOFF_BASE;
+    let mut saw_retryable = false;
     loop {
         if Instant::now() >= deadline {
-            return Err(CoreError::WaitProviderDegraded {
-                channel: channel.to_string(),
-                message: "deadline reached before a successful observation".into(),
-            });
+            return Err(deadline_error(
+                channel,
+                saw_retryable,
+                Some("deadline reached before a successful observation".into()),
+            ));
         }
         match op().await {
             Ok(v) => return Ok(v),
             Err(err) if is_terminal_auth(&err) => return Err(err),
             Err(err) if is_retryable_provider(&err) => {
+                saw_retryable = true;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(CoreError::WaitProviderDegraded {
-                        channel: channel.to_string(),
-                        message: format!("provider error until deadline: {err}"),
-                    });
+                    return Err(deadline_error(
+                        channel,
+                        true,
+                        Some(format!("provider error until deadline: {err}")),
+                    ));
                 }
                 sleep(delay.min(remaining).min(BACKOFF_CAP)).await;
                 delay = (delay * 2).min(BACKOFF_CAP);
@@ -744,6 +772,54 @@ mod tests {
         let mut other = good.clone();
         other.channel_id = "ch-other".into();
         assert!(!p.matches_inbound(&other));
+    }
+
+    #[test]
+    fn pure_deadline_is_clean_deadman_not_provider() {
+        let err = deadline_error("ops", false, None);
+        assert!(
+            matches!(err, CoreError::WaitTimeout(_)),
+            "no retryable failure → WaitTimeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn retryable_deadline_is_provider_degraded() {
+        let err = deadline_error("ops", true, Some("500s".into()));
+        match err {
+            CoreError::WaitProviderDegraded { channel, message } => {
+                assert_eq!(channel, "ops");
+                assert!(message.contains("500"));
+            }
+            other => panic!("expected WaitProviderDegraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tip_id_in_rest_baseline_does_not_block_bus_eval() {
+        // rest_baseline is not passed to evaluate_bus_event — only processed.
+        let p = pred(Some("X"), None);
+        let processed = HashSet::new();
+        let event = DaemonEvent {
+            seq: 1,
+            kind: chanvoy_core::DaemonEventKind::InboundMessage,
+            payload: DaemonEventPayloadInner::Inbound(InboundEventPayload {
+                profile: "t".into(),
+                provider: Provider::Mattermost,
+                channel_id: "ch-1".into(),
+                channel_name: "c".into(),
+                post_id: "tip-also-on-bus".into(),
+                root_id: "tip-also-on-bus".into(),
+                sender_id: "u".into(),
+                sender_username: "u".into(),
+                message: "X here".into(),
+                create_at: 1,
+                received_at: 1,
+                mentioned: false,
+            }),
+        };
+        let hit = evaluate_bus_event(&event, &p, &processed).expect("bus eligible");
+        assert_eq!(hit.id, "tip-also-on-bus");
     }
 
     #[test]

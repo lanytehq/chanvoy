@@ -1250,9 +1250,18 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             code: RPC_UNKNOWN_METHOD,
             ..
         }) if advanced => {
-            return Err(CliError::DaemonPredatesVerb {
-                verb: "wait --contains/--pattern/--after".to_string(),
-            });
+            // Exit 2, not 1: must not collide with clean deadman for
+            // exit-code-only agents (devrev r1).
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                "the running daemon does not support filtered wait \
+                 (--contains/--pattern/--after); it was started from an earlier \
+                 chanvoy. Cycle it with `chanvoy daemon stop` then \
+                 `chanvoy auto-setup`, and run the command again.",
+            );
         }
         Err(DaemonError::Rpc {
             code: RPC_UNKNOWN_METHOD,
