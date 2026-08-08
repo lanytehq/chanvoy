@@ -5459,18 +5459,41 @@ impl MattermostWs {
     }
 }
 
+/// Detect Mattermost websocket authentication success.
+///
+/// Live Mattermost (verified against 11.5.x) sends **two** frames after
+/// `authentication_challenge`, in either order depending on server build:
+///
+/// 1. Action reply: `{"status":"OK","seq_reply":1}`
+/// 2. Hello event: `{"event":"hello","data":{"server_version":...,"connection_id":...},...}`
+///
+/// The hello event does **not** carry `data.status`. Older unit fixtures
+/// that required `event=hello` + `data.status=OK` never matched production
+/// frames, so the client stayed unauthenticated until the 10s auth
+/// deadline — permanent reconnect flap (B3 / never-connected). Accept
+/// either success shape.
 fn is_auth_success(text: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return false;
     };
+
+    // Action-level OK reply to authentication_challenge (seq_reply present).
+    let top_status = value.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if top_status == "OK" && value.get("seq_reply").is_some() {
+        return true;
+    }
+
+    // Hello event after successful auth. Real servers put version /
+    // connection_id in data; they do not put status:"OK" there.
     let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
     if event == "hello" {
-        let status = value
+        // Refuse an explicit fail marker if a server ever sends one.
+        let data_status = value
             .get("data")
             .and_then(|d| d.get("status"))
             .and_then(|s| s.as_str())
             .unwrap_or("");
-        return status == "OK";
+        return data_status != "FAIL" && data_status != "INVALID_TOKEN";
     }
     false
 }
@@ -5482,6 +5505,11 @@ fn is_auth_error(text: &str) -> bool {
     let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
     let has_error = value.get("error").is_some();
     if seq == 0 && has_error {
+        return true;
+    }
+    // Action-level failure reply (top-level status).
+    let top_status = value.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if matches!(top_status, "FAIL" | "INVALID_TOKEN" | "fail") {
         return true;
     }
     let status = value
@@ -6206,7 +6234,23 @@ monitored_channels = ["per-003", "per-004"]
     }
 
     #[test]
-    fn is_auth_success_accepts_hello_ok() {
+    fn is_auth_success_accepts_live_hello_without_data_status() {
+        // Shape captured from mm.3leaps.dev Mattermost 11.5.1 — hello has
+        // connection_id / server_version, not data.status.
+        let frame = r#"{"event":"hello","data":{"connection_id":"qm9e3tnxrfyqppjkndt19bhe4w","server_hostname":"b5f4c8f4034a","server_version":"11.5.1.22760374792.deadbeef"},"broadcast":{"omit_users":null,"user_id":"u1","channel_id":"","team_id":""},"seq":0}"#;
+        assert!(is_auth_success(frame));
+    }
+
+    #[test]
+    fn is_auth_success_accepts_seq_reply_ok() {
+        // Action-level OK that follows (or precedes) hello after challenge.
+        let frame = r#"{"status":"OK","seq_reply":1}"#;
+        assert!(is_auth_success(frame));
+    }
+
+    #[test]
+    fn is_auth_success_accepts_legacy_hello_with_data_status_ok() {
+        // Keep the old fixture green if a server ever embeds status.
         let frame = r#"{"event":"hello","data":{"status":"OK","server_version":"10.5.0"}}"#;
         assert!(is_auth_success(frame));
     }
@@ -6224,6 +6268,13 @@ monitored_channels = ["per-003", "per-004"]
     }
 
     #[test]
+    fn is_auth_success_rejects_bare_ok_without_seq_reply() {
+        // Avoid treating unrelated OK-shaped JSON as auth success.
+        let frame = r#"{"status":"OK"}"#;
+        assert!(!is_auth_success(frame));
+    }
+
+    #[test]
     fn is_auth_error_detects_fail_status() {
         let frame = r#"{"data":{"status":"FAIL"}}"#;
         assert!(is_auth_error(frame));
@@ -6232,6 +6283,12 @@ monitored_channels = ["per-003", "per-004"]
     #[test]
     fn is_auth_error_detects_invalid_token() {
         let frame = r#"{"data":{"status":"INVALID_TOKEN"}}"#;
+        assert!(is_auth_error(frame));
+    }
+
+    #[test]
+    fn is_auth_error_detects_top_level_fail_reply() {
+        let frame = r#"{"status":"FAIL","seq_reply":1,"error":{"message":"invalid session"}}"#;
         assert!(is_auth_error(frame));
     }
 
