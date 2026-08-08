@@ -19,8 +19,11 @@ fn main() {
         .unwrap_or_else(|| manifest_dir.clone());
 
     let version = read_version(&workspace_root);
-    let commit = git(&workspace_root, &["rev-parse", "--short=7", "HEAD"])
-        .unwrap_or_else(|| "unknown".into());
+    // Machine identity uses the full object name (40-char hex when on a
+    // normal commit). Short form is display-only for human version lines.
+    let commit = git(&workspace_root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let commit_short = git(&workspace_root, &["rev-parse", "--short=7", "HEAD"])
+        .unwrap_or_else(|| short_from_full(&commit));
     let dirty = git(&workspace_root, &["status", "--porcelain"])
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
@@ -29,6 +32,7 @@ fn main() {
 
     println!("cargo:rustc-env=FULMEN_HOST_VERSION={version}");
     println!("cargo:rustc-env=FULMEN_HOST_COMMIT={commit}");
+    println!("cargo:rustc-env=FULMEN_HOST_COMMIT_SHORT={commit_short}");
     println!("cargo:rustc-env=FULMEN_HOST_BUILD_DATE={built}");
     println!("cargo:rustc-env=FULMEN_HOST_DIRTY={dirty}");
     println!("cargo:rustc-env=FULMEN_HOST_RUSTC={rustc}");
@@ -92,6 +96,14 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     }
     let s = String::from_utf8(output.stdout).ok()?;
     Some(s.trim().to_string())
+}
+
+/// Best-effort short form when only the full object name is known.
+fn short_from_full(commit: &str) -> String {
+    if commit == "unknown" || commit.len() < 7 {
+        return commit.to_string();
+    }
+    commit.chars().take(7).collect()
 }
 
 fn rustc_version() -> Option<String> {

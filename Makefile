@@ -21,7 +21,7 @@ endif
 # `make version-sync` (which uses cargo-set-version under the hood).
 VERSION_FILE := VERSION
 
-.PHONY: all clean check fmt quality test test-integration build build-release install ensure-msrv msrv precommit prepush pr-final
+.PHONY: all clean check fmt quality test test-integration build build-release install install-restart-daemons ensure-msrv msrv precommit prepush pr-final
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
 .PHONY: sbom security-scan license-check release-prep release-smoke workflow-lint
 .PHONY: release-preflight release-clean release-download release-checksums release-sign
@@ -80,15 +80,71 @@ build-release:
 # binary that may still be referenced by running processes: existing
 # daemons keep their own open inode until they exit on their own
 # lifecycle, while new execs resolve to the fresh file.
+#
+# After the binary lands, `install-restart-daemons` cycles every live
+# daemon whose argv binary is exactly $(LOCAL_BIN)/chanvoy so shared-host
+# seats pick up the new control plane without a manual stop/auto-setup
+# each. Worktree/debug daemons (other binary paths) are left alone.
+# Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1 make install
+# Re-run cycle alone: make install-restart-daemons
 install: build-release
 	@mkdir -p $(LOCAL_BIN)
 	@rm -f $(LOCAL_BIN)/chanvoy$(EXT)
 	@cp target/release/chanvoy$(EXT) $(LOCAL_BIN)/chanvoy$(EXT)
 	@echo "[ok] installed chanvoy to $(LOCAL_BIN)/chanvoy$(EXT)"
-	@echo "[!!] NEXT: cycle the daemon or filtered wait / new verbs will use the old binary:"
-	@echo "     chanvoy daemon stop && chanvoy auto-setup"
-	@echo "     chanvoy version --extended   # prove CLI pin (Commit: …)"
-	@echo "     note: a running daemon keeps the binary it was started from until restart."
+	@$(MAKE) --no-print-directory install-restart-daemons
+
+# Cycle daemons started from the userspace install path onto the binary
+# currently at that path. Safe for shared hosts with many profiles:
+#   - only processes whose argv[0] is exactly $(LOCAL_BIN)/chanvoy
+#   - stop/start is always --profile-explicit (never wildcard kill)
+#   - uses daemon start (not auto-setup) so we do not steal active-profile
+#     or require the installer's env identity for other seats
+#   - per-profile failures are reported; install does not hard-fail
+# Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1
+install-restart-daemons:
+ifeq ($(OS),Windows_NT)
+	@echo "[!!] install-restart-daemons is Unix-only; cycle daemons manually:"
+	@echo "     chanvoy daemon stop --profile <name> && chanvoy daemon start --profile <name>"
+else
+	@set -euo pipefail; \
+	BIN="$(LOCAL_BIN)/chanvoy$(EXT)"; \
+	if [ "$${CHANVOY_INSTALL_SKIP_DAEMON_RESTART:-}" = "1" ]; then \
+		echo "[ok] skipped daemon restart (CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1)"; \
+		echo "[!!] NEXT: cycle daemons or filtered wait / new verbs may use the old binary:"; \
+		echo "     make install-restart-daemons"; \
+		echo "     # or: chanvoy daemon stop --profile <name> && chanvoy daemon start --profile <name>"; \
+		exit 0; \
+	fi; \
+	if [ ! -x "$$BIN" ]; then \
+		echo "[!!] $$BIN not executable; nothing to cycle"; \
+		exit 0; \
+	fi; \
+	profiles=$$(ps -axo args= 2>/dev/null \
+		| sed -n "s|^$${BIN} --profile \\([^ ]*\\) daemon serve.*|\\1|p" \
+		| sort -u); \
+	if [ -z "$$profiles" ]; then \
+		echo "[ok] no live daemons on $$BIN — nothing to cycle"; \
+		exit 0; \
+	fi; \
+	count=$$(printf '%s\n' "$$profiles" | grep -c . || true); \
+	echo "[..] cycling $$count daemon(s) onto $$BIN (brief seat interruption expected)"; \
+	ok=0; fail=0; \
+	while IFS= read -r profile; do \
+		[ -n "$$profile" ] || continue; \
+		if "$$BIN" daemon stop --profile "$$profile" >/dev/null 2>&1 \
+			&& "$$BIN" daemon start --profile "$$profile" >/dev/null 2>&1; then \
+			echo "     [ok] $$profile"; \
+			ok=$$((ok + 1)); \
+		else \
+			echo "     [!!] $$profile — stop/start failed; retry:"; \
+			echo "         $$BIN daemon stop --profile $$profile && $$BIN daemon start --profile $$profile"; \
+			fail=$$((fail + 1)); \
+		fi; \
+	done <<< "$$profiles"; \
+	echo "[ok] daemon cycle done: $$ok ok, $$fail failed"; \
+	echo "     prove CLI pin: $$BIN version --extended"
+endif
 
 ensure-msrv:
 	@echo "Checking MSRV $(MSRV)..."
