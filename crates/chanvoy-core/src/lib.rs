@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod host_build_info;
 pub mod safe_read;
 
 pub use safe_read::{
@@ -11,6 +12,11 @@ pub use bootstrap::{
     consume_bootstrap_state, generate_nonce, read_bootstrap_state, resolve_startup_identity,
     validate_bootstrap_state, write_bootstrap_state, BootstrapError, BootstrapResolution,
     BootstrapState, BOOTSTRAP_MAX_AGE_SECS, BOOTSTRAP_NONCE_ENV,
+};
+
+pub use host_build_info::{
+    format_basic, format_extended, generation_match as host_generation_match,
+    resolve as resolve_host_build_info, HostBuildInfo,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -410,6 +416,8 @@ pub fn build_daemon_status(
         ws_suspected_gap: ws.suspected_gap,
         mattermost_last_error,
         mattermost_identity_drift,
+        // PER-038A: pin of *this* process (the daemon), not the calling CLI.
+        binary: Some(host_build_info::resolve()),
     }
 }
 
@@ -1649,6 +1657,13 @@ pub struct DaemonStatus {
     /// bound on drift; network-backed RPCs surface a clear diagnostic.
     #[serde(default)]
     pub mattermost_identity_drift: Option<bool>,
+    /// PER-038A: build identity of the **daemon process** serving this
+    /// socket (compile-time pin of the binary that was exec'd). Absent when
+    /// talking to a pre-038A daemon or when the field was not populated.
+    /// Compare with CLI `version --extended` to detect generation skew after
+    /// `make install`.
+    #[serde(default)]
+    pub binary: Option<HostBuildInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -7063,6 +7078,40 @@ monitored_channels = ["per-003", "per-004"]
             );
             assert!(!status.mattermost_ok);
             assert_eq!(status.mattermost_identity_drift, None);
+        }
+
+        #[test]
+        fn build_status_includes_binary_host_pin() {
+            // PER-038A: daemon status carries this process's compile-time pin
+            // so CLI version --extended can compare generations.
+            let now = 1_777_050_000_000;
+            let ws = ws_snapshot_for(
+                Some(WsConnectionState::Healthy),
+                Some(false),
+                None,
+                Some(0),
+                0,
+            );
+            let status = build_daemon_status(
+                "bravo-devlead".to_string(),
+                PathBuf::from("/tmp/chanvoy/bravo-devlead.sock"),
+                "agent-bravo-devlead".to_string(),
+                Ok("agent-bravo-devlead".to_string()),
+                ws,
+                ipc_absent(),
+                now,
+            );
+            let bin = status
+                .binary
+                .as_ref()
+                .expect("binary pin must be present on this process");
+            assert!(!bin.version.is_empty());
+            assert!(!bin.commit.is_empty());
+            assert!(!bin.commit_short.is_empty());
+            // Same resolve path as status construction.
+            let local = crate::host_build_info::resolve();
+            assert_eq!(bin.commit, local.commit);
+            assert_eq!(bin.commit_short, local.commit_short);
         }
 
         #[tokio::test]

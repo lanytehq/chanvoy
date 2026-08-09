@@ -411,18 +411,33 @@ the older daemon.
 
 This is most visible right after `make install` / an upgrade, and on
 shared machines where a daemon may have been started days earlier by
-another session. `chanvoy version --extended` shows the **CLI** pin only
-— not daemon generation.
+another session.
+
+**Prove the skew (PER-038A dual identity)**
+
+```bash
+chanvoy version --extended
+# or: chanvoy --json version -e
+# CLI pin is always present. When a profile is resolvable (--profile or
+# active_profile), the daemon pin and generation_match appear too.
+```
+
+A `Generation: MISMATCH` line (or JSON `"generation_match": false`) means
+the CLI on PATH and the process on the socket are different binaries.
 
 **Fix**
 
 ```bash
-chanvoy daemon stop
+chanvoy daemon stop --profile <name>   # explicit profile on shared hosts
 chanvoy auto-setup
-chanvoy version --extended   # confirm CLI pin
+chanvoy version --extended             # Generation: match
 ```
 
-Then run the command again.
+After `make install`, ownable daemons (ambient bot matches profile
+`bot_username`) are restarted automatically. **Foreign** profiles are
+**left running** on the previous binary (stale-but-observing) and printed
+as self-cycle targets — install does not stop a seat it cannot restart.
+Each foreign seat must cycle under its own identity.
 
 **Note**
 

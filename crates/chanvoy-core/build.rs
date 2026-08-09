@@ -11,7 +11,7 @@ fn main() {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
     );
-    // Workspace root is two levels up from crates/chanvoy-cli.
+    // Workspace root is two levels up from crates/chanvoy-core.
     let workspace_root = manifest_dir
         .parent()
         .and_then(|p| p.parent())

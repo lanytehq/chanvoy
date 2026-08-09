@@ -81,10 +81,11 @@ build-release:
 # daemons keep their own open inode until they exit on their own
 # lifecycle, while new execs resolve to the fresh file.
 #
-# After the binary lands, `install-restart-daemons` cycles every live
-# daemon whose argv binary is exactly $(LOCAL_BIN)/chanvoy so shared-host
-# seats pick up the new control plane without a manual stop/auto-setup
-# each. Worktree/debug daemons (other binary paths) are left alone.
+# After the binary lands, `install-restart-daemons` cycles **ownable** live
+# daemons whose argv binary is exactly $(LOCAL_BIN)/chanvoy so the installer
+# seat picks up the new control plane without a manual stop/auto-setup.
+# Worktree/debug daemons (other binary paths) and **foreign** profiles are
+# left alone (PER-038A: stale-but-observing beats dark-and-unaware).
 # Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1 make install
 # Re-run cycle alone: make install-restart-daemons
 install: build-release
@@ -95,14 +96,14 @@ install: build-release
 	@$(MAKE) --no-print-directory install-restart-daemons
 
 # Cycle daemons started from the userspace install path onto the binary
-# currently at that path. Shared-host rules:
+# currently at that path. Shared-host rules (PER-038A):
 #   - only processes whose argv binary is exactly $(LOCAL_BIN)/chanvoy
 #   - stop/start is always --profile-explicit (never wildcard kill)
-#   - stop is fail-soft (already-down is OK)
-#   - start only when ambient identity can own that profile; foreign
-#     profiles are **stop-only** with a self-cycle hint (installer's
-#     LANYTE_MM_BOT / whoami cannot start another seat's daemon —
-#     observed 2026-08-09: "profile bot username mismatch")
+#   - **ownable only**: ambient LANYTE_MM_BOT_USERNAME must match the
+#     profile's bot_username (read from profile TOML). Ownable → stop+start.
+#   - **foreign**: do **not** stop — leave running on the old inode and
+#     print a self-cycle hint (stale-but-observing > dark-and-unaware;
+#     entarch residual NOTES 2026-08-09)
 #   - process probe is fail-soft under sandboxes that deny `ps`
 #   - per-profile outcomes reported; install does not hard-fail
 # Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1
@@ -124,6 +125,14 @@ else
 		echo "[!!] $$BIN not executable; nothing to cycle"; \
 		exit 0; \
 	fi; \
+	if [ -n "$${CHANVOY_CONFIG_DIR:-}" ]; then \
+		PROFILE_DIR="$${CHANVOY_CONFIG_DIR}/profiles"; \
+	elif [ "$$(uname -s)" = "Darwin" ]; then \
+		PROFILE_DIR="$${HOME}/Library/Application Support/lanytehq/chanvoy/profiles"; \
+	else \
+		PROFILE_DIR="$${XDG_CONFIG_HOME:-$${HOME}/.config}/lanytehq/chanvoy/profiles"; \
+	fi; \
+	ambient="$${LANYTE_MM_BOT_USERNAME:-}"; \
 	profiles=$$(ps -axo args= 2>/dev/null \
 		| sed -n "s|^$${BIN} --profile \\([^ ]*\\) daemon serve.*|\\1|p" \
 		| sort -u || true); \
@@ -132,29 +141,48 @@ else
 		exit 0; \
 	fi; \
 	count=$$(printf '%s\n' "$$profiles" | grep -c . || true); \
-	echo "[..] cycling $$count daemon(s) onto $$BIN (brief seat interruption expected)"; \
-	restarted=0; stopped_only=0; fail=0; \
+	echo "[..] scanning $$count daemon(s) on $$BIN (ownable only; foreign left running)"; \
+	restarted=0; left_foreign=0; fail=0; \
 	while IFS= read -r profile; do \
 		[ -n "$$profile" ] || continue; \
+		bot=""; \
+		pf="$${PROFILE_DIR}/$${profile}.toml"; \
+		if [ -f "$$pf" ]; then \
+			bot=$$(sed -n 's/^bot_username[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$$pf" | head -1); \
+		fi; \
+		ownable=0; \
+		if [ -n "$$ambient" ] && [ -n "$$bot" ] && [ "$$ambient" = "$$bot" ]; then \
+			ownable=1; \
+		fi; \
+		if [ "$$ownable" -ne 1 ]; then \
+			echo "     [..] left running $$profile (foreign / unknown ownership — self-cycle under that seat):"; \
+			if [ -n "$$bot" ]; then \
+				echo "         profile bot=$$bot ambient=$${ambient:-<unset>}"; \
+			else \
+				echo "         no bot_username in $$pf (or file missing); ambient=$${ambient:-<unset>}"; \
+			fi; \
+			echo "         source identity for $$profile && $$BIN daemon stop --profile $$profile && $$BIN auto-setup"; \
+			left_foreign=$$((left_foreign + 1)); \
+			continue; \
+		fi; \
 		"$$BIN" daemon stop --profile "$$profile" >/dev/null 2>&1 || true; \
 		start_err=$$("$$BIN" daemon start --profile "$$profile" 2>&1); \
 		start_ec=$$?; \
 		if [ "$$start_ec" -eq 0 ]; then \
 			echo "     [ok] restarted $$profile"; \
 			restarted=$$((restarted + 1)); \
-		elif printf '%s' "$$start_err" | grep -qi 'bot username mismatch\|identity\|whoami\|expected agent-'; then \
-			echo "     [..] stopped $$profile (foreign identity — self-cycle under that seat):"; \
-			echo "         source identity for $$profile && $$BIN daemon start --profile $$profile"; \
-			stopped_only=$$((stopped_only + 1)); \
 		else \
-			echo "     [!!] $$profile — start failed:"; \
+			echo "     [!!] $$profile — start failed after stop:"; \
 			echo "         $$start_err" | sed 's/^/         /'; \
 			echo "         retry: $$BIN daemon stop --profile $$profile; $$BIN daemon start --profile $$profile"; \
 			fail=$$((fail + 1)); \
 		fi; \
 	done <<< "$$profiles"; \
-	echo "[ok] daemon cycle done: $$restarted restarted, $$stopped_only stop-only (foreign), $$fail failed"; \
-	echo "     prove CLI pin: $$BIN version --extended"
+	echo "[ok] daemon cycle done: $$restarted restarted, $$left_foreign left-running (foreign/self-cycle), $$fail failed"; \
+	if [ "$$left_foreign" -gt 0 ]; then \
+		echo "[!!] foreign seats still on previous binary — each must self-cycle under its own identity"; \
+	fi; \
+	echo "     prove dual pin: $$BIN version --extended"
 endif
 
 ensure-msrv:

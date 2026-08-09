@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observation to exhaustion inside the deadman. Filters refuse empty values and
   oversize/invalid patterns before the wait arms. The daemon method
   `wait_channel_v2` is the capability gate (cycle the daemon after install).
+- **Install ↔ daemon cycle honesty (PER-038A).** Shared-host `make install`
+  restarts only **ownable** daemons (ambient `LANYTE_MM_BOT_USERNAME` matches
+  the profile `bot_username`). Foreign profiles are **left running** on the
+  previous binary with an explicit self-cycle list — install no longer stops a
+  seat it cannot restart (stale-but-observing beats dark-and-unaware).
+  `chanvoy version --extended` / `--json -e` reports dual identity: CLI host
+  pin (top-level, back-compat) plus best-effort `daemon` pin, `daemon_profile`,
+  and `generation_match` when a profile is resolvable. `daemon status` includes
+  additive `binary` (daemon process pin) and human `binary_commit`.
 
 ### Changed
 

@@ -5,22 +5,22 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    check_search_operator_conflicts, list_profiles, load_active_profile, load_profile, load_token,
-    parse_time_window, pid_path_for_profile, socket_path_for_profile, store_active_profile,
-    store_profile, AckResult, AttentionListResult, AttentionShowResult, AttentionSource,
-    CapabilityClass, Channel, ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState,
-    DaemonStatus, DmConversation, Identity, LegacyChannel, MattermostClient, Message, Notification,
-    PinResult, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult,
-    SeedCursorsResult, SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult,
-    UnreadNotifications, WaitResult, WsConnectionState,
+    check_search_operator_conflicts, format_basic as format_host_basic,
+    format_extended as format_host_extended, host_generation_match, list_profiles,
+    load_active_profile, load_profile, load_token, parse_time_window, pid_path_for_profile,
+    resolve_host_build_info, socket_path_for_profile, store_active_profile, store_profile,
+    AckResult, AttentionListResult, AttentionShowResult, AttentionSource, CapabilityClass, Channel,
+    ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation,
+    Identity, LegacyChannel, MattermostClient, Message, Notification, PinResult, PostReceipt,
+    Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
+    SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitResult,
+    WsConnectionState,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 use tokio::process::Command;
-
-mod host_build_info;
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -187,13 +187,16 @@ enum CommandSet {
     #[command(subcommand)]
     Attention(AttentionCommand),
     /// Print the installed binary version (semver). Use `--extended` for
-    /// commit, build time, rustc, and platform — identity for dirty dogfood.
+    /// CLI host identity and, when a daemon is reachable, the daemon pin
+    /// (PER-038A dual identity for dirty dogfood after install).
     Version(VersionArgs),
 }
 
 #[derive(Debug, Args)]
 struct VersionArgs {
     /// Print host build identity: commit, built time, rustc, platform, dirty.
+    /// With a live daemon, also reports the daemon process pin and whether
+    /// CLI and daemon generations match.
     #[arg(long, short = 'e')]
     extended: bool,
 }
@@ -683,35 +686,145 @@ fn init_tracing() {
         .try_init();
 }
 
-fn handle_version(json: bool, args: VersionArgs) -> Result<(), CliError> {
-    let info = host_build_info::resolve();
-    if json {
-        let value = if args.extended {
-            serde_json::to_value(&info).map_err(|e| CliError::Bootstrap(e.to_string()))?
-        } else {
-            serde_json::json!({
+/// Best-effort profile name for dual-identity daemon probe (PER-038A).
+/// Explicit `--profile` wins; otherwise the active_profile marker if present.
+fn version_probe_profile(explicit: Option<&str>) -> Option<String> {
+    if let Some(name) = explicit {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let path = chanvoy_core::active_profile_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+async fn handle_version(
+    json: bool,
+    profile_flag: Option<&str>,
+    args: VersionArgs,
+) -> Result<(), CliError> {
+    let cli_info = resolve_host_build_info();
+    if !args.extended {
+        if json {
+            let value = serde_json::json!({
                 "name": "chanvoy",
-                "version": info.version,
-            })
-        };
+                "version": cli_info.version,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value)
+                    .map_err(|e| CliError::Bootstrap(e.to_string()))?
+            );
+        } else {
+            println!("{}", format_host_basic(&cli_info));
+        }
+        return Ok(());
+    }
+
+    // PER-038A: best-effort daemon pin. Never fail version on daemon down —
+    // the CLI pin alone is still useful; absence is reported honestly.
+    let probe_profile = version_probe_profile(profile_flag);
+    let (daemon_info, daemon_profile, daemon_error) = match probe_profile.as_deref() {
+        Some(profile) => match status(profile).await {
+            Ok(st) => (st.binary, Some(st.profile_name), None),
+            Err(e) => (None, Some(profile.to_string()), Some(e.to_string())),
+        },
+        None => (None, None, None),
+    };
+    let gen_match = host_generation_match(&cli_info, daemon_info.as_ref());
+
+    if json {
+        // Top-level fields remain the CLI pin (back-compat for scripts that
+        // already pin on `commit` / `commit_short`). Additive keys carry
+        // dual identity.
+        let mut value =
+            serde_json::to_value(&cli_info).map_err(|e| CliError::Bootstrap(e.to_string()))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "cli".into(),
+                serde_json::to_value(&cli_info).map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            obj.insert(
+                "daemon".into(),
+                serde_json::to_value(&daemon_info)
+                    .map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            obj.insert(
+                "daemon_profile".into(),
+                serde_json::to_value(&daemon_profile)
+                    .map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            obj.insert(
+                "generation_match".into(),
+                serde_json::to_value(gen_match).map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            if let Some(err) = daemon_error {
+                obj.insert("daemon_probe_error".into(), serde_json::Value::String(err));
+            }
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&value).map_err(|e| CliError::Bootstrap(e.to_string()))?
         );
         return Ok(());
     }
-    if args.extended {
-        println!("{}", host_build_info::format_extended(&info));
-    } else {
-        println!("{}", host_build_info::format_basic(&info));
+
+    // Human extended: CLI block first, then daemon pin / match verdict.
+    println!("{}", format_host_extended(&cli_info));
+    match (daemon_info.as_ref(), daemon_profile.as_deref()) {
+        (Some(d), Some(profile)) => {
+            println!("Daemon profile: {profile}");
+            println!("Daemon commit: {}", d.commit_short);
+            if d.commit != "unknown" && d.commit != cli_info.commit_short && d.commit.len() >= 7 {
+                // full pin when short alone is ambiguous vs CLI short
+                if d.commit != cli_info.commit {
+                    println!("Daemon commit (full): {}", d.commit);
+                }
+            }
+            if let Some(dirty) = d.dirty {
+                println!("Daemon dirty: {dirty}");
+            }
+            match gen_match {
+                Some(true) => println!("Generation: match (CLI and daemon same pin)"),
+                Some(false) => {
+                    println!("Generation: MISMATCH — CLI and daemon are different binaries");
+                    println!(
+                        "[!!] Cycle the daemon onto this CLI before trusting new verbs / wait:"
+                    );
+                    println!("     chanvoy daemon stop --profile {profile}");
+                    println!("     chanvoy auto-setup");
+                    println!("     # or: make install-restart-daemons  (ownable profiles only)");
+                }
+                None => println!("Generation: unknown (incomplete pin on one side)"),
+            }
+        }
+        (None, Some(profile)) => {
+            println!("Daemon profile: {profile}");
+            if let Some(err) = daemon_error {
+                println!("Daemon: unreachable ({err})");
+            } else {
+                println!("Daemon: reachable but no binary pin (pre-038A daemon or empty status)");
+                println!(
+                    "[!!] Cycle the daemon to report dual identity: chanvoy daemon stop --profile {profile} && chanvoy auto-setup"
+                );
+            }
+        }
+        _ => {
+            println!("Daemon: not probed (pass --profile or set active_profile)");
+        }
     }
     Ok(())
 }
 
 async fn execute(cli: Cli) -> Result<(), CliError> {
-    // Version needs no profile or daemon — identity of the local binary only.
+    // Version is local binary identity; extended mode best-effort probes a
+    // daemon for PER-038A dual identity. Never requires a healthy daemon.
     if let CommandSet::Version(args) = cli.command {
-        return handle_version(cli.json, args);
+        return handle_version(cli.json, cli.profile.as_deref(), args).await;
     }
     // auto-setup is the bootstrap / repair surface and must not depend on resolving
     // an existing persisted profile — a malformed unrelated profile would otherwise
@@ -3617,6 +3730,12 @@ impl HumanReadable for DaemonStatus {
             self.mattermost_username,
             self.mattermost_ok
         );
+        if let Some(bin) = &self.binary {
+            out.push_str(&format!("\nbinary_commit: {}", bin.commit_short));
+            if let Some(dirty) = bin.dirty {
+                out.push_str(&format!("\nbinary_dirty: {dirty}"));
+            }
+        }
         if let Some(h) = self.health {
             out.push_str(&format!("\nhealth: {}", health_label(h)));
         }

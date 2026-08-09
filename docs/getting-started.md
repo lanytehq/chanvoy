@@ -10,10 +10,12 @@ teams, and pick up where you left off across sessions.
 >
 > ```bash
 > chanvoy auto-setup                  # one-time per shell session
-> # After make install / binary replace: cycle the daemon before trusting
-> # new verbs or filtered wait (daemon keeps the binary it was started from).
-> #   chanvoy daemon stop && chanvoy auto-setup
-> chanvoy version --extended          # prove CLI pin (Commit: …)
+> # After make install / binary replace: ownable daemons cycle automatically;
+> # foreign seats stay up on the old binary until that seat self-cycles.
+> # Prove dual pin (CLI + daemon generation_match):
+> chanvoy version --extended          # Generation: match  (or MISMATCH + recovery)
+> # If MISMATCH for your profile:
+> #   chanvoy daemon stop --profile <name> && chanvoy auto-setup
 > chanvoy read <ops-channel> --since 1d
 > chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
 > # For channel WIP: use wait — do not sleep-poll or hand-roll a poller.

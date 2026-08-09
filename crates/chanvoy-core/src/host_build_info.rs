@@ -1,4 +1,8 @@
-//! Host binary identity for `chanvoy version` / `version --extended`.
+//! Host binary identity for the process that compiled this crate.
+//!
+//! Used by CLI `version` / `version --extended` (CLI pin) and by the daemon
+//! `daemon_status` surface (daemon pin). Comparing the two is the PER-038A
+//! generation-honesty check after `make install`.
 //!
 //! Values are injected by `build.rs` (`FULMEN_HOST_*` rustc-env). This is a
 //! local Phase-A resolver until a shared library helper lands in a later
@@ -8,8 +12,8 @@
 //! Machine-readable `commit` is the full object name (typically 40-char hex).
 //! `commit_short` is the 7-char display form used on human `Commit:` lines.
 
-/// Build-time identity of the installed chanvoy binary.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// Build-time identity of this chanvoy process binary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HostBuildInfo {
     pub version: String,
     /// Full git object name when known (prefer 40-char hex for machine pin).
@@ -57,6 +61,18 @@ fn short_from_full(commit: &str) -> String {
         return commit.to_string();
     }
     commit.chars().take(7).collect()
+}
+
+/// Whether two host pins represent the same binary generation (PER-038A).
+///
+/// Returns `None` when either commit is unknown — honest incomplete, not a
+/// false match. Dirty flags must also agree when both commits are known.
+pub fn generation_match(cli: &HostBuildInfo, daemon: Option<&HostBuildInfo>) -> Option<bool> {
+    let daemon = daemon?;
+    if cli.commit == "unknown" || daemon.commit == "unknown" {
+        return None;
+    }
+    Some(cli.commit == daemon.commit && cli.dirty == daemon.dirty)
 }
 
 /// Basic line: `chanvoy <semver>`.
@@ -156,5 +172,41 @@ mod tests {
         };
         let text = format_extended(&info);
         assert!(!text.to_lowercase().contains("dirty:"));
+    }
+
+    #[test]
+    fn generation_match_true_when_commit_and_dirty_agree() {
+        let full = "abcdef1234567890abcdef1234567890abcdef12";
+        let a = sample(full, "abcdef1", Some(false));
+        let b = sample(full, "abcdef1", Some(false));
+        assert_eq!(generation_match(&a, Some(&b)), Some(true));
+    }
+
+    #[test]
+    fn generation_match_false_on_commit_skew() {
+        let a = sample(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaa",
+            Some(false),
+        );
+        let b = sample(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "bbbbbbb",
+            Some(false),
+        );
+        assert_eq!(generation_match(&a, Some(&b)), Some(false));
+    }
+
+    #[test]
+    fn generation_match_none_when_daemon_missing_or_unknown() {
+        let a = sample(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaa",
+            Some(false),
+        );
+        assert_eq!(generation_match(&a, None), None);
+        let unknown = sample("unknown", "unknown", None);
+        assert_eq!(generation_match(&a, Some(&unknown)), None);
+        assert_eq!(generation_match(&unknown, Some(&a)), None);
     }
 }
