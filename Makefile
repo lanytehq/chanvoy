@@ -99,11 +99,11 @@ install: build-release
 # currently at that path. Shared-host rules (PER-038A):
 #   - only processes whose argv binary is exactly $(LOCAL_BIN)/chanvoy
 #   - stop/start is always --profile-explicit (never wildcard kill)
-#   - **ownable only**: ambient LANYTE_MM_BOT_USERNAME must match the
-#     profile's bot_username (read from profile TOML). Ownable → stop+start.
+#   - **ownable only**: `chanvoy daemon ownable` (start-preflight whoami
+#     matches live daemon status.mattermost_username). Never env-vs-TOML
+#     bot string equality (FIX-2: org-spanning naming conventions diverge).
 #   - **foreign**: do **not** stop — leave running on the old inode and
-#     print a self-cycle hint (stale-but-observing > dark-and-unaware;
-#     entarch residual NOTES 2026-08-09)
+#     print a self-cycle hint (stale-but-observing > dark-and-unaware)
 #   - process probe is fail-soft under sandboxes that deny `ps`
 #   - per-profile outcomes reported; install does not hard-fail
 # Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1
@@ -125,14 +125,6 @@ else
 		echo "[!!] $$BIN not executable; nothing to cycle"; \
 		exit 0; \
 	fi; \
-	if [ -n "$${CHANVOY_CONFIG_DIR:-}" ]; then \
-		PROFILE_DIR="$${CHANVOY_CONFIG_DIR}/profiles"; \
-	elif [ "$$(uname -s)" = "Darwin" ]; then \
-		PROFILE_DIR="$${HOME}/Library/Application Support/lanytehq/chanvoy/profiles"; \
-	else \
-		PROFILE_DIR="$${XDG_CONFIG_HOME:-$${HOME}/.config}/lanytehq/chanvoy/profiles"; \
-	fi; \
-	ambient="$${LANYTE_MM_BOT_USERNAME:-}"; \
 	profiles=$$(ps -axo args= 2>/dev/null \
 		| sed -n "s|^$${BIN} --profile \\([^ ]*\\) daemon serve.*|\\1|p" \
 		| sort -u || true); \
@@ -145,22 +137,11 @@ else
 	restarted=0; left_foreign=0; fail=0; \
 	while IFS= read -r profile; do \
 		[ -n "$$profile" ] || continue; \
-		bot=""; \
-		pf="$${PROFILE_DIR}/$${profile}.toml"; \
-		if [ -f "$$pf" ]; then \
-			bot=$$(sed -n 's/^bot_username[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$$pf" | head -1); \
-		fi; \
-		ownable=0; \
-		if [ -n "$$ambient" ] && [ -n "$$bot" ] && [ "$$ambient" = "$$bot" ]; then \
-			ownable=1; \
-		fi; \
-		if [ "$$ownable" -ne 1 ]; then \
-			echo "     [..] left running $$profile (foreign / unknown ownership — self-cycle under that seat):"; \
-			if [ -n "$$bot" ]; then \
-				echo "         profile bot=$$bot ambient=$${ambient:-<unset>}"; \
-			else \
-				echo "         no bot_username in $$pf (or file missing); ambient=$${ambient:-<unset>}"; \
-			fi; \
+		own_err=$$("$$BIN" --profile "$$profile" daemon ownable 2>&1); \
+		own_ec=$$?; \
+		if [ "$$own_ec" -ne 0 ]; then \
+			echo "     [..] left running $$profile (foreign / not restart-ownable — self-cycle under that seat):"; \
+			echo "         $$own_err" | sed 's/^/         /'; \
 			echo "         source identity for $$profile && $$BIN daemon stop --profile $$profile && $$BIN auto-setup"; \
 			left_foreign=$$((left_foreign + 1)); \
 			continue; \

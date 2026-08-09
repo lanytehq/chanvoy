@@ -416,14 +416,17 @@ another session.
 **Prove the skew (PER-038A dual identity)**
 
 ```bash
-chanvoy version --extended
-# or: chanvoy --json version -e
-# CLI pin is always present. When a profile is resolvable (--profile or
-# active_profile), the daemon pin and generation_match appear too.
+chanvoy --profile <your-profile> version --extended
+# or: chanvoy --profile <your-profile> --json version -e
+# CLI pin is always present. generation_match is scored only when this
+# environment can restart the probed daemon (daemon-reported identity).
+# Bare version without --profile may probe active_profile belonging to
+# another seat — that path deliberately does not print Generation: match.
 ```
 
-A `Generation: MISMATCH` line (or JSON `"generation_match": false`) means
-the CLI on PATH and the process on the socket are different binaries.
+A `Generation: MISMATCH` line (or JSON `"generation_match": false` with
+`"generation_scored": true`) means the CLI on PATH and the process on the
+socket are different binaries for a daemon you own.
 
 **Fix**
 
