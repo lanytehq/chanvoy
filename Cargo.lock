@@ -188,7 +188,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chanvoy"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chanvoy-cli",
  "chanvoy-core",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chanvoy-core",
  "chanvoy-daemon",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -244,11 +244,12 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chanvoy-core",
  "chanvoy-ipc",
  "dirs",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -263,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-ipc"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chanvoy-core",
  "chrono",
@@ -276,11 +277,12 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
 name = "chanvoy-mcp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chanvoy-core",
  "serde",

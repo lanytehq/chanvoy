@@ -167,6 +167,37 @@ impl TestEnv {
         team_name: &str,
         monitored_channels: &[&str],
     ) {
+        self.write_profile_against(
+            bot_username,
+            team_name,
+            monitored_channels,
+            &self.server_url(),
+        );
+    }
+
+    /// Write the default profile pointed at an arbitrary provider URL
+    /// instead of the harness's mock server directly.
+    ///
+    /// Used by tests that stand a fault-injecting front end in front of
+    /// the mock so a specific request can be made to fail at the
+    /// transport layer — something wiremock, which always answers with
+    /// a status, cannot express.
+    pub fn write_profile_against_server(
+        &self,
+        bot_username: &str,
+        team_name: &str,
+        server_url: &str,
+    ) {
+        self.write_profile_against(bot_username, team_name, &[], server_url);
+    }
+
+    fn write_profile_against(
+        &self,
+        bot_username: &str,
+        team_name: &str,
+        monitored_channels: &[&str],
+        server_url: &str,
+    ) {
         let profile = Profile {
             name: self.profile_name.clone(),
             role: "bravo-devlead".to_string(),
@@ -174,7 +205,7 @@ impl TestEnv {
             provider: chanvoy_core::Provider::Mattermost,
             bot_username: bot_username.to_string(),
             team_name: team_name.to_string(),
-            server_url: self.server_url(),
+            server_url: server_url.to_string(),
             env_name: self.token_env_name.clone(),
             env_file: None,
             credential_mode: chanvoy_core::CredentialMode::EnvName,
@@ -268,21 +299,29 @@ impl TestEnv {
 
     /// `GET /channels/{channel_id}/posts` returning the given messages.
     /// `posts`: list of `(id, user_id, username, message, create_at)`.
+    ///
+    /// Live-shaped: a real Mattermost post object carries `user_id` and
+    /// no author name at all, so the mocked post JSON omits `username`
+    /// and the name is served from a `GET /users/{user_id}` mount
+    /// instead — the same two-step chanvoy has to perform against a
+    /// real server. Injecting the name straight into the post body (as
+    /// this helper used to) let author-resolution bugs pass the suite.
     pub async fn mock_channel_posts(
         &self,
         channel_id: &str,
         posts: &[(&str, &str, &str, &str, i64)],
     ) {
         let body = serde_json::json!({
-            "posts": posts.iter().map(|(id, user_id, username, message, create_at)| {
+            "posts": posts.iter().map(|(id, user_id, _username, message, create_at)| {
                 (
                     (*id).to_string(),
                     serde_json::json!({
                         "id": id,
+                        "channel_id": channel_id,
                         "user_id": user_id,
-                        "username": username,
                         "message": message,
                         "create_at": create_at,
+                        "root_id": "",
                     }),
                 )
             }).collect::<serde_json::Map<_, _>>()
@@ -290,6 +329,27 @@ impl TestEnv {
         Mock::given(method("GET"))
             .and(path(format!("/api/v4/channels/{channel_id}/posts")))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&self.mock)
+            .await;
+        let mut mounted: Vec<&str> = Vec::new();
+        for (_, user_id, username, _, _) in posts {
+            if mounted.contains(user_id) {
+                continue;
+            }
+            mounted.push(user_id);
+            self.mock_user_lookup(user_id, username).await;
+        }
+    }
+
+    /// `GET /users/{user_id}` returning that user's name — the lookup
+    /// chanvoy makes to put an author name on a post.
+    pub async fn mock_user_lookup(&self, user_id: &str, username: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/users/{user_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": user_id,
+                "username": username,
+            })))
             .mount(&self.mock)
             .await;
     }

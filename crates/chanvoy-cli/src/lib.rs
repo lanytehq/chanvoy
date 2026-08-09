@@ -20,6 +20,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 use tokio::process::Command;
 
+mod host_build_info;
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
@@ -40,11 +42,52 @@ pub enum CliError {
     DaemonStartup { profile: String, detail: String },
     #[error(transparent)]
     Resolver(chanvoy_core::ResolverError),
+    /// A running daemon that predates the verb the operator just used.
+    ///
+    /// Installing a new chanvoy unlinks the old binary rather than
+    /// overwriting it, so a daemon that was already running keeps
+    /// serving from its own copy until someone restarts it. The operator
+    /// then has a CLI that knows a verb talking to a daemon that does
+    /// not, and the honest wire answer is a JSON-RPC "method not found".
+    /// Left unmapped that surfaces as `rpc error -32601: unknown method
+    /// get_post` — a numeric code and an internal method name, neither
+    /// of which is the operator's verb and neither of which says what to
+    /// do. The action is always the same, so name it.
+    #[error(
+        "the running daemon does not support `{verb}`; it was started from an \
+         earlier chanvoy and keeps that binary until it is restarted. Cycle it \
+         with `chanvoy daemon stop` then `chanvoy auto-setup`, and run the \
+         command again."
+    )]
+    DaemonPredatesVerb { verb: String },
 }
 
 impl From<chanvoy_core::ResolverError> for CliError {
     fn from(value: chanvoy_core::ResolverError) -> Self {
         CliError::Resolver(value)
+    }
+}
+
+/// JSON-RPC "method not found". A daemon that has never heard of the
+/// method the CLI just called answers with this and nothing else.
+const RPC_UNKNOWN_METHOD: i64 = -32601;
+
+/// Turn "unknown method" into the one instruction that resolves it.
+///
+/// Applied only at the call sites for verbs new enough to outrun a
+/// long-lived daemon, so `verb` is the operator's spelling rather than
+/// the internal method name. Every other failure passes through
+/// untouched — this must not become a catch-all that recommends a
+/// daemon restart for unrelated causes.
+fn map_daemon_predates_verb(error: DaemonError, verb: &str) -> CliError {
+    match &error {
+        DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        } => CliError::DaemonPredatesVerb {
+            verb: verb.to_string(),
+        },
+        _ => error.into(),
     }
 }
 
@@ -57,6 +100,7 @@ impl From<chanvoy_core::ResolverError> for CliError {
 struct Cli {
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// Machine-readable stdout (JSON).
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -65,25 +109,47 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandSet {
+    /// Start/stop/status for the long-lived daemon process.
     #[command(subcommand)]
     Daemon(DaemonCommand),
+    /// Create, list, and manage local profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
+    /// Bot identity for this profile.
     Whoami,
+    /// List channels the bot can see (optionally one team).
     Channels(ChannelsArgs),
+    /// List DM conversations.
     Dms,
+    /// List recent posts (time / id modes); pure observe unless --advance.
     Read(ReadArgs),
+    /// Exit 0 if the channel has new posts since the cursor; exit 1 if none.
     Check(CheckArgs),
+    /// Post a message; --reply-to for threads.
     Post(PostArgs),
+    /// Direct messages (send / read).
     #[command(subcommand)]
     Dm(DmCommand),
+    /// Notify another bot (mention payload).
     Notify(NotifyArgs),
+    /// List notifications / unread mentions.
     Notifications(ReadWindowArgs),
+    /// Block for a matching channel post (or any non-self post), or deadman; prefer --after + --contains.
     Wait(WaitArgs),
     /// Fetch a channel's pinned posts. Pure read, no cursor side
     /// effects. Uses the cross-team channel resolver; accepts
     /// <team>/<channel> syntax and the --team flag.
     Pinned(PinnedArgs),
+    /// Fetch a single post by id from a named channel. Refuses if the
+    /// post is not in that channel, before returning any of its
+    /// content. Pure read, no cursor side effects. Accepts
+    /// <team>/<channel> syntax and the --team flag.
+    Show(ShowArgs),
+    /// Read a whole thread — the root post plus every reply. The id may
+    /// be the root's or any reply's; both read the same thread. Pure
+    /// read, no cursor side effects. Accepts <team>/<channel> syntax
+    /// and the --team flag.
+    Thread(ThreadArgs),
     /// Advance the attention cursor to the channel's current latest
     /// post without fetching content. Uses the cross-team channel
     /// resolver; accepts <team>/<channel> syntax.
@@ -110,15 +176,26 @@ enum CommandSet {
     /// with a diagnostic on inline operator conflicts (`in:`,
     /// `from:`, `before:` / `after:`).
     Search(SearchArgs),
+    /// Create / archive / restore channels and membership.
     #[command(subcommand)]
     Channel(ChannelCommand),
-    /// Bootstrap: create/refresh profile from identity env and ensure daemon is healthy.
+    /// Refresh profile from env and ensure the daemon is healthy.
     AutoSetup(AutoSetupArgs),
     /// Inspect daemon-held attention state (cursors, staleness verdicts).
     /// Strictly read-only: never mutates daemon state, never issues
     /// Mattermost API calls.
     #[command(subcommand)]
     Attention(AttentionCommand),
+    /// Print the installed binary version (semver). Use `--extended` for
+    /// commit, build time, rustc, and platform — identity for dirty dogfood.
+    Version(VersionArgs),
+}
+
+#[derive(Debug, Args)]
+struct VersionArgs {
+    /// Print host build identity: commit, built time, rustc, platform, dirty.
+    #[arg(long, short = 'e')]
+    extended: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -339,14 +416,22 @@ struct CheckArgs {
 #[derive(Debug, Args)]
 struct WaitArgs {
     channel: String,
-    /// Timeout window for the wait. Bare integer = minutes (today's
-    /// default; default 10m). Accepts s/m/h/d suffixes.
+    /// Deadman timeout (default 10m). Match exit 0; clean deadman 1; hard 2. Self-posts never wake.
     #[arg(
         long,
         default_value = "10",
-        long_help = "Wait timeout. Bare integer = minutes (today's default; default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
     )]
     timeout: String,
+    /// Literal body substring (case-sensitive). Self-posts never match.
+    #[arg(long, value_name = "TEXT")]
+    contains: Option<String>,
+    /// Rust regex over message body. Invalid/oversize patterns refuse before wait.
+    #[arg(long, value_name = "REGEX")]
+    pattern: Option<String>,
+    /// Exclusive baseline post id: only posts after this id can wake the wait.
+    #[arg(long, value_name = "POST_ID")]
+    after: Option<String>,
     /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
@@ -437,6 +522,36 @@ struct PinArgs {
     /// Post ID to pin / unpin. Format matches `chanvoy post`'s
     /// returned ID and `chanvoy read --json`'s `id` field.
     post_id: String,
+    /// Explicit team override for cross-team channel resolution.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ShowArgs {
+    /// Channel context (positional, required). Accepts
+    /// `<team>/<channel>` syntax for cross-team resolution.
+    channel: String,
+    /// Post ID to fetch. Format matches `chanvoy post`'s returned ID
+    /// and the `id=` crumb on `chanvoy read`'s output.
+    post_id: String,
+    /// Explicit team override for cross-team channel resolution.
+    #[arg(long)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ThreadArgs {
+    /// Channel context (positional, required). Accepts
+    /// `<team>/<channel>` syntax for cross-team resolution.
+    channel: String,
+    /// Any post ID in the thread — the root or a reply. The thread is
+    /// the same either way.
+    post_id: String,
+    /// Return only the most recent message in the thread. The output
+    /// is still a list; `--json` still emits an array.
+    #[arg(long)]
+    latest: bool,
     /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
@@ -568,7 +683,36 @@ fn init_tracing() {
         .try_init();
 }
 
+fn handle_version(json: bool, args: VersionArgs) -> Result<(), CliError> {
+    let info = host_build_info::resolve();
+    if json {
+        let value = if args.extended {
+            serde_json::to_value(&info).map_err(|e| CliError::Bootstrap(e.to_string()))?
+        } else {
+            serde_json::json!({
+                "name": "chanvoy",
+                "version": info.version,
+            })
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|e| CliError::Bootstrap(e.to_string()))?
+        );
+        return Ok(());
+    }
+    if args.extended {
+        println!("{}", host_build_info::format_extended(&info));
+    } else {
+        println!("{}", host_build_info::format_basic(&info));
+    }
+    Ok(())
+}
+
 async fn execute(cli: Cli) -> Result<(), CliError> {
+    // Version needs no profile or daemon — identity of the local binary only.
+    if let CommandSet::Version(args) = cli.command {
+        return handle_version(cli.json, args);
+    }
     // auto-setup is the bootstrap / repair surface and must not depend on resolving
     // an existing persisted profile — a malformed unrelated profile would otherwise
     // block the very path meant to fix it. Dispatch before resolve_profile_name.
@@ -611,7 +755,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     };
     let profile = resolve_profile_name(cli.profile.as_deref(), policy)?;
     match cli.command {
-        CommandSet::AutoSetup(_) | CommandSet::Profile(_) => {
+        CommandSet::Version(_) | CommandSet::AutoSetup(_) | CommandSet::Profile(_) => {
             unreachable!("dispatched above")
         }
         CommandSet::Daemon(command) => handle_daemon(&profile, cli.json, command).await,
@@ -733,54 +877,26 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 },
             )
         }
-        CommandSet::Wait(args) => {
-            let timeout_secs = parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes)
-                .map_err(CliError::Bootstrap)?;
-            if !cli.json {
-                eprintln!(
-                    "waiting for new message in #{} (timeout: {}s)...",
-                    args.channel, timeout_secs
-                );
-            }
-            match daemon_client(&profile)
-                .wait_channel(&args.channel, timeout_secs, args.team.clone())
-                .await
-            {
-                Ok(result) => {
-                    if !cli.json && !result.messages.is_empty() {
-                        eprintln!("--- new message ---");
-                    }
-                    print_value(cli.json, &result)
-                }
-                Err(DaemonError::Rpc {
-                    code: -32005,
-                    message,
-                }) => {
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "timeout": true,
-                                "channel": args.channel,
-                                "message": message
-                            }))?
-                        );
-                    } else {
-                        eprintln!(
-                            "timeout: no new messages in #{} after {} seconds",
-                            args.channel, timeout_secs
-                        );
-                    }
-                    process::exit(1);
-                }
-                Err(error) => Err(error.into()),
-            }
-        }
+        CommandSet::Wait(args) => handle_wait(&profile, cli.json, args).await,
         CommandSet::Pinned(args) => print_value(
             cli.json,
             &daemon_client(&profile)
                 .pinned_channel(&args.channel, args.team.clone())
                 .await?,
+        ),
+        CommandSet::Show(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .get_post(&args.channel, &args.post_id, args.team.clone())
+                .await
+                .map_err(|error| map_daemon_predates_verb(error, "show"))?,
+        ),
+        CommandSet::Thread(args) => print_value(
+            cli.json,
+            &daemon_client(&profile)
+                .read_thread(&args.channel, &args.post_id, args.latest, args.team.clone())
+                .await
+                .map_err(|error| map_daemon_predates_verb(error, "thread"))?,
         ),
         CommandSet::Ack(args) => print_value(
             cli.json,
@@ -1128,6 +1244,251 @@ fn map_post_error(err: CliError, char_count: usize) -> CliError {
     } else {
         err
     }
+}
+
+/// PER-038 wait: always prefer `wait_channel_v2`. Advanced flags never
+/// fall back to legacy. Bare wait may fall back once on method-not-found
+/// so a new CLI still works against an old daemon for unfiltered waits.
+async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    let timeout_secs = match parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes) {
+        Ok(secs) => secs,
+        Err(err) => {
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                &format!("invalid --timeout: {err}"),
+            );
+        }
+    };
+    // D4: zero window is input hard — never a clean deadman.
+    if timeout_secs == 0 {
+        return exit_wait_hard(
+            json,
+            &args.channel,
+            "input",
+            false,
+            "wait --timeout must be greater than zero",
+        );
+    }
+
+    let advanced = args.contains.is_some() || args.pattern.is_some() || args.after.is_some();
+
+    if let Some(ref c) = args.contains {
+        if c.is_empty() {
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                "empty --contains is refused (not match-all)",
+            );
+        }
+    }
+    if let Some(ref p) = args.pattern {
+        if p.is_empty() {
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                "empty --pattern is refused (not match-all)",
+            );
+        }
+    }
+
+    if !json {
+        eprintln!(
+            "waiting for new message in #{} (timeout: {}s)...",
+            args.channel, timeout_secs
+        );
+    }
+
+    let client = daemon_client(profile);
+    let result = match client
+        .wait_channel_v2(
+            &args.channel,
+            timeout_secs,
+            args.team.clone(),
+            args.contains.clone(),
+            args.pattern.clone(),
+            args.after.clone(),
+        )
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) if advanced => {
+            return exit_wait_hard(
+                json,
+                &args.channel,
+                "input",
+                false,
+                "the running daemon does not support filtered wait \
+                 (--contains/--pattern/--after); it was started from an earlier \
+                 chanvoy. Cycle it with `chanvoy daemon stop` then \
+                 `chanvoy auto-setup`, and run the command again.",
+            );
+        }
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) => {
+            client
+                .wait_channel(&args.channel, timeout_secs, args.team.clone())
+                .await
+        }
+        Err(other) => Err(other),
+    };
+
+    match result {
+        Ok(result) => {
+            if result.messages.is_empty() {
+                return exit_wait_hard(
+                    json,
+                    &args.channel,
+                    "input",
+                    false,
+                    "wait returned success with no message payload",
+                );
+            }
+            if !json {
+                eprintln!("--- new message ---");
+            }
+            let one = WaitResult {
+                channel: result.channel,
+                messages: vec![result.messages.into_iter().next().expect("non-empty")],
+            };
+            print_value(json, &one)
+        }
+        Err(err) => classify_wait_error(json, &args.channel, timeout_secs, err),
+    }
+}
+
+/// Wait-local exhaustive outcome classifier (devrev D4): deadman exit 1
+/// only for true timeout; every other failure is exit 2 with class.
+fn classify_wait_error(
+    json: bool,
+    channel: &str,
+    timeout_secs: u64,
+    err: DaemonError,
+) -> Result<(), CliError> {
+    match &err {
+        DaemonError::Rpc {
+            code: -32005,
+            message,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "timeout": true,
+                        "channel": channel,
+                        "message": message
+                    }))
+                    .unwrap_or_else(|_| r#"{"timeout":true}"#.into())
+                );
+            } else {
+                eprintln!(
+                    "timeout: true (no matching messages in #{channel} after {timeout_secs} seconds)"
+                );
+            }
+            process::exit(1);
+        }
+        DaemonError::Rpc {
+            code: -32007,
+            message,
+        } => exit_wait_hard(json, channel, "input", false, message),
+        DaemonError::Rpc {
+            code: -32008,
+            message,
+        } => exit_wait_hard(json, channel, "provider", true, message),
+        DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        } => exit_wait_hard(
+            json,
+            channel,
+            "input",
+            false,
+            "the running daemon does not support this wait method; cycle it with \
+             `chanvoy daemon stop` then `chanvoy auto-setup`",
+        ),
+        DaemonError::Rpc {
+            code: -32000,
+            message,
+        } if message.contains("wait input error")
+            || message.contains("WaitFilterInvalid")
+            || message.contains("empty --")
+            || message.contains("wait --after")
+            || message.contains("invalid --timeout")
+            || message.contains("AnchorNotFound")
+            || message.contains("AnchorChannelMismatch")
+            || message.contains("not found")
+            || message.contains("channel") && message.contains("refused") =>
+        {
+            exit_wait_hard(json, channel, "input", false, message)
+        }
+        DaemonError::Rpc {
+            code: -32000,
+            message,
+        } if message.contains("wait observation failed")
+            || message.contains("WaitProviderDegraded")
+            || message.contains("stalled")
+            || message.contains("api error 5")
+            || message.contains("api error 429")
+            || message.contains("api error 401")
+            || message.contains("api error 403") =>
+        {
+            let retryable = !message.contains("401") && !message.contains("403");
+            let class = if message.contains("401") || message.contains("403") {
+                "input"
+            } else {
+                "provider"
+            };
+            exit_wait_hard(json, channel, class, retryable, message)
+        }
+        DaemonError::NotRunning(path) => exit_wait_hard(
+            json,
+            channel,
+            "provider",
+            true,
+            &format!("no chanvoy daemon is listening at {path}"),
+        ),
+        DaemonError::Rpc { message, .. } => {
+            // Any other RPC failure from wait is hard, never exit-1 deadman.
+            exit_wait_hard(json, channel, "provider", true, message)
+        }
+        other => exit_wait_hard(json, channel, "provider", true, &other.to_string()),
+    }
+}
+
+fn exit_wait_hard(
+    json: bool,
+    channel: &str,
+    error_class: &str,
+    retryable: bool,
+    message: &str,
+) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "timeout": false,
+                "channel": channel,
+                "error_class": error_class,
+                "retryable": retryable,
+                "message": message
+            }))
+            .unwrap_or_else(|_| format!(r#"{{"timeout":false,"message":{message:?}}}"#))
+        );
+    } else {
+        eprintln!("wait error ({error_class}): {message}");
+    }
+    process::exit(EXIT_ENV_INPUT);
 }
 
 async fn handle_dm_raw(profile: &str, json: bool, args: Vec<String>) -> Result<(), CliError> {
@@ -3086,6 +3447,12 @@ impl HumanReadable for Vec<DmConversation> {
     }
 }
 
+impl HumanReadable for Message {
+    fn to_human_string(&self) -> String {
+        format_message(self)
+    }
+}
+
 impl HumanReadable for Vec<Message> {
     fn to_human_string(&self) -> String {
         self.iter()
@@ -3306,11 +3673,33 @@ fn ws_state_label(s: WsConnectionState) -> &'static str {
     }
 }
 
+/// The post id is on every row so an operator reading without `--json`
+/// can hand a citation straight to `show`, `thread`, or `post
+/// --reply-to`. It is the full id, not a shortened one, because it has
+/// to be copy-pasteable.
+///
+/// `root=` is on every row too, including top-level posts, where it
+/// repeats the post's own id. The repetition is the point: `--reply-to`
+/// takes a thread root, and a row with no `root=` leaves the operator
+/// to infer that the id doubles as the root. Reading a row must not
+/// require knowing that rule — the row states which thread it belongs
+/// to, and a top-level post belongs to its own. This matches the
+/// `--json` shape, where `root_id` is populated on every message.
+///
+/// The one omission is a root that is genuinely unknown, which arrives
+/// as an empty string from a daemon older than the field. `root=` with
+/// nothing after it would read as a citable value; leaving it off says
+/// what is true, which is that this row cannot tell you.
 fn format_message(message: &Message) -> String {
+    let mut crumb = format!("id={}", message.id);
+    if !message.root_id.is_empty() {
+        crumb.push_str(&format!(" root={}", message.root_id));
+    }
     format!(
-        "{} [{}]\n{}\n---",
+        "{} [{}] {}\n{}\n---",
         format_timestamp(message.create_at),
         message.username,
+        crumb,
         message.message
     )
 }
@@ -3332,6 +3721,7 @@ fn format_dm_timestamp(millis: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::ffi::OsStr;
     use std::sync::Mutex;
 
@@ -3340,6 +3730,81 @@ mod tests {
     /// `env::remove_var` calls would otherwise race with each other and
     /// with any test that reads the same vars.
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn wait_help_states_filter_source_and_compiled_regex_bounds() {
+        let mut cli = Cli::command();
+        let wait = cli
+            .find_subcommand_mut("wait")
+            .expect("wait subcommand is present");
+        let help = wait.render_long_help().to_string();
+
+        assert!(
+            help.contains("256 UTF-8 bytes"),
+            "wait help must state the source-size bound: {help}"
+        );
+        assert!(
+            help.contains("64 KiB"),
+            "wait help must state the compiled-regex bound: {help}"
+        );
+    }
+
+    /// A CLI that knows `show` / `thread` talking to a daemon that does
+    /// not gets an actionable instruction, not a JSON-RPC code.
+    ///
+    /// This is a normal state after `make install`: the new binary is
+    /// on PATH while the daemon still runs the old one. The message has
+    /// to name the operator's verb and the exact commands that fix it,
+    /// and it must not still be quoting the wire error underneath.
+    #[test]
+    fn an_unknown_method_from_an_old_daemon_names_the_daemon_restart() {
+        for verb in ["show", "thread"] {
+            let wire = DaemonError::Rpc {
+                code: -32601,
+                message: "unknown method get_post".to_string(),
+            };
+            let rendered = map_daemon_predates_verb(wire, verb).to_string();
+
+            assert!(
+                rendered.contains(&format!("`{verb}`")),
+                "the message names the verb the operator typed: {rendered}"
+            );
+            assert!(
+                rendered.contains("chanvoy daemon stop") && rendered.contains("chanvoy auto-setup"),
+                "the message names both commands that resolve it: {rendered}"
+            );
+            assert!(
+                !rendered.contains("-32601") && !rendered.contains("unknown method"),
+                "the raw wire error must not survive the mapping: {rendered}"
+            );
+        }
+    }
+
+    /// The mapping is narrow. Any other daemon failure keeps its own
+    /// diagnostic — a refused post, a missing channel, or a dead socket
+    /// must never be reported as "restart the daemon".
+    #[test]
+    fn other_daemon_failures_are_not_reported_as_a_stale_daemon() {
+        for error in [
+            DaemonError::Rpc {
+                code: -32000,
+                message: "anchor post p-1 is not in channel bravo-team".to_string(),
+            },
+            DaemonError::NotRunning("/run/chanvoy/profile.sock".to_string()),
+        ] {
+            let original = error.to_string();
+            let rendered = map_daemon_predates_verb(error, "show").to_string();
+
+            assert_eq!(
+                rendered, original,
+                "an unrelated failure must pass through unchanged"
+            );
+            assert!(
+                !rendered.contains("chanvoy auto-setup"),
+                "restarting the daemon is not the advice here: {rendered}"
+            );
+        }
+    }
 
     #[test]
     fn format_last_active_buckets() {
@@ -4311,5 +4776,49 @@ mod tests {
     fn read_capped_reader_accepts_within_cap() {
         let body = read_message_from_reader_capped(false, &b"ok body\n"[..], 1024).unwrap();
         assert_eq!(body, "ok body\n");
+    }
+
+    /// A message whose thread root is unknown renders no `root=` crumb
+    /// at all, rather than an empty one.
+    ///
+    /// An empty root arrives from a daemon started before the field
+    /// existed, which is a normal state right after an install: the new
+    /// binary is in place, the old daemon is still serving. `root=` with
+    /// nothing after it reads as a value the operator can paste into
+    /// `--reply-to`, and pasting it would post to the wrong place.
+    /// Omitting the crumb says the true thing, which is that this row
+    /// cannot answer the question.
+    #[test]
+    fn a_message_with_no_thread_root_renders_no_root_crumb() {
+        let unknown_root = Message {
+            id: "post-1".to_string(),
+            user_id: "user-a".to_string(),
+            username: "alice".to_string(),
+            message: "sent by an older daemon".to_string(),
+            create_at: 1_700_000_000_000,
+            root_id: String::new(),
+        };
+
+        let rendered = format_message(&unknown_root);
+        assert!(
+            rendered.contains("id=post-1"),
+            "the post id is still citable: {rendered}"
+        );
+        assert!(
+            !rendered.contains("root="),
+            "an unknown thread root must not render as an empty, paste-able \
+             crumb: {rendered}"
+        );
+
+        // The contrast case, so this test cannot be satisfied by
+        // deleting the crumb outright: a known root is still stated.
+        let known_root = Message {
+            root_id: "thread-root".to_string(),
+            ..unknown_root
+        };
+        assert!(
+            format_message(&known_root).contains("root=thread-root"),
+            "a known thread root is named on the row"
+        );
     }
 }

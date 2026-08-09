@@ -1,0 +1,1777 @@
+//! `chanvoy show` and `chanvoy thread` — the two read verbs that take a
+//! post id.
+//!
+//! The contract these tests hold down:
+//!
+//! - A post id alone is not authority to read a post. Both verbs bind
+//!   the post to the channel the operator named, and the binding runs
+//!   before any body is handed back or any thread is fetched.
+//! - A thread can be named by its root or by any reply in it. Both read
+//!   the same thread, because the canonical root comes off the anchor.
+//! - `--latest` narrows a thread to its final message without changing
+//!   the shape of the response: `--json` is an array either way.
+//! - Neither verb touches attention state. They are reads.
+//! - Human-readable output carries the post id, so an operator who did
+//!   not ask for `--json` can still cite a post to these verbs.
+//!
+//! Where a test asserts a refusal it asserts on the *absence of the
+//! downstream request*, not merely on the error: a bind that ran after
+//! the fetch would still return an error while having already leaked
+//! the read.
+
+#![allow(dead_code)]
+
+mod common;
+
+use common::{
+    read_attention_state, read_attention_state_bytes, run_chanvoy, spawn_daemon,
+    stop_daemon_cleanly, TestEnv,
+};
+use serde_json::{json, Value};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, ResponseTemplate};
+
+const CHANNEL: &str = "bravo-team";
+const CHANNEL_ID: &str = "chan-id-show-thread";
+const OTHER_CHANNEL_ID: &str = "chan-id-out-of-reach";
+/// A second team the bot also belongs to, carrying a channel of the
+/// same slug as `CHANNEL` under a different channel id. Cross-team
+/// resolution is only testable against a team that is not the profile's
+/// primary one.
+const OTHER_TEAM_ID: &str = "team-id-999";
+const OTHER_TEAM_SLUG: &str = "org-otherhq";
+const OTHER_TEAM_CHANNEL_ID: &str = "chan-id-other-team";
+
+/// A body marker distinctive enough that a leak assertion cannot pass
+/// by accident.
+fn body_of(id: &str) -> String {
+    format!("BODY-MARKER-{id}")
+}
+
+/// One post in the shape Mattermost actually sends: `user_id` and no
+/// author name anywhere on it.
+fn wire_post(id: &str, channel_id: &str, user_id: &str, create_at: i64, root_id: &str) -> Value {
+    json!({
+        "id": id,
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "message": body_of(id),
+        "create_at": create_at,
+        "root_id": root_id,
+    })
+}
+
+fn posts_envelope(posts: Vec<Value>) -> Value {
+    let order: Vec<String> = posts
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    let map: serde_json::Map<String, Value> = posts
+        .into_iter()
+        .map(|p| (p["id"].as_str().unwrap().to_string(), p))
+        .collect();
+    json!({ "order": order, "posts": map })
+}
+
+/// `GET /posts/{id}` returning the full post object. The harness's
+/// `mock_post_lookup` serves only `{id, channel_id}`, which is enough
+/// for an existence assertion but not for a verb that returns the post.
+async fn mount_post(env: &TestEnv, post: Value) {
+    let id = post["id"].as_str().unwrap().to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/posts/{id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(post))
+        .mount(&env.mock)
+        .await;
+}
+
+/// `GET /posts/{requested_id}` answering with some *other* post. The
+/// provider is claiming that the post the operator named is this one.
+async fn mount_post_at(env: &TestEnv, requested_id: &str, answered_with: Value) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/posts/{requested_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answered_with))
+        .mount(&env.mock)
+        .await;
+}
+
+async fn mount_missing_post(env: &TestEnv, post_id: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/posts/{post_id}")))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(json!({"status_code": 404, "message": "no"})),
+        )
+        .mount(&env.mock)
+        .await;
+}
+
+async fn mount_thread(env: &TestEnv, root_id: &str, posts: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/posts/{root_id}/thread")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(posts_envelope(posts)))
+        .mount(&env.mock)
+        .await;
+}
+
+async fn mount_user(env: &TestEnv, user_id: &str, username: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/users/{user_id}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": user_id, "username": username})),
+        )
+        .mount(&env.mock)
+        .await;
+}
+
+/// `/users/me/teams`, needed by the explicit `<team>/<channel>` and
+/// `--team` resolution paths. Takes the full membership list so a test
+/// can express "member of these, not that one".
+async fn mount_my_teams(env: &TestEnv, teams: &[(&str, &str)]) {
+    let body: Vec<Value> = teams
+        .iter()
+        .map(|(id, name)| json!({"id": id, "name": name, "display_name": name}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/api/v4/users/me/teams"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&env.mock)
+        .await;
+}
+
+/// How many times the provider's thread endpoint was asked for
+/// anything at all.
+async fn thread_requests(env: &TestEnv) -> usize {
+    env.mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|req| req.url.path().ends_with("/thread"))
+        .count()
+}
+
+/// How many author lookups the provider was asked for. `/users/me` and
+/// its sub-paths are the daemon's own identity traffic — whoami at bind
+/// and the probe on every `daemon status` — and are not hydration.
+async fn author_lookups(env: &TestEnv) -> usize {
+    env.mock
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|req| {
+            let path = req.url.path();
+            path.starts_with("/api/v4/users/")
+                && path != "/api/v4/users/me"
+                && !path.starts_with("/api/v4/users/me/")
+        })
+        .count()
+}
+
+fn stdout_of(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn combined_output(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+// ----------------------------------------------------------------------
+// The point-fetch itself: the bind runs before the body is built
+// ----------------------------------------------------------------------
+//
+// The integration tests below prove nothing leaks to the operator.
+// These prove *why*: the channel comparison happens before the post is
+// hydrated at all, so there is no window in which a body exists to
+// leak. Author resolution is the observable proxy — it is the first
+// thing hydration does, and it is a separate provider request.
+
+mod point_fetch {
+    use super::{body_of, wire_post, CHANNEL_ID, OTHER_CHANNEL_ID};
+    use chanvoy_core::{
+        CapabilityClass, CoreError, CredentialMode, MattermostClient, Profile, Provider,
+    };
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn build_client(mock_url: &str) -> MattermostClient {
+        let profile = Profile {
+            name: "point-fetch".to_string(),
+            role: "bravo-devlead".to_string(),
+            scope: "lanytehq".to_string(),
+            provider: Provider::Mattermost,
+            bot_username: "bot-stable".to_string(),
+            team_name: "org-lanytehq".to_string(),
+            server_url: mock_url.to_string(),
+            env_name: "LANYTE_MM_TOKEN".to_string(),
+            env_file: None,
+            credential_mode: CredentialMode::EnvName,
+            capability_class: CapabilityClass::Standard,
+            monitored_channels: vec![],
+            ipc: None,
+            reduce: None,
+        };
+        MattermostClient::new(&profile, "fixture-token".to_string()).expect("build client")
+    }
+
+    async fn mount(server: &MockServer, post: serde_json::Value) {
+        let id = post["id"].as_str().unwrap().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/posts/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(post))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/user-a"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "user-a", "username": "alice"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn author_lookups(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("received_requests")
+            .iter()
+            .filter(|req| req.url.path().starts_with("/api/v4/users/"))
+            .count()
+    }
+
+    /// A post in the expected channel comes back hydrated, with the
+    /// author resolved and the thread root normalized.
+    #[tokio::test]
+    async fn a_post_in_the_expected_channel_comes_back_hydrated() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            wire_post("post-1", CHANNEL_ID, "user-a", 1_700_000_000_000, ""),
+        )
+        .await;
+        let client = build_client(&server.uri());
+
+        let message = client
+            .get_post_in_channel(CHANNEL_ID, "the-channel", "post-1")
+            .await
+            .expect("post in the expected channel");
+
+        assert_eq!(message.id, "post-1");
+        assert_eq!(message.username, "alice", "the author is resolved");
+        assert_eq!(
+            message.root_id, "post-1",
+            "a top-level post names itself as its thread root"
+        );
+        assert_eq!(message.message, body_of("post-1"));
+    }
+
+    /// A post in a different channel is refused, and the refusal lands
+    /// before hydration even begins — no author lookup is issued,
+    /// because there is no body being assembled to put an author on.
+    #[tokio::test]
+    async fn a_post_in_another_channel_is_refused_before_it_is_hydrated() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            wire_post("post-1", OTHER_CHANNEL_ID, "user-a", 1_700_000_000_000, ""),
+        )
+        .await;
+        let client = build_client(&server.uri());
+
+        let error = client
+            .get_post_in_channel(CHANNEL_ID, "the-channel", "post-1")
+            .await
+            .expect_err("a post in another channel must not be returned");
+
+        match &error {
+            CoreError::AnchorChannelMismatch { post_id, channel } => {
+                assert_eq!(post_id, "post-1");
+                assert_eq!(channel, "the-channel");
+            }
+            other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+        }
+        assert!(
+            !error.to_string().contains(&body_of("post-1")),
+            "the refusal must not quote the body it withheld: {error}"
+        );
+        assert_eq!(
+            author_lookups(&server).await,
+            0,
+            "the channel check runs before hydration; an author lookup \
+             would mean a body was already being built"
+        );
+    }
+
+    /// The provider answers the point-fetch with a well-formed post in
+    /// the right channel that is simply not the post that was asked
+    /// for. It is refused, in terms of the id the caller supplied.
+    ///
+    /// A 200 is not on its own an answer to the question: the question
+    /// was about one specific post. Believing the response would let a
+    /// substituted reply stand in for someone else's post — `show`
+    /// would hand back that post's body under a successful fetch, and a
+    /// thread read would take its root and fetch a conversation nobody
+    /// named. The channel binding does not catch it, because the
+    /// substitute is in the caller's channel.
+    #[tokio::test]
+    async fn a_post_that_is_not_the_one_requested_is_refused_before_it_is_hydrated() {
+        let server = MockServer::start().await;
+        // Asked for `requested-post`; answered with `substituted-post`,
+        // in the caller's own channel and otherwise well-formed.
+        Mock::given(method("GET"))
+            .and(path("/api/v4/posts/requested-post"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(wire_post(
+                "substituted-post",
+                CHANNEL_ID,
+                "user-a",
+                1_700_000_000_000,
+                "someone-elses-root",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/user-a"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id": "user-a", "username": "alice"})),
+            )
+            .mount(&server)
+            .await;
+        let client = build_client(&server.uri());
+
+        let error = client
+            .get_post_in_channel(CHANNEL_ID, "the-channel", "requested-post")
+            .await
+            .expect_err("a post that is not the one asked for must not be returned");
+
+        match &error {
+            CoreError::AnchorChannelMismatch { post_id, channel } => {
+                assert_eq!(
+                    post_id, "requested-post",
+                    "the refusal names the id the caller supplied"
+                );
+                assert_eq!(channel, "the-channel");
+            }
+            other => panic!("expected AnchorChannelMismatch, got {other:?}"),
+        }
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("substituted-post"),
+            "the substituted post's id is provider-supplied and must not be \
+             handed back: {rendered}"
+        );
+        assert!(
+            !rendered.contains("someone-elses-root"),
+            "nor the thread it claims to belong to: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&body_of("substituted-post")),
+            "nor any part of its body: {rendered}"
+        );
+        assert_eq!(
+            author_lookups(&server).await,
+            0,
+            "the identity check runs before hydration; an author lookup would \
+             mean the substituted post was already being believed"
+        );
+    }
+
+    /// A missing post is the same refusal the write verbs already give.
+    #[tokio::test]
+    async fn a_missing_post_is_refused_as_a_missing_anchor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/posts/no-such-post"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"status_code": 404})))
+            .mount(&server)
+            .await;
+        let client = build_client(&server.uri());
+
+        let error = client
+            .get_post_in_channel(CHANNEL_ID, "the-channel", "no-such-post")
+            .await
+            .expect_err("a missing post must not be returned");
+
+        match error {
+            CoreError::AnchorNotFound(id) => assert_eq!(id, "no-such-post"),
+            other => panic!("expected AnchorNotFound, got {other:?}"),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
+// show
+// ----------------------------------------------------------------------
+
+/// `show` on a root and on a reply: one JSON object each, with the
+/// author resolved and the thread the post belongs to named.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn show_returns_one_object_for_a_root_and_for_a_reply() {
+    let env = TestEnv::new("show-root-and-reply").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-sr", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post(
+        &env,
+        wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, ""),
+    )
+    .await;
+    mount_post(
+        &env,
+        wire_post("reply-1", CHANNEL_ID, "user-b", 1_700_000_001_000, "root-1"),
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+
+    let out = run_chanvoy(&env, &["--json", "show", CHANNEL, "root-1"]).await;
+    assert!(
+        out.status.success(),
+        "show on a root must exit 0; output={}",
+        combined_output(&out)
+    );
+    let root: Value = serde_json::from_str(&stdout_of(&out)).expect("show --json parses");
+    assert!(root.is_object(), "show emits one object, got {root}");
+    assert_eq!(root["id"], "root-1");
+    assert_eq!(root["username"], "alice", "the author is resolved by name");
+    assert_eq!(
+        root["root_id"], "root-1",
+        "a root names itself as its thread"
+    );
+    assert_eq!(root["message"], body_of("root-1"));
+
+    let out = run_chanvoy(&env, &["--json", "show", CHANNEL, "reply-1"]).await;
+    assert!(
+        out.status.success(),
+        "show on a reply must exit 0; output={}",
+        combined_output(&out)
+    );
+    let reply: Value = serde_json::from_str(&stdout_of(&out)).expect("show --json parses");
+    assert!(reply.is_object(), "show emits one object, got {reply}");
+    assert_eq!(reply["id"], "reply-1");
+    assert_eq!(reply["username"], "bob");
+    assert_eq!(
+        reply["root_id"], "root-1",
+        "a reply names the thread it belongs to, not itself"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// A post that lives in another channel is refused, and none of its
+/// content reaches the operator. The refusal is what stands between a
+/// bare post id and a read of any channel the bot can see.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn show_refuses_a_post_in_another_channel_without_leaking_it() {
+    let env = TestEnv::new("show-cross-channel").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-sx", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post(
+        &env,
+        wire_post(
+            "elsewhere-1",
+            OTHER_CHANNEL_ID,
+            "user-a",
+            1_700_000_000_000,
+            "",
+        ),
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "show", CHANNEL, "elsewhere-1"]).await;
+
+    assert!(
+        !out.status.success(),
+        "show on an out-of-channel post must exit non-zero"
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("elsewhere-1") && rendered.contains(CHANNEL),
+        "the refusal names the post and the channel it is not in: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&body_of("elsewhere-1")),
+        "no part of the post body may reach the operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains("alice"),
+        "not even the author may be disclosed: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// A post that does not exist refuses cleanly rather than rendering an
+/// empty or half-built object.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn show_refuses_a_missing_post() {
+    let env = TestEnv::new("show-missing").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-sm", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_missing_post(&env, "no-such-post").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "show", CHANNEL, "no-such-post"]).await;
+
+    assert!(
+        !out.status.success(),
+        "show on a missing post must exit non-zero"
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("no-such-post"),
+        "the refusal names the post: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// The provider answers the operator's post id with a different post —
+/// well-formed, and in the very channel the operator named. `show`
+/// refuses and prints nothing.
+///
+/// The channel bind cannot catch this one: the substitute passes it.
+/// Without an identity check the operator asks for one post and is
+/// handed another under a successful fetch, with no sign in the output
+/// that the answer is about a different post from the question.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn show_refuses_a_post_that_is_not_the_one_requested() {
+    let env = TestEnv::new("show-substituted-post").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-ssub", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post_at(
+        &env,
+        "requested-post",
+        wire_post(
+            "substituted-post",
+            CHANNEL_ID,
+            "user-a",
+            1_700_000_000_000,
+            "someone-elses-root",
+        ),
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "show", CHANNEL, "requested-post"]).await;
+
+    assert!(
+        !out.status.success(),
+        "show must refuse a post that is not the one asked for; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("requested-post"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("substituted-post"),
+        "the substituted post's id is provider-supplied and must not reach the \
+         operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains("someone-elses-root"),
+        "nor the thread it claims to belong to: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&body_of("substituted-post")),
+        "no part of the substituted post's body may reach the operator: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+// ----------------------------------------------------------------------
+// thread
+// ----------------------------------------------------------------------
+
+/// Naming a reply reads the same thread as naming the root. The
+/// provider is deliberately given no answer for the reply's own thread
+/// URL, so a call made against the id the operator typed — rather than
+/// against the canonical root — fails outright.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_reads_the_same_thread_as_by_root_id() {
+    let env = TestEnv::new("thread-root-vs-reply").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-trr", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
+    let reply = wire_post("reply-1", CHANNEL_ID, "user-b", 1_700_000_001_000, "root-1");
+    mount_post(&env, root.clone()).await;
+    mount_post(&env, reply.clone()).await;
+    // Only the canonical root's thread URL is answerable.
+    mount_thread(&env, "root-1", vec![root, reply]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+
+    let by_root = run_chanvoy(&env, &["--json", "thread", CHANNEL, "root-1"]).await;
+    assert!(
+        by_root.status.success(),
+        "thread by root must exit 0; output={}",
+        combined_output(&by_root)
+    );
+    let by_reply = run_chanvoy(&env, &["--json", "thread", CHANNEL, "reply-1"]).await;
+    assert!(
+        by_reply.status.success(),
+        "thread by reply must exit 0; output={}",
+        combined_output(&by_reply)
+    );
+
+    let from_root: Value = serde_json::from_str(&stdout_of(&by_root)).expect("parses");
+    let from_reply: Value = serde_json::from_str(&stdout_of(&by_reply)).expect("parses");
+    assert!(from_root.is_array(), "thread emits an array: {from_root}");
+    assert_eq!(
+        from_root, from_reply,
+        "a reply id and its root id read the identical thread"
+    );
+    assert_eq!(
+        from_root
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["root-1", "reply-1"],
+        "the thread is the root plus every reply, root first"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// `--latest` returns exactly the final message of the thread, still as
+/// an array. The fixture's ids sort in the opposite order to its
+/// timestamps, so "the last element of whatever the provider's map
+/// yielded" is a different post from the right answer.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_latest_is_the_final_message_as_a_one_element_array() {
+    let env = TestEnv::new("thread-latest").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tl", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
+    // Ids deliberately in the opposite order to timestamps: the newest
+    // reply sorts first by id, so an unsorted implementation picks
+    // "zz-reply" and fails here.
+    let older = wire_post(
+        "zz-reply",
+        CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "root-1",
+    );
+    let newest = wire_post(
+        "aa-reply",
+        CHANNEL_ID,
+        "user-c",
+        1_700_000_002_000,
+        "root-1",
+    );
+    mount_post(&env, root.clone()).await;
+    mount_thread(&env, "root-1", vec![root, older, newest]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+    mount_user(&env, "user-c", "carol").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "root-1", "--latest"]).await;
+    assert!(
+        out.status.success(),
+        "thread --latest must exit 0; output={}",
+        combined_output(&out)
+    );
+
+    let value: Value = serde_json::from_str(&stdout_of(&out)).expect("parses");
+    let array = value
+        .as_array()
+        .unwrap_or_else(|| panic!("--latest must not change the JSON type: {value}"));
+    assert_eq!(array.len(), 1, "--latest is one element, got {value}");
+    assert_eq!(
+        array[0]["id"], "aa-reply",
+        "the final message is the newest one, not the last by id"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// A thread anchored on a post in another channel is refused and the
+/// provider's thread endpoint is never asked for anything. The endpoint
+/// is mounted and would answer happily — the point is that the request
+/// is not made.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_with_a_mismatched_channel_makes_no_thread_request() {
+    let env = TestEnv::new("thread-cross-channel").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tx", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let elsewhere = wire_post(
+        "elsewhere-1",
+        OTHER_CHANNEL_ID,
+        "user-a",
+        1_700_000_000_000,
+        "",
+    );
+    mount_post(&env, elsewhere.clone()).await;
+    mount_thread(&env, "elsewhere-1", vec![elsewhere]).await;
+    mount_user(&env, "user-a", "alice").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "elsewhere-1"]).await;
+
+    assert!(
+        !out.status.success(),
+        "thread on an out-of-channel anchor must exit non-zero"
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        !rendered.contains(&body_of("elsewhere-1")),
+        "no part of the thread may reach the operator: {rendered}"
+    );
+    assert_eq!(
+        thread_requests(&env).await,
+        0,
+        "a cross-channel thread read must issue no thread request at all"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// A thread whose anchor is legitimately in the named channel, but
+/// whose envelope also carries a reply from a channel the operator did
+/// not name, is refused whole — including the in-channel root.
+///
+/// This is the case the anchor bind alone does not cover. The bot's
+/// credential reaches every channel it is a member of; the channel the
+/// operator named is the narrower scope, and it is the one that governs
+/// the read. An envelope that mixes the two is not a thread the
+/// operator asked for, and there is no honest way to hand back "the
+/// part you were allowed to see": once a post becomes a `Message` its
+/// channel is gone, so a partial result would be labelled with the
+/// requested channel and be wrong about it.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_with_an_out_of_channel_reply_is_refused_whole() {
+    let env = TestEnv::new("thread-mixed-envelope").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tme", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    // The anchor is in the requested channel, so the bind on it passes
+    // and the thread request is genuinely issued.
+    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
+    let stray = wire_post(
+        "stray-reply",
+        OTHER_CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "root-1",
+    );
+    mount_post(&env, root.clone()).await;
+    mount_thread(&env, "root-1", vec![root, stray]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "root-1"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a thread carrying an out-of-channel post must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    for id in ["root-1", "stray-reply"] {
+        assert!(
+            !rendered.contains(&body_of(id)),
+            "no body from the envelope may reach the operator, including the \
+             in-channel root's: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("stray-reply"),
+        "the offending post's id is provider-supplied, not the caller's, and \
+         must not reach the operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains(OTHER_CHANNEL_ID),
+        "the refusal must not name the channel the stray post came from: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// The same substitution under `thread`, where believing the answer
+/// costs more: the substituted post's root is what the thread request
+/// would be made against, so a trusted substitution reads an entirely
+/// different conversation and labels it with the id the operator typed.
+///
+/// The refusal is asserted on the absence of both downstream requests.
+/// A check that ran after the fetch would produce the same error while
+/// the read had already happened.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_refuses_a_substituted_post_before_reading_or_hydrating_anything() {
+    let env = TestEnv::new("thread-substituted-post").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tsub", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let substituted = wire_post(
+        "substituted-post",
+        CHANNEL_ID,
+        "user-a",
+        1_700_000_001_000,
+        "someone-elses-root",
+    );
+    mount_post_at(&env, "requested-post", substituted.clone()).await;
+    // The conversation the substitution points at. Mounted and
+    // answerable on purpose: the point is that it is never asked for.
+    mount_thread(
+        &env,
+        "someone-elses-root",
+        vec![
+            wire_post(
+                "someone-elses-root",
+                CHANNEL_ID,
+                "user-b",
+                1_700_000_000_000,
+                "",
+            ),
+            substituted,
+        ],
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "requested-post"]).await;
+
+    assert!(
+        !out.status.success(),
+        "thread must refuse a post that is not the one asked for; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("requested-post"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    for leaked in ["substituted-post", "someone-elses-root"] {
+        assert!(
+            !rendered.contains(leaked),
+            "no provider-supplied id may reach the operator: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&body_of(leaked)),
+            "no provider-supplied body may reach the operator: {rendered}"
+        );
+    }
+    assert_eq!(
+        thread_requests(&env).await,
+        0,
+        "the substituted post's root must never be read: a thread request here \
+         means a conversation the operator did not name was fetched"
+    );
+    assert_eq!(
+        author_lookups(&env).await,
+        0,
+        "no hydration either — an author lookup means the substituted post was \
+         already being believed"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+// ----------------------------------------------------------------------
+// A refusal names the id the operator typed, and only that one
+// ----------------------------------------------------------------------
+//
+// `thread` accepts a reply id and reads the whole thread, which means
+// the root it actually fetches against is derived here rather than
+// supplied by the operator. Every failure raised past that point knows
+// only the derived root — so unless it is re-stated, citing a reply and
+// getting a refusal hands back the id of the post that started the
+// conversation. That is a lookup the operator did not ask for and, on a
+// thread they turn out not to be allowed to read, did not earn.
+
+/// A reply id, a malformed thread envelope, and a refusal that names
+/// the reply and nothing else.
+///
+/// The envelope carries a post from a channel the operator never named,
+/// so the refusal is raised inside the thread read — the point furthest
+/// from the id the operator typed.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_without_disclosing_the_derived_root() {
+    let env = TestEnv::new("thread-reply-refusal").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-trf", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    // The operator cites the reply. Its root is the canonical one, and
+    // the operator has no way to know it.
+    let cited_reply = wire_post(
+        "cited-reply",
+        CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "canonical-root",
+    );
+    let canonical_root = wire_post(
+        "canonical-root",
+        CHANNEL_ID,
+        "user-a",
+        1_700_000_000_000,
+        "",
+    );
+    let stray = wire_post(
+        "stray-post",
+        OTHER_CHANNEL_ID,
+        "user-c",
+        1_700_000_002_000,
+        "canonical-root",
+    );
+    mount_post(&env, cited_reply.clone()).await;
+    // The anchor bind passes, so the thread request is genuinely made —
+    // against the derived root, which is where the mixed envelope lives.
+    mount_thread(
+        &env,
+        "canonical-root",
+        vec![canonical_root, cited_reply, stray],
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+    mount_user(&env, "user-c", "carol").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a malformed thread envelope must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root was never supplied by the operator and must not \
+         be handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("stray-post"),
+        "a provider-supplied post id must not reach the operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains(OTHER_CHANNEL_ID),
+        "the refusal must not name the channel the stray post came from: {rendered}"
+    );
+    for id in ["canonical-root", "cited-reply", "stray-post"] {
+        assert!(
+            !rendered.contains(&body_of(id)),
+            "no body from the envelope may reach the operator: {rendered}"
+        );
+    }
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// Same contract on the other malformed shape: an envelope that is
+/// entirely in the right channel but simply does not contain the
+/// canonical root.
+///
+/// Nothing here fails the channel bind, so this is refused for a
+/// different reason and through a different branch — and has to be just
+/// as quiet about the derived root.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_a_rootless_envelope_naming_only_the_reply() {
+    let env = TestEnv::new("thread-reply-rootless").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-trr2", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let cited_reply = wire_post(
+        "cited-reply",
+        CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "canonical-root",
+    );
+    let sibling = wire_post(
+        "sibling-reply",
+        CHANNEL_ID,
+        "user-c",
+        1_700_000_002_000,
+        "canonical-root",
+    );
+    mount_post(&env, cited_reply.clone()).await;
+    // Replies only: every post passes the channel bind and names the
+    // right thread, but the root itself is absent.
+    mount_thread(&env, "canonical-root", vec![cited_reply, sibling]).await;
+    mount_user(&env, "user-b", "bob").await;
+    mount_user(&env, "user-c", "carol").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "an envelope missing the canonical root must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the refusal names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root must not be handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("sibling-reply"),
+        "a provider-supplied post id must not reach the operator: {rendered}"
+    );
+    for id in ["cited-reply", "sibling-reply"] {
+        assert!(
+            !rendered.contains(&body_of(id)),
+            "no body from the envelope may reach the operator: {rendered}"
+        );
+    }
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// An empty thread reached through a reply id is reported against the
+/// reply.
+///
+/// This one fails on a different path again, with its own wording, so
+/// it is a third independent chance to leak the derived root.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_reports_an_empty_thread_against_the_reply() {
+    let env = TestEnv::new("thread-reply-empty").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tre", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post(
+        &env,
+        wire_post(
+            "cited-reply",
+            CHANNEL_ID,
+            "user-b",
+            1_700_000_001_000,
+            "canonical-root",
+        ),
+    )
+    .await;
+    mount_thread(&env, "canonical-root", vec![]).await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "an empty thread body must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the diagnostic names the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root must not be handed back: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// The provider refuses the derived thread with a status, and says so
+/// in its own words — words that quote the id it was asked about.
+///
+/// After the derivation that id is the root the operator never named,
+/// so the provider's body cannot be relayed. The status is a different
+/// matter: it is the operator's only clue whether the read is worth
+/// trying again, and it survives.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_a_provider_failure_without_disclosing_the_derived_root() {
+    let env = TestEnv::new("thread-reply-provider-error").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-trp", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    mount_post(
+        &env,
+        wire_post(
+            "cited-reply",
+            CHANNEL_ID,
+            "user-b",
+            1_700_000_001_000,
+            "canonical-root",
+        ),
+    )
+    .await;
+    // The provider's own text about the request it failed — which, at
+    // this point in the read, is a request about the derived root.
+    Mock::given(method("GET"))
+        .and(path("/api/v4/posts/canonical-root/thread"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("upstream is unwell while reading thread canonical-root"),
+        )
+        .mount(&env.mock)
+        .await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a provider failure on the thread read must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the failure is reported against the id the operator typed: {rendered}"
+    );
+    assert!(
+        rendered.contains("500"),
+        "the provider's status is the operator's only clue whether a retry is \
+         worth making, and must survive the re-statement: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root was never supplied by the operator and must not be \
+         handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("upstream is unwell"),
+        "the provider's body is its own text about an id the operator never \
+         named, and must not be relayed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/posts/"),
+        "no fragment of the URL the request was made against may be \
+         rendered: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// The thread request fails at the transport layer instead of coming
+/// back with a status.
+///
+/// A reqwest failure renders the URL it was fetching, and after the
+/// derivation that URL contains the derived root — so an error
+/// forwarded from here discloses the id through wording nobody chose.
+/// This is the shape a variant-by-variant sanitiser misses, because
+/// nothing about a transport error looks like it is carrying a post id.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_by_reply_id_refuses_a_transport_failure_without_disclosing_the_derived_root() {
+    let env = TestEnv::new("thread-reply-transport-error").await;
+    let front_end = HangUpOnThread::in_front_of(*env.mock.address());
+    // The daemon talks to the front end; the front end talks to the
+    // mock, so every mount below is reached as usual — except the
+    // thread request, which never gets there.
+    env.write_profile_against_server("agent-bravo-devlead", "org-lanytehq", &front_end.uri());
+    env.mock_baseline("bot-id-trt", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let cited_reply = wire_post(
+        "cited-reply",
+        CHANNEL_ID,
+        "user-b",
+        1_700_000_001_000,
+        "canonical-root",
+    );
+    mount_post(&env, cited_reply.clone()).await;
+    // Mounted and answerable: the front end is what stops the request,
+    // so this is not quietly a test of an unmounted route.
+    mount_thread(
+        &env,
+        "canonical-root",
+        vec![
+            wire_post(
+                "canonical-root",
+                CHANNEL_ID,
+                "user-a",
+                1_700_000_000_000,
+                "",
+            ),
+            cited_reply,
+        ],
+    )
+    .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "cited-reply"]).await;
+
+    assert!(
+        !out.status.success(),
+        "a transport failure on the thread read must exit non-zero; output={}",
+        combined_output(&out)
+    );
+    assert!(
+        stdout_of(&out).trim().is_empty(),
+        "a refusal prints no result document: {}",
+        stdout_of(&out)
+    );
+    let rendered = combined_output(&out);
+    assert!(
+        rendered.contains("cited-reply"),
+        "the failure is reported against the id the operator typed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("canonical-root"),
+        "the derived root must not be handed back: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/posts/"),
+        "a transport error renders the URL it was fetching; no fragment of it \
+         may reach the operator: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&front_end.uri()),
+        "nor may the provider address: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+/// A front end that relays everything to the mock provider except a
+/// thread request: that one it accepts and then hangs up on, without
+/// writing a status line.
+///
+/// Shutting the provider down instead would fail the anchor fetch too,
+/// and the derived root would never be reached — leaving nothing to
+/// disclose and a test that proves nothing. Standing in front of it
+/// lets the anchor succeed and only the thread request fail, which is
+/// the case the operator-visible wording is being checked against.
+struct HangUpOnThread {
+    addr: std::net::SocketAddr,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accept_loop: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HangUpOnThread {
+    fn in_front_of(upstream: std::net::SocketAddr) -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind front end");
+        let addr = listener.local_addr().expect("front end address");
+        listener
+            .set_nonblocking(true)
+            .expect("front end accept loop must be interruptible");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+        let accept_loop = std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        std::thread::spawn(move || forward_unless_thread(stream, upstream));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            shutdown,
+            accept_loop: Some(accept_loop),
+        }
+    }
+
+    fn uri(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for HangUpOnThread {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.accept_loop.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// One connection: read the request head, hang up on a thread request,
+/// otherwise relay it upstream and stream the answer back verbatim.
+fn forward_unless_thread(mut client: std::net::TcpStream, upstream: std::net::SocketAddr) {
+    use std::io::Write;
+
+    // `accept` may hand back a non-blocking socket on some platforms;
+    // the relay below is written blocking.
+    let _ = client.set_nonblocking(false);
+    let Some((head, path)) = read_request_head(&mut client) else {
+        return;
+    };
+    if path.split('?').next().unwrap_or(&path).ends_with("/thread") {
+        return;
+    }
+    let Ok(mut server) = std::net::TcpStream::connect(upstream) else {
+        return;
+    };
+    // One request per connection: asking upstream to close means the
+    // relay below terminates on EOF, and means the client opens a fresh
+    // connection for the thread request rather than reusing a pooled
+    // one that is about to be hung up on.
+    let relayed = head
+        .lines()
+        .filter(|line| {
+            !line.to_ascii_lowercase().starts_with("connection:")
+                && !line.to_ascii_lowercase().starts_with("proxy-connection:")
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    if server
+        .write_all(format!("{relayed}\r\nConnection: close\r\n\r\n").as_bytes())
+        .is_err()
+    {
+        return;
+    }
+    let _ = std::io::copy(&mut server, &mut client);
+    let _ = client.flush();
+}
+
+/// Read up to the blank line that ends an HTTP request head. Returns
+/// the head without its terminating blank line, and the request target.
+/// Requests with bodies are not relayed — the reads under test are all
+/// GETs.
+fn read_request_head(client: &mut std::net::TcpStream) -> Option<(String, String)> {
+    use std::io::Read;
+
+    let mut head: Vec<u8> = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match client.read(&mut byte) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => head.push(byte[0]),
+        }
+        if head.len() > 16 * 1024 {
+            return None;
+        }
+    }
+    let text = String::from_utf8_lossy(&head).to_string();
+    let path = text.lines().next()?.split_whitespace().nth(1)?.to_string();
+    Some((text.trim_end().to_string(), path))
+}
+
+/// `--latest` is the newest message, not the last element of the list.
+///
+/// The thread ordering pins the root first no matter what its timestamp
+/// says, so on a thread whose root is newer than its reply the two
+/// answers differ: the tail is the reply, the newest message is the
+/// root. A root can legitimately carry the later timestamp — a post
+/// edited after it was replied to, or a backdated import — and an
+/// operator asking for the latest message wants the latest message.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn thread_latest_is_the_newest_message_even_when_the_root_is_newest() {
+    let env = TestEnv::new("thread-latest-backdated").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-tlb", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    // The root's timestamp is LATER than its reply's. Root-first
+    // ordering still puts the root at index 0, so the tail of the list
+    // is the reply — the wrong answer.
+    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_009_000, "");
+    let reply = wire_post("reply-1", CHANNEL_ID, "user-b", 1_700_000_001_000, "root-1");
+    mount_post(&env, root.clone()).await;
+    mount_thread(&env, "root-1", vec![root, reply]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["--json", "thread", CHANNEL, "root-1", "--latest"]).await;
+    assert!(
+        out.status.success(),
+        "thread --latest must exit 0; output={}",
+        combined_output(&out)
+    );
+
+    let value: Value = serde_json::from_str(&stdout_of(&out)).expect("parses");
+    let array = value
+        .as_array()
+        .unwrap_or_else(|| panic!("--latest must not change the JSON type: {value}"));
+    assert_eq!(array.len(), 1, "--latest is one element, got {value}");
+    assert_eq!(
+        array[0]["id"], "root-1",
+        "the newest message here is the root; taking the tail of a \
+         root-pinned list returns the reply instead: {value}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+// ----------------------------------------------------------------------
+// Cursor neutrality
+// ----------------------------------------------------------------------
+
+/// `show`, `thread`, and `thread --latest` are reads. Attention state
+/// must come out of all three byte-identical.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn show_and_thread_do_not_advance_the_cursor() {
+    let env = TestEnv::new("show-thread-cursor").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-stc", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    let root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
+    let reply = wire_post("reply-1", CHANNEL_ID, "user-b", 1_700_000_001_000, "root-1");
+    mount_post(&env, root.clone()).await;
+    mount_thread(&env, "root-1", vec![root, reply]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    // Seed a real cursor first. Without this the state file does not
+    // exist, every comparison is `None == None`, and the test can only
+    // catch a verb that CREATES state — never one that mutates an
+    // existing entry, which is what every real cursor writer does.
+    env.mock_post_create("seed-post-1").await;
+    let daemon = spawn_daemon(&env).await;
+    let seed = run_chanvoy(&env, &["post", CHANNEL, "seed"]).await;
+    assert!(
+        seed.status.success(),
+        "seeding post must succeed; output={}",
+        combined_output(&seed)
+    );
+
+    let pre_state =
+        read_attention_state_bytes(&env).expect("a cursor exists after the seeding post");
+    let parsed = read_attention_state(&env).expect("state parses");
+    assert!(
+        parsed.channels.keys().any(|key| key.ends_with(CHANNEL)),
+        "the seeded channel must have a cursor entry, or there is nothing for a \
+         read to accidentally advance; keys={:?}",
+        parsed.channels.keys().collect::<Vec<_>>()
+    );
+
+    for args in [
+        vec!["show", CHANNEL, "root-1"],
+        vec!["thread", CHANNEL, "root-1"],
+        vec!["thread", CHANNEL, "root-1", "--latest"],
+    ] {
+        let out = run_chanvoy(&env, &args).await;
+        assert!(
+            out.status.success(),
+            "{args:?} must exit 0; output={}",
+            combined_output(&out)
+        );
+        assert_eq!(
+            Some(&pre_state),
+            read_attention_state_bytes(&env).as_ref(),
+            "{args:?} is a read and must not mutate attention state"
+        );
+    }
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+// ----------------------------------------------------------------------
+// Human-readable output
+// ----------------------------------------------------------------------
+
+/// Without `--json` an operator still gets a citation they can hand
+/// straight back to `show` / `thread` / `post --reply-to`. Every row
+/// carries both crumbs: its own id, and the thread it belongs to —
+/// which for a top-level post is itself.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn read_human_output_carries_the_post_id_and_a_root_on_every_row() {
+    let env = TestEnv::new("read-id-crumb").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-crumb", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v4/channels/{CHANNEL_ID}/posts")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(posts_envelope(vec![
+                wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, ""),
+                wire_post("reply-1", CHANNEL_ID, "user-b", 1_700_000_001_000, "root-1"),
+            ])),
+        )
+        .mount(&env.mock)
+        .await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = run_chanvoy(&env, &["read", CHANNEL]).await;
+    assert!(
+        out.status.success(),
+        "read must exit 0; output={}",
+        combined_output(&out)
+    );
+    let rendered = stdout_of(&out);
+
+    assert!(
+        rendered.contains("id=root-1"),
+        "every row carries its full post id: {rendered}"
+    );
+    assert!(
+        rendered.contains("id=reply-1"),
+        "every row carries its full post id: {rendered}"
+    );
+    assert!(
+        rendered.contains("id=root-1 root=root-1"),
+        "a top-level row names itself as its own thread, so an operator \
+         never has to infer which id `--reply-to` wants: {rendered}"
+    );
+    assert!(
+        rendered.contains("id=reply-1 root=root-1"),
+        "a reply names the thread it belongs to: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("root=").count(),
+        2,
+        "both rows carry a root crumb — the root's is not omitted: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}
+
+// ----------------------------------------------------------------------
+// Clap surface
+// ----------------------------------------------------------------------
+
+/// Both cross-team spellings select a *different* team from the
+/// profile's primary one, and a team the bot is not in is refused.
+///
+/// The fixture gives two teams a channel of the same slug, each holding
+/// a differently-marked post. That duplicate slug is the whole point:
+/// with a single team, or with the primary team as the only membership,
+/// `<team>/` and `--team` can be deleted outright and every assertion
+/// still passes, because primary-team resolution lands on the same
+/// channel either way. Here the two spellings must reach the second
+/// team's channel — and its post — or the read is bound against the
+/// primary team's channel id and refused.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn team_syntax_and_team_flag_select_a_non_primary_team() {
+    let env = TestEnv::new("show-thread-clap").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-clap", "agent-bravo-devlead", "team-id-456")
+        .await;
+    mount_my_teams(
+        &env,
+        &[
+            ("team-id-456", "org-lanytehq"),
+            (OTHER_TEAM_ID, OTHER_TEAM_SLUG),
+        ],
+    )
+    .await;
+    // Same channel slug in both teams, different channel ids.
+    env.mock_channel_lookup(CHANNEL, CHANNEL_ID).await;
+    env.mock_channel_lookup_for_team(OTHER_TEAM_ID, CHANNEL, OTHER_TEAM_CHANNEL_ID)
+        .await;
+
+    let primary_root = wire_post("root-1", CHANNEL_ID, "user-a", 1_700_000_000_000, "");
+    let other_root = wire_post(
+        "other-root-1",
+        OTHER_TEAM_CHANNEL_ID,
+        "user-b",
+        1_700_000_000_000,
+        "",
+    );
+    mount_post(&env, primary_root.clone()).await;
+    mount_post(&env, other_root.clone()).await;
+    mount_thread(&env, "other-root-1", vec![other_root]).await;
+    mount_user(&env, "user-a", "alice").await;
+    mount_user(&env, "user-b", "bob").await;
+
+    let daemon = spawn_daemon(&env).await;
+
+    // `<team>/<channel>` reaches the second team's channel, and the post
+    // that lives there.
+    let qualified = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "show",
+            &format!("{OTHER_TEAM_SLUG}/{CHANNEL}"),
+            "other-root-1",
+        ],
+    )
+    .await;
+    assert!(
+        qualified.status.success(),
+        "<team>/<channel> must resolve against the named team, not the \
+         primary one; output={}",
+        combined_output(&qualified)
+    );
+    let value: Value = serde_json::from_str(&stdout_of(&qualified)).expect("parses");
+    assert_eq!(value["id"], "other-root-1");
+    assert_eq!(
+        value["message"],
+        body_of("other-root-1"),
+        "the body is the second team's post, not the primary team's: {value}"
+    );
+
+    // `--team` does the same, and `--latest` still parses alongside it.
+    let flagged = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "thread",
+            CHANNEL,
+            "other-root-1",
+            "--latest",
+            "--team",
+            OTHER_TEAM_SLUG,
+        ],
+    )
+    .await;
+    assert!(
+        flagged.status.success(),
+        "--team must select the named team and --latest must parse \
+         alongside it; output={}",
+        combined_output(&flagged)
+    );
+    let value: Value = serde_json::from_str(&stdout_of(&flagged)).expect("parses");
+    let array = value
+        .as_array()
+        .unwrap_or_else(|| panic!("--latest must not change the JSON type: {value}"));
+    assert_eq!(
+        array.len(),
+        1,
+        "--latest on a one-post thread is still a one-element array: {value}"
+    );
+    assert_eq!(array[0]["id"], "other-root-1");
+
+    // The duplicate slug is not a shortcut between teams: naming the
+    // primary team's channel reaches the primary team's channel, so the
+    // other team's post is refused there.
+    let crossed = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "show",
+            &format!("org-lanytehq/{CHANNEL}"),
+            "other-root-1",
+        ],
+    )
+    .await;
+    assert!(
+        !crossed.status.success(),
+        "a post from the other team's same-named channel must not resolve \
+         through the primary team; output={}",
+        combined_output(&crossed)
+    );
+    assert!(
+        !combined_output(&crossed).contains(&body_of("other-root-1")),
+        "no body may leak across the duplicate slug: {}",
+        combined_output(&crossed)
+    );
+
+    // A team the bot is not a member of is refused by name, and the
+    // refusal is about the team rather than the channel or the post.
+    let stranger = run_chanvoy(
+        &env,
+        &["--json", "show", "org-not-a-member/bravo-team", "root-1"],
+    )
+    .await;
+    assert!(
+        !stranger.status.success(),
+        "a team outside the bot's membership must be refused; output={}",
+        combined_output(&stranger)
+    );
+    let rendered = combined_output(&stranger);
+    assert!(
+        rendered.contains("org-not-a-member"),
+        "the refusal names the team that was asked for: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&body_of("root-1")),
+        "a wrong-team read must not fall back to a team that does have \
+         the channel: {rendered}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}

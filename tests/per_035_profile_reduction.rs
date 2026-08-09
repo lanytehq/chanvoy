@@ -418,9 +418,17 @@ async fn missing_reduce_target_refuses_daemon_start() {
         stderr.contains("dataeng-galaxy-does-not-exist"),
         "diagnostic must name the missing reduce target; got: {stderr}"
     );
+    // Attribution is asserted against the operator-facing wording, not
+    // an internal error-type name: the CLI deliberately prints messages
+    // rather than internal shapes, so keying on a variant name would
+    // test the leak instead of the diagnostic.
     assert!(
-        stderr.contains("ReduceProfileNotFound"),
+        stderr.contains("reduce.use_profile") && stderr.contains("no such profile exists"),
         "diagnostic must attribute the failure to the reduction policy; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ReduceProfileNotFound"),
+        "internal error-type names must not reach the operator; got: {stderr}"
     );
 }
 
@@ -473,12 +481,26 @@ async fn reduce_target_token_shadowed_by_stream_refuses_start() {
         "daemon serve must exit non-zero when the reduce token authenticates as the wrong bot"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // As above: assert the operator-facing wording, not an internal
+    // error-type name.
     assert!(
-        stderr.contains("ReduceIdentityMismatch"),
+        stderr.contains("reduce target profile") && stderr.contains("authenticates as"),
         "diagnostic must attribute the failure to identity-mismatch; got: {stderr}"
     );
     assert!(
-        stderr.contains(FAMILY_BOT) && stderr.contains(STREAM_BOT),
-        "diagnostic must name both the expected (family) and actual (stream) bot; got: {stderr}"
+        !stderr.contains("ReduceIdentityMismatch"),
+        "internal error-type names must not reach the operator; got: {stderr}"
+    );
+    // `STREAM_BOT` has `FAMILY_BOT` as a prefix, so a plain `contains`
+    // for the family bot is satisfied by the stream bot alone and would
+    // pass even if the expected identity were never named. Require the
+    // family bot to appear somewhere other than inside the stream bot.
+    assert!(
+        stderr.contains(STREAM_BOT),
+        "diagnostic must name the actual (stream) bot; got: {stderr}"
+    );
+    assert!(
+        stderr.replace(STREAM_BOT, "").contains(FAMILY_BOT),
+        "diagnostic must name the expected (family) bot distinctly from the stream bot; got: {stderr}"
     );
 }

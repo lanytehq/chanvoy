@@ -21,7 +21,7 @@ endif
 # `make version-sync` (which uses cargo-set-version under the hood).
 VERSION_FILE := VERSION
 
-.PHONY: all clean check fmt quality test test-integration build build-release install ensure-msrv msrv precommit prepush pr-final
+.PHONY: all clean check fmt quality test test-integration build build-release install install-restart-daemons ensure-msrv msrv precommit prepush pr-final
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
 .PHONY: sbom security-scan license-check release-prep release-smoke workflow-lint
 .PHONY: release-preflight release-clean release-download release-checksums release-sign
@@ -40,6 +40,8 @@ check:
 
 test-integration:
 	cargo test --package chanvoy --test restart_harness -- --ignored --nocapture
+	cargo test --package chanvoy --test per_038_wait -- --ignored --nocapture
+	cargo test --package chanvoy --test post_show_and_thread -- --ignored --nocapture
 
 fmt:
 	cargo fmt
@@ -78,14 +80,82 @@ build-release:
 # binary that may still be referenced by running processes: existing
 # daemons keep their own open inode until they exit on their own
 # lifecycle, while new execs resolve to the fresh file.
+#
+# After the binary lands, `install-restart-daemons` cycles every live
+# daemon whose argv binary is exactly $(LOCAL_BIN)/chanvoy so shared-host
+# seats pick up the new control plane without a manual stop/auto-setup
+# each. Worktree/debug daemons (other binary paths) are left alone.
+# Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1 make install
+# Re-run cycle alone: make install-restart-daemons
 install: build-release
 	@mkdir -p $(LOCAL_BIN)
 	@rm -f $(LOCAL_BIN)/chanvoy$(EXT)
 	@cp target/release/chanvoy$(EXT) $(LOCAL_BIN)/chanvoy$(EXT)
 	@echo "[ok] installed chanvoy to $(LOCAL_BIN)/chanvoy$(EXT)"
-	@echo "     note: if a chanvoy daemon was already running, it"
-	@echo "     keeps the previous binary until you restart it via"
-	@echo "     'chanvoy daemon stop' + 'chanvoy auto-setup'"
+	@$(MAKE) --no-print-directory install-restart-daemons
+
+# Cycle daemons started from the userspace install path onto the binary
+# currently at that path. Shared-host rules:
+#   - only processes whose argv binary is exactly $(LOCAL_BIN)/chanvoy
+#   - stop/start is always --profile-explicit (never wildcard kill)
+#   - stop is fail-soft (already-down is OK)
+#   - start only when ambient identity can own that profile; foreign
+#     profiles are **stop-only** with a self-cycle hint (installer's
+#     LANYTE_MM_BOT / whoami cannot start another seat's daemon —
+#     observed 2026-08-09: "profile bot username mismatch")
+#   - process probe is fail-soft under sandboxes that deny `ps`
+#   - per-profile outcomes reported; install does not hard-fail
+# Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1
+install-restart-daemons:
+ifeq ($(OS),Windows_NT)
+	@echo "[!!] install-restart-daemons is Unix-only; cycle daemons manually:"
+	@echo "     chanvoy daemon stop --profile <name> && chanvoy daemon start --profile <name>"
+else
+	@set -uo pipefail; \
+	BIN="$(LOCAL_BIN)/chanvoy$(EXT)"; \
+	if [ "$${CHANVOY_INSTALL_SKIP_DAEMON_RESTART:-}" = "1" ]; then \
+		echo "[ok] skipped daemon restart (CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1)"; \
+		echo "[!!] NEXT: cycle daemons or filtered wait / new verbs may use the old binary:"; \
+		echo "     make install-restart-daemons"; \
+		echo "     # or: chanvoy daemon stop --profile <name> && chanvoy daemon start --profile <name>"; \
+		exit 0; \
+	fi; \
+	if [ ! -x "$$BIN" ]; then \
+		echo "[!!] $$BIN not executable; nothing to cycle"; \
+		exit 0; \
+	fi; \
+	profiles=$$(ps -axo args= 2>/dev/null \
+		| sed -n "s|^$${BIN} --profile \\([^ ]*\\) daemon serve.*|\\1|p" \
+		| sort -u || true); \
+	if [ -z "$$profiles" ]; then \
+		echo "[ok] no live daemons on $$BIN — nothing to cycle"; \
+		exit 0; \
+	fi; \
+	count=$$(printf '%s\n' "$$profiles" | grep -c . || true); \
+	echo "[..] cycling $$count daemon(s) onto $$BIN (brief seat interruption expected)"; \
+	restarted=0; stopped_only=0; fail=0; \
+	while IFS= read -r profile; do \
+		[ -n "$$profile" ] || continue; \
+		"$$BIN" daemon stop --profile "$$profile" >/dev/null 2>&1 || true; \
+		start_err=$$("$$BIN" daemon start --profile "$$profile" 2>&1); \
+		start_ec=$$?; \
+		if [ "$$start_ec" -eq 0 ]; then \
+			echo "     [ok] restarted $$profile"; \
+			restarted=$$((restarted + 1)); \
+		elif printf '%s' "$$start_err" | grep -qi 'bot username mismatch\|identity\|whoami\|expected agent-'; then \
+			echo "     [..] stopped $$profile (foreign identity — self-cycle under that seat):"; \
+			echo "         source identity for $$profile && $$BIN daemon start --profile $$profile"; \
+			stopped_only=$$((stopped_only + 1)); \
+		else \
+			echo "     [!!] $$profile — start failed:"; \
+			echo "         $$start_err" | sed 's/^/         /'; \
+			echo "         retry: $$BIN daemon stop --profile $$profile; $$BIN daemon start --profile $$profile"; \
+			fail=$$((fail + 1)); \
+		fi; \
+	done <<< "$$profiles"; \
+	echo "[ok] daemon cycle done: $$restarted restarted, $$stopped_only stop-only (foreign), $$fail failed"; \
+	echo "     prove CLI pin: $$BIN version --extended"
+endif
 
 ensure-msrv:
 	@echo "Checking MSRV $(MSRV)..."
@@ -103,6 +173,8 @@ pr-final: ensure-msrv version-check workflow-lint
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace --all-targets
 	cargo test --package chanvoy --test restart_harness -- --ignored
+	cargo test --package chanvoy --test per_038_wait -- --ignored
+	cargo test --package chanvoy --test post_show_and_thread -- --ignored
 	cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] pr-final gate passed"
 

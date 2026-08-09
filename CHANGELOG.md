@@ -5,9 +5,108 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - unreleased
+
+### Migration
+
+- **The error type is now open to extension, and this release is the boundary
+  where that lands.** `CoreError` carries `#[non_exhaustive]`, so code matching
+  on it must include a catch-all arm (`_ => { ... }`). Two error cases were also
+  added, for a thread request that comes back with no posts and for the removed
+  unbound thread read.
+
+  Rust treats adding a variant to an exhaustive public enum as a breaking change
+  even though nothing was removed, so this is a deliberate version boundary
+  rather than a patch. Marking the type non-exhaustive now means later
+  **variants** will not be — this is an operational taxonomy that will keep
+  growing.
+
+- **Upgrading, for everyone else.** There is no on-disk or state migration for
+  profiles or attention state, and a binary distribution needs no source rebuild
+  for ordinary operators. Things worth checking: a daemon keeps the binary it
+  was started from and must be cycled before new verbs and the enhanced wait
+  path work; default `read` rows and error text on stderr both changed; messages
+  gain a `root_id` field in JSON (additive); **`wait` always returns at most one
+  message** (including unfiltered REST/lag paths that previously could return a
+  multi-post window); and wait hard failures exit **2** with structured JSON
+  (`error_class`, `retryable`) rather than looking like a clean timeout.
+
+### Added
+
+- **`chanvoy show <channel> <post-id>`** fetches a single post. The channel is
+  required and the post is bound to it: a post that lives in another channel is
+  refused before any of its content is returned, so a post id on its own is not
+  authority to read a post. `--json` emits one object.
+- **`chanvoy thread <channel> <post-id>`** reads a whole thread — the root post
+  plus every reply. The id may be the root's or any reply's; both read the same
+  thread, so a citation taken from the middle of a conversation works without
+  the operator having to find the root first. `--latest` narrows the result to
+  the most recent message. `--json` emits an array in both cases, including
+  with `--latest`, so a flag never changes the shape of the output.
+- **`chanvoy wait` content filter, exclusive baseline, and deadman contract.**
+  For channel WIP, use `chanvoy wait` — do not sleep-poll or hand-roll a poller.
+  New flags: `--contains` (case-sensitive body substring), `--pattern` (Rust
+  regex over body; use `(?i)…` when case should not matter), and `--after
+  <post-id>` (exclusive baseline). Match exits **0** with one message payload
+  (`{channel, messages:[one]}`); clean deadman exits **1** with
+  `timeout: true` only when observation actually ran; hard/config and
+  provider-exhausted (including stalled provider calls and an unhealthy push
+  path with no successful observe) exit **2** and never set `timeout: true`.
+  Prefer `--after` for catch-up; empty-at-arm recovery pages the first non-empty
+  observation to exhaustion inside the deadman. Filters refuse empty values and
+  oversize/invalid patterns before the wait arms. The daemon method
+  `wait_channel_v2` is the capability gate (cycle the daemon after install).
 
 ### Changed
+
+- **The `CoreError` type gained additional variants, which will stop some code
+  from compiling.** This affects Rust code that depends on the `chanvoy-core`
+  library. Variants in this release include empty-thread and unbound-thread
+  removals from the rehydrate cut, plus wait filter-invalid and
+  provider-degraded cases from the wait cut. It requires no on-disk or state
+  migration. (Human output and stderr text also changed — see the entries
+  below.) If your code has a `match` on a `CoreError` that lists every variant
+  by name and has no catch-all arm, that `match` no longer covers every case and
+  the compiler will reject it. The fix is to add a catch-all arm —
+  `_ => { ... }` — which also keeps the `match` compiling the next time a
+  variant is added.
+
+  The unbound thread read, `read_thread`, is still exported and still compiles,
+  now marked deprecated and always refusing. Keeping that name available does
+  not by itself make this release a drop-in recompile: the added variants are a
+  separate break, and both need handling before code that matches exhaustively
+  on `CoreError` will build again.
+
+- **Human-readable reads now show the post id and the thread it belongs to.**
+  `chanvoy read` printed a timestamp, an author, and a body, with no id
+  anywhere — so an operator who had not asked for `--json` could not cite a
+  post to `show`, `thread`, or `post --reply-to`. Every row now carries
+  `id=<post-id>` and `root=<root-id>`, including top-level posts, where the
+  root repeats the post's own id. Both crumbs are on every row so a row can be
+  read without knowing that a post with no root is its own root. The crumbs are
+  human output only; they are not how the same information appears in `--json`,
+  where it is a field on the message object (see the thread-orientation entry
+  below).
+
+- **A daemon older than the verb you just used now says so.** Installing a new
+  chanvoy leaves any already-running daemon on its previous binary until it is
+  restarted, so a fresh CLI can call `show` or `thread` against a daemon that
+  has never heard of them. That surfaced as a JSON-RPC "method not found"
+  quoting an internal method name — neither of which is the verb the operator
+  typed, and neither of which says what to do. It now names the verb and the
+  two commands that resolve it: `chanvoy daemon stop`, then
+  `chanvoy auto-setup`. Other daemon failures are unaffected.
+
+- **Messages now carry the thread they belong to.** Every message on the read
+  and push paths reports a thread root: its own id when the message is
+  top-level, the thread's root id when it is a reply. This is needed to reply
+  at all — the server rejects a reply aimed at another reply — so previously a
+  caller citing a post had no way to tell which ids were valid reply targets.
+  In `--json`, the output type is unchanged — a read still returns what it
+  returned before — and every existing field on a message keeps its name and
+  meaning. Each message object gains one field, `root_id`. A consumer that
+  reads fields by name is unaffected; one that requires an exact set of keys
+  will see the new one.
 
 - **Errors now print their message instead of their internal shape.** The CLI
   returned errors from `main`, which makes Rust print the `Debug`
@@ -27,6 +126,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A thread read over the agent IPC surface is now bound to the channel it
+  names.** The request carries a channel id and a thread root id, but only the
+  root id was used: the thread was fetched on the strength of the post id
+  alone, and every post in the response was then stamped with whatever channel
+  the caller had claimed. A caller holding any post id could read that thread
+  by naming any channel. The anchor post is now checked against the named
+  channel first, and a mismatch issues no thread request at all. Every post in
+  the thread response is checked too, not only the anchor: the credential the
+  bot reads with reaches more channels than the caller named, so a response
+  mixing the two is refused whole rather than returned in part. Nothing
+  downstream can re-check it — a post's channel is dropped on the way into a
+  message, and every result is stamped with the channel that was asked for.
+- **A truncated thread over the agent IPC surface now says it is truncated.**
+  The read limit was applied to the result while `has_more` was left unset, so
+  a thread cut short was indistinguishable from a complete one and a caller
+  reasoning about the conversation had no way to learn it had seen only the
+  front of it. `has_more` now reports whether anything was withheld.
+- **Message authors are real names again, instead of "unknown".** Posts carry
+  only a user id, and the code read an author-name field the server does not
+  send on a post, so every message in every listing was attributed to
+  `unknown`. Names are now resolved from the user id through a shared cache.
+  When a name genuinely cannot be resolved the author is reported as the
+  literal user id — something an operator can look up — rather than a
+  placeholder that reads like a person's name.
+- **Reading a thread no longer returns an empty thread.** Thread reads filtered
+  posts through that same absent author-name field, so every post was discarded
+  and the read reported success with nothing in it. A thread with a root and N
+  replies now returns N+1 messages. A thread response that genuinely contains
+  no posts is now reported as an error rather than as a plausible-looking empty
+  result, since the causes are permanent — a deleted post, an unreadable
+  channel, or an id that is not a post.
 - **`daemon start` now starts a daemon that outlives the command that
   started it.** It previously spawned the daemon without detaching it
   into its own session and without the parent-side identity handoff, so
@@ -751,7 +881,8 @@ session-survival, hash-chained reconnect-health surface. Pre-this-changelog
 shipping history is captured in git log and the per-task briefs under
 `lanyte-productbook-internal/content/projmgmt/peers/`.
 
-[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lanytehq/chanvoy/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/lanytehq/chanvoy/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lanytehq/chanvoy/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/lanytehq/chanvoy/compare/v0.1.0...v0.1.1

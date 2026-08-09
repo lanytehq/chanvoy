@@ -5,19 +5,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{env, fs, io};
 
+mod wait;
+
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
     now_unix_millis, pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile,
     store_attention_state, AckChannelParams, AckResult, AddMemberParams, ArchiveChannelParams,
     AttentionShowParams, AttentionState, CapabilityClass, Channel, CheckChannelParams, CheckResult,
     CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
-    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, IpcConfig,
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs,
-    NotificationsParams, NotifyParams, PinParams, PinResult, PinnedChannelParams,
+    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, GetPostParams,
+    IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient,
+    MattermostWs, NotificationsParams, NotifyParams, PinParams, PinResult, PinnedChannelParams,
     PostMessageParams, Profile, ProfileStatus, Provider, ReactParams, ReactionResult,
-    ReadChannelParams, ReadDirectMessageParams, SearchParams, SearchResult, ShutdownResult,
-    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult, UnreactParams,
-    UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitResult, WsState,
+    ReadChannelParams, ReadDirectMessageParams, ReadThreadParams, SearchParams, SearchResult,
+    ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult,
+    UnreactParams, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitChannelV2Params,
+    WaitResult, WsState,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -25,7 +28,7 @@ use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
-use tokio::time::{sleep, timeout, Duration};
+
 use tracing::{info, warn};
 
 #[derive(Debug, thiserror::Error)]
@@ -222,8 +225,13 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     if socket_path.exists() {
         fs::remove_file(&socket_path)?;
     }
+    // Loaded exactly once and reused for every surface this daemon
+    // brings up. Reading it a second time later would let a rotation
+    // between the two reads pair a request-response client
+    // authenticated as one identity with a websocket authenticated by
+    // another — and the drift probe only ever inspects the first.
     let token = load_token(&profile)?;
-    let client = MattermostClient::new(&profile, token)?;
+    let client = MattermostClient::new(&profile, token.clone())?;
 
     // PER-035: if this profile carries a reduction policy, build the
     // family-identity writer up-front. Loud failure on a missing target
@@ -307,8 +315,10 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             enabled: true,
             gateway_socket,
         }) if !gateway_socket.is_empty() => {
-            let token_for_ipc = load_token(&profile)?;
-            let client_for_ipc = MattermostClient::new(&profile, token_for_ipc)?;
+            // Clone rather than build a second client: clones share the
+            // client's caches, so the IPC surface and the local socket
+            // surface resolve teams and authors from the same place.
+            let client_for_ipc = client.clone();
             let ipc_peer = Arc::new(IpcPeer::new(
                 &profile,
                 client_for_ipc,
@@ -378,12 +388,15 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
 
     let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::watch::channel(false);
     {
-        let token_for_ws = load_token(&profile)?;
-        let client_for_ws = MattermostClient::new(&profile, token_for_ws.clone())?;
+        // Same-profile client, shared by clone (see the IPC peer above)
+        // so the websocket pipeline reads author names out of the same
+        // cache the request-response paths fill — and authenticates
+        // with that client's credential, which is why no token is
+        // passed here.
+        let client_for_ws = state.client.clone();
         let event_bus = Arc::clone(&event_bus);
         let ws = Arc::new(MattermostWs::new(
             &profile,
-            token_for_ws,
             client_for_ws,
             event_bus,
             state.my_user_id.clone(),
@@ -804,6 +817,81 @@ async fn dispatch_request(
             .await
             .map(to_value)
         }
+        "get_post" => parse_and_call(&request.params, |params: GetPostParams| async move {
+            // Pure read. Resolution first so the post is bound against
+            // the channel id the operator's channel argument actually
+            // named, then one point-fetch that refuses before it
+            // returns a body if the post lives elsewhere.
+            let resolved = state
+                .client
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            state
+                .client
+                .get_post_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &params.post_id,
+                )
+                .await
+        })
+        .await
+        .map(to_value),
+        "read_thread" => parse_and_call(&request.params, |params: ReadThreadParams| async move {
+            // Pure read. The anchor point-fetch does double duty: it is
+            // the channel binding (no thread request is issued at all if
+            // it refuses) and it is where the canonical root comes from,
+            // which is what lets an operator name any reply in the
+            // thread rather than having to know the root.
+            let resolved = state
+                .client
+                .resolve_channel(&params.channel, params.team.as_deref())
+                .await?;
+            let anchor = state
+                .client
+                .get_post_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &params.post_id,
+                )
+                .await?;
+            // Failures are re-stated against the id the caller actually
+            // supplied. The root was derived here, not asked for: a
+            // caller who cited a reply never named it, and echoing it
+            // back would hand them an id they had no way to know.
+            let mut messages = state
+                .client
+                .read_thread_in_channel(
+                    &resolved.channel_id,
+                    &resolved.channel_name,
+                    &anchor.root_id,
+                )
+                .await
+                .map_err(|error| restate_against_requested_post(error, &params.post_id))?;
+            // `--latest` narrows the list; it does not change its type.
+            //
+            // Select the genuine maximum rather than taking the tail.
+            // The thread ordering pins the root first no matter when it
+            // was written, so "the last element" means "the last reply",
+            // which is a different post from "the newest message" for
+            // any thread whose root carries a later timestamp than a
+            // reply. Ties break on id so the choice is stable across
+            // calls.
+            if params.latest {
+                if let Some(index) = messages
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| (a.create_at, &a.id).cmp(&(b.create_at, &b.id)))
+                    .map(|(index, _)| index)
+                {
+                    let latest = messages.swap_remove(index);
+                    messages = vec![latest];
+                }
+            }
+            Ok::<_, CoreError>(messages)
+        })
+        .await
+        .map(to_value),
         "ack_channel" => parse_and_call(&request.params, |params: AckChannelParams| async move {
             let team = params.team.as_deref();
             // Resolve up-front so the result carries the operator-visible
@@ -1052,18 +1140,40 @@ async fn dispatch_request(
         .await
         .map(to_value),
         "wait_channel" => parse_and_call(&request.params, |params: WaitChannelParams| async move {
-            // PER-019 (devrev PR #17 finding #1): thread --team into
-            // the wait helper so duplicate-name channels wait on the
-            // requested team's cursor.
-            // PER-023: prefer second-resolution `timeout_secs` so
-            // suffixes like `30s` aren't lossily rounded.
+            // Legacy method: bare wait only (no filter/after). Same engine
+            // as v2 so old clients on a new daemon get seam/deadline/N→1.
             let timeout_secs = params
                 .timeout_secs
                 .unwrap_or(params.timeout_minutes.saturating_mul(60));
-            wait_for_messages(state, &params.channel, timeout_secs, params.team.as_deref()).await
+            wait::wait_with_params(
+                state,
+                &params.channel,
+                timeout_secs,
+                params.team.as_deref(),
+                None,
+                None,
+                None,
+            )
+            .await
         })
         .await
         .map(to_value),
+        "wait_channel_v2" => {
+            parse_and_call(&request.params, |params: WaitChannelV2Params| async move {
+                wait::wait_with_params(
+                    state,
+                    &params.channel,
+                    params.timeout_secs,
+                    params.team.as_deref(),
+                    params.contains.as_deref(),
+                    params.pattern.as_deref(),
+                    params.after.as_deref(),
+                )
+                .await
+            })
+            .await
+            .map(to_value)
+        }
         "create_channel" => {
             parse_and_call(&request.params, |params: CreateChannelParams| async move {
                 state
@@ -1248,6 +1358,56 @@ async fn dispatch_request(
     }
 }
 
+/// Rebuild a thread failure so that nothing of the provider's survives.
+///
+/// A thread read anchors on whatever post the caller named, then runs
+/// against that post's thread root. When a reply was named, the root is
+/// derived — so anything quoting it would hand the caller an identifier
+/// they never supplied and could not otherwise obtain.
+///
+/// The identifier is not the only thing that changes. Modelled failures
+/// keep their kind and are restated against the caller's post. Everything
+/// else is deliberately *converted* to a constructed gateway-status
+/// failure, because a provider's own error body, or a transport error
+/// carrying the URL it was fetching, both quote that derived root. The
+/// status is preserved where there is one, since that is what tells a
+/// caller whether to retry; the provider's prose never is.
+///
+/// Nothing returned from here was received from anywhere: every arm
+/// builds its value, including the fallthrough. Forwarding the original
+/// is what leaked twice.
+fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> CoreError {
+    match error {
+        CoreError::AnchorChannelMismatch { channel, .. } => CoreError::AnchorChannelMismatch {
+            post_id: requested_post_id.to_string(),
+            channel,
+        },
+        CoreError::AnchorNotFound(_) => CoreError::AnchorNotFound(requested_post_id.to_string()),
+        CoreError::EmptyThread { .. } => CoreError::EmptyThread {
+            root_id: requested_post_id.to_string(),
+        },
+        // Provider answered, but its body is its own text and may quote
+        // the derived root. Keep the status — that is what decides
+        // whether a caller should retry — and drop the body.
+        CoreError::Api { status, .. } => CoreError::Api {
+            status,
+            message: format!("could not read the thread for post {requested_post_id}"),
+        },
+        // Everything else is discarded rather than forwarded.
+        //
+        // This arm exists because the previous version forwarded the
+        // original error, and a transport failure renders the URL it was
+        // fetching — which after the derivation is the derived root.
+        // Enumerating the leaky variants is what produced that bug: the
+        // surface ends up defined by the cases not thought of. Nothing
+        // reaches a caller from here that was not built here.
+        _ => CoreError::Api {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            message: format!("could not read the thread for post {requested_post_id}"),
+        },
+    }
+}
+
 async fn parse_and_call<P, F, Fut, T>(params: &serde_json::Value, func: F) -> Result<T, DaemonError>
 where
     P: DeserializeOwned,
@@ -1269,7 +1429,50 @@ fn error_code(error: &DaemonError) -> i64 {
         DaemonError::AlreadyRunning(_) => -32003,
         DaemonError::Core(CoreError::WaitTimeout(_)) => -32005,
         DaemonError::Core(CoreError::RequiresElevatedCapability) => -32006,
+        // PER-038: wait hard failures — distinct from deadman (-32005).
+        DaemonError::Core(CoreError::WaitFilterInvalid(_)) => -32007,
+        DaemonError::Core(CoreError::WaitProviderDegraded { .. }) => -32008,
         _ => -32000,
+    }
+}
+
+#[cfg(test)]
+mod wait_rpc_code_tests {
+    use super::*;
+
+    /// CLI maps −32005 → exit 1 timeout; −32007/−32008 → exit 2 hard.
+    #[test]
+    fn wait_outcome_rpc_codes_are_distinct() {
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitTimeout("ch".into()))),
+            -32005
+        );
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitFilterInvalid(
+                "bad".into()
+            ))),
+            -32007
+        );
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitProviderDegraded {
+                channel: "ch".into(),
+                message: "down".into(),
+            })),
+            -32008
+        );
+    }
+
+    #[test]
+    fn wait_channel_v2_params_require_timeout_secs() {
+        // Capability surface: v2 carries timeout_secs (not optional minutes-only).
+        let v = serde_json::json!({
+            "channel": "ops",
+            "timeout_secs": 60,
+            "contains": "ASSENT"
+        });
+        let p: WaitChannelV2Params = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(p.timeout_secs, 60);
+        assert_eq!(p.contains.as_deref(), Some("ASSENT"));
     }
 }
 
@@ -1279,185 +1482,6 @@ fn require_elevated_profile(profile: &Profile) -> Result<(), CoreError> {
     } else {
         Err(CoreError::RequiresElevatedCapability)
     }
-}
-
-async fn wait_for_messages(
-    state: &AppState,
-    channel: &str,
-    timeout_secs: u64,
-    team: Option<&str>,
-) -> Result<WaitResult, CoreError> {
-    // PER-019 (devrev PR #17 finding #1): resolve via the cross-team
-    // resolver so duplicate-name channels wait on the requested team.
-    // The previous `channel_id_for_name` path went through the legacy
-    // `channel_id` helper, which now uses the resolver default chain
-    // (primary-first/fallback) but did not honor the operator's
-    // explicit `--team` override.
-    let channel_id = state
-        .client
-        .resolve_channel(channel, team)
-        .await?
-        .channel_id;
-
-    let initial = state
-        .client
-        .latest_channel_messages_by_id(&channel_id, 30)
-        .await?;
-
-    let cursor_id = initial.last().map(|m| m.id.clone()).unwrap_or_default();
-    let cursor_create_at = initial.last().map(|m| m.create_at).unwrap_or(0);
-
-    let is_monitored = state
-        .profile
-        .monitored_channels
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(channel));
-
-    let limit = Duration::from_secs(timeout_secs);
-
-    if is_monitored {
-        wait_push_backed(
-            state,
-            channel,
-            &channel_id,
-            &cursor_id,
-            cursor_create_at,
-            limit,
-        )
-        .await
-    } else {
-        wait_rest_poll(
-            state,
-            channel,
-            &channel_id,
-            &cursor_id,
-            cursor_create_at,
-            limit,
-        )
-        .await
-    }
-}
-
-/// PER-019 (devrev PR #17 second-pass finding): predicate for
-/// `wait_push_backed` event matching, extracted for unit testability.
-/// Returns true when the inbound event should wake the wait — same
-/// resolved `channel_id` (not name; same-named channels on different
-/// teams have distinct ids), past the cursor, not authored by us.
-fn inbound_event_wakes_wait(
-    payload: &chanvoy_core::InboundEventPayload,
-    channel_id: &str,
-    cursor_id: &str,
-    cursor_create_at: i64,
-    my_user_id: &str,
-) -> bool {
-    payload.channel_id == channel_id
-        && payload.post_id != cursor_id
-        && payload.create_at > cursor_create_at
-        && payload.sender_id != my_user_id
-}
-
-async fn wait_push_backed(
-    state: &AppState,
-    channel: &str,
-    channel_id: &str,
-    cursor_id: &str,
-    cursor_create_at: i64,
-    limit: Duration,
-) -> Result<WaitResult, CoreError> {
-    let mut rx = state.event_bus.subscribe();
-
-    let future = async {
-        loop {
-            match rx.recv().await {
-                Ok(event) => match &event.payload {
-                    DaemonEventPayloadInner::Inbound(p)
-                        if inbound_event_wakes_wait(
-                            p,
-                            channel_id,
-                            cursor_id,
-                            cursor_create_at,
-                            &state.my_user_id,
-                        ) =>
-                    {
-                        return Ok(WaitResult {
-                            channel: channel.to_string(),
-                            messages: vec![chanvoy_core::Message {
-                                id: p.post_id.clone(),
-                                user_id: p.sender_id.clone(),
-                                username: p.sender_username.clone(),
-                                message: p.message.clone(),
-                                create_at: p.create_at,
-                            }],
-                        });
-                    }
-                    _ => {}
-                },
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let messages = state
-                        .client
-                        .latest_channel_messages_by_id(channel_id, 30)
-                        .await?;
-                    let fresh: Vec<_> = messages
-                        .into_iter()
-                        .filter(|m| {
-                            m.user_id != state.my_user_id
-                                && m.id != cursor_id
-                                && m.create_at > cursor_create_at
-                        })
-                        .collect();
-                    if !fresh.is_empty() {
-                        return Ok(WaitResult {
-                            channel: channel.to_string(),
-                            messages: fresh,
-                        });
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    };
-
-    timeout(limit, future)
-        .await
-        .map_err(|_| CoreError::WaitTimeout(channel.to_string()))?
-}
-
-async fn wait_rest_poll(
-    state: &AppState,
-    channel: &str,
-    channel_id: &str,
-    cursor_id: &str,
-    cursor_create_at: i64,
-    limit: Duration,
-) -> Result<WaitResult, CoreError> {
-    let my_user_id = state.my_user_id.clone();
-    let channel_name = channel.to_string();
-    let future: std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<WaitResult, CoreError>> + Send + '_>,
-    > = Box::pin(async {
-        loop {
-            let messages = state
-                .client
-                .latest_channel_messages_by_id(channel_id, 10)
-                .await?;
-            let fresh: Vec<_> = messages
-                .into_iter()
-                .filter(|m| {
-                    m.user_id != my_user_id && m.id != cursor_id && m.create_at > cursor_create_at
-                })
-                .collect();
-            if !fresh.is_empty() {
-                return Ok(WaitResult {
-                    channel: channel_name.clone(),
-                    messages: fresh,
-                });
-            }
-            sleep(Duration::from_secs(2)).await;
-        }
-    });
-    timeout(limit, future)
-        .await
-        .map_err(|_| CoreError::WaitTimeout(channel.to_string()))?
 }
 
 async fn check_channel(
@@ -2239,6 +2263,45 @@ impl DaemonClient {
         .await
     }
 
+    /// Fetch one post from a named channel. Pure read.
+    pub async fn get_post(
+        &self,
+        channel: &str,
+        post_id: &str,
+        team: Option<String>,
+    ) -> Result<chanvoy_core::Message, DaemonError> {
+        self.call(
+            "get_post",
+            serde_json::to_value(GetPostParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
+                team,
+            })?,
+        )
+        .await
+    }
+
+    /// Read the thread a post belongs to. `post_id` may be the root or
+    /// any reply. Pure read; always returns a list.
+    pub async fn read_thread(
+        &self,
+        channel: &str,
+        post_id: &str,
+        latest: bool,
+        team: Option<String>,
+    ) -> Result<Vec<chanvoy_core::Message>, DaemonError> {
+        self.call(
+            "read_thread",
+            serde_json::to_value(ReadThreadParams {
+                channel: channel.to_string(),
+                post_id: post_id.to_string(),
+                latest,
+                team,
+            })?,
+        )
+        .await
+    }
+
     pub async fn direct_message(
         &self,
         username: &str,
@@ -2309,12 +2372,7 @@ impl DaemonClient {
         timeout_secs: u64,
         team: Option<String>,
     ) -> Result<WaitResult, DaemonError> {
-        // Devrev PR #20 P1 fix: legacy `timeout_minutes` field is
-        // populated with a rounded-up compatibility value so an old
-        // daemon waits for an approximate (not zero) window. Without
-        // this, `wait --timeout 5m` against a v0.2.0 daemon would
-        // immediately return `WaitTimeout` because the legacy field
-        // came across as 0. New daemon prefers `timeout_secs`.
+        // Legacy bare wait — kept for old-client compatibility tests.
         self.call(
             "wait_channel",
             serde_json::to_value(WaitChannelParams {
@@ -2322,6 +2380,32 @@ impl DaemonClient {
                 timeout_minutes: secs_to_minutes_compat(timeout_secs),
                 timeout_secs: Some(timeout_secs),
                 team,
+            })?,
+        )
+        .await
+    }
+
+    /// PER-038: enhanced wait (filter + after + absolute deadline engine).
+    /// New CLI uses this for all waits. Method-not-found on an old daemon
+    /// is the capability gate.
+    pub async fn wait_channel_v2(
+        &self,
+        channel: &str,
+        timeout_secs: u64,
+        team: Option<String>,
+        contains: Option<String>,
+        pattern: Option<String>,
+        after: Option<String>,
+    ) -> Result<WaitResult, DaemonError> {
+        self.call(
+            "wait_channel_v2",
+            serde_json::to_value(WaitChannelV2Params {
+                channel: channel.to_string(),
+                timeout_secs,
+                team,
+                contains,
+                pattern,
+                after,
             })?,
         )
         .await
@@ -2491,6 +2575,37 @@ mod compat_tests {
 mod tests {
     use super::*;
 
+    /// The daemon reads the profile's credential exactly once.
+    ///
+    /// Reading it a second time for another surface can straddle a
+    /// rotation and leave the websocket authenticated as one identity
+    /// while the request-response client is another — and the drift
+    /// probe only inspects the first. The websocket now derives its
+    /// credential from the shared client, so a split is unrepresentable
+    /// rather than merely avoided; this guards the remaining way to
+    /// reintroduce it, which is a second load in `start`.
+    ///
+    /// The reduction writer's own load is deliberately excluded: it is
+    /// a different profile and a different identity by design.
+    #[test]
+    fn the_profile_credential_is_loaded_exactly_once() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub async fn start(")
+            .expect("start function present");
+        // Stop at the test module: this test's own source mentions the
+        // pattern it searches for, and counting those would make the
+        // assertion about itself rather than about `start`.
+        let end = source.find("\nmod tests {").expect("test module present");
+        let body = &source[start..end];
+        let loads = body.matches("load_token(&profile)").count();
+        assert_eq!(
+            loads, 1,
+            "the profile credential must be loaded once and reused; a second \
+             load can pair surfaces with different identities"
+        );
+    }
+
     #[test]
     fn stale_daemon_cursor_degrades_to_nonfatal_probe() {
         let result = stale_cursor_check_result("per-008");
@@ -2521,6 +2636,7 @@ mod tests {
                 channel_id: "ch1".to_string(),
                 channel_name: channel_name.to_string(),
                 post_id: "p1".to_string(),
+                root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
                 sender_username: "alice".to_string(),
                 message: if mentioned {
@@ -2585,14 +2701,9 @@ mod tests {
         ));
     }
 
-    /// PER-019 (devrev PR #17 second-pass regression): when two
-    /// channels share a name across different teams (e.g.
-    /// `org-lanytehq/general` and `3-leaps-operations/general`),
-    /// the push-backed wait must wake only on events for the
-    /// resolved `channel_id`, never on a name-collision from the
-    /// other team. Pre-fix, the predicate compared by `channel_name`
-    /// and would wake on either; post-fix, only the matching id
-    /// wakes.
+    /// PER-019 / PER-038: wait predicate matches by resolved channel_id
+    /// (not name) and ignores self. Cursor/timestamp membership lives in
+    /// the wait engine; this is the shared body/channel/self gate.
     #[test]
     fn devrev_pr17_finding5_wait_push_backed_filters_by_channel_id() {
         fn payload(channel_id: &str, channel_name: &str, post_id: &str) -> InboundEventPayload {
@@ -2602,6 +2713,7 @@ mod tests {
                 channel_id: channel_id.to_string(),
                 channel_name: channel_name.to_string(),
                 post_id: post_id.to_string(),
+                root_id: post_id.to_string(),
                 sender_id: "u-other".to_string(),
                 sender_username: "alice".to_string(),
                 message: "hello".to_string(),
@@ -2611,50 +2723,25 @@ mod tests {
             }
         }
 
-        // Wait was set up for the Ops team's #general (id=ch-ops-general).
-        let wait_channel_id = "ch-ops-general";
-        let cursor_id = "p-cursor";
-        let cursor_create_at = 1000;
-        let my_user_id = "bot-bravo";
+        let pred = wait::WaitPredicate::compile("bot-bravo", "ch-ops-general", None, None)
+            .expect("compile");
 
-        // Event from the SAME team (matching id) → wake.
         let ops_event = payload("ch-ops-general", "general", "p-ops-1");
         assert!(
-            inbound_event_wakes_wait(
-                &ops_event,
-                wait_channel_id,
-                cursor_id,
-                cursor_create_at,
-                my_user_id,
-            ),
+            pred.matches_inbound(&ops_event),
             "matching channel_id should wake the wait"
         );
 
-        // Event from the OTHER team (same name, different id) → must NOT wake.
         let lh_event = payload("ch-lanytehq-general", "general", "p-lh-1");
         assert!(
-            !inbound_event_wakes_wait(
-                &lh_event,
-                wait_channel_id,
-                cursor_id,
-                cursor_create_at,
-                my_user_id,
-            ),
+            !pred.matches_inbound(&lh_event),
             "same-named channel on a different team must not wake the wait"
         );
 
-        // Self-authored event (matching id) → must NOT wake (existing
-        // contract; preserved by the fix).
         let mut self_event = payload("ch-ops-general", "general", "p-self");
-        self_event.sender_id = my_user_id.to_string();
+        self_event.sender_id = "bot-bravo".to_string();
         assert!(
-            !inbound_event_wakes_wait(
-                &self_event,
-                wait_channel_id,
-                cursor_id,
-                cursor_create_at,
-                my_user_id,
-            ),
+            !pred.matches_inbound(&self_event),
             "self-authored event must not wake the wait"
         );
     }

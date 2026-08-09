@@ -301,7 +301,7 @@ Every read-shaped verb is one of three kinds:
 
 | Kind | Verbs | Cursor effect |
 |---|---|---|
-| Pure read | `read --after`, `read --since`, `read --since-bootstrap`, `read --since-last-mine`, `pinned`, `notifications --unread`, `search`, `attention list`, `attention show` | None |
+| Pure read | `read --after`, `read --since`, `read --since-bootstrap`, `read --since-last-mine`, `pinned`, `show`, `thread` (with or without `--latest`), `notifications --unread`, `search`, `attention list`, `attention show` | None |
 | Probe (pure-read with cursor consultation) | `check` | Reads cursor, never writes |
 | Cursor-advance | `read --advance`, `ack`, `post`, full `notifications` (without `--unread`; with or without `--since`) | Writes cursor on success |
 
@@ -456,7 +456,7 @@ crates/
 ├── chanvoy-cli       CLI surface, argument parsing, output formatting
 ├── chanvoy-ipc       JSON-RPC envelope types (factored out of chanvoy-core
 │                     so chanvoy-mcp can use them without pulling in MM client)
-└── chanvoy-mcp       MCP bridge scaffold (early; not part of v0.2.x daily flow)
+└── chanvoy-mcp       MCP bridge scaffold (early; not part of v0.3.x daily flow)
 
 src/
 └── main.rs           binary entry, wires chanvoy-cli into the binary
@@ -464,8 +464,19 @@ src/
 
 Public API stability: `chanvoy-core`'s exported types are the
 de-facto contract for downstream tools (chanvoy-mcp, future
-peer-adapters, integration-test fixtures). Adding fields is fine;
-removing or re-typing them is a contract change.
+peer-adapters, integration-test fixtures). Removing or re-typing them
+is a contract change.
+
+Adding is not automatically safe, which earlier wording here implied.
+Adding a variant to an exhaustive public enum, or a field to a public
+struct that callers construct themselves, is **source-breaking**: code
+matching or constructing exhaustively stops compiling. It is only safe
+when the type is designed for evolution — `#[non_exhaustive]` on an
+enum, or a constructor that callers must go through.
+
+`CoreError` is `#[non_exhaustive]` for exactly this reason. Types that
+are not should be treated as closed: adding to them needs the same
+deliberate version boundary as removing from them.
 
 ---
 

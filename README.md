@@ -23,7 +23,7 @@ Where mlvoy bridges the inbox, chanvoy bridges the war room.
 
 ## Status
 
-Chanvoy v0.2.x. Local-mode (CLI ↔ per-profile daemon ↔ Mattermost)
+Chanvoy v0.3.x. Local-mode (CLI ↔ per-profile daemon ↔ Mattermost)
 is the validated operating mode; the remote control plane and
 attested transport remain on the roadmap (deferred).
 
@@ -45,6 +45,12 @@ What's shipped:
   time-window flag.
 - **Conversation primitives** — threaded replies via `post --reply-to`,
   emoji reactions via `react` / `unreact`.
+- **Post and thread rehydration** — `show <channel> <post-id>` reopens
+  a single cited post; `thread <channel> <post-id>` reads the whole
+  conversation and accepts the root's id or any reply's. Both prove
+  the post belongs to the named channel before returning any of it.
+  Human `read` rows carry `id=` and `root=` crumbs so a citation can
+  be handed straight to another verb without re-reading with `--json`.
 - **Discovery primitives** — `search <channel> <query>` over MM's
   search endpoint, `channels --sort active` traffic-aware listing.
 - **Cross-team channel admin** — `channel create --team <slug>`
@@ -125,11 +131,11 @@ for per-command reference, flags, and worked examples.
 | Category | Commands | Notes |
 |---|---|---|
 | **Bootstrap & lifecycle** | `auto-setup`, `daemon {start,serve,stop,status}`, `profile {list,active,create,create-from-env}`, `whoami` | `auto-setup` is the canonical bootstrap. `daemon serve` is the foreground variant for debug or sandbox parent-shell use. |
-| **Reading (cursor-neutral)** | `channels`, `pinned <ch>`, `read <ch>` (with `--since` / `--after` / `--since-bootstrap` / `--since-last-mine` / `--limit`), `check <ch>`, `dms`, `notifications --unread`, `search <ch> <query>` | Pure reads; do not advance cursors unless `--advance` is passed on `read`. |
+| **Reading (cursor-neutral)** | `channels`, `pinned <ch>`, `read <ch>` (with `--since` / `--after` / `--since-bootstrap` / `--since-last-mine` / `--limit`), `check <ch>`, `dms`, `notifications --unread`, `search <ch> <query>`, `show <ch> <post-id>`, `thread <ch> <post-id>` (with `--latest`) | Pure reads; do not advance cursors unless `--advance` is passed on `read`. `show` / `thread` refuse a post that is not in the named channel before returning any content. |
 | **Cursor-advancing reads** | `read --advance`, `ack <ch>`, full `notifications` (without `--unread`; with or without `--since`) | Channel-cursor advance for `read --advance` / `ack`; mention-cursor advance for full `notifications`. |
 | **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Only `post` advances the channel cursor; `dm`, `notify`, `react`, `unreact` are cursor-neutral. |
 | **Channel admin** | `channel {create,archive,restore,add-member}` (with `--team` for cross-team where authorized) | `restore` requires an elevated-capability profile. |
-| **Wait / probe** | `wait <ch> --timeout` | Block until new posts arrive or timeout. |
+| **Wait / probe** | `wait <ch> --timeout [--contains|--pattern] [--after]` | Block until a matching post (or any non-self post) arrives, or deadman. |
 | **Inspect (state, not chat)** | `attention {list,show}` | Strictly read-only on daemon state; never issues Mattermost API calls. |
 
 Time-window flags (`read --since`, `notifications --since`, `wait

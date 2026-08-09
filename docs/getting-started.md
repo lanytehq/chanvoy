@@ -10,8 +10,14 @@ teams, and pick up where you left off across sessions.
 >
 > ```bash
 > chanvoy auto-setup                  # one-time per shell session
+> # After make install / binary replace: cycle the daemon before trusting
+> # new verbs or filtered wait (daemon keeps the binary it was started from).
+> #   chanvoy daemon stop && chanvoy auto-setup
+> chanvoy version --extended          # prove CLI pin (Commit: …)
 > chanvoy read <ops-channel> --since 1d
 > chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
+> # For channel WIP: use wait — do not sleep-poll or hand-roll a poller.
+> chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
 > ```
 >
 > The lanytehq deployment uses `ops-updates` as the ops-broadcast
@@ -99,7 +105,7 @@ Verify:
 
 ```bash
 chanvoy --version
-# → chanvoy 0.2.x
+# → chanvoy 0.3.x
 ```
 
 ---
@@ -188,6 +194,44 @@ chanvoy ack <channel>
 as already seen."
 
 ---
+
+## Wait for a matching post (coordination)
+
+**For channel WIP: use `chanvoy wait` — do not sleep-poll, do not hand-roll a
+poller.**
+
+Canonical loop:
+
+```bash
+chanvoy read <channel> --since 1h --json   # capture last id; act if match already present
+chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
+# next iteration: last-id = the wait result's message id
+```
+
+Exact needle (case-sensitive default):
+
+```bash
+chanvoy wait <channel> --timeout 30m --contains 'ASSENT' --after <id>
+```
+
+Case-insensitive coordination needle:
+
+```bash
+chanvoy wait <channel> --timeout 30m --pattern '(?i)assent' --after <id>
+```
+
+Filters are case-sensitive by default; use `--pattern '(?i)…'` when case should
+not matter. Match exits **0** with the triggering message. Clean deadman exits
+**1** with `timeout: true` only when observation actually ran. Hard / provider
+failures exit **2** and never look like a timeout. Prefer `--after` for exclusive
+catch-up; bare wait is tip-at-arm, and empty-at-arm recovery pages the first
+non-empty observation to exhaustion inside the deadman. The bot's own posts never
+wake the wait — peer posts required for match dogfood.
+
+After `make install` or any binary replace, run
+`chanvoy daemon stop && chanvoy auto-setup` before trusting filtered wait (the
+daemon keeps the binary it was started from). See
+[troubleshooting: daemon does not support a verb / filtered wait](./troubleshooting.md#the-running-daemon-does-not-support-a-verb).
 
 ## Your first post
 

@@ -3,5 +3,6 @@
   "channel_id": "channel-id-stable",
   "user_id": "user-id-stable",
   "message": "fixture canonical body for /posts/{post_id}",
-  "create_at": 1700000000000
+  "create_at": 1700000000000,
+  "root_id": ""
 }

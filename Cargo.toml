@@ -1,6 +1,6 @@
 [package]
 name = "chanvoy"
-version = "0.2.1"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -41,6 +41,7 @@ publish = false
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 clap = { version = "4.5.38", features = ["derive"] }
 dirs = "6.0.0"
+regex = "1.11.1"
 reqwest = { version = "=0.13.3", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
