@@ -5135,11 +5135,22 @@ impl MattermostWs {
         let mut authenticated = false;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Auth window starts when the challenge is sent. Success may arrive as
+        // bare `hello` and/or `{"status":"OK","seq_reply":N}` in either order.
+        // Option (b): even after a provisional Healthy on the first success
+        // shape, keep treating is_auth_error as fatal until this deadline so a
+        // late FAIL/INVALID_TOKEN cannot be swallowed (devrev/entarch residual).
         let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
 
         loop {
+            let now = tokio::time::Instant::now();
+            let in_auth_window = now < auth_deadline;
             let remaining = if !authenticated {
-                auth_deadline.saturating_duration_since(tokio::time::Instant::now())
+                auth_deadline.saturating_duration_since(now)
+            } else if in_auth_window {
+                // Stay selective until the auth window closes so a late FAIL
+                // can still be observed without a 3600s sleep arm.
+                auth_deadline.saturating_duration_since(now)
             } else {
                 Duration::from_secs(3600)
             };
@@ -5148,6 +5159,27 @@ impl MattermostWs {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
+                            // Option (b): auth errors remain fatal for the whole
+                            // challenge window, including after provisional Healthy.
+                            if auth_error_still_fatal(authenticated, in_auth_window, &text) {
+                                if authenticated {
+                                    self.ws_state
+                                        .set_state(WsConnectionState::Disconnected)
+                                        .await;
+                                    self.ws_state
+                                        .set_error(format!(
+                                            "websocket auth rejected after provisional success: {text}"
+                                        ))
+                                        .await;
+                                    warn!(
+                                        "websocket auth rejected after provisional healthy (option b)"
+                                    );
+                                }
+                                return Err(CoreError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    format!("websocket auth rejected: {text}"),
+                                )));
+                            }
                             if !authenticated {
                                 if is_auth_success(&text) {
                                     authenticated = true;
@@ -5169,12 +5201,9 @@ impl MattermostWs {
                                         ),
                                     });
                                     self.reconnect_catchup().await;
-                                } else if is_auth_error(&text) {
-                                    return Err(CoreError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::PermissionDenied,
-                                        format!("websocket auth rejected: {}", text),
-                                    )));
                                 }
+                                // Non-success, non-error frames before first
+                                // success are ignored (same as prior behavior).
                             } else {
                                 self.handle_ws_message(&text).await;
                             }
@@ -5212,6 +5241,8 @@ impl MattermostWs {
                             "websocket auth timed out waiting for server ack",
                         )));
                     }
+                    // Authenticated + auth window elapsed: loop continues with
+                    // a long remaining sleep on the next iteration.
                 }
             }
         }
@@ -5457,6 +5488,22 @@ impl MattermostWs {
     async fn resolve_username(&self, user_id: &str) -> String {
         self.client.author_username(user_id).await
     }
+}
+
+/// Whether an auth-error frame must kill the websocket session.
+///
+/// Residual option **(b)** (devrev + entarch): after a provisional Healthy
+/// from the first success shape (often bare `hello`), a late
+/// `FAIL`/`INVALID_TOKEN` must still be fatal for the remainder of the
+/// original challenge window. Outside that window, only ordinary event
+/// handling applies (a mid-session FAIL is not a defined Mattermost path).
+fn auth_error_still_fatal(authenticated: bool, in_auth_window: bool, text: &str) -> bool {
+    if !is_auth_error(text) {
+        return false;
+    }
+    // Unauthenticated: always fatal (original fail-closed).
+    // Provisionally authenticated: fatal only while the challenge window is open.
+    !authenticated || in_auth_window
 }
 
 /// Detect Mattermost websocket authentication success.
@@ -6296,6 +6343,38 @@ monitored_channels = ["per-003", "per-004"]
     fn is_auth_error_rejects_normal_event() {
         let frame = r#"{"event":"posted","data":{"post":"{}"}}"#;
         assert!(!is_auth_error(frame));
+    }
+
+    #[test]
+    fn auth_error_still_fatal_before_success() {
+        let fail = r#"{"status":"FAIL","seq_reply":1}"#;
+        assert!(auth_error_still_fatal(false, true, fail));
+        assert!(auth_error_still_fatal(false, false, fail));
+    }
+
+    #[test]
+    fn auth_error_still_fatal_after_provisional_success_inside_window() {
+        // Option (b): bare-hello already flipped Healthy, late FAIL still kills.
+        let fail = r#"{"status":"FAIL","seq_reply":1,"error":{"message":"invalid session"}}"#;
+        assert!(auth_error_still_fatal(true, true, fail));
+        let invalid = r#"{"data":{"status":"INVALID_TOKEN"}}"#;
+        assert!(auth_error_still_fatal(true, true, invalid));
+    }
+
+    #[test]
+    fn auth_error_not_fatal_after_window_once_authenticated() {
+        let fail = r#"{"status":"FAIL","seq_reply":1}"#;
+        assert!(!auth_error_still_fatal(true, false, fail));
+    }
+
+    #[test]
+    fn auth_error_still_fatal_ignores_non_error_frames() {
+        let hello = r#"{"event":"hello","data":{"server_version":"11.5.1"}}"#;
+        let ok = r#"{"status":"OK","seq_reply":1}"#;
+        let posted = r#"{"event":"posted","data":{"post":"{}"}}"#;
+        assert!(!auth_error_still_fatal(false, true, hello));
+        assert!(!auth_error_still_fatal(true, true, ok));
+        assert!(!auth_error_still_fatal(true, true, posted));
     }
 
     // ---- PER-009 wiremock integration tests ----

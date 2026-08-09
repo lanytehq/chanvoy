@@ -95,19 +95,23 @@ install: build-release
 	@$(MAKE) --no-print-directory install-restart-daemons
 
 # Cycle daemons started from the userspace install path onto the binary
-# currently at that path. Safe for shared hosts with many profiles:
-#   - only processes whose argv[0] is exactly $(LOCAL_BIN)/chanvoy
+# currently at that path. Shared-host rules:
+#   - only processes whose argv binary is exactly $(LOCAL_BIN)/chanvoy
 #   - stop/start is always --profile-explicit (never wildcard kill)
-#   - uses daemon start (not auto-setup) so we do not steal active-profile
-#     or require the installer's env identity for other seats
-#   - per-profile failures are reported; install does not hard-fail
+#   - stop is fail-soft (already-down is OK)
+#   - start only when ambient identity can own that profile; foreign
+#     profiles are **stop-only** with a self-cycle hint (installer's
+#     LANYTE_MM_BOT / whoami cannot start another seat's daemon —
+#     observed 2026-08-09: "profile bot username mismatch")
+#   - process probe is fail-soft under sandboxes that deny `ps`
+#   - per-profile outcomes reported; install does not hard-fail
 # Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1
 install-restart-daemons:
 ifeq ($(OS),Windows_NT)
 	@echo "[!!] install-restart-daemons is Unix-only; cycle daemons manually:"
 	@echo "     chanvoy daemon stop --profile <name> && chanvoy daemon start --profile <name>"
 else
-	@set -euo pipefail; \
+	@set -uo pipefail; \
 	BIN="$(LOCAL_BIN)/chanvoy$(EXT)"; \
 	if [ "$${CHANVOY_INSTALL_SKIP_DAEMON_RESTART:-}" = "1" ]; then \
 		echo "[ok] skipped daemon restart (CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1)"; \
@@ -122,27 +126,34 @@ else
 	fi; \
 	profiles=$$(ps -axo args= 2>/dev/null \
 		| sed -n "s|^$${BIN} --profile \\([^ ]*\\) daemon serve.*|\\1|p" \
-		| sort -u); \
+		| sort -u || true); \
 	if [ -z "$$profiles" ]; then \
 		echo "[ok] no live daemons on $$BIN — nothing to cycle"; \
 		exit 0; \
 	fi; \
 	count=$$(printf '%s\n' "$$profiles" | grep -c . || true); \
 	echo "[..] cycling $$count daemon(s) onto $$BIN (brief seat interruption expected)"; \
-	ok=0; fail=0; \
+	restarted=0; stopped_only=0; fail=0; \
 	while IFS= read -r profile; do \
 		[ -n "$$profile" ] || continue; \
-		if "$$BIN" daemon stop --profile "$$profile" >/dev/null 2>&1 \
-			&& "$$BIN" daemon start --profile "$$profile" >/dev/null 2>&1; then \
-			echo "     [ok] $$profile"; \
-			ok=$$((ok + 1)); \
+		"$$BIN" daemon stop --profile "$$profile" >/dev/null 2>&1 || true; \
+		start_err=$$("$$BIN" daemon start --profile "$$profile" 2>&1); \
+		start_ec=$$?; \
+		if [ "$$start_ec" -eq 0 ]; then \
+			echo "     [ok] restarted $$profile"; \
+			restarted=$$((restarted + 1)); \
+		elif printf '%s' "$$start_err" | grep -qi 'bot username mismatch\|identity\|whoami\|expected agent-'; then \
+			echo "     [..] stopped $$profile (foreign identity — self-cycle under that seat):"; \
+			echo "         source identity for $$profile && $$BIN daemon start --profile $$profile"; \
+			stopped_only=$$((stopped_only + 1)); \
 		else \
-			echo "     [!!] $$profile — stop/start failed; retry:"; \
-			echo "         $$BIN daemon stop --profile $$profile && $$BIN daemon start --profile $$profile"; \
+			echo "     [!!] $$profile — start failed:"; \
+			echo "         $$start_err" | sed 's/^/         /'; \
+			echo "         retry: $$BIN daemon stop --profile $$profile; $$BIN daemon start --profile $$profile"; \
 			fail=$$((fail + 1)); \
 		fi; \
 	done <<< "$$profiles"; \
-	echo "[ok] daemon cycle done: $$ok ok, $$fail failed"; \
+	echo "[ok] daemon cycle done: $$restarted restarted, $$stopped_only stop-only (foreign), $$fail failed"; \
 	echo "     prove CLI pin: $$BIN version --extended"
 endif
 
