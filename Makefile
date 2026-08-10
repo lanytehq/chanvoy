@@ -134,7 +134,7 @@ else
 	fi; \
 	count=$$(printf '%s\n' "$$profiles" | grep -c . || true); \
 	echo "[..] scanning $$count daemon(s) on $$BIN (ownable only; foreign left running)"; \
-	restarted=0; left_foreign=0; fail=0; \
+	restarted=0; left_foreign=0; fail=0; proved=""; \
 	while IFS= read -r profile; do \
 		[ -n "$$profile" ] || continue; \
 		own_err=$$("$$BIN" --profile "$$profile" daemon ownable 2>&1); \
@@ -152,9 +152,11 @@ else
 		if [ "$$start_ec" -eq 0 ]; then \
 			echo "     [ok] restarted $$profile"; \
 			restarted=$$((restarted + 1)); \
+			[ -n "$$proved" ] || proved="$$profile"; \
 		else \
 			echo "     [!!] $$profile — start failed after stop:"; \
 			echo "         $$start_err" | sed 's/^/         /'; \
+			echo "         this profile is DOWN until a start succeeds (the stop did land)"; \
 			echo "         retry: $$BIN daemon stop --profile $$profile; $$BIN daemon start --profile $$profile"; \
 			fail=$$((fail + 1)); \
 		fi; \
@@ -163,7 +165,16 @@ else
 	if [ "$$left_foreign" -gt 0 ]; then \
 		echo "[!!] foreign seats still on previous binary — each must self-cycle under its own identity"; \
 	fi; \
-	echo "     prove dual pin: $$BIN version --extended"
+	if [ "$$fail" -gt 0 ]; then \
+		echo "[!!] $$fail profile(s) stopped but did not restart — they are DOWN, not stale"; \
+	fi; \
+	if [ -n "$$proved" ]; then \
+		echo "     prove dual pin: $$BIN --profile $$proved version --extended"; \
+	else \
+		echo "     prove dual pin: $$BIN --profile <your-profile> version --extended"; \
+	fi; \
+	echo "     (bare \`version --extended\` may probe another seat's active profile,"; \
+	echo "      which reports \`Generation: not scored\` and proves nothing about yours)"
 endif
 
 ensure-msrv:

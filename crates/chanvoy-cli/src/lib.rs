@@ -728,6 +728,70 @@ struct RestartOwnership {
     reason: String,
 }
 
+/// Operator-facing summary of an identity-preflight failure.
+///
+/// `CoreError::Api` carries the provider's response body verbatim. For a
+/// profile this environment cannot speak for, that body is a full server
+/// error payload — internal error ids, a `detailed_error` string, and a
+/// per-request correlation id. None of it tells an operator what to do, and
+/// splicing it into the one-line `Generation: not scored (…)` reason buries
+/// the single fact that matters: this environment does not hold that
+/// profile's identity. Classify the failure and keep the body off the line.
+///
+/// Detail is not lost — it is one command away, under the seat that owns
+/// the profile: `chanvoy --profile <name> whoami`.
+fn preflight_failure_summary(err: &CliError) -> String {
+    match err {
+        // `CoreError::Api` is every non-success response, not only a refusal
+        // of this credential. Reading them all as "your credential was
+        // rejected" would send an operator to re-source an identity that is
+        // fine while the provider is down or throttling, so the wording is
+        // status-aware: only the statuses that actually speak about the
+        // caller's identity say so.
+        CliError::Core(chanvoy_core::CoreError::Api { status, .. }) => {
+            let code = status.as_u16();
+            match code {
+                401 | 403 => {
+                    format!("server rejected this environment's credential (HTTP {code})")
+                }
+                429 => format!("server throttled the identity check (HTTP {code})"),
+                _ => format!("identity check failed at the server (HTTP {code})"),
+            }
+        }
+        CliError::Core(chanvoy_core::CoreError::Http(_)) => {
+            "could not reach the server for the identity check".to_string()
+        }
+        CliError::Core(chanvoy_core::CoreError::MissingCredential(source)) => {
+            format!("no credential available from {source} in this environment")
+        }
+        CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch { expected, actual }) => {
+            format!("token authenticates as {actual}, profile expects {expected}")
+        }
+        _ => "identity check failed in this environment".to_string(),
+    }
+}
+
+/// Whether a generation verdict may be scored, and what it is.
+///
+/// PER-038A FIX-1 gate, kept pure so it can be exercised without a live
+/// daemon or a token: a verdict is scored **only** when this environment
+/// owns the probed daemon. Matching pins on a daemon we do not own are not
+/// evidence of anything — the daemon can be cycled out from under us by the
+/// seat that does own it — so the verdict is withheld rather than reported.
+fn score_generation(
+    ownership: Option<&RestartOwnership>,
+    cli: &chanvoy_core::HostBuildInfo,
+    daemon: Option<&chanvoy_core::HostBuildInfo>,
+) -> (bool, Option<bool>) {
+    let scored = ownership.is_some_and(|o| o.ownable);
+    let verdict = if scored {
+        host_generation_match(cli, daemon)
+    } else {
+        None
+    };
+    (scored, verdict)
+}
+
 async fn probe_restart_ownership(profile_name: &str) -> RestartOwnership {
     let profile = match load_profile(profile_name) {
         Ok(p) => p,
@@ -749,7 +813,7 @@ async fn probe_restart_ownership(profile_name: &str) -> RestartOwnership {
                 profile: profile_name.to_string(),
                 cli_username: None,
                 daemon_username: None,
-                reason: format!("start preflight failed: {e}"),
+                reason: format!("start preflight failed: {}", preflight_failure_summary(&e)),
             };
         }
     };
@@ -831,12 +895,8 @@ async fn handle_version(
         Some(p) => Some(probe_restart_ownership(p).await),
         None => None,
     };
-    let generation_scored = ownership.as_ref().is_some_and(|o| o.ownable);
-    let gen_match = if generation_scored {
-        host_generation_match(&cli_info, daemon_info.as_ref())
-    } else {
-        None
-    };
+    let (generation_scored, gen_match) =
+        score_generation(ownership.as_ref(), &cli_info, daemon_info.as_ref());
 
     if json {
         // Top-level fields remain the CLI pin (back-compat for scripts that
@@ -5114,5 +5174,221 @@ mod tests {
             format_message(&known_root).contains("root=thread-root"),
             "a known thread root is named on the row"
         );
+    }
+
+    fn pin(commit: &str, dirty: Option<bool>) -> chanvoy_core::HostBuildInfo {
+        chanvoy_core::HostBuildInfo {
+            version: "0.3.0".to_string(),
+            commit: commit.to_string(),
+            commit_short: commit.chars().take(7).collect(),
+            build_date: "2026-08-10T00:00:00Z".to_string(),
+            dirty,
+            rustc: "rustc 1.89.0".to_string(),
+            platform: "macos/aarch64".to_string(),
+        }
+    }
+
+    fn ownership(ownable: bool) -> RestartOwnership {
+        RestartOwnership {
+            ownable,
+            profile: "seat-lanytehq".to_string(),
+            cli_username: Some("agent-seat".to_string()),
+            daemon_username: Some(if ownable { "agent-seat" } else { "agent-other" }.to_string()),
+            reason: "test fixture".to_string(),
+        }
+    }
+
+    const COMMIT_A: &str = "aaaaaaa1111111aaaaaaa1111111aaaaaaa11111";
+    const COMMIT_B: &str = "bbbbbbb2222222bbbbbbb2222222bbbbbbb22222";
+
+    /// An owned daemon on the same pin scores, and scores `match`.
+    #[test]
+    fn owned_daemon_on_the_same_pin_scores_a_match() {
+        let (scored, verdict) = score_generation(
+            Some(&ownership(true)),
+            &pin(COMMIT_A, Some(false)),
+            Some(&pin(COMMIT_A, Some(false))),
+        );
+        assert!(scored, "ownership was established, so the gate is open");
+        assert_eq!(verdict, Some(true));
+    }
+
+    /// An owned daemon on a different pin scores, and scores `MISMATCH` —
+    /// the case the whole verb exists to catch.
+    #[test]
+    fn owned_daemon_on_a_different_pin_scores_a_mismatch() {
+        let (scored, verdict) = score_generation(
+            Some(&ownership(true)),
+            &pin(COMMIT_A, Some(false)),
+            Some(&pin(COMMIT_B, Some(false))),
+        );
+        assert!(scored);
+        assert_eq!(verdict, Some(false));
+    }
+
+    /// Ownership opens the gate; it does not manufacture a verdict. An
+    /// owned daemon that cannot state its own pin stays `unknown`.
+    #[test]
+    fn owned_daemon_with_an_unknown_pin_is_scored_but_undecided() {
+        let (scored, verdict) = score_generation(
+            Some(&ownership(true)),
+            &pin(COMMIT_A, Some(false)),
+            Some(&pin("unknown", None)),
+        );
+        assert!(scored);
+        assert_eq!(verdict, None, "an unknown pin is not a mismatch");
+
+        let (scored, verdict) =
+            score_generation(Some(&ownership(true)), &pin(COMMIT_A, Some(false)), None);
+        assert!(scored);
+        assert_eq!(
+            verdict, None,
+            "a daemon that reported no pin is not a mismatch"
+        );
+    }
+
+    /// FIX-1, the load-bearing case: a foreign daemon is never scored,
+    /// **even when the pins agree**. Matching pins on a daemon this
+    /// environment cannot restart are not evidence — the owning seat can
+    /// cycle it at any moment — so no verdict is printed.
+    #[test]
+    fn a_foreign_daemon_is_not_scored_even_when_the_pins_agree() {
+        let (scored, verdict) = score_generation(
+            Some(&ownership(false)),
+            &pin(COMMIT_A, Some(false)),
+            Some(&pin(COMMIT_A, Some(false))),
+        );
+        assert!(!scored, "a daemon we do not own is never scored");
+        assert_eq!(
+            verdict, None,
+            "withholding the verdict is the point: identical pins must not \
+             surface as a confident `Generation: match` about someone else's daemon"
+        );
+    }
+
+    /// No ownership probe at all (no profile resolved) is the same
+    /// closed gate, not a default-open one.
+    #[test]
+    fn an_undetermined_ownership_is_not_scored() {
+        let (scored, verdict) = score_generation(
+            None,
+            &pin(COMMIT_A, Some(false)),
+            Some(&pin(COMMIT_A, Some(false))),
+        );
+        assert!(!scored);
+        assert_eq!(verdict, None);
+    }
+
+    /// A dirty working tree on one side only is a different generation
+    /// even at the same commit, and is scored as such when owned.
+    #[test]
+    fn owned_daemon_differing_only_in_dirtiness_is_a_mismatch() {
+        let (scored, verdict) = score_generation(
+            Some(&ownership(true)),
+            &pin(COMMIT_A, Some(true)),
+            Some(&pin(COMMIT_A, Some(false))),
+        );
+        assert!(scored);
+        assert_eq!(verdict, Some(false));
+    }
+
+    /// The provider's error body never reaches the operator-facing
+    /// reason. A foreign profile's 403 payload carries a correlation id
+    /// and an internal error id; the operator needs the classification,
+    /// not the payload.
+    #[test]
+    fn a_rejected_credential_summarizes_without_the_provider_body() {
+        let body = r#"{"id":"api.context.permissions.app_error","message":"You do not have the appropriate permissions.","detailed_error":"","request_id":"kjy8x1t4tbrupcgm1ye3wm3rma","status_code":403}"#;
+        let err = CliError::Core(chanvoy_core::CoreError::Api {
+            status: chanvoy_core::StatusCode::FORBIDDEN,
+            message: body.to_string(),
+        });
+
+        let summary = preflight_failure_summary(&err);
+        assert!(
+            summary.contains("403"),
+            "the status is the actionable part and is kept: {summary}"
+        );
+        assert!(
+            !summary.contains("request_id") && !summary.contains("kjy8x1t4tbrupcgm1ye3wm3rma"),
+            "the correlation id must not reach the human line: {summary}"
+        );
+        assert!(
+            !summary.contains("app_error") && !summary.contains("detailed_error"),
+            "the provider's internal error shape must not reach the human line: {summary}"
+        );
+    }
+
+    /// A provider that is down or throttling has not said anything about
+    /// this environment's credential, and must not be reported as if it
+    /// had — that sends an operator to re-source an identity that is fine.
+    /// The body stays redacted either way; only the wording changes.
+    #[test]
+    fn a_server_side_failure_is_not_reported_as_a_rejected_credential() {
+        let body = r#"{"id":"api.context.internal_error","message":"Internal server error","request_id":"zzq1t4tbrupcgm1ye3wm3rmaxx","status_code":500}"#;
+        for status in [
+            chanvoy_core::StatusCode::INTERNAL_SERVER_ERROR,
+            chanvoy_core::StatusCode::BAD_GATEWAY,
+            chanvoy_core::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let summary =
+                preflight_failure_summary(&CliError::Core(chanvoy_core::CoreError::Api {
+                    status,
+                    message: body.to_string(),
+                }));
+            assert!(
+                !summary.contains("credential"),
+                "HTTP {status} is the server failing, not a verdict on this \
+                 seat's credential: {summary}"
+            );
+            assert!(
+                summary.contains(status.as_u16().to_string().as_str()),
+                "the status is still named so the operator can tell the \
+                 cases apart: {summary}"
+            );
+            assert!(
+                !summary.contains("request_id") && !summary.contains("zzq1t4tbrupcgm1ye3wm3rmaxx"),
+                "redaction holds on every status, not only 403: {summary}"
+            );
+        }
+    }
+
+    /// Throttling is its own case: the credential is fine and the action is
+    /// to wait, not to re-source an identity.
+    #[test]
+    fn a_throttled_identity_check_says_so() {
+        let summary = preflight_failure_summary(&CliError::Core(chanvoy_core::CoreError::Api {
+            status: chanvoy_core::StatusCode::TOO_MANY_REQUESTS,
+            message: r#"{"request_id":"throttle1234567890"}"#.to_string(),
+        }));
+        assert!(!summary.contains("credential"), "{summary}");
+        assert!(summary.contains("429"), "{summary}");
+        assert!(!summary.contains("throttle1234567890"), "{summary}");
+    }
+
+    /// 401 joins 403: both are the server speaking about this credential.
+    #[test]
+    fn an_unauthorized_status_still_names_the_credential() {
+        let summary = preflight_failure_summary(&CliError::Core(chanvoy_core::CoreError::Api {
+            status: chanvoy_core::StatusCode::UNAUTHORIZED,
+            message: r#"{"request_id":"unauth1234567890"}"#.to_string(),
+        }));
+        assert!(summary.contains("credential"), "{summary}");
+        assert!(summary.contains("401"), "{summary}");
+        assert!(!summary.contains("unauth1234567890"), "{summary}");
+    }
+
+    /// Identity drift is our own diagnostic, not a provider body, so it
+    /// keeps the two usernames — that pair is exactly what the operator
+    /// acts on.
+    #[test]
+    fn an_identity_mismatch_keeps_both_usernames() {
+        let err = CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch {
+            expected: "agent-seat".to_string(),
+            actual: "agent-other".to_string(),
+        });
+        let summary = preflight_failure_summary(&err);
+        assert!(summary.contains("agent-seat"), "{summary}");
+        assert!(summary.contains("agent-other"), "{summary}");
     }
 }
