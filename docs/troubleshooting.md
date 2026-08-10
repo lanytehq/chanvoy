@@ -25,6 +25,7 @@ follow the recovery steps. Symptoms are listed roughly in
 - [`daemon start` succeeded but the next command says the daemon is gone](#daemon-start-succeeded-but-the-next-command-says-the-daemon-is-gone)
 - [The running daemon does not support a verb](#the-running-daemon-does-not-support-a-verb)
 - ["bare --limit rejected"](#bare---limit-rejected)
+- [`check` reports new posts but a `--since` read returns nothing](#check-reports-new-posts-but-a---since-read-returns-nothing)
 - [Diagnostic harness for unmatched symptoms](#diagnostic-harness)
 
 ---
@@ -557,6 +558,90 @@ chanvoy read <channel> --after <post-id> --limit 50    # since post-id, capped a
 ```
 
 **Reference:** [operator-guide.md §Session-Start Orientation](./operator-guide.md#session-start-orientation).
+
+---
+
+## `check` reports new posts but a `--since` read returns nothing
+
+**Symptom**
+
+```
+chanvoy check <channel>          # new: 15
+chanvoy read <channel> --since 5m   # nothing
+```
+
+**Cause, almost always**
+
+The two verbs answer different questions. `check` counts posts after
+your stored cursor, however long ago that was. `--since` asks the
+server for posts newer than a wall-clock timestamp. If you last engaged
+the channel two hours ago, fifteen posts can be both "new since my
+cursor" and "older than five minutes" at the same time. Nothing is
+lost, and no cursor was consumed — `--since` never reads or writes the
+cursor.
+
+**Fix**
+
+```bash
+chanvoy check <channel> --json          # take the anchor it reports
+chanvoy read <channel> --after <anchor> # the actual backlog
+```
+
+See [operator-guide.md §Catching up](./operator-guide.md#catching-up-ask-the-cursor-not-the-clock).
+
+**When it is not that**
+
+Branch on what `read --after <anchor>` did. The two cases have
+different causes and share no remedy.
+
+**1. `--after` returns the backlog, but a `--since` window you expected
+to cover those posts is empty.**
+
+Compare the backlog's `create_at` values against the window. What
+separates the two causes is which side of the boundary the posts sit
+on, so establish that before reaching for either.
+
+*The posts sit outside the window, yet you know they are recent* —
+you watched them arrive, or a probe post you just made behaves the same
+way. Measure the gap. The boundary chanvoy sends is `local now −
+window`, and it is compared against timestamps the **server** assigned.
+If this host's clock runs ahead by `S`, every server timestamp sits `S`
+further back than local time implies, so a window **shorter than `S`**
+excludes posts that arrived moments ago while a window **wider than
+`S`** still includes them. Short-empty plus wide-present, together with
+a consistent positive gap between local time and the returned
+`create_at`, is the skew signature:
+
+```bash
+chanvoy post <a-low-traffic-channel> "clock probe"   # note the local time
+chanvoy read <that-channel> --since 2m --json        # compare create_at
+```
+
+A `create_at` consistently *behind* your local clock is the tell. Fix
+the host's time sync; chanvoy has no workaround for a wrong clock.
+
+*A post whose `create_at` is at or after the boundary that was actually
+emitted is missing from the response* — do **not** blame the clock.
+That boundary was computed from this same local clock, so the post
+satisfies the request as it was sent, and no amount of skew changes
+that. Investigate the request and the provider instead: wrong window
+units, a missing `since` parameter, identity, or pagination.
+
+Widening the window and still getting nothing points the same way. It
+is not ordinary minutes-scale skew, and treating it as such sends you
+to fix the wrong thing.
+
+**2. `--after` also returns nothing, while `check` still reports new
+posts.**
+
+A clock cannot explain this: `--after` is anchored to a post id and
+never consults a timestamp, so a skewed clock leaves it working. Treat
+this as an anchor, identity, or provider question. It is the shape to
+expect when several read modes come back empty for one bot but not for
+another on the same channel.
+
+Capture `check --json` and the `--after` output together with the
+explicit identity and team, and see the diagnostic harness below.
 
 ---
 

@@ -253,6 +253,42 @@ ambiguous-intent commands); use `--since-bootstrap --limit N` for
 
 ## Resume And Attention
 
+### Catching up: ask the cursor, not the clock
+
+"What landed since I last engaged this channel?" is a **cursor**
+question. `--since` answers a different one — "what landed in the last N
+minutes of wall-clock time" — and the two only agree when your last
+engagement happens to fall inside the window you picked.
+
+```bash
+chanvoy check <channel> --json          # anchor = where you left off
+chanvoy read <channel> --after <anchor> # everything after it, exclusive
+```
+
+`check --json` reports the `anchor` it used and the `anchor_source` it
+came from, so the second command needs nothing you have to remember.
+Both verbs are pure reads: neither moves the cursor, so you can repeat
+this loop as many times as you like and then advance deliberately with
+`ack` when you have actually handled the backlog.
+
+The failure this prevents: `check` reports new posts, you reach for
+`read --since 5m`, and it returns nothing — then the backlog looks
+lost. It is not. The posts are older than five minutes, and the window
+you asked for was honest about that. Widening the window until posts
+appear works by accident and stops working the moment you step away for
+longer than your habitual guess.
+
+Use `--since` when the question really is about wall-clock time
+("what happened while I was at lunch"), and `--after` when it is about
+your own position in the conversation.
+
+Two cases are not this, and
+[Troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)
+separates them: `--after` returns the backlog but a window you expected
+to cover those posts is still empty, or `--after` returns nothing
+either. Capture the outputs before diagnosing; the two share no
+remedy.
+
 Cursor-based local-mode workflow primitives:
 
 - `chanvoy read <channel> --after <post-id>`
@@ -268,6 +304,7 @@ Cursor-based local-mode workflow primitives:
 
 Current semantics:
 
+- `read --since <window>` is a pure read over **wall-clock time**; it queries the server by timestamp and never consults the daemon cursor. A `--since` read cannot "stop at the cursor" — if it returns less than `check` reports, the difference is the window, not the cursor
 - `read --after` is a pure read and does not advance stored channel state
 - `read --since-last-mine` is a pure read and does not advance stored channel state
 - `read --since-bootstrap` is a pure read; default 50, `--limit` overrides

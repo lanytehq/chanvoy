@@ -307,3 +307,120 @@ async fn read_since_does_not_advance_cursor() {
 
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
+
+/// The emitted `?since=` boundary, asserted against the request the
+/// daemon actually sent.
+///
+/// The tests above mount wiremock with a path-only matcher, so the
+/// query string is ignored and a `--since` read is proven only from the
+/// response side: given posts, the daemon returns them. That leaves the
+/// request side unproven — a build that emitted no `since` at all, or a
+/// boundary computed in seconds instead of milliseconds, or one derived
+/// from the wrong end of the window, would satisfy every assertion in
+/// this file while sending a query that cannot mean what the operator
+/// asked for.
+///
+/// This test reads the recorded request instead. A `--since 60` (bare
+/// integer = minutes) must emit a millisecond boundary one hour behind
+/// the moment of the call, and the post sitting inside that window must
+/// come back.
+///
+/// It matters because the symptom this file documents — `check` sees
+/// posts while a time-window read comes back empty — is exactly what a
+/// wrong boundary looks like from an operator's seat, and the response
+/// side cannot tell the two apart.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn read_since_emits_a_millisecond_window_boundary() {
+    let env = TestEnv::new("per-032-since-query-boundary").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-i4", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("bravo-team", "chan-id-i4").await;
+
+    // A post whose create_at is inside the requested window, so the
+    // request-side assertion is not carried by an empty response.
+    let now_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_millis() as i64;
+    let inside_window = now_millis - 5 * 60 * 1000;
+    env.mock_channel_posts(
+        "chan-id-i4",
+        &[("post-i4-a", "user-1", "alice", "inside", inside_window)],
+    )
+    .await;
+
+    let daemon = spawn_daemon(&env).await;
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_millis() as i64;
+    let out = run_chanvoy(&env, &["--json", "read", "bravo-team", "--since", "60"]).await;
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the unix epoch")
+        .as_millis() as i64;
+    assert!(
+        out.status.success(),
+        "read --since 60 must exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let messages: Vec<serde_json::Value> =
+        serde_json::from_slice(&out.stdout).expect("read --json parses");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the post inside the window must be returned; got {messages:?}"
+    );
+
+    // The request side: find the posts fetch and read its `since`.
+    let requests = env
+        .mock
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    let posts_request = requests
+        .iter()
+        .rev()
+        .find(|r| r.url.path() == "/api/v4/channels/chan-id-i4/posts")
+        .expect("the daemon fetched channel posts");
+    let since_raw = posts_request
+        .url
+        .query_pairs()
+        .find(|(k, _)| k == "since")
+        .map(|(_, v)| v.into_owned())
+        .expect("a time-window read must emit a `since` query parameter");
+    let since: i64 = since_raw
+        .parse()
+        .unwrap_or_else(|e| panic!("`since={since_raw}` must be an integer: {e}"));
+
+    // One hour behind the call, in milliseconds. The bounds are the
+    // clock readings taken either side of the call, so this cannot go
+    // green on a boundary derived from a fixed or stale timestamp.
+    let window_millis = 60 * 60 * 1000;
+    assert!(
+        since >= before - window_millis && since <= after - window_millis,
+        "`--since 60` must emit a millisecond boundary one hour behind the \
+         call: got {since}, expected within [{}, {}]",
+        before - window_millis,
+        after - window_millis
+    );
+
+    // Seconds-vs-milliseconds is the failure this pins down: a boundary
+    // in seconds is ~1000x too small and would read as 1970 to the
+    // provider, quietly widening every window to all of history.
+    assert!(
+        since > 1_000_000_000_000,
+        "the boundary must be in milliseconds, not seconds: got {since}"
+    );
+    assert!(
+        since < inside_window,
+        "the emitted boundary must precede the post that has to be \
+         returned: boundary={since}, post create_at={inside_window}"
+    );
+
+    let _ = stop_daemon_cleanly(&env, daemon).await;
+}

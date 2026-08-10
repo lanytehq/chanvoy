@@ -360,6 +360,20 @@ done
 `check` exits 0 when there are new posts, 1 when there aren't,
 non-zero-but-not-1 on errors. Loop scripts can rely on this.
 
+When `check` says there is something new, read it by **position**, not
+by clock:
+
+```bash
+chanvoy check <channel> --json           # reports the anchor it used
+chanvoy read <channel> --after <anchor>  # exactly what came after it
+```
+
+`--since <window>` is a wall-clock query and never consults your
+cursor, so it will not show you a backlog older than the window you
+typed — `check` counting fifteen new posts and `read --since 5m`
+returning none is the two verbs agreeing, not a bug. Reach for
+`--since` when you actually mean "the last N minutes".
+
 ---
 
 ## Sandboxed agents
