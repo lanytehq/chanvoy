@@ -282,9 +282,12 @@ Use `--since` when the question really is about wall-clock time
 ("what happened while I was at lunch"), and `--after` when it is about
 your own position in the conversation.
 
-If `check` reports new posts and `read --after <anchor>` **also**
-returns nothing, that is not this — capture both outputs and see
-[Troubleshooting](./troubleshooting.md).
+Two cases are not this, and
+[Troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)
+separates them: `--after` returns the backlog but a window that should
+have covered those posts is still empty, or `--after` returns nothing
+either. Capture the outputs before diagnosing; the two share no
+remedy.
 
 Cursor-based local-mode workflow primitives:
 

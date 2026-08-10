@@ -591,31 +591,49 @@ See [operator-guide.md §Catching up](./operator-guide.md#catching-up-ask-the-cu
 
 **When it is not that**
 
-If `read --after <anchor>` *also* returns nothing while `check` still
-reports new posts, the mode explanation does not apply. Two known
-possibilities, in the order worth checking:
+Branch on what `read --after <anchor>` did. The two cases have
+different causes and share no remedy.
 
-1. **Local clock ahead of the server.** The window boundary is computed
-   from this machine's clock and compared against server-assigned
-   timestamps. A host running minutes fast asks for posts newer than a
-   moment that has not happened yet on the server, so every window read
-   comes back empty while cursor reads keep working — the signature is
-   `--after` fine, every `--since` empty regardless of window size.
-   Compare the two clocks:
+**1. `--after` returns the backlog, but a `--since` window that should
+have covered those posts is empty.**
 
-   ```bash
-   chanvoy post <a-low-traffic-channel> "clock probe"   # note the local time
-   chanvoy read <that-channel> --since 2m --json        # compare create_at
-   ```
+First compare the backlog's `create_at` values against the window you
+asked for. If the posts really are older than the window, this is the
+ordinary case above and there is nothing wrong. If they fall *inside*
+it, suspect the clock the boundary was computed from.
 
-   A `create_at` meaningfully *behind* your local clock is the tell.
-   Fix the host's time sync; chanvoy has no workaround for a wrong
-   clock.
+The boundary is `local now − window`, and it is compared against
+timestamps the server assigned. A local clock running ahead by `S`
+shifts the boundary forward by `S`, so a window **shorter than `S`**
+asks for posts newer than a moment the server has not reached yet and
+comes back empty. A window **wider than `S`** still reaches real posts
+and returns them — so widening the window and seeing posts appear is
+itself the signature.
 
-2. **Reads failing under one identity while another works.** If several
-   read shapes come back empty for one bot but not for another on the
-   same channel, this is not a window problem. Capture the outputs and
-   the identity, and see the diagnostic harness below.
+```bash
+chanvoy post <a-low-traffic-channel> "clock probe"   # note the local time
+chanvoy read <that-channel> --since 2m --json        # compare create_at
+```
+
+A `create_at` meaningfully *behind* your local clock is the tell. Fix
+the host's time sync; chanvoy has no workaround for a wrong clock.
+
+If **wide** windows are also empty, stop — that is not ordinary
+minutes-scale skew. Wrong window units, a missing `since` parameter,
+identity, or the provider are all live candidates, and blaming the
+clock here sends you to fix the wrong thing.
+
+**2. `--after` also returns nothing, while `check` still reports new
+posts.**
+
+A clock cannot explain this: `--after` is anchored to a post id and
+never consults a timestamp, so a skewed clock leaves it working. Treat
+this as an anchor, identity, or provider question. It is the shape to
+expect when several read modes come back empty for one bot but not for
+another on the same channel.
+
+Capture `check --json` and the `--after` output together with the
+explicit identity and team, and see the diagnostic harness below.
 
 ---
 

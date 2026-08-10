@@ -249,8 +249,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator guide and the agent onboarding doc now give the
   `check --json` → `read --after <anchor>` loop, and troubleshooting
   covers the case where `check` reports new posts and a `--since` read
-  returns none, including the clock-skew signature to check when
-  `--after` also comes back empty.
+  returns none. The residual branches on what `read --after` did: it
+  returns the backlog and a covering window is still empty (compare
+  timestamps; a local clock ahead by `S` empties windows shorter than
+  `S`, while wider ones still return posts), or `--after` is empty too,
+  which no clock explains and which is an identity or provider
+  question.
 - **Test coverage: the `?since=` query a time-window read emits.** The
   existing time-window tests match on path only, so they assert what the
   daemon does with a response and not what it asked for. Added a
