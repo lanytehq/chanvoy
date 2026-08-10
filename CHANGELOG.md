@@ -201,8 +201,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-request correlation id. None of that told an operator what to do,
   and it buried the fact that mattered: this environment does not hold
   that profile's identity. The failure is now classified and the status
-  kept (`server rejected this environment's credential (HTTP 403)`),
-  with the body left out of both the human line and the JSON `reason`.
+  kept, with the body left out of both the human line and the JSON
+  `reason`. The wording follows the status rather than assuming a
+  refusal: `401`/`403` name the credential, `429` names throttling, and
+  any other server-side failure says the identity check failed at the
+  server — so a provider outage never sends an operator off to re-source
+  an identity that was fine.
 
 ### Changed
 

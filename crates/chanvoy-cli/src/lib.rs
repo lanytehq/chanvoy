@@ -742,10 +742,22 @@ struct RestartOwnership {
 /// the profile: `chanvoy --profile <name> whoami`.
 fn preflight_failure_summary(err: &CliError) -> String {
     match err {
-        CliError::Core(chanvoy_core::CoreError::Api { status, .. }) => format!(
-            "server rejected this environment's credential (HTTP {})",
-            status.as_u16()
-        ),
+        // `CoreError::Api` is every non-success response, not only a refusal
+        // of this credential. Reading them all as "your credential was
+        // rejected" would send an operator to re-source an identity that is
+        // fine while the provider is down or throttling, so the wording is
+        // status-aware: only the statuses that actually speak about the
+        // caller's identity say so.
+        CliError::Core(chanvoy_core::CoreError::Api { status, .. }) => {
+            let code = status.as_u16();
+            match code {
+                401 | 403 => {
+                    format!("server rejected this environment's credential (HTTP {code})")
+                }
+                429 => format!("server throttled the identity check (HTTP {code})"),
+                _ => format!("identity check failed at the server (HTTP {code})"),
+            }
+        }
         CliError::Core(chanvoy_core::CoreError::Http(_)) => {
             "could not reach the server for the identity check".to_string()
         }
@@ -5305,6 +5317,65 @@ mod tests {
             !summary.contains("app_error") && !summary.contains("detailed_error"),
             "the provider's internal error shape must not reach the human line: {summary}"
         );
+    }
+
+    /// A provider that is down or throttling has not said anything about
+    /// this environment's credential, and must not be reported as if it
+    /// had — that sends an operator to re-source an identity that is fine.
+    /// The body stays redacted either way; only the wording changes.
+    #[test]
+    fn a_server_side_failure_is_not_reported_as_a_rejected_credential() {
+        let body = r#"{"id":"api.context.internal_error","message":"Internal server error","request_id":"zzq1t4tbrupcgm1ye3wm3rmaxx","status_code":500}"#;
+        for status in [
+            chanvoy_core::StatusCode::INTERNAL_SERVER_ERROR,
+            chanvoy_core::StatusCode::BAD_GATEWAY,
+            chanvoy_core::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let summary =
+                preflight_failure_summary(&CliError::Core(chanvoy_core::CoreError::Api {
+                    status,
+                    message: body.to_string(),
+                }));
+            assert!(
+                !summary.contains("credential"),
+                "HTTP {status} is the server failing, not a verdict on this \
+                 seat's credential: {summary}"
+            );
+            assert!(
+                summary.contains(status.as_u16().to_string().as_str()),
+                "the status is still named so the operator can tell the \
+                 cases apart: {summary}"
+            );
+            assert!(
+                !summary.contains("request_id") && !summary.contains("zzq1t4tbrupcgm1ye3wm3rmaxx"),
+                "redaction holds on every status, not only 403: {summary}"
+            );
+        }
+    }
+
+    /// Throttling is its own case: the credential is fine and the action is
+    /// to wait, not to re-source an identity.
+    #[test]
+    fn a_throttled_identity_check_says_so() {
+        let summary = preflight_failure_summary(&CliError::Core(chanvoy_core::CoreError::Api {
+            status: chanvoy_core::StatusCode::TOO_MANY_REQUESTS,
+            message: r#"{"request_id":"throttle1234567890"}"#.to_string(),
+        }));
+        assert!(!summary.contains("credential"), "{summary}");
+        assert!(summary.contains("429"), "{summary}");
+        assert!(!summary.contains("throttle1234567890"), "{summary}");
+    }
+
+    /// 401 joins 403: both are the server speaking about this credential.
+    #[test]
+    fn an_unauthorized_status_still_names_the_credential() {
+        let summary = preflight_failure_summary(&CliError::Core(chanvoy_core::CoreError::Api {
+            status: chanvoy_core::StatusCode::UNAUTHORIZED,
+            message: r#"{"request_id":"unauth1234567890"}"#.to_string(),
+        }));
+        assert!(summary.contains("credential"), "{summary}");
+        assert!(summary.contains("401"), "{summary}");
+        assert!(!summary.contains("unauth1234567890"), "{summary}");
     }
 
     /// Identity drift is our own diagnostic, not a provider body, so it
