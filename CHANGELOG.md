@@ -56,6 +56,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observation to exhaustion inside the deadman. Filters refuse empty values and
   oversize/invalid patterns before the wait arms. The daemon method
   `wait_channel_v2` is the capability gate (cycle the daemon after install).
+- **Install ↔ daemon cycle honesty (PER-038A).** Shared-host `make install`
+  restarts only **ownable** daemons. Ownership is daemon-reported:
+  `chanvoy daemon ownable --profile` (start-preflight whoami matches live
+  `status.mattermost_username`) — not ambient env vs TOML bot string equality
+  (org-spanning seat naming conventions diverge). Foreign profiles are **left
+  running** on the previous binary with an explicit self-cycle list.
+  `chanvoy version --extended` / `--json -e` reports dual identity: CLI host
+  pin (top-level, back-compat) plus best-effort `daemon` pin, `daemon_profile`,
+  and `generation_match` only when the probed daemon is restart-ownable in this
+  environment (`generation_scored`); foreign/`active_profile` probes never
+  emit a bare Generation match. `daemon status` includes additive `binary`
+  (daemon process pin) and human `binary_commit`.
 
 ### Changed
 

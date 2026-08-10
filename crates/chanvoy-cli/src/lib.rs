@@ -5,22 +5,22 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    check_search_operator_conflicts, list_profiles, load_active_profile, load_profile, load_token,
-    parse_time_window, pid_path_for_profile, socket_path_for_profile, store_active_profile,
-    store_profile, AckResult, AttentionListResult, AttentionShowResult, AttentionSource,
-    CapabilityClass, Channel, ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState,
-    DaemonStatus, DmConversation, Identity, LegacyChannel, MattermostClient, Message, Notification,
-    PinResult, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult,
-    SeedCursorsResult, SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult,
-    UnreadNotifications, WaitResult, WsConnectionState,
+    check_search_operator_conflicts, format_basic as format_host_basic,
+    format_extended as format_host_extended, host_generation_match, list_profiles,
+    load_active_profile, load_profile, load_token, parse_time_window, pid_path_for_profile,
+    resolve_host_build_info, socket_path_for_profile, store_active_profile, store_profile,
+    AckResult, AttentionListResult, AttentionShowResult, AttentionSource, CapabilityClass, Channel,
+    ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation,
+    Identity, LegacyChannel, MattermostClient, Message, Notification, PinResult, PostReceipt,
+    Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
+    SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitResult,
+    WsConnectionState,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 use tokio::process::Command;
-
-mod host_build_info;
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -187,13 +187,16 @@ enum CommandSet {
     #[command(subcommand)]
     Attention(AttentionCommand),
     /// Print the installed binary version (semver). Use `--extended` for
-    /// commit, build time, rustc, and platform — identity for dirty dogfood.
+    /// CLI host identity and, when a daemon is reachable, the daemon pin
+    /// (PER-038A dual identity for dirty dogfood after install).
     Version(VersionArgs),
 }
 
 #[derive(Debug, Args)]
 struct VersionArgs {
     /// Print host build identity: commit, built time, rustc, platform, dirty.
+    /// With a live daemon, also reports the daemon process pin and whether
+    /// CLI and daemon generations match.
     #[arg(long, short = 'e')]
     extended: bool,
 }
@@ -275,6 +278,16 @@ enum DaemonCommand {
     Stop,
     /// Report daemon health, including a live Mattermost identity probe.
     Status,
+    /// Exit 0 if this environment can restart the live daemon for a profile.
+    ///
+    /// PER-038A / FIX-2: ownership is **daemon-reported**, not env-vs-TOML
+    /// string equality. Loads the profile token, runs whoami (start preflight),
+    /// and compares to the live daemon's `status.mattermost_username`. Used by
+    /// `make install-restart-daemons` so org-spanning seats whose ambient
+    /// `LANYTE_MM_BOT_USERNAME` diverges from profile TOML bot naming still
+    /// cycle their own daemon, while foreign seats stay left-running.
+    /// Requires an explicit profile (`--profile` / `CHANVOY_PROFILE` / identity).
+    Ownable,
 }
 
 #[derive(Debug, Subcommand)]
@@ -683,35 +696,287 @@ fn init_tracing() {
         .try_init();
 }
 
-fn handle_version(json: bool, args: VersionArgs) -> Result<(), CliError> {
-    let info = host_build_info::resolve();
-    if json {
-        let value = if args.extended {
-            serde_json::to_value(&info).map_err(|e| CliError::Bootstrap(e.to_string()))?
-        } else {
-            serde_json::json!({
+/// Best-effort profile name for dual-identity daemon probe (PER-038A).
+/// Explicit `--profile` wins; otherwise the active_profile marker if present.
+fn version_probe_profile(explicit: Option<&str>) -> Option<String> {
+    if let Some(name) = explicit {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let path = chanvoy_core::active_profile_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether this process environment may restart the live daemon for `profile`.
+///
+/// PER-038A FIX-2: ownable iff (1) profile token + start preflight whoami
+/// succeeds and matches the persisted bot expectation, and (2) the live
+/// daemon's reported `mattermost_username` equals that whoami. Never compares
+/// `LANYTE_MM_BOT_USERNAME` to TOML — those strings follow divergent seat
+/// naming conventions on shared hosts.
+#[derive(Debug, Clone, serde::Serialize)]
+struct RestartOwnership {
+    ownable: bool,
+    profile: String,
+    cli_username: Option<String>,
+    daemon_username: Option<String>,
+    reason: String,
+}
+
+async fn probe_restart_ownership(profile_name: &str) -> RestartOwnership {
+    let profile = match load_profile(profile_name) {
+        Ok(p) => p,
+        Err(e) => {
+            return RestartOwnership {
+                ownable: false,
+                profile: profile_name.to_string(),
+                cli_username: None,
+                daemon_username: None,
+                reason: format!("profile load failed: {e}"),
+            };
+        }
+    };
+    let identity = match validate_persisted_profile_identity(&profile).await {
+        Ok(id) => id,
+        Err(e) => {
+            return RestartOwnership {
+                ownable: false,
+                profile: profile_name.to_string(),
+                cli_username: None,
+                daemon_username: None,
+                reason: format!("start preflight failed: {e}"),
+            };
+        }
+    };
+    match status(profile_name).await {
+        Ok(st) => {
+            let daemon_user = st.mattermost_username.clone();
+            if identity.username == daemon_user {
+                RestartOwnership {
+                    ownable: true,
+                    profile: profile_name.to_string(),
+                    cli_username: Some(identity.username),
+                    daemon_username: Some(daemon_user),
+                    reason: "cli whoami matches daemon-reported identity".into(),
+                }
+            } else {
+                RestartOwnership {
+                    ownable: false,
+                    profile: profile_name.to_string(),
+                    cli_username: Some(identity.username),
+                    daemon_username: Some(daemon_user),
+                    reason: "cli whoami does not match daemon-reported identity".into(),
+                }
+            }
+        }
+        Err(e) => RestartOwnership {
+            ownable: false,
+            profile: profile_name.to_string(),
+            cli_username: Some(identity.username),
+            daemon_username: None,
+            reason: format!("daemon unreachable for ownership probe: {e}"),
+        },
+    }
+}
+
+async fn handle_version(
+    json: bool,
+    profile_flag: Option<&str>,
+    args: VersionArgs,
+) -> Result<(), CliError> {
+    let cli_info = resolve_host_build_info();
+    if !args.extended {
+        if json {
+            let value = serde_json::json!({
                 "name": "chanvoy",
-                "version": info.version,
-            })
+                "version": cli_info.version,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value)
+                    .map_err(|e| CliError::Bootstrap(e.to_string()))?
+            );
+        } else {
+            println!("{}", format_host_basic(&cli_info));
+        }
+        return Ok(());
+    }
+
+    // PER-038A: best-effort daemon pin. Never fail version on daemon down —
+    // the CLI pin alone is still useful; absence is reported honestly.
+    let probe_profile = version_probe_profile(profile_flag);
+    let (daemon_info, daemon_profile, daemon_error, daemon_username) =
+        match probe_profile.as_deref() {
+            Some(profile) => match status(profile).await {
+                Ok(st) => (
+                    st.binary,
+                    Some(st.profile_name),
+                    None,
+                    Some(st.mattermost_username),
+                ),
+                Err(e) => (None, Some(profile.to_string()), Some(e.to_string()), None),
+            },
+            None => (None, None, None, None),
         };
+
+    // FIX-1: only score generation when this environment owns the probed
+    // daemon. A bare `active_profile` pointing at another seat must never
+    // print a confident Generation: match that conceals a stale local daemon.
+    let ownership = match daemon_profile.as_deref() {
+        Some(p) => Some(probe_restart_ownership(p).await),
+        None => None,
+    };
+    let generation_scored = ownership.as_ref().is_some_and(|o| o.ownable);
+    let gen_match = if generation_scored {
+        host_generation_match(&cli_info, daemon_info.as_ref())
+    } else {
+        None
+    };
+
+    if json {
+        // Top-level fields remain the CLI pin (back-compat for scripts that
+        // already pin on `commit` / `commit_short`). Additive keys carry
+        // dual identity.
+        let mut value =
+            serde_json::to_value(&cli_info).map_err(|e| CliError::Bootstrap(e.to_string()))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "cli".into(),
+                serde_json::to_value(&cli_info).map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            obj.insert(
+                "daemon".into(),
+                serde_json::to_value(&daemon_info)
+                    .map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            obj.insert(
+                "daemon_profile".into(),
+                serde_json::to_value(&daemon_profile)
+                    .map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            obj.insert(
+                "daemon_username".into(),
+                serde_json::to_value(&daemon_username)
+                    .map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            obj.insert(
+                "generation_scored".into(),
+                serde_json::Value::Bool(generation_scored),
+            );
+            obj.insert(
+                "generation_match".into(),
+                serde_json::to_value(gen_match).map_err(|e| CliError::Bootstrap(e.to_string()))?,
+            );
+            if let Some(own) = &ownership {
+                obj.insert(
+                    "ownership".into(),
+                    serde_json::to_value(own).map_err(|e| CliError::Bootstrap(e.to_string()))?,
+                );
+            }
+            if let Some(err) = daemon_error {
+                obj.insert("daemon_probe_error".into(), serde_json::Value::String(err));
+            }
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&value).map_err(|e| CliError::Bootstrap(e.to_string()))?
         );
         return Ok(());
     }
-    if args.extended {
-        println!("{}", host_build_info::format_extended(&info));
-    } else {
-        println!("{}", host_build_info::format_basic(&info));
+
+    // Human extended: CLI block first, then daemon pin / match verdict.
+    println!("{}", format_host_extended(&cli_info));
+    match (daemon_info.as_ref(), daemon_profile.as_deref()) {
+        (Some(d), Some(profile)) => {
+            println!("Daemon profile: {profile}");
+            if let Some(user) = daemon_username.as_deref() {
+                println!("Daemon identity: {user}");
+            }
+            println!("Daemon commit: {}", d.commit_short);
+            if d.commit != "unknown" && d.commit != cli_info.commit_short && d.commit.len() >= 7 {
+                // full pin when short alone is ambiguous vs CLI short
+                if d.commit != cli_info.commit {
+                    println!("Daemon commit (full): {}", d.commit);
+                }
+            }
+            if let Some(dirty) = d.dirty {
+                println!("Daemon dirty: {dirty}");
+            }
+            if generation_scored {
+                match gen_match {
+                    Some(true) => println!("Generation: match (CLI and daemon same pin)"),
+                    Some(false) => {
+                        println!("Generation: MISMATCH — CLI and daemon are different binaries");
+                        println!(
+                            "[!!] Cycle the daemon onto this CLI before trusting new verbs / wait:"
+                        );
+                        println!("     chanvoy daemon stop --profile {profile}");
+                        println!("     chanvoy auto-setup");
+                        println!(
+                            "     # or: make install-restart-daemons  (ownable profiles only)"
+                        );
+                    }
+                    None => println!("Generation: unknown (incomplete pin on one side)"),
+                }
+            } else {
+                // FIX-1 fail-closed: never a bare match/MISMATCH about a
+                // daemon this environment does not own.
+                let why = ownership
+                    .as_ref()
+                    .map(|o| o.reason.as_str())
+                    .unwrap_or("ownership not determined");
+                println!("Generation: not scored ({why})");
+                println!(
+                    "         probed profile `{profile}` is not restart-ownable in this environment"
+                );
+                println!(
+                    "         target your seat: chanvoy --profile <your-profile> version --extended"
+                );
+            }
+        }
+        (None, Some(profile)) => {
+            println!("Daemon profile: {profile}");
+            if let Some(err) = daemon_error {
+                println!("Daemon: unreachable ({err})");
+            } else {
+                println!("Daemon: reachable but no binary pin (pre-038A daemon or empty status)");
+            }
+            if generation_scored {
+                println!(
+                    "[!!] Cycle the daemon to report dual identity: chanvoy daemon stop --profile {profile} && chanvoy auto-setup"
+                );
+            } else {
+                let why = ownership
+                    .as_ref()
+                    .map(|o| o.reason.as_str())
+                    .unwrap_or("ownership not determined");
+                println!("Generation: not scored ({why})");
+                println!(
+                    "         target your seat: chanvoy --profile <your-profile> version --extended"
+                );
+            }
+        }
+        _ => {
+            println!("Daemon: not probed (pass --profile or set active_profile)");
+            println!("Generation: not scored (no daemon profile resolved)");
+            println!(
+                "         target your seat: chanvoy --profile <your-profile> version --extended"
+            );
+        }
     }
     Ok(())
 }
 
 async fn execute(cli: Cli) -> Result<(), CliError> {
-    // Version needs no profile or daemon — identity of the local binary only.
+    // Version is local binary identity; extended mode best-effort probes a
+    // daemon for PER-038A dual identity. Never requires a healthy daemon.
     if let CommandSet::Version(args) = cli.command {
-        return handle_version(cli.json, args);
+        return handle_version(cli.json, cli.profile.as_deref(), args).await;
     }
     // auto-setup is the bootstrap / repair surface and must not depend on resolving
     // an existing persisted profile — a malformed unrelated profile would otherwise
@@ -748,7 +1013,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     // only ever reached with an explicit `--profile`, either from an operator
     // debugging in the foreground or from `spawn_durable_daemon`.
     let policy = match &cli.command {
-        CommandSet::Daemon(DaemonCommand::Stop | DaemonCommand::Start) => {
+        CommandSet::Daemon(DaemonCommand::Stop | DaemonCommand::Start | DaemonCommand::Ownable) => {
             chanvoy_core::FallbackPolicy::ExplicitOnly
         }
         _ => chanvoy_core::FallbackPolicy::AllowReadFallbacks,
@@ -1560,6 +1825,29 @@ fn dm_usage_error() -> CliError {
 
 async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Result<(), CliError> {
     match command {
+        DaemonCommand::Ownable => {
+            let report = probe_restart_ownership(profile).await;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| CliError::Bootstrap(e.to_string()))?
+                );
+            } else if report.ownable {
+                println!(
+                    "ownable: yes (profile {profile}; cli={} daemon={})",
+                    report.cli_username.as_deref().unwrap_or("?"),
+                    report.daemon_username.as_deref().unwrap_or("?"),
+                );
+            } else {
+                println!("ownable: no (profile {profile}; {})", report.reason);
+            }
+            if report.ownable {
+                Ok(())
+            } else {
+                process::exit(1);
+            }
+        }
         DaemonCommand::Start => {
             // CHAN-TASK-001: `daemon start` is a *durable* background start.
             // It used to spawn `daemon serve` directly — no bootstrap
@@ -3617,6 +3905,12 @@ impl HumanReadable for DaemonStatus {
             self.mattermost_username,
             self.mattermost_ok
         );
+        if let Some(bin) = &self.binary {
+            out.push_str(&format!("\nbinary_commit: {}", bin.commit_short));
+            if let Some(dirty) = bin.dirty {
+                out.push_str(&format!("\nbinary_dirty: {dirty}"));
+            }
+        }
         if let Some(h) = self.health {
             out.push_str(&format!("\nhealth: {}", health_label(h)));
         }
