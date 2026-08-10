@@ -19,6 +19,12 @@ pub use host_build_info::{
     resolve as resolve_host_build_info, HostBuildInfo,
 };
 
+/// `CoreError::Api` already exposes this type in the public error enum, so
+/// downstream crates must be able to name it to match on a status. Re-export
+/// it rather than forcing every consumer to take a direct `reqwest`
+/// dependency purely to spell out a variant it already receives.
+pub use reqwest::StatusCode;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
@@ -29,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;

@@ -436,11 +436,41 @@ chanvoy auto-setup
 chanvoy version --extended             # Generation: match
 ```
 
-After `make install`, ownable daemons (ambient bot matches profile
-`bot_username`) are restarted automatically. **Foreign** profiles are
-**left running** on the previous binary (stale-but-observing) and printed
-as self-cycle targets — install does not stop a seat it cannot restart.
-Each foreign seat must cycle under its own identity.
+After `make install`, ownable daemons are restarted automatically. A
+daemon is ownable when the profile's own start-preflight `whoami` matches
+the identity the live daemon reports — not when two configured bot-name
+strings happen to look alike. **Foreign** profiles are **left running** on
+the previous binary (stale-but-observing) and printed as self-cycle
+targets — install does not stop a seat it cannot restart. Each foreign
+seat must cycle under its own identity.
+
+**Prove your own seat, not whichever profile is active**
+
+```bash
+chanvoy --profile <your-profile> version --extended
+```
+
+A bare `version --extended` probes the `active_profile` marker, which on a
+shared host may name another seat. That path deliberately reports
+`Generation: not scored` and tells you nothing about your daemon. The
+restart step prints the `--profile` form for a profile it just cycled.
+
+**Restart is stop-then-start, so a failed start leaves the profile down**
+
+Cycling an ownable daemon stops it before starting the replacement. If the
+start then fails — bad credential, revoked token, no runtime dir — that
+profile is **down**, not merely stale, until a start succeeds. The restart
+step says so per profile and repeats it in the summary; the recovery is
+the printed retry:
+
+```bash
+chanvoy daemon stop --profile <name>   # no-op if already stopped
+chanvoy daemon start --profile <name>
+```
+
+The window is bounded by that one start attempt and never spans profiles:
+each is stopped and started before the next is touched, so a failure
+cannot darken a seat the installer never intended to cycle.
 
 **Note**
 

@@ -193,6 +193,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirmed, the command says so and names the pid instead of claiming a
   clean sweep, and leaves the runtime files alone rather than deleting
   them under a process that may still be alive.
+- **A profile this environment cannot speak for now says so in one line,
+  instead of quoting the server's error payload.** Probing another seat's
+  profile — through `daemon ownable`, or through `version --extended`
+  reporting why a generation verdict was withheld — echoed the provider's
+  rejection body verbatim, including its internal error id and a
+  per-request correlation id. None of that told an operator what to do,
+  and it buried the fact that mattered: this environment does not hold
+  that profile's identity. The failure is now classified and the status
+  kept (`server rejected this environment's credential (HTTP 403)`),
+  with the body left out of both the human line and the JSON `reason`.
 
 ### Changed
 
@@ -216,6 +226,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Behavior is unchanged (attached, `Ctrl-C`-able); the docs and
   `--help` text no longer imply it differs from `daemon start` only in
   where stdio points.
+- **The post-install daemon cycle now hands back a check that actually
+  proves the upgrade.** It printed a bare `chanvoy version --extended`,
+  which probes whichever profile the shared `active_profile` marker
+  names — on a multi-seat host, frequently someone else's, which reports
+  `Generation: not scored` and says nothing about the operator's own
+  daemon. The hint now names a profile the step just restarted (falling
+  back to `--profile <your-profile>`) and states why the bare form is not
+  a proof. A profile whose restart stops but fails to start again is also
+  now called out as **down** rather than left to read as merely stale,
+  both per profile and in the summary line.
 
 ### Documentation
 
