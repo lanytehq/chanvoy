@@ -594,34 +594,42 @@ See [operator-guide.md §Catching up](./operator-guide.md#catching-up-ask-the-cu
 Branch on what `read --after <anchor>` did. The two cases have
 different causes and share no remedy.
 
-**1. `--after` returns the backlog, but a `--since` window that should
-have covered those posts is empty.**
+**1. `--after` returns the backlog, but a `--since` window you expected
+to cover those posts is empty.**
 
-First compare the backlog's `create_at` values against the window you
-asked for. If the posts really are older than the window, this is the
-ordinary case above and there is nothing wrong. If they fall *inside*
-it, suspect the clock the boundary was computed from.
+Compare the backlog's `create_at` values against the window. What
+separates the two causes is which side of the boundary the posts sit
+on, so establish that before reaching for either.
 
-The boundary is `local now − window`, and it is compared against
-timestamps the server assigned. A local clock running ahead by `S`
-shifts the boundary forward by `S`, so a window **shorter than `S`**
-asks for posts newer than a moment the server has not reached yet and
-comes back empty. A window **wider than `S`** still reaches real posts
-and returns them — so widening the window and seeing posts appear is
-itself the signature.
+*The posts sit outside the window, yet you know they are recent* —
+you watched them arrive, or a probe post you just made behaves the same
+way. Measure the gap. The boundary chanvoy sends is `local now −
+window`, and it is compared against timestamps the **server** assigned.
+If this host's clock runs ahead by `S`, every server timestamp sits `S`
+further back than local time implies, so a window **shorter than `S`**
+excludes posts that arrived moments ago while a window **wider than
+`S`** still includes them. Short-empty plus wide-present, together with
+a consistent positive gap between local time and the returned
+`create_at`, is the skew signature:
 
 ```bash
 chanvoy post <a-low-traffic-channel> "clock probe"   # note the local time
 chanvoy read <that-channel> --since 2m --json        # compare create_at
 ```
 
-A `create_at` meaningfully *behind* your local clock is the tell. Fix
+A `create_at` consistently *behind* your local clock is the tell. Fix
 the host's time sync; chanvoy has no workaround for a wrong clock.
 
-If **wide** windows are also empty, stop — that is not ordinary
-minutes-scale skew. Wrong window units, a missing `since` parameter,
-identity, or the provider are all live candidates, and blaming the
-clock here sends you to fix the wrong thing.
+*A post whose `create_at` is at or after the boundary that was actually
+emitted is missing from the response* — do **not** blame the clock.
+That boundary was computed from this same local clock, so the post
+satisfies the request as it was sent, and no amount of skew changes
+that. Investigate the request and the provider instead: wrong window
+units, a missing `since` parameter, identity, or pagination.
+
+Widening the window and still getting nothing points the same way. It
+is not ordinary minutes-scale skew, and treating it as such sends you
+to fix the wrong thing.
 
 **2. `--after` also returns nothing, while `check` still reports new
 posts.**

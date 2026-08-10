@@ -284,8 +284,8 @@ your own position in the conversation.
 
 Two cases are not this, and
 [Troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)
-separates them: `--after` returns the backlog but a window that should
-have covered those posts is still empty, or `--after` returns nothing
+separates them: `--after` returns the backlog but a window you expected
+to cover those posts is still empty, or `--after` returns nothing
 either. Capture the outputs before diagnosing; the two share no
 remedy.
 
