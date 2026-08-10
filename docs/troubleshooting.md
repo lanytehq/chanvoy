@@ -25,6 +25,7 @@ follow the recovery steps. Symptoms are listed roughly in
 - [`daemon start` succeeded but the next command says the daemon is gone](#daemon-start-succeeded-but-the-next-command-says-the-daemon-is-gone)
 - [The running daemon does not support a verb](#the-running-daemon-does-not-support-a-verb)
 - ["bare --limit rejected"](#bare---limit-rejected)
+- [`check` reports new posts but a `--since` read returns nothing](#check-reports-new-posts-but-a---since-read-returns-nothing)
 - [Diagnostic harness for unmatched symptoms](#diagnostic-harness)
 
 ---
@@ -557,6 +558,64 @@ chanvoy read <channel> --after <post-id> --limit 50    # since post-id, capped a
 ```
 
 **Reference:** [operator-guide.md §Session-Start Orientation](./operator-guide.md#session-start-orientation).
+
+---
+
+## `check` reports new posts but a `--since` read returns nothing
+
+**Symptom**
+
+```
+chanvoy check <channel>          # new: 15
+chanvoy read <channel> --since 5m   # nothing
+```
+
+**Cause, almost always**
+
+The two verbs answer different questions. `check` counts posts after
+your stored cursor, however long ago that was. `--since` asks the
+server for posts newer than a wall-clock timestamp. If you last engaged
+the channel two hours ago, fifteen posts can be both "new since my
+cursor" and "older than five minutes" at the same time. Nothing is
+lost, and no cursor was consumed — `--since` never reads or writes the
+cursor.
+
+**Fix**
+
+```bash
+chanvoy check <channel> --json          # take the anchor it reports
+chanvoy read <channel> --after <anchor> # the actual backlog
+```
+
+See [operator-guide.md §Catching up](./operator-guide.md#catching-up-ask-the-cursor-not-the-clock).
+
+**When it is not that**
+
+If `read --after <anchor>` *also* returns nothing while `check` still
+reports new posts, the mode explanation does not apply. Two known
+possibilities, in the order worth checking:
+
+1. **Local clock ahead of the server.** The window boundary is computed
+   from this machine's clock and compared against server-assigned
+   timestamps. A host running minutes fast asks for posts newer than a
+   moment that has not happened yet on the server, so every window read
+   comes back empty while cursor reads keep working — the signature is
+   `--after` fine, every `--since` empty regardless of window size.
+   Compare the two clocks:
+
+   ```bash
+   chanvoy post <a-low-traffic-channel> "clock probe"   # note the local time
+   chanvoy read <that-channel> --since 2m --json        # compare create_at
+   ```
+
+   A `create_at` meaningfully *behind* your local clock is the tell.
+   Fix the host's time sync; chanvoy has no workaround for a wrong
+   clock.
+
+2. **Reads failing under one identity while another works.** If several
+   read shapes come back empty for one bot but not for another on the
+   same channel, this is not a window problem. Capture the outputs and
+   the identity, and see the diagnostic harness below.
 
 ---
 

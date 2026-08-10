@@ -243,6 +243,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **Catching up on a channel is documented as a cursor operation.**
+  `check` counts posts after the stored cursor; `read --since` queries the
+  server by wall-clock timestamp and never consults the cursor. The
+  operator guide and the agent onboarding doc now give the
+  `check --json` → `read --after <anchor>` loop, and troubleshooting
+  covers the case where `check` reports new posts and a `--since` read
+  returns none, including the clock-skew signature to check when
+  `--after` also comes back empty.
+- **Test coverage: the `?since=` query a time-window read emits.** The
+  existing time-window tests match on path only, so they assert what the
+  daemon does with a response and not what it asked for. Added a
+  request-side regression that reads the recorded query and pins the
+  millisecond boundary to the moment of the call. No behavior change.
+
 - **CLI `--help` cleanup.** Stripped internal brief-ID references
   (e.g., "PER-023 primitive 1," "PER-019 γ hybrid resolver,"
   "PER-008B") from clap doc-comments and from the bare-`--limit`
