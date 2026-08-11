@@ -13,7 +13,10 @@
 //!   macOS `dirs::config_dir()` does not respect `XDG_CONFIG_HOME`)
 //! - Parent-process env is never mutated
 //! - Unique per-test `--profile` slug prevents socket / pid / state
-//!   filename collisions under parallel execution
+//!   filename collisions under parallel execution within one process
+//! - Multi-seat concurrent suites on one host: process-table checks must
+//!   scope to each env's runtime dir; see `count_daemon_serve_processes`
+//!   in restart_harness.rs
 //! - Long-lived `wiremock::MockServer` per test; `reset_mocks()` between
 //!   phases prevents phase-1 responders from satisfying phase-2 asserts
 //!
@@ -58,6 +61,12 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
+    /// Isolated harness env with unique config/runtime TempDirs.
+    ///
+    /// Profile slugs are test-chosen and unique **within one cargo process**.
+    /// Concurrent multi-seat runs of the same suite on one host can reuse the
+    /// same slug; process-table observations must therefore scope to this
+    /// env's runtime dir, not the slug alone.
     pub async fn new(profile_name: &str) -> Self {
         Self {
             config_dir: tempfile::tempdir().expect("tempdir config"),
@@ -68,6 +77,12 @@ impl TestEnv {
             token_value: "test-token-value".to_string(),
             extra_env: Vec::new(),
         }
+    }
+
+    /// Alias for [`Self::new`] — documents intentional shared-slug setups
+    /// used by multi-seat collision regressions.
+    pub async fn new_fixed(profile_name: &str) -> Self {
+        Self::new(profile_name).await
     }
 
     /// PER-035: register an additional env var (e.g. a family-bot token)
@@ -224,7 +239,24 @@ impl TestEnv {
 
     /// Baseline Mattermost mocks for daemon startup (whoami + team lookup).
     /// Tests add channel / post mocks on top.
+    ///
+    /// Team lookup is mounted for the historical fixture slug used by most
+    /// suites. Prefer [`Self::mock_baseline_for_team`] when the profile's
+    /// `team_name` is a different (e.g. synthetic) value.
     pub async fn mock_baseline(&self, bot_id: &str, bot_username: &str, team_id: &str) {
+        self.mock_baseline_for_team(bot_id, bot_username, team_id, "org-lanytehq")
+            .await;
+    }
+
+    /// Like [`Self::mock_baseline`], but mounts `/api/v4/teams/name/{team_name}`
+    /// so the mock matches the profile's configured team slug.
+    pub async fn mock_baseline_for_team(
+        &self,
+        bot_id: &str,
+        bot_username: &str,
+        team_id: &str,
+        team_name: &str,
+    ) {
         Mock::given(method("GET"))
             .and(path("/api/v4/users/me"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -237,11 +269,11 @@ impl TestEnv {
             .mount(&self.mock)
             .await;
         Mock::given(method("GET"))
-            .and(path("/api/v4/teams/name/org-lanytehq"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"id": team_id, "name": "org-lanytehq"})),
-            )
+            .and(path(format!("/api/v4/teams/name/{team_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": team_id,
+                "name": team_name,
+            })))
             .mount(&self.mock)
             .await;
     }
