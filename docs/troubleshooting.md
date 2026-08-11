@@ -619,9 +619,12 @@ chanvoy doctor                  # or: doctor <channel> --json
 ```
 
 `doctor` compares local wall clock to the provider HTTP `Date` header and
-reports `suspected_ahead` / `suspected_behind` / `unavailable` without
-mutating cursors. When skew is suspected, it points at the catch-up loop
-above. See [operator-guide.md §doctor](./operator-guide.md#read-visibility-diagnostics-doctor).
+reports a banded clock verdict without mutating cursors: `healthy` (≤5s),
+`elevated_ahead` / `elevated_behind` ((5s, 30s] — soft, exit 1),
+`suspected_ahead` / `suspected_behind` (>30s), or `unavailable` (no
+trustworthy `Date`). Elevated- and suspected-ahead point at the catch-up
+loop above. Full band table:
+[operator-guide.md §doctor](./operator-guide.md#read-visibility-diagnostics-doctor).
 
 If you need a manual cross-check without `doctor`, compare a known post's
 `create_at` explicitly:
