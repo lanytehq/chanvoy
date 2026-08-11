@@ -354,19 +354,28 @@ states stay distinct:
 | `clock` | Local wall clock vs HTTP `Date` on `GET /users/me` |
 | `channel` (optional) | Pure resolve / membership for a named channel |
 
-Clock verdicts: `healthy`, `suspected_ahead`, `suspected_behind`,
-`unavailable`. A missing or unparseable `Date` is **unavailable** — never
-a green skew verdict. Suspected-ahead guidance points at the catch-up
-loop (`check --json` → `read --after <anchor>`); fix host time sync when
-skew is real. A post at or after the emitted `--since` boundary that is
-still missing is a request/provider question, not NTP (see
+Clock verdicts (residual after RTT/2):
+
+| Verdict | Residual band |
+| --- | --- |
+| `healthy` | ≤ 5s noise |
+| `elevated_ahead` / `elevated_behind` | (5s, 30s] — soft non-healthy (exit 1) |
+| `suspected_ahead` / `suspected_behind` | > 30s |
+| `unavailable` | no trustworthy `Date` |
+
+A missing or unparseable `Date` is **unavailable** — never a green skew
+verdict. **Never** report `healthy` / exit 0 when residual is above the
+5s noise bound. Elevated- and suspected-ahead guidance points at the
+catch-up loop (`check --json` → `read --after <anchor>`); fix host time
+sync when skew is real. A post at or after the emitted `--since` boundary
+that is still missing is a request/provider question, not NTP (see
 [troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)).
 
 Exit codes: **0** all checks pass · **1** any soft finding (clock
-`suspected_*` / unavailable, generation mismatch or not scored, channel
-throttle warn, daemon mattermost_ok false) · **2** hard failure (auth /
-identity mismatch, channel hard fail, daemon unreachable or identity
-drift).
+`elevated_*` / `suspected_*` / unavailable, generation mismatch or not
+scored, channel throttle warn, daemon mattermost_ok false) · **2** hard
+failure (auth / identity mismatch, channel hard fail, daemon unreachable
+or identity drift).
 
 ## Reopening A Cited Post (`show` / `thread`)
 

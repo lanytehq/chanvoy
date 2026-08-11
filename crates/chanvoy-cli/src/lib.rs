@@ -4097,6 +4097,8 @@ fn check_verdict_label(v: CheckVerdict) -> &'static str {
 fn clock_verdict_label(v: chanvoy_core::ClockVerdict) -> &'static str {
     match v {
         chanvoy_core::ClockVerdict::Healthy => "healthy",
+        chanvoy_core::ClockVerdict::ElevatedAhead => "elevated_ahead",
+        chanvoy_core::ClockVerdict::ElevatedBehind => "elevated_behind",
         chanvoy_core::ClockVerdict::SuspectedAhead => "suspected_ahead",
         chanvoy_core::ClockVerdict::SuspectedBehind => "suspected_behind",
         chanvoy_core::ClockVerdict::Unavailable => "unavailable",

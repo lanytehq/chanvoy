@@ -24,10 +24,21 @@ pub enum CheckVerdict {
 }
 
 /// Clock skew classification (evidence-bearing vocabulary).
+///
+/// Bands (residual after RTT/2 allowance):
+/// * `healthy` — residual ≤ [`CLOCK_HEALTHY_BOUND_MS`] (5s noise)
+/// * `elevated_*` — residual in (5s, 30s] — soft non-healthy (FIX-2)
+/// * `suspected_*` — residual > [`CLOCK_SUSPECT_THRESHOLD_MS`] (30s)
+/// * `unavailable` — no trustworthy server observation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClockVerdict {
     Healthy,
+    /// Residual above noise and at or under the suspicion threshold; host
+    /// appears ahead. Soft finding — not pass/exit 0 (FIX-2).
+    ElevatedAhead,
+    /// Same mid-band, host appears behind.
+    ElevatedBehind,
     SuspectedAhead,
     SuspectedBehind,
     Unavailable,
@@ -96,8 +107,10 @@ pub fn parse_http_date_ms(value: &str) -> Option<i64> {
 /// Classify local mid-time vs a server observation.
 ///
 /// * `delta = local_mid − server` — positive means the host is ahead.
-/// * Residual magnitude after subtracting `RTT/2` must clear
-///   [`CLOCK_SUSPECT_THRESHOLD_MS`] before `suspected_*` is returned.
+/// * Residual after subtracting `RTT/2`:
+///   - ≤ [`CLOCK_HEALTHY_BOUND_MS`] → `healthy`
+///   - (healthy, [`CLOCK_SUSPECT_THRESHOLD_MS`]] → `elevated_*` (soft; not pass)
+///   - \> suspect threshold → `suspected_*`
 /// * Missing server time ⇒ `unavailable` (never a green skew verdict).
 ///
 /// Does **not** invent clock as the explanation for a missing post that
@@ -139,14 +152,23 @@ pub fn classify_clock_skew(
             )),
         );
     }
-    // Between healthy noise and suspect threshold: report healthy with
-    // the measured delta so operators can still see the evidence, but do
-    // not claim suspicion without clearing the bar.
+    // Mid-band (FIX-2): residual above the healthy noise bound and at or
+    // under the suspicion threshold. This is *not* healthy — a 15s residual
+    // can empty a 5s/10s --since window — but it is not yet full suspicion.
+    if delta > 0 {
+        return (
+            ClockVerdict::ElevatedAhead,
+            Some(delta),
+            Some(format!(
+                "local clock residual ~{residual}ms ahead of server (above {CLOCK_HEALTHY_BOUND_MS}ms noise, at or under {CLOCK_SUSPECT_THRESHOLD_MS}ms suspicion); short --since windows may return empty"
+            )),
+        );
+    }
     (
-        ClockVerdict::Healthy,
+        ClockVerdict::ElevatedBehind,
         Some(delta),
         Some(format!(
-            "measured |skew| residual ~{residual}ms is above noise but below the {CLOCK_SUSPECT_THRESHOLD_MS}ms suspicion threshold"
+            "local clock residual ~{residual}ms behind server (above {CLOCK_HEALTHY_BOUND_MS}ms noise, at or under {CLOCK_SUSPECT_THRESHOLD_MS}ms suspicion)"
         )),
     )
 }
@@ -158,11 +180,14 @@ pub fn clock_check_from_observation(obs: &ServerTimeObservation) -> ClockCheck {
     let reason = reason.or_else(|| obs.unavailable_reason.clone());
     let check = match verdict {
         ClockVerdict::Healthy => CheckVerdict::Pass,
-        ClockVerdict::SuspectedAhead | ClockVerdict::SuspectedBehind => CheckVerdict::Warn,
+        ClockVerdict::ElevatedAhead
+        | ClockVerdict::ElevatedBehind
+        | ClockVerdict::SuspectedAhead
+        | ClockVerdict::SuspectedBehind => CheckVerdict::Warn,
         ClockVerdict::Unavailable => CheckVerdict::Unavailable,
     };
     let guidance = match verdict {
-        ClockVerdict::SuspectedAhead => Some(
+        ClockVerdict::ElevatedAhead | ClockVerdict::SuspectedAhead => Some(
             "For catch-up use: chanvoy check <channel> --json  then  chanvoy read <channel> --after <anchor>. Fix host time sync; chanvoy cannot compensate for a wrong clock.".into(),
         ),
         _ => None,
@@ -299,31 +324,67 @@ mod tests {
     #[test]
     fn classify_rtt_eats_into_residual() {
         let server = 1_000_000;
-        // 40s raw delta but 30s RTT → uncertainty 15s → residual 25s < 30s threshold
+        // 40s raw delta but 30s RTT → uncertainty 15s → residual 25s → elevated mid-band
         let (v, _, _) = classify_clock_skew(server + 40_000, Some(server), 30_000);
-        assert_eq!(v, ClockVerdict::Healthy);
+        assert_eq!(v, ClockVerdict::ElevatedAhead);
     }
 
     #[test]
-    fn classify_between_noise_and_suspect_stays_healthy() {
+    fn classify_mid_band_ahead_is_elevated_not_healthy() {
         let server = 1_000_000;
-        // 15s residual: above 5s noise, below 30s suspect
+        // 15s residual: above 5s noise, at/under 30s suspect → elevated_ahead (FIX-2)
         let (v, d, reason) = classify_clock_skew(server + 15_000, Some(server), 0);
-        assert_eq!(v, ClockVerdict::Healthy);
+        assert_eq!(v, ClockVerdict::ElevatedAhead);
         assert_eq!(d, Some(15_000));
-        assert!(reason.unwrap().contains("suspicion threshold"));
+        assert!(reason.unwrap().contains("short --since"));
+        let check = clock_check_from_observation(&ServerTimeObservation {
+            local_before_ms: server + 15_000,
+            local_after_ms: server + 15_000,
+            local_mid_ms: server + 15_000,
+            rtt_ms: 0,
+            server_ms: Some(server),
+            source: ServerTimeSource::HttpDate,
+            date_header_present: true,
+            date_header_parse_ok: true,
+            unavailable_reason: None,
+        });
+        assert_eq!(check.check, CheckVerdict::Warn);
+        assert!(check.guidance.as_ref().unwrap().contains("--after"));
+    }
+
+    #[test]
+    fn classify_mid_band_behind_is_elevated_not_healthy() {
+        let server = 1_000_000;
+        let (v, d, reason) = classify_clock_skew(server - 15_000, Some(server), 0);
+        assert_eq!(v, ClockVerdict::ElevatedBehind);
+        assert_eq!(d, Some(-15_000));
+        assert!(reason.unwrap().contains("behind"));
+        assert_eq!(
+            doctor_exit_code(&[CheckVerdict::Warn], false),
+            1,
+            "elevated mid-band must soft-fail exit"
+        );
     }
 
     #[test]
     fn threshold_edge_exactly_suspect_bound() {
         let server = 1_000_000;
-        // residual == threshold + 1 → suspected; residual == threshold → healthy band
+        // residual == threshold → elevated (at or under suspicion); +1 → suspected
         let (v_eq, _, _) =
             classify_clock_skew(server + CLOCK_SUSPECT_THRESHOLD_MS, Some(server), 0);
-        assert_eq!(v_eq, ClockVerdict::Healthy);
+        assert_eq!(v_eq, ClockVerdict::ElevatedAhead);
         let (v_over, _, _) =
             classify_clock_skew(server + CLOCK_SUSPECT_THRESHOLD_MS + 1, Some(server), 0);
         assert_eq!(v_over, ClockVerdict::SuspectedAhead);
+    }
+
+    #[test]
+    fn healthy_bound_edge_stays_healthy() {
+        let server = 1_000_000;
+        let (v, _, _) = classify_clock_skew(server + CLOCK_HEALTHY_BOUND_MS, Some(server), 0);
+        assert_eq!(v, ClockVerdict::Healthy);
+        let (v2, _, _) = classify_clock_skew(server + CLOCK_HEALTHY_BOUND_MS + 1, Some(server), 0);
+        assert_eq!(v2, ClockVerdict::ElevatedAhead);
     }
 
     #[test]
