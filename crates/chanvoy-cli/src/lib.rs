@@ -5,12 +5,13 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    check_search_operator_conflicts, format_basic as format_host_basic,
-    format_extended as format_host_extended, host_generation_match, list_profiles,
-    load_active_profile, load_profile, load_token, parse_time_window, pid_path_for_profile,
-    resolve_host_build_info, socket_path_for_profile, store_active_profile, store_profile,
-    AckResult, AttentionListResult, AttentionShowResult, AttentionSource, CapabilityClass, Channel,
-    ChanvoyScopes, CheckResult, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation,
+    check_search_operator_conflicts, clock_check_from_observation, doctor_exit_code,
+    format_basic as format_host_basic, format_extended as format_host_extended,
+    host_generation_match, list_profiles, load_active_profile, load_profile, load_token,
+    parse_time_window, pid_path_for_profile, provider_status_class, resolve_host_build_info,
+    socket_path_for_profile, store_active_profile, store_profile, AckResult, AttentionListResult,
+    AttentionShowResult, AttentionSource, CapabilityClass, Channel, ChanvoyScopes, CheckResult,
+    CheckVerdict, ClockCheck, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation,
     Identity, LegacyChannel, MattermostClient, Message, Notification, PinResult, PostReceipt,
     Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
     SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitResult,
@@ -190,6 +191,22 @@ enum CommandSet {
     /// CLI host identity and, when a daemon is reachable, the daemon pin
     /// (PER-038A dual identity for dirty dogfood after install).
     Version(VersionArgs),
+    /// Read-visibility self-diagnostic: identity, dual pin, server-time
+    /// clock skew, and optional channel access. Cursor-neutral — never
+    /// posts, acks, advances, or calls `check`.
+    Doctor(DoctorArgs),
+}
+
+/// `chanvoy doctor [channel]` — CHAN-TASK-003.
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Optional channel to probe for membership / resolve access.
+    /// Pure resolve only; does not read posts or touch attention state.
+    channel: Option<String>,
+    /// Team slug when the channel name is ambiguous, or for explicit
+    /// `<team>` membership checks with the channel argument.
+    #[arg(long)]
+    team: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1339,6 +1356,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 .await?;
             print_json_or_text(cli.json, &result, &render_attention_show_text(&result))
         }
+        CommandSet::Doctor(args) => handle_doctor(&profile, cli.json, args).await,
     }
 }
 
@@ -3508,6 +3526,487 @@ fn store_profile_and_maybe_activate(
         }
     }
     Ok(())
+}
+
+/// CHAN-TASK-003: assemble and print a cursor-neutral read-visibility report.
+///
+/// Network half uses the profile token via core (works when the daemon is
+/// degraded). Dual pin reuses PER-038A ownership/generation scoring. Never
+/// mutates attention state.
+async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Result<(), CliError> {
+    let profile = load_profile(profile_name)?;
+    let mut checks: Vec<CheckVerdict> = Vec::new();
+    let mut hard_failure = false;
+
+    // --- daemon reachability + status (best-effort) ---
+    let (daemon_check, daemon_block, daemon_binary) = match status(profile_name).await {
+        Ok(st) => {
+            let drifted = st.mattermost_identity_drift.unwrap_or(false);
+            let check = if drifted {
+                hard_failure = true;
+                CheckVerdict::Fail
+            } else if st.mattermost_ok {
+                CheckVerdict::Pass
+            } else {
+                CheckVerdict::Warn
+            };
+            checks.push(check);
+            let binary = st.binary.clone();
+            (
+                check,
+                DoctorDaemonBlock {
+                    reachable: true,
+                    mattermost_ok: st.mattermost_ok,
+                    identity_drift: drifted,
+                    mattermost_username: Some(st.mattermost_username.clone()),
+                    health: st.health.map(|h| health_label(h).to_string()),
+                    reason: if drifted {
+                        Some(
+                            "daemon reports identity drift; network RPCs through the daemon are refused"
+                                .into(),
+                        )
+                    } else if !st.mattermost_ok {
+                        Some("daemon is up but its last Mattermost probe was not ok".into())
+                    } else {
+                        None
+                    },
+                },
+                binary,
+            )
+        }
+        Err(e) => {
+            let check = CheckVerdict::Fail;
+            hard_failure = true;
+            checks.push(check);
+            (
+                check,
+                DoctorDaemonBlock {
+                    reachable: false,
+                    mattermost_ok: false,
+                    identity_drift: false,
+                    mattermost_username: None,
+                    health: None,
+                    reason: Some(format!("daemon unreachable: {e}")),
+                },
+                None,
+            )
+        }
+    };
+
+    // --- generation (reuse ownership gate; no bare active_profile greenwash) ---
+    let cli_info = resolve_host_build_info();
+    let ownership = probe_restart_ownership(profile_name).await;
+    let daemon_info = daemon_binary;
+    let (generation_scored, generation_match) =
+        score_generation(Some(&ownership), &cli_info, daemon_info.as_ref());
+    let generation_check = if !generation_scored {
+        CheckVerdict::Unavailable
+    } else if generation_match == Some(true) {
+        CheckVerdict::Pass
+    } else {
+        CheckVerdict::Warn
+    };
+    checks.push(generation_check);
+    let generation_block = DoctorGenerationBlock {
+        check: generation_check,
+        generation_scored,
+        generation_match,
+        ownership: ownership.clone(),
+        cli_commit: cli_info.commit_short.clone(),
+        daemon_commit: daemon_info.as_ref().map(|d| d.commit_short.clone()),
+        reason: if !generation_scored {
+            Some(format!("generation not scored: {}", ownership.reason))
+        } else if generation_match != Some(true) {
+            Some("CLI and daemon binary pins differ; cycle the ownable daemon after install".into())
+        } else {
+            None
+        },
+    };
+
+    // --- identity + clock (single GET /users/me with Date) ---
+    let token = load_token(&profile)?;
+    let client = MattermostClient::new(&profile, token)?;
+    let (identity_check, identity_block, clock_block) = match client.whoami_with_server_time().await
+    {
+        Ok((identity, observation)) => {
+            let id_check = CheckVerdict::Pass;
+            checks.push(id_check);
+            let clock = clock_check_from_observation(&observation);
+            checks.push(clock.check);
+            (
+                id_check,
+                DoctorIdentityBlock {
+                    ok: true,
+                    username: Some(identity.username),
+                    user_id: Some(identity.id),
+                    status_class: None,
+                    reason: None,
+                },
+                clock,
+            )
+        }
+        Err(e) => {
+            hard_failure = true;
+            let (status_class, reason) = doctor_provider_error_summary(&e);
+            let id_check = CheckVerdict::Fail;
+            checks.push(id_check);
+            // Clock unavailable when identity probe failed — do not greenwash.
+            let clock = ClockCheck {
+                verdict: chanvoy_core::ClockVerdict::Unavailable,
+                check: CheckVerdict::Unavailable,
+                delta_ms: None,
+                local_mid_ms: chanvoy_core::now_unix_millis(),
+                server_ms: None,
+                rtt_ms: 0,
+                source: chanvoy_core::ServerTimeSource::HttpDate,
+                reason: Some(
+                    "server-time observation unavailable because the identity probe failed".into(),
+                ),
+                guidance: None,
+            };
+            checks.push(clock.check);
+            (
+                id_check,
+                DoctorIdentityBlock {
+                    ok: false,
+                    username: None,
+                    user_id: None,
+                    status_class,
+                    reason: Some(reason),
+                },
+                clock,
+            )
+        }
+    };
+
+    // --- optional channel resolve (pure; no post read, no cursor) ---
+    let channel_block = if let Some(channel) = args.channel.as_deref() {
+        match client.resolve_channel(channel, args.team.as_deref()).await {
+            Ok(resolved) => {
+                let check = CheckVerdict::Pass;
+                checks.push(check);
+                Some(DoctorChannelBlock {
+                    check,
+                    requested: channel.to_string(),
+                    team: args.team.clone(),
+                    resolved_name: Some(resolved.channel_name),
+                    resolved_team: Some(resolved.team_name),
+                    status_class: None,
+                    reason: None,
+                })
+            }
+            Err(e) => {
+                let (status_class, reason, check) = doctor_channel_error_summary(&e);
+                if check == CheckVerdict::Fail {
+                    hard_failure = true;
+                }
+                checks.push(check);
+                Some(DoctorChannelBlock {
+                    check,
+                    requested: channel.to_string(),
+                    team: args.team.clone(),
+                    resolved_name: None,
+                    resolved_team: None,
+                    status_class,
+                    reason: Some(reason),
+                })
+            }
+        }
+    } else {
+        None
+    };
+
+    let exit = doctor_exit_code(&checks, hard_failure);
+    let report = DoctorReport {
+        profile: profile_name.to_string(),
+        exit_code: exit,
+        daemon: DoctorCheckWrap {
+            check: daemon_check,
+            detail: daemon_block,
+        },
+        generation: generation_block,
+        identity: DoctorCheckWrap {
+            check: identity_check,
+            detail: identity_block,
+        },
+        clock: clock_block,
+        channel: channel_block,
+        notes: vec![
+            "doctor is cursor-neutral: it does not post, ack, advance, or call check".into(),
+            "daemon reachability is not a substitute for provider read visibility".into(),
+            "a post at/after an emitted --since boundary that is still missing is a request/provider question, not clock".into(),
+        ],
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", render_doctor_human(&report));
+    }
+    if exit != 0 {
+        process::exit(exit);
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorReport {
+    profile: String,
+    exit_code: i32,
+    daemon: DoctorCheckWrap<DoctorDaemonBlock>,
+    generation: DoctorGenerationBlock,
+    identity: DoctorCheckWrap<DoctorIdentityBlock>,
+    clock: ClockCheck,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<DoctorChannelBlock>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorCheckWrap<T: serde::Serialize> {
+    check: CheckVerdict,
+    #[serde(flatten)]
+    detail: T,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorDaemonBlock {
+    reachable: bool,
+    mattermost_ok: bool,
+    identity_drift: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mattermost_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorGenerationBlock {
+    check: CheckVerdict,
+    generation_scored: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_match: Option<bool>,
+    ownership: RestartOwnership,
+    cli_commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorIdentityBlock {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorChannelBlock {
+    check: CheckVerdict,
+    requested: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    team: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_team: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+fn doctor_provider_error_summary(err: &chanvoy_core::CoreError) -> (Option<String>, String) {
+    match err {
+        chanvoy_core::CoreError::Api { status, .. } => {
+            let code = status.as_u16();
+            let class = provider_status_class(code).to_string();
+            let reason = match code {
+                401 | 403 => format!("server rejected this credential (HTTP {code})"),
+                429 => format!("server throttled the identity check (HTTP {code})"),
+                _ => format!("identity check failed at the server (HTTP {code})"),
+            };
+            (Some(class), reason)
+        }
+        chanvoy_core::CoreError::Http(_) => (
+            Some("unreachable".into()),
+            "could not reach the server for the identity check".into(),
+        ),
+        chanvoy_core::CoreError::MissingCredential(source) => (
+            Some("missing_credential".into()),
+            format!("no credential available from {source}"),
+        ),
+        chanvoy_core::CoreError::ProfileIdentityMismatch { expected, actual } => (
+            Some("identity_mismatch".into()),
+            format!("token authenticates as {actual}, profile expects {expected}"),
+        ),
+        other => (None, format!("identity check failed: {other}")),
+    }
+}
+
+fn doctor_channel_error_summary(
+    err: &chanvoy_core::CoreError,
+) -> (Option<String>, String, CheckVerdict) {
+    match err {
+        chanvoy_core::CoreError::ChannelNotFoundInAnyTeam { channel, teams } => (
+            Some("channel_not_found".into()),
+            format!(
+                "channel {channel:?} not found on any team this bot is a member of (searched {})",
+                teams.join(", ")
+            ),
+            CheckVerdict::Fail,
+        ),
+        chanvoy_core::CoreError::NotAMemberOfTeam { team, teams } => (
+            Some("not_a_member_of_team".into()),
+            format!(
+                "not a member of team {team:?}; membership covers: {}",
+                teams.join(", ")
+            ),
+            CheckVerdict::Fail,
+        ),
+        chanvoy_core::CoreError::AmbiguousChannel { channel, teams } => (
+            Some("ambiguous_channel".into()),
+            format!(
+                "channel {channel:?} is ambiguous across teams {}; use --team or <team>/<channel>",
+                teams.join(", ")
+            ),
+            CheckVerdict::Fail,
+        ),
+        chanvoy_core::CoreError::Api { status, .. } => {
+            let code = status.as_u16();
+            let class = provider_status_class(code).to_string();
+            let reason = format!("channel probe failed at the server (HTTP {code})");
+            let check = match code {
+                401 | 403 => CheckVerdict::Fail,
+                404 => CheckVerdict::Fail,
+                429 => CheckVerdict::Warn,
+                _ => CheckVerdict::Fail,
+            };
+            (Some(class), reason, check)
+        }
+        other => (
+            None,
+            format!("channel probe failed: {other}"),
+            CheckVerdict::Fail,
+        ),
+    }
+}
+
+fn render_doctor_human(report: &DoctorReport) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("chanvoy doctor — profile {}", report.profile));
+    lines.push(format!("exit_code: {}", report.exit_code));
+    lines.push(String::new());
+
+    let d = &report.daemon.detail;
+    lines.push(format!(
+        "daemon: {} (reachable={} mattermost_ok={} identity_drift={})",
+        check_verdict_label(report.daemon.check),
+        d.reachable,
+        d.mattermost_ok,
+        d.identity_drift
+    ));
+    if let Some(u) = &d.mattermost_username {
+        lines.push(format!("  username: {u}"));
+    }
+    if let Some(r) = &d.reason {
+        lines.push(format!("  reason: {r}"));
+    }
+
+    let g = &report.generation;
+    lines.push(format!(
+        "generation: {} (scored={} match={:?} cli={} daemon={})",
+        check_verdict_label(g.check),
+        g.generation_scored,
+        g.generation_match,
+        g.cli_commit,
+        g.daemon_commit.as_deref().unwrap_or("n/a")
+    ));
+    if let Some(r) = &g.reason {
+        lines.push(format!("  reason: {r}"));
+    }
+
+    let i = &report.identity.detail;
+    lines.push(format!(
+        "identity: {} (ok={})",
+        check_verdict_label(report.identity.check),
+        i.ok
+    ));
+    if let Some(u) = &i.username {
+        lines.push(format!("  username: {u}"));
+    }
+    if let Some(c) = &i.status_class {
+        lines.push(format!("  status_class: {c}"));
+    }
+    if let Some(r) = &i.reason {
+        lines.push(format!("  reason: {r}"));
+    }
+
+    let c = &report.clock;
+    lines.push(format!(
+        "clock: {} (verdict={} delta_ms={:?} rtt_ms={})",
+        check_verdict_label(c.check),
+        clock_verdict_label(c.verdict),
+        c.delta_ms,
+        c.rtt_ms
+    ));
+    if let Some(r) = &c.reason {
+        lines.push(format!("  reason: {r}"));
+    }
+    if let Some(g) = &c.guidance {
+        lines.push(format!("  guidance: {g}"));
+    }
+
+    if let Some(ch) = &report.channel {
+        lines.push(format!(
+            "channel: {} (requested={})",
+            check_verdict_label(ch.check),
+            ch.requested
+        ));
+        if let (Some(n), Some(t)) = (&ch.resolved_name, &ch.resolved_team) {
+            lines.push(format!("  resolved: {t}/{n}"));
+        }
+        if let Some(c) = &ch.status_class {
+            lines.push(format!("  status_class: {c}"));
+        }
+        if let Some(r) = &ch.reason {
+            lines.push(format!("  reason: {r}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("notes:".into());
+    for n in &report.notes {
+        lines.push(format!("  - {n}"));
+    }
+    lines.join("\n")
+}
+
+fn check_verdict_label(v: CheckVerdict) -> &'static str {
+    match v {
+        CheckVerdict::Pass => "pass",
+        CheckVerdict::Warn => "warn",
+        CheckVerdict::Fail => "fail",
+        CheckVerdict::Unavailable => "unavailable",
+    }
+}
+
+fn clock_verdict_label(v: chanvoy_core::ClockVerdict) -> &'static str {
+    match v {
+        chanvoy_core::ClockVerdict::Healthy => "healthy",
+        chanvoy_core::ClockVerdict::SuspectedAhead => "suspected_ahead",
+        chanvoy_core::ClockVerdict::SuspectedBehind => "suspected_behind",
+        chanvoy_core::ClockVerdict::Unavailable => "unavailable",
+    }
 }
 
 fn print_value<T>(json: bool, value: &T) -> Result<(), CliError>

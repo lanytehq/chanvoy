@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod doctor;
 pub mod host_build_info;
 pub mod safe_read;
 
@@ -12,6 +13,13 @@ pub use bootstrap::{
     consume_bootstrap_state, generate_nonce, read_bootstrap_state, resolve_startup_identity,
     validate_bootstrap_state, write_bootstrap_state, BootstrapError, BootstrapResolution,
     BootstrapState, BOOTSTRAP_MAX_AGE_SECS, BOOTSTRAP_NONCE_ENV,
+};
+
+pub use doctor::{
+    classify_clock_skew, clock_check_from_observation, doctor_exit_code,
+    observe_server_time_from_date_header, parse_http_date_ms, provider_status_class, CheckVerdict,
+    ClockCheck, ClockVerdict, ServerTimeObservation, ServerTimeSource, CLOCK_HEALTHY_BOUND_MS,
+    CLOCK_SUSPECT_THRESHOLD_MS,
 };
 
 pub use host_build_info::{
@@ -2900,6 +2908,19 @@ impl MattermostClient {
     }
 
     pub async fn whoami(&self) -> Result<Identity, CoreError> {
+        Ok(self.whoami_with_server_time().await?.0)
+    }
+
+    /// Authenticated identity probe that also captures a server-time
+    /// observation from the HTTP `Date` header on the same response.
+    ///
+    /// CHAN-TASK-003: a post's `create_at` is not a current server clock.
+    /// The `Date` header is the deliberate metadata-preserving source;
+    /// when it is missing or unparseable the observation reports
+    /// `unavailable` rather than inventing a healthy skew verdict.
+    pub async fn whoami_with_server_time(
+        &self,
+    ) -> Result<(Identity, ServerTimeObservation), CoreError> {
         #[derive(Deserialize)]
         struct RawUser {
             id: String,
@@ -2909,14 +2930,26 @@ impl MattermostClient {
             nickname: Option<String>,
             email: Option<String>,
         }
-        let user: RawUser = self.request("GET", "/users/me", None::<Value>).await?;
-        Ok(Identity {
-            id: user.id,
-            username: user.username,
-            is_bot: user.is_bot,
-            nickname: user.nickname,
-            email: user.email,
-        })
+        let local_before = now_unix_millis();
+        let (user, meta): (RawUser, ResponseMeta) = self
+            .request_with_meta("GET", "/users/me", None::<Value>)
+            .await?;
+        let local_after = now_unix_millis();
+        let observation = observe_server_time_from_date_header(
+            local_before,
+            local_after,
+            meta.date_header.as_deref(),
+        );
+        Ok((
+            Identity {
+                id: user.id,
+                username: user.username,
+                is_bot: user.is_bot,
+                nickname: user.nickname,
+                email: user.email,
+            },
+            observation,
+        ))
     }
 
     pub async fn list_channels(&self) -> Result<Vec<Channel>, CoreError> {
@@ -4798,7 +4831,7 @@ impl MattermostClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize,
     {
-        self.request_raw(method, endpoint, body).await
+        Ok(self.request_with_meta(method, endpoint, body).await?.0)
     }
 
     pub async fn request_raw<T, B>(
@@ -4807,6 +4840,24 @@ impl MattermostClient {
         endpoint: &str,
         body: Option<B>,
     ) -> Result<T, CoreError>
+    where
+        T: for<'de> Deserialize<'de>,
+        B: Serialize,
+    {
+        Ok(self.request_with_meta(method, endpoint, body).await?.0)
+    }
+
+    /// Like [`Self::request_raw`] but also returns response metadata
+    /// (HTTP `Date` header) needed for trustworthy server-time observation.
+    ///
+    /// Existing callers that only need the body keep using `request` /
+    /// `request_raw`; doctor is the first consumer of the meta half.
+    pub async fn request_with_meta<T, B>(
+        &self,
+        method: &str,
+        endpoint: &str,
+        body: Option<B>,
+    ) -> Result<(T, ResponseMeta), CoreError>
     where
         T: for<'de> Deserialize<'de>,
         B: Serialize,
@@ -4827,13 +4878,37 @@ impl MattermostClient {
         };
         let response = request.send().await?;
         let status = response.status();
+        let date_header = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let bytes = response.bytes().await?;
         if !status.is_success() {
             let message = String::from_utf8_lossy(&bytes).to_string();
             return Err(CoreError::Api { status, message });
         }
-        Ok(serde_json::from_slice(&bytes)?)
+        let body = serde_json::from_slice(&bytes)?;
+        Ok((
+            body,
+            ResponseMeta {
+                status,
+                date_header,
+            },
+        ))
     }
+}
+
+/// Metadata retained from a provider HTTP response.
+///
+/// Deliberately minimal: doctor needs the `Date` header for clock
+/// observation. Provider bodies and correlation ids stay out of this
+/// struct so they cannot leak into diagnostic reports by accident.
+#[derive(Debug, Clone)]
+pub struct ResponseMeta {
+    pub status: StatusCode,
+    /// Raw `Date` header value when the provider sent one.
+    pub date_header: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

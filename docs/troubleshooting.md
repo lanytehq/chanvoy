@@ -610,11 +610,27 @@ further back than local time implies, so a window **shorter than `S`**
 excludes posts that arrived moments ago while a window **wider than
 `S`** still includes them. Short-empty plus wide-present, together with
 a consistent positive gap between local time and the returned
-`create_at`, is the skew signature:
+`create_at`, is the skew signature.
+
+**Prefer the self-diagnostic first:**
+
+```bash
+chanvoy doctor                  # or: doctor <channel> --json
+```
+
+`doctor` compares local wall clock to the provider HTTP `Date` header and
+reports `suspected_ahead` / `suspected_behind` / `unavailable` without
+mutating cursors. When skew is suspected, it points at the catch-up loop
+above. See [operator-guide.md §doctor](./operator-guide.md#read-visibility-diagnostics-doctor).
+
+If you need a manual cross-check without `doctor`, compare a known post's
+`create_at` explicitly:
 
 ```bash
 chanvoy post <a-low-traffic-channel> "clock probe"   # note the local time
-chanvoy read <that-channel> --since 2m --json        # compare create_at
+# take the post id from the receipt
+chanvoy show <that-channel> <post-id> --json         # read create_at on that post
+chanvoy read <that-channel> --since 2m --json        # compare window inclusion
 ```
 
 A `create_at` consistently *behind* your local clock is the tell. Fix
@@ -641,7 +657,9 @@ expect when several read modes come back empty for one bot but not for
 another on the same channel.
 
 Capture `check --json` and the `--after` output together with the
-explicit identity and team, and see the diagnostic harness below.
+explicit identity and team. Run `chanvoy doctor <channel> --json` to
+separate identity/membership failures from clock skew, then see the
+diagnostic harness below.
 
 ---
 

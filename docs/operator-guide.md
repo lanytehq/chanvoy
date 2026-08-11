@@ -327,10 +327,43 @@ Current durable cursor behavior:
 - `ack <channel>` stores the channel's current latest post id at the time of the call
 - probes do not clear attention
 
-Current inspectability gap worth tracking:
+Attention state is inspectable with `chanvoy attention list` and
+`chanvoy attention show <channel>` (local only; no Mattermost calls).
+For identity, dual-pin, and clock / read-visibility diagnostics, use
+[`chanvoy doctor`](#read-visibility-diagnostics-doctor).
 
-- there is not yet a first-class `doctor` or `status` surface for showing the current stored attention state file and cursor values
-- operators can inspect the per-profile JSON state file directly under the config root for now
+## Read-Visibility Diagnostics (`doctor`)
+
+When `check` reports new posts but a short `--since` read returns empty,
+or when a channel read fails for an unclear reason, run:
+
+```bash
+chanvoy --profile <seat> doctor
+chanvoy --profile <seat> doctor <channel> --json
+```
+
+`doctor` is **cursor-neutral**: it never posts, acks, advances a cursor,
+or calls `check`. It reports separate checks so the three common empty-read
+states stay distinct:
+
+| Check | What it answers |
+| --- | --- |
+| `daemon` | Socket reachable; drift bit; Mattermost probe on the daemon |
+| `generation` | CLI/daemon dual pin when this environment owns the daemon (PER-038A) |
+| `identity` | Token whoami (status class only on failure — no provider body) |
+| `clock` | Local wall clock vs HTTP `Date` on `GET /users/me` |
+| `channel` (optional) | Pure resolve / membership for a named channel |
+
+Clock verdicts: `healthy`, `suspected_ahead`, `suspected_behind`,
+`unavailable`. A missing or unparseable `Date` is **unavailable** — never
+a green skew verdict. Suspected-ahead guidance points at the catch-up
+loop (`check --json` → `read --after <anchor>`); fix host time sync when
+skew is real. A post at or after the emitted `--since` boundary that is
+still missing is a request/provider question, not NTP (see
+[troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)).
+
+Exit codes: **0** all pass · **1** soft findings (skew / unavailable clock) ·
+**2** hard failure (auth, channel hard fail, daemon hard fail).
 
 ## Reopening A Cited Post (`show` / `thread`)
 
@@ -1089,15 +1122,13 @@ dimension from the network-access dimension — in the network case,
    "neither redirect nor escalation can make one path
    mutually-reachable."
 
-**Forward reference — `chanvoy doctor`.** Once `chanvoy doctor`
-ships, its sandbox-context check (Check 6) promotes socket-access
-failures from a generic "missing or refused" diagnostic to the
-actionable "socket lives outside sandbox-writable mount; re-run
-with escalation, or use `CHANVOY_RUNTIME_DIR` redirect" form, and
-emits a one-line at-invocation hint when sandbox context is
-detected. Triage socket-access friction with `chanvoy doctor`
-first once it lands; the decision boundary above maps directly to
-its structured output.
+**`chanvoy doctor` today** covers identity, dual pin, server-time clock
+skew, and optional channel resolve (see
+[Read-Visibility Diagnostics](#read-visibility-diagnostics-doctor)). A
+dedicated sandbox-context / socket-access Check 6 (promoting "missing or
+refused" to "socket outside sandbox-writable mount; escalate or
+`CHANVOY_RUNTIME_DIR`") is **not** in this cut — use the decision boundary
+above until that surface lands.
 
 ### Identity drift surface
 

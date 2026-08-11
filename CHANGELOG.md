@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`chanvoy doctor [channel]`** — cursor-neutral read-visibility self-diagnostic
+  (identity, dual CLI/daemon generation, HTTP `Date` clock skew, optional channel
+  resolve). Human + `--json`; exit **0** / **1** (soft) / **2** (hard). Never
+  mutates attention state. Suspected-ahead guidance points at
+  `check --json` → `read --after <anchor>`.
 - **`chanvoy show <channel> <post-id>`** fetches a single post. The channel is
   required and the post is bound to it: a post that lives in another channel is
   refused before any of its content is returned, so a post id on its own is not
