@@ -239,7 +239,24 @@ impl TestEnv {
 
     /// Baseline Mattermost mocks for daemon startup (whoami + team lookup).
     /// Tests add channel / post mocks on top.
+    ///
+    /// Team lookup is mounted for the historical fixture slug used by most
+    /// suites. Prefer [`Self::mock_baseline_for_team`] when the profile's
+    /// `team_name` is a different (e.g. synthetic) value.
     pub async fn mock_baseline(&self, bot_id: &str, bot_username: &str, team_id: &str) {
+        self.mock_baseline_for_team(bot_id, bot_username, team_id, "org-lanytehq")
+            .await;
+    }
+
+    /// Like [`Self::mock_baseline`], but mounts `/api/v4/teams/name/{team_name}`
+    /// so the mock matches the profile's configured team slug.
+    pub async fn mock_baseline_for_team(
+        &self,
+        bot_id: &str,
+        bot_username: &str,
+        team_id: &str,
+        team_name: &str,
+    ) {
         Mock::given(method("GET"))
             .and(path("/api/v4/users/me"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -252,11 +269,11 @@ impl TestEnv {
             .mount(&self.mock)
             .await;
         Mock::given(method("GET"))
-            .and(path("/api/v4/teams/name/org-lanytehq"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"id": team_id, "name": "org-lanytehq"})),
-            )
+            .and(path(format!("/api/v4/teams/name/{team_name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": team_id,
+                "name": team_name,
+            })))
             .mount(&self.mock)
             .await;
     }

@@ -1358,12 +1358,22 @@ async fn process_count_is_scoped_to_invocation_runtime() {
     let foreign = TestEnv::new_fixed("shared-collide-slug").await;
     foreign.write_default_profile("agent-reviewer-bot", "org-example");
     foreign
-        .mock_baseline("bot-id-collide-a", "agent-reviewer-bot", "team-id-456")
+        .mock_baseline_for_team(
+            "bot-id-collide-a",
+            "agent-reviewer-bot",
+            "team-id-456",
+            "org-example",
+        )
         .await;
     let local = TestEnv::new_fixed("shared-collide-slug").await;
     local.write_default_profile("agent-reviewer-bot", "org-example");
     local
-        .mock_baseline("bot-id-collide-b", "agent-reviewer-bot", "team-id-456")
+        .mock_baseline_for_team(
+            "bot-id-collide-b",
+            "agent-reviewer-bot",
+            "team-id-456",
+            "org-example",
+        )
         .await;
 
     // Foreign seat keeps a healthy daemon for the shared slug.
