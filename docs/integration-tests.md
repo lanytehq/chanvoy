@@ -14,12 +14,42 @@ make pr-final               # full merge-gate (includes integration tests)
 Integration tests are marked `#[ignore]` so `cargo test` / `make check` skip
 them by default — the fast loop stays fast. `--ignored` turns them on.
 
-Tests are parallel-safe: each test owns independent `TempDir` instances for
-config and runtime paths, passed to the child process via `CHANVOY_CONFIG_DIR`
-and `CHANVOY_RUNTIME_DIR` (explicit overrides in `chanvoy-core` — these exist
-both for test isolation and for production use on non-standard layouts). Each
-test uses a unique `--profile <slug>` so socket/pid/state filenames never
-collide. Parent-process env is never mutated.
+Tests are parallel-safe **within one cargo process**: each test owns
+independent `TempDir` instances for config and runtime paths, passed to the
+child process via `CHANVOY_CONFIG_DIR` and `CHANVOY_RUNTIME_DIR` (explicit
+overrides in `chanvoy-core` — these exist both for test isolation and for
+production use on non-standard layouts). Callers supply the `--profile` slug
+(unique per test within a suite). Concurrent multi-seat runs on one machine may
+reuse the same fixed slugs; process-table checks therefore scope to each
+invocation's runtime dir via `lsof`. Parent-process env is never mutated.
+
+### Multi-seat host SOP
+
+**Primary (this repo — self-contained).** Acceptance for this product does
+**not** depend on a mutable shared checkout of agent-support docs.
+
+On a **shared** agent host, concurrent multi-seat panels that each run
+`make pr-final` (or `make test-integration`) used to false-fail
+`daemon_start_sweeps_residue_when_child_exits_after_binding` when process
+counts matched only on fixed profile slugs. Isolation now scopes counts to
+each invocation's runtime dir via `lsof` (see `tests/restart_harness.rs`).
+
+**Residual serialization (still required):** only **one seat at a time**
+should run chanvoy `make pr-final` / `make test-integration`
+(`restart_harness`). Other panel seats use `make check` (or wait their turn).
+Why: integration tests share fixed profile slugs across seats while each has
+its own runtime dir; harness process-count isolation helps, but concurrent
+full restart suites still thrash the host (CPU / mock-server noise).
+
+**Channel deadman is separate:** one seat owns `chanvoy wait` per channel —
+that rule is chat control-plane discipline, not a substitute for the product
+serialization above.
+
+**Secondary (estate echo, optional):** when present and durable on your host's
+support pin, the same one-liner may also appear under
+`$LANYTE_AGENT_SUPPORT_ROOT/multi-harness-recipes.md` (Card D — shared-host
+multi-seat gates). That card is **not** required for scoring this repo tip;
+do not treat a missing or branch-raced support checkout as a chanvoy code defect.
 
 Shared harness primitives live in `tests/common/mod.rs` (mounted via
 `mod common;` from each integration test file). Test-specific helpers
