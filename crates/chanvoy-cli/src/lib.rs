@@ -3629,21 +3629,43 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     let (identity_check, identity_block, clock_block) = match client.whoami_with_server_time().await
     {
         Ok((identity, observation)) => {
-            let id_check = CheckVerdict::Pass;
+            // Token whoami alone is not enough: a drifted credential can
+            // authenticate as a different bot while still returning 200.
+            // Match profile.bot_username so identity.ok never greenwashes a
+            // mismatch that ownership already surfaces elsewhere.
+            let profile_bot = profile.bot_username.trim();
+            let username_ok = profile_bot.is_empty() || identity.username.as_str() == profile_bot;
+            let (id_check, id_block) = if username_ok {
+                (
+                    CheckVerdict::Pass,
+                    DoctorIdentityBlock {
+                        ok: true,
+                        username: Some(identity.username.clone()),
+                        user_id: Some(identity.id.clone()),
+                        status_class: None,
+                        reason: None,
+                    },
+                )
+            } else {
+                hard_failure = true;
+                (
+                    CheckVerdict::Fail,
+                    DoctorIdentityBlock {
+                        ok: false,
+                        username: Some(identity.username.clone()),
+                        user_id: Some(identity.id.clone()),
+                        status_class: Some("identity_mismatch".into()),
+                        reason: Some(format!(
+                            "token authenticates as {}, profile expects {}",
+                            identity.username, profile.bot_username
+                        )),
+                    },
+                )
+            };
             checks.push(id_check);
             let clock = clock_check_from_observation(&observation);
             checks.push(clock.check);
-            (
-                id_check,
-                DoctorIdentityBlock {
-                    ok: true,
-                    username: Some(identity.username),
-                    user_id: Some(identity.id),
-                    status_class: None,
-                    reason: None,
-                },
-                clock,
-            )
+            (id_check, id_block, clock)
         }
         Err(e) => {
             hard_failure = true;
@@ -3849,7 +3871,7 @@ fn doctor_provider_error_summary(err: &chanvoy_core::CoreError) -> (Option<Strin
             Some("identity_mismatch".into()),
             format!("token authenticates as {actual}, profile expects {expected}"),
         ),
-        other => (None, format!("identity check failed: {other}")),
+        _ => (None, "identity check failed in this environment".into()),
     }
 }
 
@@ -3893,9 +3915,9 @@ fn doctor_channel_error_summary(
             };
             (Some(class), reason, check)
         }
-        other => (
+        _ => (
             None,
-            format!("channel probe failed: {other}"),
+            "channel probe failed (see status_class when present)".into(),
             CheckVerdict::Fail,
         ),
     }

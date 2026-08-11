@@ -132,6 +132,31 @@ async fn doctor_clock_unavailable_on_invalid_date_header() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
+/// Profile bot_username ≠ whoami username → identity fail (no greenwash).
+#[tokio::test]
+async fn doctor_identity_mismatches_profile_bot() {
+    let env = TestEnv::new("doctor-id-mismatch").await;
+    env.write_default_profile("agent-expected", "org-lanytehq");
+    // Provider authenticates as a different bot than the profile claims.
+    mount_whoami_with_date(&env, "bot-id", "agent-actual", 0).await;
+    mount_primary_team(&env).await;
+
+    let output = run_chanvoy(&env, &["--json", "doctor"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(v["identity"]["ok"], false);
+    assert_eq!(v["identity"]["status_class"], "identity_mismatch");
+    assert_eq!(v["identity"]["username"], "agent-actual");
+    let reason = v["identity"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("agent-expected"), "reason={reason}");
+}
+
 /// 401 identity → fail + redacted reason; clock unavailable; exit 2.
 ///
 /// No daemon: doctor still runs the direct core whoami probe and reports
@@ -208,10 +233,9 @@ async fn doctor_channel_http_classes_redacted() {
         );
         let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
         let sc = v["channel"]["status_class"].as_str().unwrap_or("");
-        let reason = v["channel"]["reason"].as_str().unwrap_or("");
-        assert!(
-            sc.contains(class_substr) || reason.contains("HTTP") || reason.contains("not found"),
-            "status={status} status_class={sc} reason={reason} full={stdout}"
+        assert_eq!(
+            sc, class_substr,
+            "status={status} status_class={sc} full={stdout}"
         );
         assert!(!stdout.contains("must not leak"));
         assert!(!stdout.contains("\"request_id\""));

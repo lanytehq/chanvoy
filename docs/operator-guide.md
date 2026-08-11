@@ -362,8 +362,11 @@ skew is real. A post at or after the emitted `--since` boundary that is
 still missing is a request/provider question, not NTP (see
 [troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)).
 
-Exit codes: **0** all pass · **1** soft findings (skew / unavailable clock) ·
-**2** hard failure (auth, channel hard fail, daemon hard fail).
+Exit codes: **0** all checks pass · **1** any soft finding (clock
+`suspected_*` / unavailable, generation mismatch or not scored, channel
+throttle warn, daemon mattermost_ok false) · **2** hard failure (auth /
+identity mismatch, channel hard fail, daemon unreachable or identity
+drift).
 
 ## Reopening A Cited Post (`show` / `thread`)
 
