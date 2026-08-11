@@ -13,7 +13,10 @@
 //!   macOS `dirs::config_dir()` does not respect `XDG_CONFIG_HOME`)
 //! - Parent-process env is never mutated
 //! - Unique per-test `--profile` slug prevents socket / pid / state
-//!   filename collisions under parallel execution
+//!   filename collisions under parallel execution within one process
+//! - Multi-seat concurrent suites on one host: process-table checks must
+//!   scope to each env's runtime dir; see `count_daemon_serve_processes`
+//!   in restart_harness.rs
 //! - Long-lived `wiremock::MockServer` per test; `reset_mocks()` between
 //!   phases prevents phase-1 responders from satisfying phase-2 asserts
 //!
@@ -58,6 +61,12 @@ pub struct TestEnv {
 }
 
 impl TestEnv {
+    /// Isolated harness env with unique config/runtime TempDirs.
+    ///
+    /// Profile slugs are test-chosen and unique **within one cargo process**.
+    /// Concurrent multi-seat runs of the same suite on one host can reuse the
+    /// same slug; process-table observations must therefore scope to this
+    /// env's runtime dir, not the slug alone.
     pub async fn new(profile_name: &str) -> Self {
         Self {
             config_dir: tempfile::tempdir().expect("tempdir config"),
@@ -68,6 +77,12 @@ impl TestEnv {
             token_value: "test-token-value".to_string(),
             extra_env: Vec::new(),
         }
+    }
+
+    /// Alias for [`Self::new`] — documents intentional shared-slug setups
+    /// used by multi-seat collision regressions.
+    pub async fn new_fixed(profile_name: &str) -> Self {
+        Self::new(profile_name).await
     }
 
     /// PER-035: register an additional env var (e.g. a family-bot token)

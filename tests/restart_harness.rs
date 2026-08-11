@@ -1056,27 +1056,65 @@ async fn daemon_start_classifies_child_startup_failure() {
     );
 }
 
-/// Count live `chanvoy ... daemon serve` processes for one profile.
+/// Count live `chanvoy ... daemon serve` processes owned by this harness env.
 ///
 /// The direct proof for "a failed start left nothing running" and "a retry
-/// produced exactly one daemon". Matches on the profile slug, which is unique
-/// per test, so concurrent tests cannot contaminate the count. Deliberately
-/// process-table-based rather than pid-file-based: the failure mode being
-/// tested is a child that is alive *without* having written a pid file.
-fn count_daemon_serve_processes(profile_name: &str) -> usize {
+/// produced exactly one daemon". Deliberately process-table-based rather than
+/// pid-file-based: the failure mode being tested is a child that is alive
+/// *without* having written a pid file.
+///
+/// Process-table match on profile slug alone is **not** safe under concurrent
+/// multi-seat `make pr-final` on a shared host — seats use the same fixed test
+/// slugs with isolated `CHANVOY_RUNTIME_DIR` trees, so a foreign daemon with the
+/// same `--profile` would false-count as a survivor. Scope candidates to
+/// processes that hold open our runtime dir (or socket) via `lsof`.
+fn count_daemon_serve_processes(env: &TestEnv) -> usize {
     let out = std::process::Command::new("ps")
-        .args(["-ax", "-o", "command="])
+        .args(["-ax", "-o", "pid=,command="])
         .output()
         .expect("ps -ax");
+    let runtime = env.chanvoy_runtime_dir();
+    let socket = env.socket_path();
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|line| {
-            line.contains("chanvoy")
-                && line.contains("daemon")
-                && line.contains("serve")
-                && line.contains(profile_name)
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let pid: u32 = parts.next()?.trim().parse().ok()?;
+            let cmd = parts.next().unwrap_or("");
+            if !(cmd.contains("chanvoy")
+                && cmd.contains("daemon")
+                && cmd.contains("serve")
+                && cmd.contains(&env.profile_name))
+            {
+                return None;
+            }
+            // Belong to this harness invocation: open file under our runtime
+            // or our socket path. Foreign seats with the same slug fail this.
+            if process_holds_path(pid, &socket) || process_holds_path(pid, &runtime) {
+                Some(pid)
+            } else {
+                None
+            }
         })
         .count()
+}
+
+/// Whether process `pid` has `path` open (socket, cwd, or any FD under a dir).
+fn process_holds_path(pid: u32, path: &std::path::Path) -> bool {
+    let Some(path_str) = path.to_str() else {
+        return false;
+    };
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "--", path_str])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => !o.stdout.is_empty(),
+        _ => false,
+    }
 }
 
 /// Write a `[reduce]`-configured stream profile plus its family profile, with
@@ -1177,7 +1215,7 @@ async fn daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon()
 
     // TERMINAL-FAILURE PROOF: nothing from that spawn survives.
     assert_eq!(
-        count_daemon_serve_processes(&env.profile_name),
+        count_daemon_serve_processes(&env),
         0,
         "a failed start must leave no live daemon child — an unowned child would \
          make the next start spawn a second daemon for the same profile"
@@ -1217,7 +1255,7 @@ async fn daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon()
         String::from_utf8_lossy(&retry.stderr)
     );
     assert_eq!(
-        count_daemon_serve_processes(&env.profile_name),
+        count_daemon_serve_processes(&env),
         1,
         "retry must produce exactly one daemon for the profile"
     );
@@ -1271,7 +1309,7 @@ async fn daemon_start_sweeps_residue_when_child_exits_after_binding() {
 
     // The claim the diagnostic makes must be true.
     assert_eq!(
-        count_daemon_serve_processes(&env.profile_name),
+        count_daemon_serve_processes(&env),
         0,
         "no daemon may survive a failed start"
     );
@@ -1299,12 +1337,79 @@ async fn daemon_start_sweeps_residue_when_child_exits_after_binding() {
         String::from_utf8_lossy(&retry.stderr)
     );
     assert_eq!(
-        count_daemon_serve_processes(&env.profile_name),
+        count_daemon_serve_processes(&env),
         1,
         "exactly one daemon after recovery"
     );
 
     teardown_auto_setup_daemon(&env).await;
+}
+
+/// Process-table counts must not see a foreign seat's daemon.
+///
+/// Two harness envs share the same fixed profile slug (as concurrent multi-seat
+/// `make pr-final` runs do) but own distinct runtime roots. A live daemon on
+/// env A must not inflate env B's survivor count after B's failed start.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn process_count_is_scoped_to_invocation_runtime() {
+    // Fixed slug on purpose: models multi-seat collision of identical test names.
+    // Synthetic bot/team identities — not live estate accounts.
+    let foreign = TestEnv::new_fixed("shared-collide-slug").await;
+    foreign.write_default_profile("agent-reviewer-bot", "org-example");
+    foreign
+        .mock_baseline("bot-id-collide-a", "agent-reviewer-bot", "team-id-456")
+        .await;
+    let local = TestEnv::new_fixed("shared-collide-slug").await;
+    local.write_default_profile("agent-reviewer-bot", "org-example");
+    local
+        .mock_baseline("bot-id-collide-b", "agent-reviewer-bot", "team-id-456")
+        .await;
+
+    // Foreign seat keeps a healthy daemon for the shared slug.
+    let _foreign_guard = foreign.daemon_guard();
+    let start_foreign = run_chanvoy(&foreign, &["daemon", "start"]).await;
+    assert!(
+        start_foreign.status.success(),
+        "foreign start must succeed; stderr={}",
+        String::from_utf8_lossy(&start_foreign.stderr)
+    );
+    assert_eq!(
+        count_daemon_serve_processes(&foreign),
+        1,
+        "foreign env owns its live daemon"
+    );
+
+    // Local seat fails post-bind (malformed attention state) for the same slug.
+    std::fs::write(local.state_path(), "{ this is not valid json").expect("plant bad state");
+    let _local_guard = local.daemon_guard();
+    let start_local = run_chanvoy(&local, &["daemon", "start"]).await;
+    assert!(
+        !start_local.status.success(),
+        "local failed start must fail; stderr={}",
+        String::from_utf8_lossy(&start_local.stderr)
+    );
+
+    // The multi-seat failure mode: unscoped process-table match would count the
+    // foreign daemon as a local survivor. Scoped count must stay 0.
+    assert_eq!(
+        count_daemon_serve_processes(&local),
+        0,
+        "local count must ignore a foreign daemon that shares the profile slug"
+    );
+    assert_eq!(
+        count_daemon_serve_processes(&foreign),
+        1,
+        "foreign daemon must still be live after local failed start + cleanup"
+    );
+    assert!(
+        foreign.socket_path().exists(),
+        "foreign socket must not be swept by local failed-start cleanup"
+    );
+
+    teardown_auto_setup_daemon(&foreign).await;
+    // local never left a live daemon; teardown is a no-op if pid absent
+    teardown_auto_setup_daemon(&local).await;
 }
 
 /// devrev P2 — the command-to-policy mapping for `daemon start`, proven at the
