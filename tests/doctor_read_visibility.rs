@@ -132,6 +132,57 @@ async fn doctor_clock_unavailable_on_invalid_date_header() {
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }
 
+/// Missing credential must still emit a doctor JSON report (FIX-1).
+///
+/// Early `load_token?` would bypass identity/clock blocks and print only the
+/// generic top-level error — the opposite of a self-diagnostic.
+#[tokio::test]
+async fn doctor_missing_credential_emits_report_not_top_level_error() {
+    let env = TestEnv::new("doctor-no-cred").await;
+    // Profile points at an env name that is never set in the child.
+    env.write_default_profile("agent-test", "org-lanytehq");
+    // Force a different env name so LANYTE_MM_TOKEN from the harness is ignored.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = env.profile_path();
+        let mut profile: chanvoy_core::Profile =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        profile.env_name = "CHANVOY_DOCTOR_TEST_MISSING_TOKEN".to_string();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(toml::to_string_pretty(&profile).unwrap().as_bytes())
+            .unwrap();
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let output = run_chanvoy(&env, &["--json", "doctor"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={stdout} stderr={stderr}"
+    );
+    // Must be a doctor document, not only a top-level Error: line.
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor must emit JSON on missing credential");
+    assert_eq!(v["exit_code"], 2);
+    assert_eq!(v["identity"]["ok"], false);
+    assert_eq!(v["identity"]["status_class"], "missing_credential");
+    assert_eq!(v["clock"]["verdict"], "unavailable");
+    assert_eq!(v["clock"]["check"], "unavailable");
+    // Redaction: never disclose a credential value (none was present either).
+    let dumped = format!("{stdout}{stderr}").to_lowercase();
+    assert!(!dumped.contains("bearer "));
+    assert!(!dumped.contains("secret"));
+    // Reason may name the env var key, not a value — key is fine.
+    let reason = v["identity"]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("CHANVOY_DOCTOR_TEST_MISSING_TOKEN") || reason.contains("credential"),
+        "reason={reason}"
+    );
+}
+
 /// Profile bot_username ≠ whoami username → identity fail (no greenwash).
 #[tokio::test]
 async fn doctor_identity_mismatches_profile_bot() {

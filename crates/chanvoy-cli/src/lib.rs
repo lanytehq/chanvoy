@@ -3624,68 +3624,33 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     };
 
     // --- identity + clock (single GET /users/me with Date) ---
-    let token = load_token(&profile)?;
-    let client = MattermostClient::new(&profile, token)?;
-    let (identity_check, identity_block, clock_block) = match client.whoami_with_server_time().await
-    {
-        Ok((identity, observation)) => {
-            // Token whoami alone is not enough: a drifted credential can
-            // authenticate as a different bot while still returning 200.
-            // Match profile.bot_username so identity.ok never greenwashes a
-            // mismatch that ownership already surfaces elsewhere.
-            let profile_bot = profile.bot_username.trim();
-            let username_ok = profile_bot.is_empty() || identity.username.as_str() == profile_bot;
-            let (id_check, id_block) = if username_ok {
-                (
-                    CheckVerdict::Pass,
-                    DoctorIdentityBlock {
-                        ok: true,
-                        username: Some(identity.username.clone()),
-                        user_id: Some(identity.id.clone()),
-                        status_class: None,
-                        reason: None,
-                    },
-                )
-            } else {
-                hard_failure = true;
-                (
-                    CheckVerdict::Fail,
-                    DoctorIdentityBlock {
-                        ok: false,
-                        username: Some(identity.username.clone()),
-                        user_id: Some(identity.id.clone()),
-                        status_class: Some("identity_mismatch".into()),
-                        reason: Some(format!(
-                            "token authenticates as {}, profile expects {}",
-                            identity.username, profile.bot_username
-                        )),
-                    },
-                )
-            };
-            checks.push(id_check);
-            let clock = clock_check_from_observation(&observation);
-            checks.push(clock.check);
-            (id_check, id_block, clock)
+    // Token load failures must stay inside the doctor document (FIX-1):
+    // missing credential is itself the identity/read-visibility finding.
+    // An early `load_token?` would bypass JSON checks and greenwash the
+    // diagnostic contract.
+    fn doctor_clock_unavailable(reason: &str) -> ClockCheck {
+        ClockCheck {
+            verdict: chanvoy_core::ClockVerdict::Unavailable,
+            check: CheckVerdict::Unavailable,
+            delta_ms: None,
+            local_mid_ms: chanvoy_core::now_unix_millis(),
+            server_ms: None,
+            rtt_ms: 0,
+            source: chanvoy_core::ServerTimeSource::HttpDate,
+            reason: Some(reason.to_string()),
+            guidance: None,
         }
+    }
+
+    let (identity_check, identity_block, clock_block, client) = match load_token(&profile) {
         Err(e) => {
             hard_failure = true;
             let (status_class, reason) = doctor_provider_error_summary(&e);
             let id_check = CheckVerdict::Fail;
             checks.push(id_check);
-            // Clock unavailable when identity probe failed — do not greenwash.
-            let clock = ClockCheck {
-                verdict: chanvoy_core::ClockVerdict::Unavailable,
-                check: CheckVerdict::Unavailable,
-                delta_ms: None,
-                local_mid_ms: chanvoy_core::now_unix_millis(),
-                server_ms: None,
-                rtt_ms: 0,
-                source: chanvoy_core::ServerTimeSource::HttpDate,
-                reason: Some(
-                    "server-time observation unavailable because the identity probe failed".into(),
-                ),
-                guidance: None,
-            };
+            let clock = doctor_clock_unavailable(
+                "server-time observation unavailable because no credential was available",
+            );
             checks.push(clock.check);
             (
                 id_check,
@@ -3697,31 +3662,105 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     reason: Some(reason),
                 },
                 clock,
+                None,
             )
         }
+        Ok(token) => match MattermostClient::new(&profile, token) {
+            Err(e) => {
+                hard_failure = true;
+                let (status_class, reason) = doctor_provider_error_summary(&e);
+                let id_check = CheckVerdict::Fail;
+                checks.push(id_check);
+                let clock = doctor_clock_unavailable(
+                    "server-time observation unavailable because the client could not be built",
+                );
+                checks.push(clock.check);
+                (
+                    id_check,
+                    DoctorIdentityBlock {
+                        ok: false,
+                        username: None,
+                        user_id: None,
+                        status_class,
+                        reason: Some(reason),
+                    },
+                    clock,
+                    None,
+                )
+            }
+            Ok(client) => match client.whoami_with_server_time().await {
+                Ok((identity, observation)) => {
+                    // Token whoami alone is not enough: a drifted credential can
+                    // authenticate as a different bot while still returning 200.
+                    // Match profile.bot_username so identity.ok never greenwashes a
+                    // mismatch that ownership already surfaces elsewhere.
+                    let profile_bot = profile.bot_username.trim();
+                    let username_ok =
+                        profile_bot.is_empty() || identity.username.as_str() == profile_bot;
+                    let (id_check, id_block) = if username_ok {
+                        (
+                            CheckVerdict::Pass,
+                            DoctorIdentityBlock {
+                                ok: true,
+                                username: Some(identity.username.clone()),
+                                user_id: Some(identity.id.clone()),
+                                status_class: None,
+                                reason: None,
+                            },
+                        )
+                    } else {
+                        hard_failure = true;
+                        (
+                            CheckVerdict::Fail,
+                            DoctorIdentityBlock {
+                                ok: false,
+                                username: Some(identity.username.clone()),
+                                user_id: Some(identity.id.clone()),
+                                status_class: Some("identity_mismatch".into()),
+                                reason: Some(format!(
+                                    "token authenticates as {}, profile expects {}",
+                                    identity.username, profile.bot_username
+                                )),
+                            },
+                        )
+                    };
+                    checks.push(id_check);
+                    let clock = clock_check_from_observation(&observation);
+                    checks.push(clock.check);
+                    (id_check, id_block, clock, Some(client))
+                }
+                Err(e) => {
+                    hard_failure = true;
+                    let (status_class, reason) = doctor_provider_error_summary(&e);
+                    let id_check = CheckVerdict::Fail;
+                    checks.push(id_check);
+                    let clock = doctor_clock_unavailable(
+                        "server-time observation unavailable because the identity probe failed",
+                    );
+                    checks.push(clock.check);
+                    (
+                        id_check,
+                        DoctorIdentityBlock {
+                            ok: false,
+                            username: None,
+                            user_id: None,
+                            status_class,
+                            reason: Some(reason),
+                        },
+                        clock,
+                        Some(client),
+                    )
+                }
+            },
+        },
     };
 
     // --- optional channel resolve (pure; no post read, no cursor) ---
     let channel_block = if let Some(channel) = args.channel.as_deref() {
-        match client.resolve_channel(channel, args.team.as_deref()).await {
-            Ok(resolved) => {
-                let check = CheckVerdict::Pass;
-                checks.push(check);
-                Some(DoctorChannelBlock {
-                    check,
-                    requested: channel.to_string(),
-                    team: args.team.clone(),
-                    resolved_name: Some(resolved.channel_name),
-                    resolved_team: Some(resolved.team_name),
-                    status_class: None,
-                    reason: None,
-                })
-            }
-            Err(e) => {
-                let (status_class, reason, check) = doctor_channel_error_summary(&e);
-                if check == CheckVerdict::Fail {
-                    hard_failure = true;
-                }
+        match &client {
+            None => {
+                hard_failure = true;
+                let check = CheckVerdict::Fail;
                 checks.push(check);
                 Some(DoctorChannelBlock {
                     check,
@@ -3729,10 +3768,43 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     team: args.team.clone(),
                     resolved_name: None,
                     resolved_team: None,
-                    status_class,
-                    reason: Some(reason),
+                    status_class: Some("missing_credential".into()),
+                    reason: Some(
+                        "channel probe skipped: no credential available for provider access".into(),
+                    ),
                 })
             }
+            Some(client) => match client.resolve_channel(channel, args.team.as_deref()).await {
+                Ok(resolved) => {
+                    let check = CheckVerdict::Pass;
+                    checks.push(check);
+                    Some(DoctorChannelBlock {
+                        check,
+                        requested: channel.to_string(),
+                        team: args.team.clone(),
+                        resolved_name: Some(resolved.channel_name),
+                        resolved_team: Some(resolved.team_name),
+                        status_class: None,
+                        reason: None,
+                    })
+                }
+                Err(e) => {
+                    let (status_class, reason, check) = doctor_channel_error_summary(&e);
+                    if check == CheckVerdict::Fail {
+                        hard_failure = true;
+                    }
+                    checks.push(check);
+                    Some(DoctorChannelBlock {
+                        check,
+                        requested: channel.to_string(),
+                        team: args.team.clone(),
+                        resolved_name: None,
+                        resolved_team: None,
+                        status_class,
+                        reason: Some(reason),
+                    })
+                }
+            },
         }
     } else {
         None
