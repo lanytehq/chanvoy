@@ -20,6 +20,8 @@ teams, and pick up where you left off across sessions.
 > chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
 > # For channel WIP: use wait — do not sleep-poll or hand-roll a poller.
 > chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
+> # Two floors, one wait (first match wins):
+> # chanvoy wait --channel <team>/<release> --channel <team>/<brief> --timeout 20m
 > ```
 >
 > The lanytehq deployment uses `ops-updates` as the ops-broadcast

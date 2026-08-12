@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`chanvoy wait` multi-channel fan-in.** Repeat `--channel team/channel`
+  (2–8 arms) to block on the first eligible peer post under one shared
+  deadline. Per-arm exclusive baselines use `--after-channel
+  team/channel=post-id`. Match JSON is `{mode:"fan_in", channels, matched_channel,
+  messages:[one]}`; clean deadman is exit **1** with `timeout:true`;
+  capability/input/provider failures are exit **2** and never set
+  `timeout:true`. A daemon that does not implement `wait_channels_v1` is a
+  hard failure — cycle it after install. Single-channel `wait <channel>`
+  is unchanged.
 - **`chanvoy doctor [channel]`** — cursor-neutral read-visibility self-diagnostic
   (identity, dual CLI/daemon generation, HTTP `Date` clock skew, optional channel
   resolve). Human + `--json`; exit **0** / **1** (soft) / **2** (hard). Never

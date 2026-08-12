@@ -200,6 +200,29 @@ chanvoy wait <channel> --timeout 30m \
   [--json]
 ```
 
+To watch two through eight channels under one deadline (first match
+wins; one shared deadman):
+
+```bash
+chanvoy wait \
+  --channel org-example/release-floor \
+  --channel org-example/feature-brief \
+  --after-channel org-example/release-floor=<post-id> \
+  --after-channel org-example/feature-brief=<post-id> \
+  --contains ASSENT \
+  --timeout 20m \
+  --json
+```
+
+Every fan-in selector must be explicit `team/channel`. Do not mix the
+positional form with `--channel`. Use `--after-channel` rather than
+`--after` so a baseline cannot attach to the wrong arm. Human match
+output names the winning `team/channel` before the post. On fire,
+drain and judge — a match is not an automatic action. Re-arm from the
+returned post id. A CLI that knows fan-in talking to an older daemon
+fails hard; cycle the daemon (`chanvoy daemon stop` then
+`chanvoy auto-setup`) after install.
+
 | Outcome | Exit | Notes |
 | --- | ---: | --- |
 | Match | 0 | One message in `{channel, messages:[…]}` |

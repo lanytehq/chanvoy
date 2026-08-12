@@ -26,9 +26,9 @@ use crate::AppState;
 pub const FILTER_SOURCE_MAX_BYTES: usize = 256;
 /// Compiled regex size limit (bytes) enforced at RegexBuilder.
 pub const REGEX_COMPILED_SIZE_LIMIT: usize = 64 * 1024;
-const BACKOFF_BASE: Duration = Duration::from_millis(500);
-const BACKOFF_CAP: Duration = Duration::from_secs(8);
-const REST_IDLE: Duration = Duration::from_secs(2);
+pub(crate) const BACKOFF_BASE: Duration = Duration::from_millis(500);
+pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(8);
+pub(crate) const REST_IDLE: Duration = Duration::from_secs(2);
 
 /// Compiled body filter shared by backfill, push, REST poll, and lag recovery.
 #[derive(Debug, Clone)]
@@ -174,7 +174,7 @@ fn is_terminal_auth(err: &CoreError) -> bool {
 }
 
 /// Refuse zero / empty wait windows before any subscribe or provider work.
-fn validate_wait_timeout_secs(timeout_secs: u64) -> Result<(), CoreError> {
+pub(crate) fn validate_wait_timeout_secs(timeout_secs: u64) -> Result<(), CoreError> {
     if timeout_secs == 0 {
         return Err(CoreError::WaitFilterInvalid(
             "wait timeout must be greater than zero".into(),
@@ -683,7 +683,7 @@ async fn wait_rest_path(
 
 /// Empty-at-arm: page first non-empty observation to exhaustion, return
 /// the full set for earliest-match selection (entarch/secrev R2 residual A).
-async fn empty_at_arm_observation(
+pub(crate) async fn empty_at_arm_observation(
     state: &AppState,
     channel: &str,
     predicate: &WaitPredicate,
@@ -710,7 +710,7 @@ async fn empty_at_arm_observation(
     .await
 }
 
-async fn establish_baseline(
+pub(crate) async fn establish_baseline(
     state: &AppState,
     channel: &str,
     channel_id: &str,
@@ -767,7 +767,7 @@ fn map_anchor_err(err: CoreError, anchor_id: &str) -> CoreError {
     }
 }
 
-fn note_after_eligible(after_eligible: &mut Option<HashSet<String>>, page: &[Message]) {
+pub(crate) fn note_after_eligible(after_eligible: &mut Option<HashSet<String>>, page: &[Message]) {
     if let Some(el) = after_eligible.as_mut() {
         for m in page {
             el.insert(m.id.clone());
@@ -784,7 +784,7 @@ fn bus_id_after_eligible(after_eligible: Option<&HashSet<String>>, post_id: &str
 
 /// Prefer bus **arrival order**, then REST chronological first match.
 /// Does not reorder bus events by provider timestamps (devrev R2).
-fn first_match_bus_then_rest(
+pub(crate) fn first_match_bus_then_rest(
     rest: &[Message],
     bus: &VecDeque<Arc<DaemonEvent>>,
     predicate: &WaitPredicate,
@@ -812,7 +812,7 @@ fn first_match_bus_then_rest(
 /// `after_eligible` stay pending so a later REST confirmation can fire them
 /// exactly once (entarch/secrev F1). Bare wait treats all channel inbound as
 /// immediately terminal (post-sub bus is eligible without REST).
-fn reconcile_bus_after_eval(
+pub(crate) fn reconcile_bus_after_eval(
     bus: &mut VecDeque<Arc<DaemonEvent>>,
     predicate: &WaitPredicate,
     processed: &mut HashSet<String>,
@@ -847,7 +847,7 @@ fn reconcile_bus_after_eval(
 /// them `processed`, so a later REST page that does return the id can still
 /// fire (concurrent race). Failed/timeout REST paths must not call this.
 /// Bare wait (`after_eligible == None`) is a no-op.
-fn drop_pending_non_members_after_success(
+pub(crate) fn drop_pending_non_members_after_success(
     bus: &mut VecDeque<Arc<DaemonEvent>>,
     predicate: &WaitPredicate,
     after_eligible: Option<&HashSet<String>>,
@@ -882,7 +882,7 @@ fn drop_pending_non_members_after_success(
     *bus = keep;
 }
 
-fn drain_bus(
+pub(crate) fn drain_bus(
     rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
     bus_buffer: &mut VecDeque<Arc<DaemonEvent>>,
     channel: &str,
@@ -914,7 +914,7 @@ fn one_message_result(channel: &str, message: Message) -> WaitResult {
     }
 }
 
-async fn lag_recover_page(
+pub(crate) async fn lag_recover_page(
     state: &AppState,
     channel: &str,
     predicate: &WaitPredicate,
@@ -933,7 +933,7 @@ async fn lag_recover_page(
     }
 }
 
-async fn ws_connection_healthy(state: &AppState) -> bool {
+pub(crate) async fn ws_connection_healthy(state: &AppState) -> bool {
     let ws = {
         let guard = state.ws_state_holder.lock().await;
         guard.clone()
@@ -989,7 +989,7 @@ fn deadline_error(channel: &str, saw_retryable: bool, detail: Option<String>) ->
     }
 }
 
-async fn provider_retry<T, F, Fut>(
+pub(crate) async fn provider_retry<T, F, Fut>(
     state: &AppState,
     channel: &str,
     deadline: Instant,
