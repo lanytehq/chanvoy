@@ -8,11 +8,15 @@
 
 mod common;
 
-use chanvoy_core::{rpc_error, JsonRpcRequest, WAIT_CHANNELS_V1_METHOD};
+use std::path::PathBuf;
+
+use chanvoy_core::{
+    rpc_error, rpc_request, JsonRpcRequest, JsonRpcResponse, WAIT_CHANNELS_V1_METHOD,
+};
 use common::{read_attention_state_bytes, run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -556,5 +560,82 @@ async fn single_channel_v2_shape_unchanged() {
     assert_eq!(body["messages"][0]["id"], "v2-post");
     assert!(body.get("mode").is_none());
     assert!(body.get("matched_channel").is_none());
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
+async fn raw_rpc(socket_path: PathBuf, method: &str, params: serde_json::Value) -> JsonRpcResponse {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .expect("connect daemon");
+    let request = rpc_request(method, params);
+    stream
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .expect("write rpc");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read rpc");
+    serde_json::from_str(line.trim_end()).expect("decode rpc")
+}
+
+#[tokio::test]
+async fn ac_f1_unknown_rpc_members_are_hard_input() {
+    let env = TestEnv::new("per-039-closed-object").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    mount_two_arms(
+        &env,
+        ArmFixture {
+            name: "release-floor",
+            id: "chan-rel-u",
+            after: None,
+            posts: &[],
+        },
+        ArmFixture {
+            name: "feature-brief",
+            id: "chan-feat-u",
+            after: None,
+            posts: &[],
+        },
+    )
+    .await;
+    let daemon = spawn_daemon(&env).await;
+    let extra_top = raw_rpc(
+        env.socket_path(),
+        WAIT_CHANNELS_V1_METHOD,
+        json!({
+            "arms": [
+                {"team": "org-lanytehq", "channel": "release-floor"},
+                {"team": "org-lanytehq", "channel": "feature-brief"}
+            ],
+            "timeout_secs": 2,
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert!(extra_top.result.is_none());
+    let top_code = extra_top.error.as_ref().map(|e| e.code);
+    assert!(
+        top_code == Some(-32000) || top_code == Some(-32007),
+        "unknown top-level field must be hard RPC error, got {top_code:?}"
+    );
+
+    let extra_arm = raw_rpc(
+        env.socket_path(),
+        WAIT_CHANNELS_V1_METHOD,
+        json!({
+            "arms": [
+                {"team": "org-lanytehq", "channel": "release-floor", "extra": "no"},
+                {"team": "org-lanytehq", "channel": "feature-brief"}
+            ],
+            "timeout_secs": 2
+        }),
+    )
+    .await;
+    assert!(extra_arm.result.is_none());
+    let arm_code = extra_arm.error.as_ref().map(|e| e.code);
+    assert!(
+        arm_code == Some(-32000) || arm_code == Some(-32007),
+        "unknown arm field must be hard RPC error, got {arm_code:?}"
+    );
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }

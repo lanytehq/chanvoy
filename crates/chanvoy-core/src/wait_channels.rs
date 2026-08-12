@@ -53,6 +53,7 @@ impl WaitChannelSelector {
 
 /// One fan-in arm.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WaitChannelArm {
     pub team: String,
     pub channel: String,
@@ -68,6 +69,7 @@ impl WaitChannelArm {
 
 /// Parameters for `wait_channels_v1`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WaitChannelsParams {
     pub arms: Vec<WaitChannelArm>,
     pub timeout_secs: u64,
@@ -331,6 +333,27 @@ mod tests {
         let win = first_backfill_winner([&a, &b, &c]).unwrap();
         assert_eq!(win.1.id, "p1");
         assert_eq!(win.2, "ch-b");
+    }
+
+    #[test]
+    fn unknown_top_level_and_arm_fields_are_rejected() {
+        let extra_top = serde_json::json!({
+            "arms": [
+                {"team": "t", "channel": "a"},
+                {"team": "t", "channel": "b"}
+            ],
+            "timeout_secs": 30,
+            "unexpected": true
+        });
+        assert!(serde_json::from_value::<WaitChannelsParams>(extra_top).is_err());
+        let extra_arm = serde_json::json!({
+            "arms": [
+                {"team": "t", "channel": "a", "extra": "no"},
+                {"team": "t", "channel": "b"}
+            ],
+            "timeout_secs": 30
+        });
+        assert!(serde_json::from_value::<WaitChannelsParams>(extra_arm).is_err());
     }
 
     #[test]

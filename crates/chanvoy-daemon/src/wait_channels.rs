@@ -18,9 +18,9 @@ use tokio::sync::broadcast;
 use tokio::time::{sleep, Instant};
 
 use crate::wait::{
-    drain_bus, drop_pending_non_members_after_success, empty_at_arm_observation,
-    establish_baseline, first_match, inbound_to_message, lag_recover_page, note_after_eligible,
-    provider_retry, reconcile_bus_after_eval, ws_connection_healthy, WaitPredicate, REST_IDLE,
+    drain_bus, empty_at_arm_observation, establish_baseline, first_match, inbound_to_message,
+    lag_recover_page, note_after_eligible, provider_retry, ws_connection_healthy, WaitPredicate,
+    REST_IDLE,
 };
 use crate::AppState;
 
@@ -159,7 +159,8 @@ pub async fn wait_channels_with_params(
                 Ok(v) => v,
                 Err(err) => return Err(map_arm_err(&arm.selector, err)),
             };
-        arm.processed.extend(rest_baseline);
+        let retained = retained_post_ids_for_channel(&bus, &arm.channel_id);
+        merge_snapshot_into_processed(&mut arm.processed, rest_baseline, &retained);
         arm.scan_cursor = scan_after;
     }
 
@@ -203,18 +204,9 @@ pub async fn wait_channels_with_params(
         ));
     }
     for arm in &mut armed {
-        reconcile_bus_after_eval(
-            &mut bus,
-            &arm.predicate,
-            &mut arm.processed,
-            arm.after_eligible.as_ref(),
-        );
+        reconcile_fan_in_arm(&mut bus, arm);
         if arm.after.is_some() {
-            drop_pending_non_members_after_success(
-                &mut bus,
-                &arm.predicate,
-                arm.after_eligible.as_ref(),
-            );
+            drop_pending_fan_in(&mut bus, arm);
         }
     }
 
@@ -254,12 +246,7 @@ async fn live_loop(
                             return Ok(WaitChannelsResult::match_one(channels, selector, message));
                         }
                         for arm in armed.iter_mut() {
-                            reconcile_bus_after_eval(
-                                bus,
-                                &arm.predicate,
-                                &mut arm.processed,
-                                arm.after_eligible.as_ref(),
-                            );
+                            reconcile_fan_in_arm(bus, arm);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -347,65 +334,138 @@ async fn poll_rest_arms(
     if let Some((selector, message)) = first_live_match(bus, armed) {
         return Ok(Some((selector, message)));
     }
-    for arm in armed.iter_mut() {
-        let qualified = arm.selector.qualified();
+    let mut deadline_hit = false;
+    for i in 0..armed.len() {
+        let qualified = armed[i].selector.qualified();
         let fetch = async {
-            if let Some(cursor) = arm.scan_cursor.clone() {
+            if let Some(cursor) = armed[i].scan_cursor.clone() {
                 provider_retry(state, &qualified, deadline, || {
                     let c = cursor.clone();
-                    let ch = arm.channel_id.clone();
+                    let ch = armed[i].channel_id.clone();
                     async move { state.client.posts_after_by_channel_id(&ch, &c).await }
                 })
                 .await
             } else {
-                empty_at_arm_observation(state, &qualified, &arm.predicate, deadline).await
+                empty_at_arm_observation(state, &qualified, &armed[i].predicate, deadline).await
             }
         };
         match with_bus_drain(rx, bus, &qualified, fetch).await {
             Ok(page) => {
-                note_after_eligible(&mut arm.after_eligible, &page);
-                arm.saw_successful_rest = true;
-                arm.clean_observe = true;
+                note_after_eligible(&mut armed[i].after_eligible, &page);
+                armed[i].saw_successful_rest = true;
+                armed[i].clean_observe = true;
                 drain_bus(rx, bus, &qualified)?;
-                if let Some((selector, message)) = first_live_match(bus, std::slice::from_ref(arm))
-                {
+                if let Some((selector, message)) = first_live_match(bus, armed) {
                     return Ok(Some((selector, message)));
                 }
-                if let Some(hit) = first_match(&page, &arm.predicate, &arm.processed) {
-                    return Ok(Some((arm.selector.clone(), hit)));
+                if let Some(hit) = first_match(&page, &armed[i].predicate, &armed[i].processed) {
+                    return Ok(Some((armed[i].selector.clone(), hit)));
                 }
-                reconcile_bus_after_eval(
-                    bus,
-                    &arm.predicate,
-                    &mut arm.processed,
-                    arm.after_eligible.as_ref(),
-                );
-                if arm.after.is_some() {
-                    drop_pending_non_members_after_success(
-                        bus,
-                        &arm.predicate,
-                        arm.after_eligible.as_ref(),
-                    );
+                reconcile_fan_in_arm(bus, &mut armed[i]);
+                if armed[i].after.is_some() {
+                    drop_pending_fan_in(bus, &armed[i]);
                 }
                 if let Some(last) = page.last() {
-                    if arm.scan_cursor.as_deref() != Some(last.id.as_str()) {
-                        arm.scan_cursor = Some(last.id.clone());
+                    if armed[i].scan_cursor.as_deref() != Some(last.id.as_str()) {
+                        armed[i].scan_cursor = Some(last.id.clone());
                     }
                     for m in page {
-                        arm.processed.insert(m.id);
+                        armed[i].processed.insert(m.id);
                     }
                 }
             }
             Err(CoreError::WaitProviderDegraded { .. }) => {
-                arm.clean_observe = false;
+                armed[i].clean_observe = false;
             }
             Err(CoreError::WaitTimeout(_)) => {
-                return Err(fan_in_deadline(std::slice::from_ref(arm)).unwrap_err());
+                deadline_hit = true;
+                break;
             }
-            Err(other) => return Err(map_arm_err(&arm.selector, other)),
+            Err(other) => return Err(map_arm_err(&armed[i].selector, other)),
         }
     }
+    if deadline_hit {
+        return Err(fan_in_deadline(armed).unwrap_err());
+    }
     Ok(None)
+}
+
+fn retained_post_ids_for_channel(
+    bus: &VecDeque<Arc<DaemonEvent>>,
+    channel_id: &str,
+) -> HashSet<String> {
+    bus.iter()
+        .filter_map(|event| match &event.payload {
+            DaemonEventPayloadInner::Inbound(payload) if payload.channel_id == channel_id => {
+                Some(payload.post_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A later tip snapshot must not mark a retained post-sub event processed.
+fn merge_snapshot_into_processed(
+    processed: &mut HashSet<String>,
+    snapshot_ids: impl IntoIterator<Item = String>,
+    retained_ids: &HashSet<String>,
+) {
+    for id in snapshot_ids {
+        if !retained_ids.contains(&id) {
+            processed.insert(id);
+        }
+    }
+}
+
+/// Per-arm reconcile that keeps other arms' inbound events on the shared bus.
+fn reconcile_fan_in_arm(bus: &mut VecDeque<Arc<DaemonEvent>>, arm: &mut ArmedArm) {
+    let mut keep = VecDeque::new();
+    for event in bus.drain(..) {
+        match &event.payload {
+            DaemonEventPayloadInner::Inbound(payload) if payload.channel_id == arm.channel_id => {
+                if arm.processed.contains(&payload.post_id) {
+                    continue;
+                }
+                let eligible = match arm.after_eligible.as_ref() {
+                    None => true,
+                    Some(set) => set.contains(&payload.post_id),
+                };
+                if !eligible && arm.predicate.matches_inbound(payload) {
+                    keep.push_back(event);
+                    continue;
+                }
+                arm.processed.insert(payload.post_id.clone());
+            }
+            DaemonEventPayloadInner::Inbound(_) => keep.push_back(event),
+            _ => {}
+        }
+    }
+    *bus = keep;
+}
+
+/// Drop this arm's proven non-members after a successful posts_after; keep
+/// every other arm's events.
+fn drop_pending_fan_in(bus: &mut VecDeque<Arc<DaemonEvent>>, arm: &ArmedArm) {
+    let Some(eligible) = arm.after_eligible.as_ref() else {
+        return;
+    };
+    let mut keep = VecDeque::new();
+    for event in bus.drain(..) {
+        match &event.payload {
+            DaemonEventPayloadInner::Inbound(payload)
+                if payload.channel_id == arm.channel_id
+                    && arm.predicate.matches_inbound(payload) =>
+            {
+                if eligible.contains(&payload.post_id) {
+                    keep.push_back(event);
+                }
+            }
+            DaemonEventPayloadInner::Inbound(payload) if payload.channel_id == arm.channel_id => {}
+            DaemonEventPayloadInner::Inbound(_) => keep.push_back(event),
+            _ => {}
+        }
+    }
+    *bus = keep;
 }
 
 fn first_live_match(
@@ -609,5 +669,77 @@ mod tests {
         let mut seam = FanInRetain::default();
         seam.retain(ev);
         assert!(seam.eval_arm("ch-a", &p).is_none());
+    }
+
+    fn arm(channel: &str, channel_id: &str, after: Option<&str>) -> ArmedArm {
+        ArmedArm {
+            selector: WaitChannelSelector::new("org", channel),
+            channel_id: channel_id.into(),
+            predicate: pred(channel_id),
+            after: after.map(str::to_string),
+            after_eligible: after.map(|_| HashSet::new()),
+            scan_cursor: None,
+            processed: HashSet::new(),
+            saw_successful_rest: true,
+            saw_healthy_inbound: false,
+            clean_observe: true,
+        }
+    }
+
+    #[test]
+    fn snapshot_does_not_erase_retained_post_sub_event() {
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound("ch-a", "p-live", "ASSENT now"));
+        let retained = retained_post_ids_for_channel(&bus, "ch-a");
+        assert!(retained.contains("p-live"));
+        let mut processed = HashSet::new();
+        merge_snapshot_into_processed(&mut processed, ["older".into(), "p-live".into()], &retained);
+        assert!(processed.contains("older"));
+        assert!(
+            !processed.contains("p-live"),
+            "retained post-sub id must survive the tip snapshot"
+        );
+        let armed = [arm("a", "ch-a", None)];
+        let (sel, msg) = first_live_match(&bus, &armed).expect("retained event still matches");
+        assert_eq!(sel.channel, "a");
+        assert_eq!(msg.id, "p-live");
+    }
+
+    #[test]
+    fn earlier_arm_reconcile_keeps_later_explicit_after_candidate() {
+        let mut a = arm("a", "ch-a", None);
+        let mut b = arm("b", "ch-b", Some("anchor-b"));
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound("ch-b", "p-b", "ASSENT b"));
+        reconcile_fan_in_arm(&mut bus, &mut a);
+        assert_eq!(bus.len(), 1, "foreign inbound must stay on the shared bus");
+        reconcile_fan_in_arm(&mut bus, &mut b);
+        assert_eq!(
+            bus.len(),
+            1,
+            "later explicit-after candidate stays pending until REST confirms"
+        );
+        b.after_eligible
+            .as_mut()
+            .expect("gated")
+            .insert("p-b".into());
+        let (sel, msg) = first_live_match(&bus, &[a, b]).expect("later arm can still fire");
+        assert_eq!(sel.channel, "b");
+        assert_eq!(msg.id, "p-b");
+    }
+
+    #[test]
+    fn shared_deadline_with_one_degraded_arm_is_not_clean_timeout() {
+        let mut a = arm("a", "ch-a", None);
+        a.clean_observe = false;
+        a.saw_successful_rest = false;
+        let mut b = arm("b", "ch-b", None);
+        b.clean_observe = true;
+        b.saw_successful_rest = true;
+        let err = fan_in_deadline(&[a, b]).unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitProviderDegraded { .. }),
+            "mixed degraded + later deadline must stay hard, got {err:?}"
+        );
     }
 }
