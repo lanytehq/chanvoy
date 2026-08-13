@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::{env, fs, io};
 
 mod wait;
+mod wait_channels;
 
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
@@ -20,7 +21,7 @@ use chanvoy_core::{
     ReadChannelParams, ReadDirectMessageParams, ReadThreadParams, SearchParams, SearchResult,
     ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult,
     UnreactParams, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitChannelV2Params,
-    WaitResult, WsState,
+    WaitChannelsParams, WaitChannelsResult, WaitResult, WsState, WAIT_CHANNELS_V1_METHOD,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -1174,6 +1175,17 @@ async fn dispatch_request(
             .await
             .map(to_value)
         }
+        method if method == WAIT_CHANNELS_V1_METHOD => {
+            match serde_json::from_value::<WaitChannelsParams>(request.params.clone()) {
+                Ok(params) => wait_channels::wait_channels_with_params(state, params)
+                    .await
+                    .map(to_value)
+                    .map_err(DaemonError::from),
+                Err(err) => Err(DaemonError::Core(CoreError::WaitFilterInvalid(format!(
+                    "wait_channels_v1 input: {err}"
+                )))),
+            }
+        }
         "create_channel" => {
             parse_and_call(&request.params, |params: CreateChannelParams| async move {
                 state
@@ -1460,6 +1472,21 @@ mod wait_rpc_code_tests {
             })),
             -32008
         );
+    }
+
+    #[test]
+    fn wait_channels_v1_params_require_two_arms() {
+        let v = serde_json::json!({
+            "arms": [
+                {"team": "org-example", "channel": "release-floor"},
+                {"team": "org-example", "channel": "feature-brief", "after": "p1"}
+            ],
+            "timeout_secs": 1200
+        });
+        let p: WaitChannelsParams = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(p.timeout_secs, 1200);
+        assert_eq!(p.arms.len(), 2);
+        assert_eq!(p.arms[1].after.as_deref(), Some("p1"));
     }
 
     #[test]
@@ -2383,6 +2410,17 @@ impl DaemonClient {
             })?,
         )
         .await
+    }
+
+    /// Bounded multi-channel wait. Method-not-found on an old daemon is
+    /// a hard capability failure — callers must not fall back to N
+    /// single-channel waits.
+    pub async fn wait_channels_v1(
+        &self,
+        params: WaitChannelsParams,
+    ) -> Result<WaitChannelsResult, DaemonError> {
+        self.call(WAIT_CHANNELS_V1_METHOD, serde_json::to_value(params)?)
+            .await
     }
 
     /// PER-038: enhanced wait (filter + after + absolute deadline engine).

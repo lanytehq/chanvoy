@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod doctor;
 pub mod host_build_info;
 pub mod safe_read;
+pub mod wait_channels;
 
 pub use safe_read::{
     read_caller_named_file, read_credential_file, read_tool_owned_file, SafeReadError,
@@ -25,6 +26,13 @@ pub use doctor::{
 pub use host_build_info::{
     format_basic, format_extended, generation_match as host_generation_match,
     resolve as resolve_host_build_info, HostBuildInfo,
+};
+
+pub use wait_channels::{
+    first_backfill_winner, parse_after_channel_flag, parse_qualified_wait_selector,
+    validate_wait_channels_params, WaitChannelArm, WaitChannelSelector, WaitChannelsParams,
+    WaitChannelsResult, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS,
+    WAIT_CHANNELS_UTF8_MAX_BYTES, WAIT_CHANNELS_V1_METHOD,
 };
 
 /// `CoreError::Api` already exposes this type in the public error enum, so

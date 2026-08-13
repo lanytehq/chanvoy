@@ -8,14 +8,17 @@ use chanvoy_core::{
     check_search_operator_conflicts, clock_check_from_observation, doctor_exit_code,
     format_basic as format_host_basic, format_extended as format_host_extended,
     host_generation_match, list_profiles, load_active_profile, load_profile, load_token,
-    parse_time_window, pid_path_for_profile, provider_status_class, resolve_host_build_info,
-    socket_path_for_profile, store_active_profile, store_profile, AckResult, AttentionListResult,
-    AttentionShowResult, AttentionSource, CapabilityClass, Channel, ChanvoyScopes, CheckResult,
-    CheckVerdict, ClockCheck, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation,
-    Identity, LegacyChannel, MattermostClient, Message, Notification, PinResult, PostReceipt,
-    Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
-    SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitResult,
-    WsConnectionState,
+    parse_after_channel_flag, parse_qualified_wait_selector, parse_time_window,
+    pid_path_for_profile, provider_status_class, resolve_host_build_info, socket_path_for_profile,
+    store_active_profile, store_profile, validate_wait_channels_params, AckResult,
+    AttentionListResult, AttentionShowResult, AttentionSource, CapabilityClass, Channel,
+    ChanvoyScopes, CheckResult, CheckVerdict, ClockCheck, CredentialMode, DaemonHealthState,
+    DaemonStatus, DmConversation, Identity, LegacyChannel, MattermostClient, Message, Notification,
+    PinResult, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult,
+    SeedCursorsResult, SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult,
+    UnreadNotifications, WaitChannelArm, WaitChannelSelector, WaitChannelsParams,
+    WaitChannelsResult, WaitResult, WsConnectionState, WAIT_CHANNELS_MAX_ARMS,
+    WAIT_CHANNELS_MIN_ARMS,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -135,7 +138,7 @@ enum CommandSet {
     Notify(NotifyArgs),
     /// List notifications / unread mentions.
     Notifications(ReadWindowArgs),
-    /// Block for a matching channel post (or any non-self post), or deadman; prefer --after + --contains.
+    /// Block for a matching channel post (or any non-self post), or deadman; prefer --after + --contains. Repeated --channel waits on 2–8 channels.
     Wait(WaitArgs),
     /// Fetch a channel's pinned posts. Pure read, no cursor side
     /// effects. Uses the cross-team channel resolver; accepts
@@ -445,12 +448,24 @@ struct CheckArgs {
 
 #[derive(Debug, Args)]
 struct WaitArgs {
-    channel: String,
+    /// Single-channel wait. Mutually exclusive with repeated `--channel`.
+    #[arg(required_unless_present = "channels")]
+    channel: Option<String>,
+    /// Fan-in arm. Repeat 2–8 times with explicit `team/channel` selectors.
+    #[arg(long = "channel", value_name = "TEAM/CHANNEL", action = clap::ArgAction::Append)]
+    channels: Vec<String>,
+    /// Per-arm exclusive baseline: `team/channel=post-id`. Repeatable. Fan-in only.
+    #[arg(
+        long = "after-channel",
+        value_name = "TEAM/CHANNEL=POST_ID",
+        action = clap::ArgAction::Append
+    )]
+    after_channels: Vec<String>,
     /// Deadman timeout (default 10m). Match exit 0; clean deadman 1; hard 2. Self-posts never wake.
     #[arg(
         long,
         default_value = "10",
-        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after and --team are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
     )]
     timeout: String,
     /// Literal body substring (case-sensitive). Self-posts never match.
@@ -1592,13 +1607,18 @@ fn map_post_error(err: CliError, char_count: usize) -> CliError {
 /// PER-038 wait: always prefer `wait_channel_v2`. Advanced flags never
 /// fall back to legacy. Bare wait may fall back once on method-not-found
 /// so a new CLI still works against an old daemon for unfiltered waits.
+/// Fan-in (`--channel` ×2–8) uses `wait_channels_v1` and never falls back.
 async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    if !args.channels.is_empty() || args.channel.is_none() {
+        return handle_wait_fan_in(profile, json, args).await;
+    }
+    let channel = args.channel.clone().expect("single-channel wait");
     let timeout_secs = match parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes) {
         Ok(secs) => secs,
         Err(err) => {
             return exit_wait_hard(
                 json,
-                &args.channel,
+                &channel,
                 "input",
                 false,
                 &format!("invalid --timeout: {err}"),
@@ -1609,7 +1629,7 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
     if timeout_secs == 0 {
         return exit_wait_hard(
             json,
-            &args.channel,
+            &channel,
             "input",
             false,
             "wait --timeout must be greater than zero",
@@ -1622,7 +1642,7 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
         if c.is_empty() {
             return exit_wait_hard(
                 json,
-                &args.channel,
+                &channel,
                 "input",
                 false,
                 "empty --contains is refused (not match-all)",
@@ -1633,7 +1653,7 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
         if p.is_empty() {
             return exit_wait_hard(
                 json,
-                &args.channel,
+                &channel,
                 "input",
                 false,
                 "empty --pattern is refused (not match-all)",
@@ -1642,16 +1662,13 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
     }
 
     if !json {
-        eprintln!(
-            "waiting for new message in #{} (timeout: {}s)...",
-            args.channel, timeout_secs
-        );
+        eprintln!("waiting for new message in #{channel} (timeout: {timeout_secs}s)...");
     }
 
     let client = daemon_client(profile);
     let result = match client
         .wait_channel_v2(
-            &args.channel,
+            &channel,
             timeout_secs,
             args.team.clone(),
             args.contains.clone(),
@@ -1667,7 +1684,7 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
         }) if advanced => {
             return exit_wait_hard(
                 json,
-                &args.channel,
+                &channel,
                 "input",
                 false,
                 "the running daemon does not support filtered wait \
@@ -1681,7 +1698,7 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             ..
         }) => {
             client
-                .wait_channel(&args.channel, timeout_secs, args.team.clone())
+                .wait_channel(&channel, timeout_secs, args.team.clone())
                 .await
         }
         Err(other) => Err(other),
@@ -1692,7 +1709,7 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             if result.messages.is_empty() {
                 return exit_wait_hard(
                     json,
-                    &args.channel,
+                    &channel,
                     "input",
                     false,
                     "wait returned success with no message payload",
@@ -1707,8 +1724,240 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             };
             print_value(json, &one)
         }
-        Err(err) => classify_wait_error(json, &args.channel, timeout_secs, err),
+        Err(err) => classify_wait_error(json, &channel, timeout_secs, err),
     }
+}
+
+fn build_fan_in_params(args: &WaitArgs, timeout_secs: u64) -> Result<WaitChannelsParams, String> {
+    if args.channel.is_some() {
+        return Err("positional <channel> cannot be mixed with repeated --channel".into());
+    }
+    if args.team.is_some() {
+        return Err("fan-in wait refuses --team; use explicit team/channel selectors".into());
+    }
+    if args.after.is_some() {
+        return Err("fan-in wait refuses --after; use --after-channel team/channel=post-id".into());
+    }
+    let n = args.channels.len();
+    if !(WAIT_CHANNELS_MIN_ARMS..=WAIT_CHANNELS_MAX_ARMS).contains(&n) {
+        return Err(format!(
+            "fan-in wait requires {WAIT_CHANNELS_MIN_ARMS}–{WAIT_CHANNELS_MAX_ARMS} --channel selectors, got {n}"
+        ));
+    }
+    let mut arms: Vec<WaitChannelArm> = Vec::with_capacity(n);
+    let mut seen = Vec::new();
+    for raw in &args.channels {
+        let selector = parse_qualified_wait_selector(raw).map_err(|e| e.to_string())?;
+        let key = selector.requested_key();
+        if seen.iter().any(|k| k == &key) {
+            return Err(format!("duplicate wait arm {}", selector.qualified()));
+        }
+        seen.push(key);
+        arms.push(WaitChannelArm {
+            team: selector.team,
+            channel: selector.channel,
+            after: None,
+        });
+    }
+    for raw in &args.after_channels {
+        let (selector, after) = parse_after_channel_flag(raw).map_err(|e| e.to_string())?;
+        let exact = arms
+            .iter_mut()
+            .find(|arm| arm.team == selector.team && arm.channel == selector.channel);
+        let Some(arm) = exact else {
+            return Err(format!(
+                "--after-channel {} does not match a requested --channel",
+                selector.qualified()
+            ));
+        };
+        if arm.after.is_some() {
+            return Err(format!(
+                "duplicate --after-channel for {}",
+                selector.qualified()
+            ));
+        }
+        arm.after = Some(after);
+    }
+    let params = WaitChannelsParams {
+        arms,
+        timeout_secs,
+        contains: args.contains.clone(),
+        pattern: args.pattern.clone(),
+    };
+    validate_wait_channels_params(&params).map_err(|e| e.to_string())?;
+    Ok(params)
+}
+
+async fn handle_wait_fan_in(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    let timeout_secs = match parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes) {
+        Ok(secs) => secs,
+        Err(err) => {
+            return exit_fan_in_hard(
+                json,
+                &[],
+                "input",
+                false,
+                &format!("invalid --timeout: {err}"),
+            );
+        }
+    };
+    if timeout_secs == 0 {
+        return exit_fan_in_hard(
+            json,
+            &[],
+            "input",
+            false,
+            "wait --timeout must be greater than zero",
+        );
+    }
+    let params = match build_fan_in_params(&args, timeout_secs) {
+        Ok(params) => params,
+        Err(message) => {
+            return exit_fan_in_hard(json, &[], "input", false, &message);
+        }
+    };
+    let channels: Vec<WaitChannelSelector> = params.arms.iter().map(|a| a.selector()).collect();
+    if !json {
+        let listed = channels
+            .iter()
+            .map(WaitChannelSelector::qualified)
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("waiting for new message in {listed} (timeout: {timeout_secs}s)...");
+    }
+    let client = daemon_client(profile);
+    match client.wait_channels_v1(params).await {
+        Ok(result) => {
+            if result.messages.is_empty() || result.mode != WaitChannelsResult::MODE_FAN_IN {
+                return exit_fan_in_hard(
+                    json,
+                    &channels,
+                    "input",
+                    false,
+                    "wait returned success with no fan-in match payload",
+                );
+            }
+            if !json {
+                eprintln!(
+                    "--- new message in {} ---",
+                    result.matched_channel.qualified()
+                );
+            }
+            print_value(json, &result)
+        }
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) => exit_fan_in_hard(
+            json,
+            &channels,
+            "capability",
+            false,
+            "the running daemon does not support multi-channel wait; \
+             it was started from an earlier chanvoy. Cycle it with \
+             `chanvoy daemon stop` then `chanvoy auto-setup`, and run \
+             the command again.",
+        ),
+        Err(err) => classify_fan_in_error(json, &channels, timeout_secs, err),
+    }
+}
+
+fn classify_fan_in_error(
+    json: bool,
+    channels: &[WaitChannelSelector],
+    timeout_secs: u64,
+    err: DaemonError,
+) -> Result<(), CliError> {
+    match &err {
+        DaemonError::Rpc { code: -32005, .. } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "mode": WaitChannelsResult::MODE_FAN_IN,
+                        "timeout": true,
+                        "timeout_secs": timeout_secs,
+                        "channels": channels,
+                    }))
+                    .unwrap_or_else(|_| r#"{"mode":"fan_in","timeout":true}"#.into())
+                );
+            } else {
+                eprintln!("timeout: true (no matching messages after {timeout_secs} seconds)");
+            }
+            process::exit(1);
+        }
+        DaemonError::Rpc {
+            code: -32007,
+            message,
+        } => exit_fan_in_hard(json, channels, "input", false, message),
+        DaemonError::Rpc {
+            code: -32008,
+            message,
+        } => exit_fan_in_hard(json, channels, "provider", true, message),
+        DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        } => exit_fan_in_hard(
+            json,
+            channels,
+            "capability",
+            false,
+            "the running daemon does not support multi-channel wait; \
+             cycle it with `chanvoy daemon stop` then `chanvoy auto-setup`",
+        ),
+        DaemonError::Rpc {
+            code: -32000,
+            message,
+        } => {
+            let class = if message.contains("wait input")
+                || message.contains("WaitFilterInvalid")
+                || message.contains("resolve failed")
+                || message.contains("duplicate wait arm")
+            {
+                "input"
+            } else {
+                "provider"
+            };
+            exit_fan_in_hard(json, channels, class, class == "provider", message)
+        }
+        DaemonError::NotRunning(path) => exit_fan_in_hard(
+            json,
+            channels,
+            "provider",
+            true,
+            &format!("no chanvoy daemon is listening at {path}"),
+        ),
+        DaemonError::Rpc { message, .. } => {
+            exit_fan_in_hard(json, channels, "provider", true, message)
+        }
+        other => exit_fan_in_hard(json, channels, "provider", true, &other.to_string()),
+    }
+}
+
+fn exit_fan_in_hard(
+    json: bool,
+    channels: &[WaitChannelSelector],
+    error_class: &str,
+    retryable: bool,
+    message: &str,
+) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "timeout": false,
+                "mode": WaitChannelsResult::MODE_FAN_IN,
+                "error_class": error_class,
+                "retryable": retryable,
+                "message": message,
+                "channels": channels,
+            }))
+            .unwrap_or_else(|_| format!(r#"{{"timeout":false,"message":{message:?}}}"#))
+        );
+    } else {
+        eprintln!("wait error ({error_class}): {message}");
+    }
+    process::exit(EXIT_ENV_INPUT);
 }
 
 /// Wait-local exhaustive outcome classifier (devrev D4): deadman exit 1
@@ -4453,6 +4702,19 @@ impl HumanReadable for WaitResult {
     }
 }
 
+impl HumanReadable for WaitChannelsResult {
+    fn to_human_string(&self) -> String {
+        let header = format!("matched {}", self.matched_channel.qualified());
+        let body = self
+            .messages
+            .iter()
+            .map(format_message)
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{header}\n{body}")
+    }
+}
+
 impl HumanReadable for AckResult {
     fn to_human_string(&self) -> String {
         match &self.cursor_post_id {
@@ -4679,6 +4941,118 @@ mod tests {
     /// `env::remove_var` calls would otherwise race with each other and
     /// with any test that reads the same vars.
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn wait_help_mentions_fan_in_channel_flag() {
+        let mut cli = Cli::command();
+        let wait = cli
+            .find_subcommand_mut("wait")
+            .expect("wait subcommand is present");
+        let help = wait.render_long_help().to_string();
+        assert!(
+            help.contains("--channel") && help.contains("team/channel"),
+            "wait help must document fan-in --channel: {help}"
+        );
+        assert!(
+            help.contains("--after-channel"),
+            "wait help must document --after-channel: {help}"
+        );
+    }
+
+    #[test]
+    fn fan_in_cli_shape_refuses_mix_bare_and_counts() {
+        let timeout = "10s".to_string();
+        let mix = WaitArgs {
+            channel: Some("brief".into()),
+            channels: vec!["org/a".into(), "org/b".into()],
+            after_channels: vec![],
+            timeout: timeout.clone(),
+            contains: None,
+            pattern: None,
+            after: None,
+            team: None,
+        };
+        assert!(build_fan_in_params(&mix, 10).is_err());
+
+        let bare = WaitArgs {
+            channel: None,
+            channels: vec!["brief".into(), "org/b".into()],
+            after_channels: vec![],
+            timeout: timeout.clone(),
+            contains: None,
+            pattern: None,
+            after: None,
+            team: None,
+        };
+        assert!(build_fan_in_params(&bare, 10).is_err());
+
+        let one = WaitArgs {
+            channel: None,
+            channels: vec!["org/a".into()],
+            after_channels: vec![],
+            timeout: timeout.clone(),
+            contains: None,
+            pattern: None,
+            after: None,
+            team: None,
+        };
+        assert!(build_fan_in_params(&one, 10).is_err());
+
+        let mut nine = Vec::new();
+        for i in 0..9 {
+            nine.push(format!("org/c{i}"));
+        }
+        let too_many = WaitArgs {
+            channel: None,
+            channels: nine,
+            after_channels: vec![],
+            timeout: timeout.clone(),
+            contains: None,
+            pattern: None,
+            after: None,
+            team: None,
+        };
+        assert!(build_fan_in_params(&too_many, 10).is_err());
+
+        let after_single = WaitArgs {
+            channel: None,
+            channels: vec!["org/a".into(), "org/b".into()],
+            after_channels: vec![],
+            timeout: timeout.clone(),
+            contains: None,
+            pattern: None,
+            after: Some("post".into()),
+            team: None,
+        };
+        assert!(build_fan_in_params(&after_single, 10).is_err());
+
+        let unmatched = WaitArgs {
+            channel: None,
+            channels: vec!["org/a".into(), "org/b".into()],
+            after_channels: vec!["org/z=post".into()],
+            timeout: timeout.clone(),
+            contains: None,
+            pattern: None,
+            after: None,
+            team: None,
+        };
+        assert!(build_fan_in_params(&unmatched, 10).is_err());
+
+        let ok = WaitArgs {
+            channel: None,
+            channels: vec!["org/a".into(), "org/b".into()],
+            after_channels: vec!["org/a=post1".into()],
+            timeout,
+            contains: Some("ASSENT".into()),
+            pattern: None,
+            after: None,
+            team: None,
+        };
+        let params = build_fan_in_params(&ok, 30).expect("valid fan-in");
+        assert_eq!(params.arms.len(), 2);
+        assert_eq!(params.arms[0].after.as_deref(), Some("post1"));
+        assert_eq!(params.contains.as_deref(), Some("ASSENT"));
+    }
 
     #[test]
     fn wait_help_states_filter_source_and_compiled_regex_bounds() {
