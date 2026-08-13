@@ -26,6 +26,7 @@ pub struct CompleteGuardHold {
 }
 
 impl CompleteGuardHold {
+    #[cfg(test)]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             parked: AtomicBool::new(false),
@@ -34,10 +35,12 @@ impl CompleteGuardHold {
         })
     }
 
+    #[cfg(test)]
     pub fn is_parked(&self) -> bool {
         self.parked.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
     pub fn release(&self) {
         let mut go = self.go.lock().expect("complete-guard go");
         *go = true;
