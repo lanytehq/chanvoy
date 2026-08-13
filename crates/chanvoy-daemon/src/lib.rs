@@ -1176,11 +1176,15 @@ async fn dispatch_request(
             .map(to_value)
         }
         method if method == WAIT_CHANNELS_V1_METHOD => {
-            parse_and_call(&request.params, |params: WaitChannelsParams| async move {
-                wait_channels::wait_channels_with_params(state, params).await
-            })
-            .await
-            .map(to_value)
+            match serde_json::from_value::<WaitChannelsParams>(request.params.clone()) {
+                Ok(params) => wait_channels::wait_channels_with_params(state, params)
+                    .await
+                    .map(to_value)
+                    .map_err(DaemonError::from),
+                Err(err) => Err(DaemonError::Core(CoreError::WaitFilterInvalid(format!(
+                    "wait_channels_v1 input: {err}"
+                )))),
+            }
         }
         "create_channel" => {
             parse_and_call(&request.params, |params: CreateChannelParams| async move {

@@ -613,10 +613,19 @@ async fn ac_f1_unknown_rpc_members_are_hard_input() {
     )
     .await;
     assert!(extra_top.result.is_none());
-    let top_code = extra_top.error.as_ref().map(|e| e.code);
+    let top_err = extra_top
+        .error
+        .as_ref()
+        .expect("top-level unknown field error");
+    assert_eq!(
+        top_err.code, -32007,
+        "unknown top-level field must be invalid-input, got {top_err:?}"
+    );
     assert!(
-        top_code == Some(-32000) || top_code == Some(-32007),
-        "unknown top-level field must be hard RPC error, got {top_code:?}"
+        top_err.message.contains("wait_channels_v1 input")
+            && top_err.message.contains("unknown field"),
+        "decode failure must name the input class: {}",
+        top_err.message
     );
 
     let extra_arm = raw_rpc(
@@ -632,10 +641,16 @@ async fn ac_f1_unknown_rpc_members_are_hard_input() {
     )
     .await;
     assert!(extra_arm.result.is_none());
-    let arm_code = extra_arm.error.as_ref().map(|e| e.code);
+    let arm_err = extra_arm.error.as_ref().expect("arm unknown field error");
+    assert_eq!(
+        arm_err.code, -32007,
+        "unknown arm field must be invalid-input, got {arm_err:?}"
+    );
     assert!(
-        arm_code == Some(-32000) || arm_code == Some(-32007),
-        "unknown arm field must be hard RPC error, got {arm_code:?}"
+        arm_err.message.contains("wait_channels_v1 input")
+            && arm_err.message.contains("unknown field"),
+        "decode failure must name the input class: {}",
+        arm_err.message
     );
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
