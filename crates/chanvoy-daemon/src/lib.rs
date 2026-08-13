@@ -562,7 +562,18 @@ async fn handle_client(
                 } else {
                     None
                 };
-                let response = dispatch_request(request, &state, &shutdown_tx).await;
+                let response = if is_wait_rpc(&request.method) {
+                    let mut eof_buf = String::new();
+                    tokio::select! {
+                        response = dispatch_request(request, &state, &shutdown_tx) => response,
+                        peek = reader.read_line(&mut eof_buf) => {
+                            let _ = peek?;
+                            break;
+                        }
+                    }
+                } else {
+                    dispatch_request(request, &state, &shutdown_tx).await
+                };
 
                 if let Some(sub_ack) = extract_subscription_id(&response.result) {
                     client_sub_ids.push(sub_ack);
@@ -1483,6 +1494,13 @@ fn to_value<T: Serialize>(value: T) -> serde_json::Value {
 #[cfg(test)]
 fn error_code(error: &DaemonError) -> i64 {
     error_payload(error).0
+}
+
+fn is_wait_rpc(method: &str) -> bool {
+    matches!(
+        method,
+        "wait_channel" | "wait_channel_v2" | "wait_channels_v1"
+    ) || method == WAIT_CHANNEL_V3_METHOD
 }
 
 fn error_payload(error: &DaemonError) -> (i64, String, Option<serde_json::Value>) {

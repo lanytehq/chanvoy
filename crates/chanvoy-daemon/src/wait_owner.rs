@@ -25,6 +25,8 @@ pub struct WaitOwnerRegistry {
     /// Refused / unconfirmed acquires never arm, so this is the
     /// subscribe/backfill gate for tests.
     armed_after_acquire: AtomicU64,
+    provider_io: AtomicU64,
+    post_ack_hold: Mutex<Option<Arc<Notify>>>,
 }
 
 #[derive(Debug)]
@@ -40,6 +42,8 @@ struct LiveSlot {
     cleanup_acked: Arc<AtomicBool>,
     cleanup_notify: Arc<Notify>,
     replaced_by: Arc<Mutex<Option<String>>>,
+    /// True from BeginReplace until install or abandoned unconfirmed.
+    handoff_pending: bool,
 }
 
 #[derive(Debug)]
@@ -78,10 +82,13 @@ impl WaitOwnerRegistry {
             }),
             cleanup_budget: Mutex::new(Duration::from_secs(REPLACE_CLEANUP_BUDGET_SECS)),
             armed_after_acquire: AtomicU64::new(0),
+            provider_io: AtomicU64::new(0),
+            post_ack_hold: Mutex::new(None),
         }
     }
 
     #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_cleanup_budget(&self, budget: Duration) {
         *self.cleanup_budget.lock().expect("cleanup budget") = budget;
     }
@@ -91,11 +98,32 @@ impl WaitOwnerRegistry {
     }
 
     #[allow(dead_code)]
+    #[cfg(test)]
     pub fn armed_count(&self) -> u64 {
         self.armed_after_acquire.load(Ordering::SeqCst)
     }
 
+    pub fn note_provider_io(&self) {
+        self.provider_io.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub fn set_post_ack_hold(&self, gate: Arc<Notify>) {
+        *self.post_ack_hold.lock().expect("post-ack hold") = Some(gate);
+    }
+
+    #[cfg(test)]
+    pub fn cleanup_acked(&self, channel_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("wait registry")
+            .slots
+            .get(channel_id)
+            .is_some_and(|s| s.cleanup_acked.load(Ordering::SeqCst))
+    }
+
     #[allow(dead_code)]
+    #[cfg(test)]
     pub fn snapshot(&self, channel_id: &str) -> Option<WaitSlotView> {
         self.inner
             .lock()
@@ -106,6 +134,7 @@ impl WaitOwnerRegistry {
     }
 
     #[allow(dead_code)]
+    #[cfg(test)]
     pub fn release_generation(&self, channel_id: &str, generation: u64) {
         self.release(channel_id, generation);
     }
@@ -196,6 +225,7 @@ impl WaitOwnerRegistry {
                         }
                     })?;
                     slot.view.replacing = true;
+                    slot.handoff_pending = true;
                     *slot.replaced_by.lock().expect("replaced_by") = Some(new_wait_id.clone());
                     Prepared::Replacing {
                         old_wait_id,
@@ -227,17 +257,25 @@ impl WaitOwnerRegistry {
                 let configured = *self.cleanup_budget.lock().expect("cleanup budget");
                 let budget = remaining.min(configured);
                 if !wait_for_cleanup(budget, &acked, &notify).await {
+                    self.abandon_handoff(channel_id, old_generation);
                     return Err(CoreError::WaitReplaceUnconfirmed {
                         team: team.to_string(),
                         channel: channel.to_string(),
                         existing_wait_id: old_wait_id,
                     });
                 }
+                let gate = self.post_ack_hold.lock().expect("post-ack hold").take();
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
                 let mut inner = self.inner.lock().expect("wait registry");
                 let current = inner.slots.get(channel_id).map(|s| s.view.clone());
-                if current.is_some()
-                    && !can_install_replacement(current.as_ref(), old_generation, new_generation)
-                {
+                if !can_install_replacement(current.as_ref(), old_generation, new_generation) {
+                    if let Some(slot) = inner.slots.get_mut(channel_id) {
+                        if slot.view.generation == old_generation {
+                            slot.handoff_pending = false;
+                        }
+                    }
                     return Err(CoreError::WaitReplaceUnconfirmed {
                         team: team.to_string(),
                         channel: channel.to_string(),
@@ -282,6 +320,7 @@ impl WaitOwnerRegistry {
                 cleanup_acked: Arc::clone(&cleanup_acked),
                 cleanup_notify: Arc::clone(&cleanup_notify),
                 replaced_by: Arc::clone(&replaced_by),
+                handoff_pending: false,
             },
         );
         WaitLease {
@@ -295,6 +334,24 @@ impl WaitOwnerRegistry {
             cleanup_acked,
             cleanup_notify,
         }
+    }
+
+    fn abandon_handoff(&self, channel_id: &str, generation: u64) {
+        let mut inner = self.inner.lock().expect("wait registry");
+        if let Some(slot) = inner.slots.get_mut(channel_id) {
+            if slot.view.generation == generation {
+                slot.handoff_pending = false;
+            }
+        }
+    }
+
+    fn handoff_pending(&self, channel_id: &str, generation: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("wait registry")
+            .slots
+            .get(channel_id)
+            .is_some_and(|s| s.view.generation == generation && s.handoff_pending)
     }
 
     fn release(&self, channel_id: &str, generation: u64) {
@@ -359,7 +416,14 @@ impl WaitSession {
 
 impl Drop for WaitGuard {
     fn drop(&mut self) {
-        self.registry.release(&self.channel_id, self.generation);
+        // If a replace is in flight, keep the slot as a reservation so a
+        // default waiter cannot sneak through the empty-key window.
+        let keep_reservation = self
+            .registry
+            .handoff_pending(&self.channel_id, self.generation);
+        if !keep_reservation {
+            self.registry.release(&self.channel_id, self.generation);
+        }
         self.cleanup_acked.store(true, Ordering::SeqCst);
         self.cleanup_notify.notify_one();
     }
@@ -413,6 +477,70 @@ mod tests {
         reg.note_arm();
         assert_eq!(reg.armed_count(), 2);
         assert!(reg.snapshot("ch-1").is_some_and(|s| !s.replacing));
+    }
+
+    #[tokio::test]
+    async fn reservation_blocks_default_between_ack_and_install() {
+        let reg = Arc::new(WaitOwnerRegistry::new());
+        let old = reg
+            .acquire("ch-1", "org", "brief", None, Duration::from_secs(5))
+            .await
+            .expect("admit");
+        let old_id = old.wait_id.clone();
+        let (_session, guard) = old.into_guard();
+
+        let gate = Arc::new(Notify::new());
+        reg.set_post_ack_hold(Arc::clone(&gate));
+
+        let replacing = Arc::clone(&reg);
+        let old_id_clone = old_id.clone();
+        let replace = tokio::spawn(async move {
+            replacing
+                .acquire(
+                    "ch-1",
+                    "org",
+                    "brief",
+                    Some(&old_id_clone),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        let mark = Instant::now() + Duration::from_millis(200);
+        while !reg.snapshot("ch-1").is_some_and(|s| s.replacing) {
+            assert!(Instant::now() < mark, "replace never marked reservation");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        drop(guard);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while !reg.cleanup_acked("ch-1") {
+            assert!(Instant::now() < deadline, "cleanup ack never published");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !replace.is_finished(),
+            "replacer must park after ack before install"
+        );
+        assert!(
+            reg.snapshot("ch-1").is_some(),
+            "reservation must survive acknowledgement"
+        );
+
+        match reg
+            .acquire("ch-1", "org", "brief", None, Duration::from_secs(1))
+            .await
+        {
+            Err(CoreError::WaitAlreadyActive {
+                existing_wait_id, ..
+            }) => assert_eq!(existing_wait_id, old_id),
+            Ok(_) => panic!("default acquire won the post-ack window"),
+            Err(other) => panic!("expected already-active in post-ack window, got {other}"),
+        }
+
+        gate.notify_one();
+        let new_lease = replace.await.expect("join").expect("install after gate");
+        assert_eq!(new_lease.replaced_wait_id.as_deref(), Some(old_id.as_str()));
+        assert_eq!(reg.armed_count(), 0);
     }
 
     #[tokio::test]

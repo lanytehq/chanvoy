@@ -419,3 +419,94 @@ async fn bad_replace_tokens_leave_active_waiter() {
     let _ = first.wait().await;
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
+
+#[tokio::test]
+#[ignore = "integration: PER-040 process outcome matrix"]
+async fn client_disconnect_releases_wait_immediately() {
+    let env = TestEnv::new("per-040-disconnect").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    mount_empty_channel(&env, "brief-per-040", "chan-id-per040-disc").await;
+    let daemon = spawn_daemon(&env).await;
+
+    let mut first = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args(["--json", "wait", "brief-per-040", "--timeout", "30s"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn first wait");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let held = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&held.stdout).unwrap()["error"]["class"],
+        "wait_already_active"
+    );
+
+    let _ = first.start_kill();
+    let _ = first.wait().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let successor = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_slice(&successor.stdout).unwrap();
+    assert_ne!(
+        value["error"]["class"], "wait_already_active",
+        "disconnect must release the key: {value}"
+    );
+    assert!(
+        successor.status.code() == Some(1) || value["timeout"] == true,
+        "successor should deadman on empty channel, got {value} status={:?}",
+        successor.status.code()
+    );
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
+#[tokio::test]
+#[ignore = "integration: PER-040 process outcome matrix"]
+async fn v3_unknown_field_and_oversize_channel_are_input() {
+    let env = TestEnv::new("per-040-strict-v3").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    mount_empty_channel(&env, "brief-per-040", "chan-id-per040-strict").await;
+    let daemon = spawn_daemon(&env).await;
+
+    let extra = raw_rpc(
+        env.socket_path(),
+        WAIT_CHANNEL_V3_METHOD,
+        json!({
+            "channel": "brief-per-040",
+            "timeout_secs": 3,
+            "force": true
+        }),
+    )
+    .await;
+    assert_eq!(extra.error.as_ref().map(|e| e.code), Some(-32007));
+
+    let oversize = raw_rpc(
+        env.socket_path(),
+        WAIT_CHANNEL_V3_METHOD,
+        json!({
+            "channel": "a".repeat(257),
+            "timeout_secs": 3
+        }),
+    )
+    .await;
+    assert_eq!(oversize.error.as_ref().map(|e| e.code), Some(-32007));
+    let message = oversize
+        .error
+        .as_ref()
+        .map(|e| e.message.as_str())
+        .unwrap_or_default();
+    assert!(message.contains("256"), "{message}");
+
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}

@@ -37,10 +37,10 @@ pub use wait_channels::{
 };
 
 pub use wait_registry::{
-    can_install_replacement, decide_acquire, new_wait_id, should_release, wait_id_well_formed,
-    WaitAcquireDecision, WaitAcquireIntent, WaitSlotView, REPLACE_CLEANUP_BUDGET_SECS,
-    RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED,
-    RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNEL_V3_METHOD,
+    can_install_replacement, decide_acquire, new_wait_id, should_release,
+    validate_wait_channel_v3_strings, wait_id_well_formed, WaitAcquireDecision, WaitAcquireIntent,
+    WaitSlotView, REPLACE_CLEANUP_BUDGET_SECS, RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED,
+    RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNEL_V3_METHOD,
 };
 
 /// `CoreError::Api` already exposes this type in the public error enum, so
@@ -1619,6 +1619,7 @@ pub struct WaitChannelV2Params {
 /// New CLI uses this for every single-channel wait and must not fall
 /// back to v2 while claiming ownership enforcement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WaitChannelV3Params {
     pub channel: String,
     pub timeout_secs: u64,

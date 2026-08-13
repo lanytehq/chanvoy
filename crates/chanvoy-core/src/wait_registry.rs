@@ -6,6 +6,9 @@
 
 use uuid::Uuid;
 
+use super::wait_channels::WAIT_CHANNELS_UTF8_MAX_BYTES;
+use super::CoreError;
+
 pub const WAIT_CHANNEL_V3_METHOD: &str = "wait_channel_v3";
 pub const REPLACE_CLEANUP_BUDGET_SECS: u64 = 5;
 pub const WAIT_ID_PREFIX: &str = "wait_";
@@ -49,6 +52,43 @@ pub enum WaitAcquireDecision {
         new_generation: u64,
         started_at_ms: i64,
     },
+}
+
+pub fn validate_wait_channel_v3_strings(
+    channel: &str,
+    team: Option<&str>,
+    contains: Option<&str>,
+    pattern: Option<&str>,
+    after: Option<&str>,
+) -> Result<(), CoreError> {
+    bound("channel", channel)?;
+    if let Some(team) = team {
+        bound("team", team)?;
+    }
+    if let Some(contains) = contains {
+        bound("contains", contains)?;
+    }
+    if let Some(pattern) = pattern {
+        bound("pattern", pattern)?;
+    }
+    if let Some(after) = after {
+        bound("after", after)?;
+    }
+    Ok(())
+}
+
+fn bound(name: &str, value: &str) -> Result<(), CoreError> {
+    if value.is_empty() {
+        return Err(CoreError::WaitFilterInvalid(format!(
+            "empty {name} is refused"
+        )));
+    }
+    if value.len() > WAIT_CHANNELS_UTF8_MAX_BYTES {
+        return Err(CoreError::WaitFilterInvalid(format!(
+            "wait {name} exceeds {WAIT_CHANNELS_UTF8_MAX_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(())
 }
 
 pub fn new_wait_id() -> String {
@@ -116,7 +156,7 @@ pub fn can_install_replacement(
     reserved_generation: u64,
 ) -> bool {
     match current {
-        None => true,
+        None => false,
         Some(slot) => {
             slot.generation == old_generation
                 && slot.replacing
@@ -300,10 +340,30 @@ mod tests {
     }
 
     #[test]
+    fn v3_params_reject_unknown_fields() {
+        let extra = serde_json::json!({
+            "channel": "brief",
+            "timeout_secs": 1,
+            "force": true
+        });
+        assert!(serde_json::from_value::<crate::WaitChannelV3Params>(extra).is_err());
+    }
+
+    #[test]
+    fn channel_byte_bound_is_enforced() {
+        let big = "a".repeat(WAIT_CHANNELS_UTF8_MAX_BYTES + 1);
+        assert!(validate_wait_channel_v3_strings(&big, None, None, None, None).is_err());
+        assert!(validate_wait_channel_v3_strings("ok", None, None, None, None).is_ok());
+    }
+
+    #[test]
     fn replacement_install_is_generation_safe() {
         let replacing = slot("wait_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 3, true);
         assert!(can_install_replacement(Some(&replacing), 3, 4));
-        assert!(can_install_replacement(None, 3, 4));
+        assert!(
+            !can_install_replacement(None, 3, 4),
+            "empty key is not a reservation to exchange"
+        );
         let newer = slot("wait_cccccccccccccccccccccccccccccccc", 5, false);
         assert!(!can_install_replacement(Some(&newer), 3, 4));
     }

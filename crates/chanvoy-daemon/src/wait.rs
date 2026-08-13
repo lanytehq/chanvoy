@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chanvoy_core::{
-    CoreError, DaemonEvent, DaemonEventPayloadInner, InboundEventPayload, Message, WaitResult,
-    WsConnectionState,
+    validate_wait_channel_v3_strings, CoreError, DaemonEvent, DaemonEventPayloadInner,
+    InboundEventPayload, Message, WaitResult, WsConnectionState,
 };
 use regex::RegexBuilder;
 use reqwest::StatusCode;
@@ -212,6 +212,7 @@ pub async fn wait_with_params(
         emit_wait_ids,
     } = req;
     validate_wait_timeout_secs(timeout_secs)?;
+    validate_wait_channel_v3_strings(channel, team, contains, pattern, after)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     // Pure filter compile only (no provider). Ownership acquire is after
@@ -294,6 +295,7 @@ async fn wait_push_path(
     after: Option<&str>,
     deadline: Instant,
 ) -> Result<WaitResult, CoreError> {
+    state.wait_owners.note_provider_io();
     let mut rx = state.event_bus.subscribe();
     let mut bus_buffer: VecDeque<Arc<DaemonEvent>> = VecDeque::new();
     drain_bus(&mut rx, &mut bus_buffer, channel)?;
@@ -651,6 +653,7 @@ async fn wait_rest_path(
     after: Option<&str>,
     deadline: Instant,
 ) -> Result<WaitResult, CoreError> {
+    state.wait_owners.note_provider_io();
     let (mut scan_cursor, rest_baseline) =
         establish_baseline(state, channel, predicate.channel_id(), after, deadline).await?;
     let mut processed: HashSet<String> = HashSet::new();
