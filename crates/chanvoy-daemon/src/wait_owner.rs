@@ -124,6 +124,11 @@ impl WaitOwnerRegistry {
     }
 
     #[cfg(test)]
+    pub fn provider_io_count(&self) -> u64 {
+        self.provider_io.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
     pub fn set_post_ack_hold(&self, gate: Arc<Notify>) {
         *self.post_ack_hold.lock().expect("post-ack hold") = Some(gate);
     }
@@ -362,6 +367,10 @@ impl WaitOwnerRegistry {
 
     fn abandon_handoff(&self, channel_id: &str, generation: u64) {
         let mut inner = self.inner.lock().expect("wait registry");
+        Self::abandon_handoff_locked(&mut inner, channel_id, generation);
+    }
+
+    fn abandon_handoff_locked(inner: &mut Inner, channel_id: &str, generation: u64) {
         let acked = inner.slots.get(channel_id).is_some_and(|slot| {
             slot.view.generation == generation && slot.cleanup_acked.load(Ordering::SeqCst)
         });
@@ -370,24 +379,38 @@ impl WaitOwnerRegistry {
                 slot.handoff_pending = false;
             }
         }
-        if acked {
-            if let Some(slot) = inner.slots.get(channel_id) {
-                if slot.view.generation == generation {
-                    inner.slots.remove(channel_id);
-                }
-            }
+        if acked
+            && inner
+                .slots
+                .get(channel_id)
+                .is_some_and(|s| s.view.generation == generation)
+        {
+            inner.slots.remove(channel_id);
         }
     }
 
-    fn handoff_pending(&self, channel_id: &str, generation: u64) -> bool {
-        self.inner
-            .lock()
-            .expect("wait registry")
+    /// One locked transition for old-guard Drop: either retain a live
+    /// handoff reservation and publish ack, or release the generation.
+    fn complete_guard(&self, channel_id: &str, generation: u64, cleanup_acked: &AtomicBool) {
+        let mut inner = self.inner.lock().expect("wait registry");
+        let keep = inner
             .slots
             .get(channel_id)
-            .is_some_and(|s| s.view.generation == generation && s.handoff_pending)
+            .is_some_and(|s| s.view.generation == generation && s.handoff_pending);
+        if keep {
+            if let Some(slot) = inner.slots.get(channel_id) {
+                slot.cleanup_acked.store(true, Ordering::SeqCst);
+            }
+        } else if should_release(
+            inner.slots.get(channel_id).map(|s| s.view.clone()).as_ref(),
+            generation,
+        ) {
+            inner.slots.remove(channel_id);
+        }
+        cleanup_acked.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
     fn release(&self, channel_id: &str, generation: u64) {
         let mut inner = self.inner.lock().expect("wait registry");
         let current = inner.slots.get(channel_id).map(|s| s.view.clone());
@@ -450,15 +473,8 @@ impl WaitSession {
 
 impl Drop for WaitGuard {
     fn drop(&mut self) {
-        // If a replace is in flight, keep the slot as a reservation so a
-        // default waiter cannot sneak through the empty-key window.
-        let keep_reservation = self
-            .registry
-            .handoff_pending(&self.channel_id, self.generation);
-        if !keep_reservation {
-            self.registry.release(&self.channel_id, self.generation);
-        }
-        self.cleanup_acked.store(true, Ordering::SeqCst);
+        self.registry
+            .complete_guard(&self.channel_id, self.generation, &self.cleanup_acked);
         self.cleanup_notify.notify_one();
     }
 }
@@ -713,6 +729,107 @@ mod tests {
         drop(guard);
         // Late old guard releases that generation only.
         assert!(reg.snapshot("ch-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn timeout_and_old_guard_drop_cannot_strand_reservation() {
+        let reg = Arc::new(WaitOwnerRegistry::new());
+        reg.set_cleanup_budget(Duration::from_millis(5));
+        let old = reg
+            .acquire("ch-1", "org", "brief", None, Duration::from_secs(5))
+            .await
+            .expect("admit");
+        let old_id = old.wait_id.clone();
+        let (_session, guard) = old.into_guard();
+        let before_io = reg.provider_io_count();
+
+        let replacing = Arc::clone(&reg);
+        let replace = tokio::spawn(async move {
+            replacing
+                .acquire(
+                    "ch-1",
+                    "org",
+                    "brief",
+                    Some(&old_id),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        let mark = Instant::now() + Duration::from_millis(200);
+        while !reg.snapshot("ch-1").is_some_and(|s| s.replacing) {
+            assert!(Instant::now() < mark, "replace never started");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let dropper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            drop(guard);
+        });
+        let replace_result = replace.await.expect("join");
+        let _ = dropper.await;
+        assert_eq!(
+            reg.provider_io_count(),
+            before_io,
+            "replace acquire must not start provider I/O"
+        );
+        if let Ok(lease) = replace_result {
+            let (_session, new_guard) = lease.into_guard();
+            drop(new_guard);
+        }
+
+        match reg
+            .acquire("ch-1", "org", "brief", None, Duration::from_secs(1))
+            .await
+        {
+            Ok(_) => {}
+            Err(err) => panic!("stranded reservation after timeout/drop race: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_acquire_does_not_increment_provider_io() {
+        let reg = Arc::new(WaitOwnerRegistry::new());
+        let old = reg
+            .acquire("ch-1", "org", "brief", None, Duration::from_secs(5))
+            .await
+            .expect("admit");
+        let old_id = old.wait_id.clone();
+        let (_session, guard) = old.into_guard();
+        reg.note_provider_io();
+        let before = reg.provider_io_count();
+        let gate = Arc::new(Notify::new());
+        reg.set_post_ack_hold(Arc::clone(&gate));
+
+        let replacing = Arc::clone(&reg);
+        let replace = tokio::spawn(async move {
+            replacing
+                .acquire(
+                    "ch-1",
+                    "org",
+                    "brief",
+                    Some(&old_id),
+                    Duration::from_secs(5),
+                )
+                .await
+        });
+        let mark = Instant::now() + Duration::from_millis(200);
+        while !reg.snapshot("ch-1").is_some_and(|s| s.replacing) {
+            assert!(Instant::now() < mark, "replace never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(guard);
+        while !reg.cleanup_acked("ch-1") {
+            assert!(Instant::now() < mark + Duration::from_millis(200), "no ack");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(reg.provider_io_count(), before);
+        gate.notify_one();
+        assert!(replace.await.expect("join").is_ok());
+        assert_eq!(
+            reg.provider_io_count(),
+            before,
+            "install still precedes wait-engine provider I/O"
+        );
     }
 
     #[tokio::test]
