@@ -473,6 +473,73 @@ async fn client_disconnect_releases_wait_immediately() {
 
 #[tokio::test]
 #[ignore = "integration: PER-040 process outcome matrix"]
+async fn replacing_client_disconnect_does_not_strand_key() {
+    let env = TestEnv::new("per-040-replace-disconnect").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    mount_empty_channel(&env, "brief-per-040", "chan-id-per040-rdisc").await;
+    let daemon = spawn_daemon(&env).await;
+
+    let mut first = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args(["--json", "wait", "brief-per-040", "--timeout", "30s"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn first wait");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let conflict = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+    )
+    .await;
+    let wait_id = serde_json::from_slice::<serde_json::Value>(&conflict.stdout).unwrap()["error"]
+        ["existing_wait_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut replacer = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args([
+            "--json",
+            "wait",
+            "brief-per-040",
+            "--timeout",
+            "20s",
+            "--replace-wait",
+            &wait_id,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn replace wait");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let _ = replacer.start_kill();
+    let _ = replacer.wait().await;
+    let _ = first.start_kill();
+    let _ = first.wait().await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let successor = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+    )
+    .await;
+    let value: serde_json::Value = serde_json::from_slice(&successor.stdout).unwrap();
+    assert_ne!(
+        value["error"]["class"], "wait_already_active",
+        "stranded reservation after replacer disconnect: {value}"
+    );
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
+#[tokio::test]
+#[ignore = "integration: PER-040 process outcome matrix"]
 async fn v3_unknown_field_and_oversize_channel_are_input() {
     let env = TestEnv::new("per-040-strict-v3").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
