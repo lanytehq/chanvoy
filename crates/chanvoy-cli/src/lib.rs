@@ -16,9 +16,10 @@ use chanvoy_core::{
     DaemonStatus, DmConversation, Identity, LegacyChannel, MattermostClient, Message, Notification,
     PinResult, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult,
     SeedCursorsResult, SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult,
-    UnreadNotifications, WaitChannelArm, WaitChannelSelector, WaitChannelsParams,
-    WaitChannelsResult, WaitResult, WsConnectionState, WAIT_CHANNELS_MAX_ARMS,
-    WAIT_CHANNELS_MIN_ARMS,
+    UnreadNotifications, WaitChannelArm, WaitChannelSelector, WaitChannelV3Params,
+    WaitChannelsParams, WaitChannelsResult, WaitResult, WsConnectionState, RPC_WAIT_ALREADY_ACTIVE,
+    RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED,
+    WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -465,7 +466,7 @@ struct WaitArgs {
     #[arg(
         long,
         default_value = "10",
-        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider failures exit 2 (never timeout:true).\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after and --team are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider/ownership failures exit 2 (never timeout:true).\n\nThis profile daemon allows one active wait per canonical channel. A second wait without --replace-wait <id> is a hard conflict. --replace-wait is compare-and-replace only (no --force). This is not a host-wide or cross-seat lock.\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after, --team, and --replace-wait are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
     )]
     timeout: String,
     /// Literal body substring (case-sensitive). Self-posts never match.
@@ -480,6 +481,13 @@ struct WaitArgs {
     /// Explicit team override for cross-team channel resolution.
     #[arg(long)]
     team: Option<String>,
+    /// Replace the active wait on this profile daemon + channel only if the id still matches.
+    #[arg(
+        long = "replace-wait",
+        value_name = "WAIT_ID",
+        long_help = "Compare-and-replace the active wait on this profile daemon for the same canonical channel. Supply the opaque wait id from a wait_already_active conflict. There is no --force. This is not a host-wide or cross-seat lock."
+    )]
+    replace_wait: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1604,10 +1612,9 @@ fn map_post_error(err: CliError, char_count: usize) -> CliError {
     }
 }
 
-/// PER-038 wait: always prefer `wait_channel_v2`. Advanced flags never
-/// fall back to legacy. Bare wait may fall back once on method-not-found
-/// so a new CLI still works against an old daemon for unfiltered waits.
-/// Fan-in (`--channel` ×2–8) uses `wait_channels_v1` and never falls back.
+/// PER-040 wait: always use `wait_channel_v3`. No v2/legacy fallback —
+/// ownership claims require the v3 daemon. Fan-in (`--channel` ×2–8)
+/// uses `wait_channels_v1` and never falls back.
 async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
     if !args.channels.is_empty() || args.channel.is_none() {
         return handle_wait_fan_in(profile, json, args).await;
@@ -1635,8 +1642,6 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             "wait --timeout must be greater than zero",
         );
     }
-
-    let advanced = args.contains.is_some() || args.pattern.is_some() || args.after.is_some();
 
     if let Some(ref c) = args.contains {
         if c.is_empty() {
@@ -1667,39 +1672,32 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
 
     let client = daemon_client(profile);
     let result = match client
-        .wait_channel_v2(
-            &channel,
+        .wait_channel_v3(WaitChannelV3Params {
+            channel: channel.clone(),
             timeout_secs,
-            args.team.clone(),
-            args.contains.clone(),
-            args.pattern.clone(),
-            args.after.clone(),
-        )
+            team: args.team.clone(),
+            contains: args.contains.clone(),
+            pattern: args.pattern.clone(),
+            after: args.after.clone(),
+            replace_wait_id: args.replace_wait.clone(),
+        })
         .await
     {
         Ok(result) => Ok(result),
         Err(DaemonError::Rpc {
             code: RPC_UNKNOWN_METHOD,
             ..
-        }) if advanced => {
+        }) => {
             return exit_wait_hard(
                 json,
                 &channel,
-                "input",
+                "capability",
                 false,
-                "the running daemon does not support filtered wait \
-                 (--contains/--pattern/--after); it was started from an earlier \
+                "the running daemon does not support single-waiter wait \
+                 (wait_channel_v3); it was started from an earlier \
                  chanvoy. Cycle it with `chanvoy daemon stop` then \
                  `chanvoy auto-setup`, and run the command again.",
             );
-        }
-        Err(DaemonError::Rpc {
-            code: RPC_UNKNOWN_METHOD,
-            ..
-        }) => {
-            client
-                .wait_channel(&channel, timeout_secs, args.team.clone())
-                .await
         }
         Err(other) => Err(other),
     };
@@ -1721,6 +1719,8 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             let one = WaitResult {
                 channel: result.channel,
                 messages: vec![result.messages.into_iter().next().expect("non-empty")],
+                wait_id: result.wait_id,
+                replaced_wait_id: result.replaced_wait_id,
             };
             print_value(json, &one)
         }
@@ -1729,6 +1729,9 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
 }
 
 fn build_fan_in_params(args: &WaitArgs, timeout_secs: u64) -> Result<WaitChannelsParams, String> {
+    if args.replace_wait.is_some() {
+        return Err("fan-in wait refuses --replace-wait; single-channel wait owns one key".into());
+    }
     if args.channel.is_some() {
         return Err("positional <channel> cannot be mixed with repeated --channel".into());
     }
@@ -1889,10 +1892,12 @@ fn classify_fan_in_error(
         DaemonError::Rpc {
             code: -32007,
             message,
+            ..
         } => exit_fan_in_hard(json, channels, "input", false, message),
         DaemonError::Rpc {
             code: -32008,
             message,
+            ..
         } => exit_fan_in_hard(json, channels, "provider", true, message),
         DaemonError::Rpc {
             code: RPC_UNKNOWN_METHOD,
@@ -1908,6 +1913,7 @@ fn classify_fan_in_error(
         DaemonError::Rpc {
             code: -32000,
             message,
+            ..
         } => {
             let class = if message.contains("wait input")
                 || message.contains("WaitFilterInvalid")
@@ -1972,6 +1978,7 @@ fn classify_wait_error(
         DaemonError::Rpc {
             code: -32005,
             message,
+            ..
         } => {
             if json {
                 println!(
@@ -1991,12 +1998,23 @@ fn classify_wait_error(
             process::exit(1);
         }
         DaemonError::Rpc {
+            code:
+                RPC_WAIT_ALREADY_ACTIVE
+                | RPC_WAIT_CONFLICT_CHANGED
+                | RPC_WAIT_REPLACED
+                | RPC_WAIT_REPLACE_UNCONFIRMED,
+            message,
+            data,
+        } => exit_wait_ownership(json, channel, message, data.as_ref()),
+        DaemonError::Rpc {
             code: -32007,
             message,
+            ..
         } => exit_wait_hard(json, channel, "input", false, message),
         DaemonError::Rpc {
             code: -32008,
             message,
+            ..
         } => exit_wait_hard(json, channel, "provider", true, message),
         DaemonError::Rpc {
             code: RPC_UNKNOWN_METHOD,
@@ -2012,6 +2030,7 @@ fn classify_wait_error(
         DaemonError::Rpc {
             code: -32000,
             message,
+            ..
         } if message.contains("wait input error")
             || message.contains("WaitFilterInvalid")
             || message.contains("empty --")
@@ -2027,6 +2046,7 @@ fn classify_wait_error(
         DaemonError::Rpc {
             code: -32000,
             message,
+            ..
         } if message.contains("wait observation failed")
             || message.contains("WaitProviderDegraded")
             || message.contains("stalled")
@@ -2056,6 +2076,38 @@ fn classify_wait_error(
         }
         other => exit_wait_hard(json, channel, "provider", true, &other.to_string()),
     }
+}
+
+fn exit_wait_ownership(
+    json: bool,
+    channel: &str,
+    message: &str,
+    data: Option<&serde_json::Value>,
+) -> Result<(), CliError> {
+    let class = data
+        .and_then(|d| d.get("class"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("wait_conflict");
+    if json {
+        let mut payload = serde_json::json!({
+            "timeout": false,
+            "channel": channel,
+            "error_class": class,
+            "retryable": false,
+            "message": message,
+        });
+        if let Some(data) = data {
+            payload["error"] = data.clone();
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .unwrap_or_else(|_| format!(r#"{{"timeout":false,"message":{message:?}}}"#))
+        );
+    } else {
+        eprintln!("wait error ({class}): {message}");
+    }
+    process::exit(EXIT_ENV_INPUT);
 }
 
 fn exit_wait_hard(
@@ -4971,6 +5023,7 @@ mod tests {
             pattern: None,
             after: None,
             team: None,
+            replace_wait: None,
         };
         assert!(build_fan_in_params(&mix, 10).is_err());
 
@@ -4983,6 +5036,7 @@ mod tests {
             pattern: None,
             after: None,
             team: None,
+            replace_wait: None,
         };
         assert!(build_fan_in_params(&bare, 10).is_err());
 
@@ -4995,6 +5049,7 @@ mod tests {
             pattern: None,
             after: None,
             team: None,
+            replace_wait: None,
         };
         assert!(build_fan_in_params(&one, 10).is_err());
 
@@ -5011,6 +5066,7 @@ mod tests {
             pattern: None,
             after: None,
             team: None,
+            replace_wait: None,
         };
         assert!(build_fan_in_params(&too_many, 10).is_err());
 
@@ -5023,6 +5079,7 @@ mod tests {
             pattern: None,
             after: Some("post".into()),
             team: None,
+            replace_wait: None,
         };
         assert!(build_fan_in_params(&after_single, 10).is_err());
 
@@ -5035,6 +5092,7 @@ mod tests {
             pattern: None,
             after: None,
             team: None,
+            replace_wait: None,
         };
         assert!(build_fan_in_params(&unmatched, 10).is_err());
 
@@ -5047,6 +5105,7 @@ mod tests {
             pattern: None,
             after: None,
             team: None,
+            replace_wait: None,
         };
         let params = build_fan_in_params(&ok, 30).expect("valid fan-in");
         assert_eq!(params.arms.len(), 2);
@@ -5070,6 +5129,14 @@ mod tests {
             help.contains("64 KiB"),
             "wait help must state the compiled-regex bound: {help}"
         );
+        assert!(
+            help.contains("this profile daemon") || help.contains("profile daemon"),
+            "wait help must stay profile-local: {help}"
+        );
+        assert!(
+            help.contains("not a host-wide") || help.contains("not a host-global"),
+            "wait help must deny a host-global lock rather than claim one: {help}"
+        );
     }
 
     /// A CLI that knows `show` / `thread` talking to a daemon that does
@@ -5085,6 +5152,7 @@ mod tests {
             let wire = DaemonError::Rpc {
                 code: -32601,
                 message: "unknown method get_post".to_string(),
+                data: None,
             };
             let rendered = map_daemon_predates_verb(wire, verb).to_string();
 
@@ -5112,6 +5180,7 @@ mod tests {
             DaemonError::Rpc {
                 code: -32000,
                 message: "anchor post p-1 is not in channel bravo-team".to_string(),
+                data: None,
             },
             DaemonError::NotRunning("/run/chanvoy/profile.sock".to_string()),
         ] {

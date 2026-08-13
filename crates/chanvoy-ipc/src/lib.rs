@@ -261,6 +261,10 @@ pub fn core_error_to_chat(error: CoreError, request_id: &str) -> ChatFrame {
         CoreError::WaitTimeout(_) => (ChatErrorCode::NotFound, Some(false)),
         CoreError::WaitFilterInvalid(_) => (ChatErrorCode::InvalidRequest, Some(false)),
         CoreError::WaitProviderDegraded { .. } => (ChatErrorCode::ProviderError, Some(true)),
+        CoreError::WaitAlreadyActive { .. }
+        | CoreError::WaitConflictChanged { .. }
+        | CoreError::WaitReplaced { .. }
+        | CoreError::WaitReplaceUnconfirmed { .. } => (ChatErrorCode::InvalidRequest, Some(false)),
         CoreError::ProfileNotFound(_) => (ChatErrorCode::NotFound, Some(false)),
         // Every cause of an empty thread body is permanent: the post was
         // deleted, it sits in a channel this identity cannot read, or the

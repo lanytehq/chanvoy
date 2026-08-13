@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`chanvoy wait` single-waiter ownership.** One active wait per
+  canonical channel on **this profile daemon**. A second wait without
+  `--replace-wait <id>` exits **2** with `wait_already_active` (never
+  `timeout:true`). `--replace-wait` is compare-and-replace only. New CLI
+  uses `wait_channel_v3` and does not fall back to v2. This is not a
+  host-wide lock.
 - **`chanvoy wait` multi-channel fan-in.** Repeat `--channel team/channel`
   (2–8 arms) to block on the first eligible peer post under one shared
   deadline. Per-arm exclusive baselines use `--after-channel

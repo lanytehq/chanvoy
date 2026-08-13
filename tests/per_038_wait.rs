@@ -253,7 +253,7 @@ async fn wait_process_hard_input_is_exit_two() {
     let env = TestEnv::new("per-038-process-hard").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     let over_limit = "x".repeat(257);
-    let server = fake_daemon(&env, vec![("wait_channel_v2", FakeReply::Input)]).await;
+    let server = fake_daemon(&env, vec![("wait_channel_v3", FakeReply::Input)]).await;
     let output = run_chanvoy(
         &env,
         &[
@@ -340,7 +340,7 @@ async fn wait_process_empty_contains_is_exit_two() {
 async fn wait_skew_new_cli_advanced_old_daemon_is_hard_input() {
     let env = TestEnv::new("per-038-skew-advanced-old").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
-    let server = fake_daemon(&env, vec![("wait_channel_v2", FakeReply::UnknownMethod)]).await;
+    let server = fake_daemon(&env, vec![("wait_channel_v3", FakeReply::UnknownMethod)]).await;
     let output = run_chanvoy(
         &env,
         &[
@@ -358,36 +358,32 @@ async fn wait_skew_new_cli_advanced_old_daemon_is_hard_input() {
     assert_eq!(output.status.code(), Some(2));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["timeout"], false);
-    assert_eq!(value["error_class"], "input");
-    assert!(value["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("does not support filtered wait")));
+    assert_eq!(value["error_class"], "capability");
+    assert!(value["message"].as_str().is_some_and(
+        |message| message.contains("wait_channel_v3") || message.contains("single-waiter")
+    ));
 }
 
-/// New CLI → old daemon, bare wait: method-not-found may use the legacy
-/// method, and a legacy timeout remains the clean exit-1 contract.
+/// New CLI → old daemon, bare wait: PER-040 forbids v2 fallback. Method
+/// not found is a hard capability failure (exit 2), never a deadman.
 #[tokio::test]
 #[ignore = "integration: PER-038 protocol skew matrix"]
-async fn wait_skew_new_cli_bare_old_daemon_uses_legacy_fallback() {
+async fn wait_skew_new_cli_bare_old_daemon_is_hard_capability() {
     let env = TestEnv::new("per-038-skew-bare-old").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
-    let server = fake_daemon(
-        &env,
-        vec![
-            ("wait_channel_v2", FakeReply::UnknownMethod),
-            ("wait_channel", FakeReply::Timeout),
-        ],
-    )
-    .await;
+    let server = fake_daemon(&env, vec![("wait_channel_v3", FakeReply::UnknownMethod)]).await;
     let output = run_chanvoy(
         &env,
         &["--json", "wait", "brief-per-038", "--timeout", "1s"],
     )
     .await;
     server.await.expect("fake old daemon completed");
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["timeout"], true);
+    assert_eq!(value["timeout"], false);
+    assert!(value["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("wait_channel_v3") || message.contains("Cycle")));
 }
 
 /// Old CLI → new daemon: the legacy RPC remains accepted by the new daemon.
