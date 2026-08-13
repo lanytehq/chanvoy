@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use chanvoy_core::{
@@ -17,7 +17,42 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug)]
+/// Test-only barrier: park `complete_guard` after it has observed the
+/// reservation and released the registry lock, before it publishes ack.
+pub struct CompleteGuardHold {
+    parked: AtomicBool,
+    go: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl CompleteGuardHold {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parked: AtomicBool::new(false),
+            go: Mutex::new(false),
+            cv: Condvar::new(),
+        })
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    pub fn release(&self) {
+        let mut go = self.go.lock().expect("complete-guard go");
+        *go = true;
+        self.cv.notify_one();
+    }
+
+    fn park(&self) {
+        self.parked.store(true, Ordering::SeqCst);
+        let mut go = self.go.lock().expect("complete-guard go");
+        while !*go {
+            go = self.cv.wait(go).expect("complete-guard wait");
+        }
+    }
+}
+
 pub struct WaitOwnerRegistry {
     inner: Mutex<Inner>,
     cleanup_budget: Mutex<Duration>,
@@ -27,6 +62,7 @@ pub struct WaitOwnerRegistry {
     armed_after_acquire: AtomicU64,
     provider_io: AtomicU64,
     post_ack_hold: Mutex<Option<Arc<Notify>>>,
+    complete_guard_hold: Mutex<Option<Arc<CompleteGuardHold>>>,
 }
 
 #[derive(Debug)]
@@ -46,7 +82,6 @@ struct LiveSlot {
     handoff_pending: bool,
 }
 
-#[derive(Debug)]
 pub struct WaitLease {
     registry: Arc<WaitOwnerRegistry>,
     pub channel_id: String,
@@ -100,6 +135,7 @@ impl WaitOwnerRegistry {
             armed_after_acquire: AtomicU64::new(0),
             provider_io: AtomicU64::new(0),
             post_ack_hold: Mutex::new(None),
+            complete_guard_hold: Mutex::new(None),
         }
     }
 
@@ -131,6 +167,14 @@ impl WaitOwnerRegistry {
     #[cfg(test)]
     pub fn set_post_ack_hold(&self, gate: Arc<Notify>) {
         *self.post_ack_hold.lock().expect("post-ack hold") = Some(gate);
+    }
+
+    #[cfg(test)]
+    pub fn set_complete_guard_hold(&self, hold: Arc<CompleteGuardHold>) {
+        *self
+            .complete_guard_hold
+            .lock()
+            .expect("complete-guard hold") = Some(hold);
     }
 
     #[cfg(test)]
@@ -389,23 +433,38 @@ impl WaitOwnerRegistry {
         }
     }
 
-    /// One locked transition for old-guard Drop: either retain a live
-    /// handoff reservation and publish ack, or release the generation.
+    /// Observe reservation, optionally park (tests), then re-check and
+    /// either publish ack on a live handoff or release the generation.
     fn complete_guard(&self, channel_id: &str, generation: u64, cleanup_acked: &AtomicBool) {
+        let observed_pending = {
+            let inner = self.inner.lock().expect("wait registry");
+            inner
+                .slots
+                .get(channel_id)
+                .is_some_and(|s| s.view.generation == generation && s.handoff_pending)
+        };
+        let hold = self
+            .complete_guard_hold
+            .lock()
+            .expect("complete-guard hold")
+            .take();
+        if let Some(hold) = hold {
+            hold.park();
+        }
         let mut inner = self.inner.lock().expect("wait registry");
-        let keep = inner
+        let view = inner.slots.get(channel_id).map(|s| s.view.clone());
+        let pending = inner
             .slots
             .get(channel_id)
-            .is_some_and(|s| s.view.generation == generation && s.handoff_pending);
-        if keep {
-            if let Some(slot) = inner.slots.get(channel_id) {
-                slot.cleanup_acked.store(true, Ordering::SeqCst);
+            .is_some_and(|s| s.handoff_pending);
+        if view.as_ref().is_some_and(|v| v.generation == generation) {
+            if pending {
+                if let Some(slot) = inner.slots.get(channel_id) {
+                    slot.cleanup_acked.store(true, Ordering::SeqCst);
+                }
+            } else if observed_pending || should_release(view.as_ref(), generation) {
+                inner.slots.remove(channel_id);
             }
-        } else if should_release(
-            inner.slots.get(channel_id).map(|s| s.view.clone()).as_ref(),
-            generation,
-        ) {
-            inner.slots.remove(channel_id);
         }
         cleanup_acked.store(true, Ordering::SeqCst);
     }
@@ -734,12 +793,15 @@ mod tests {
     #[tokio::test]
     async fn timeout_and_old_guard_drop_cannot_strand_reservation() {
         let reg = Arc::new(WaitOwnerRegistry::new());
-        reg.set_cleanup_budget(Duration::from_millis(5));
+        reg.set_cleanup_budget(Duration::from_millis(15));
+        let hold = CompleteGuardHold::new();
+        reg.set_complete_guard_hold(Arc::clone(&hold));
         let old = reg
             .acquire("ch-1", "org", "brief", None, Duration::from_secs(5))
             .await
             .expect("admit");
         let old_id = old.wait_id.clone();
+        let old_gen = old.generation;
         let (_session, guard) = old.into_guard();
         let before_io = reg.provider_io_count();
 
@@ -761,27 +823,46 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        let dropper = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            drop(guard);
-        });
-        let replace_result = replace.await.expect("join");
-        let _ = dropper.await;
-        assert_eq!(
-            reg.provider_io_count(),
-            before_io,
-            "replace acquire must not start provider I/O"
-        );
-        if let Ok(lease) = replace_result {
-            let (_session, new_guard) = lease.into_guard();
-            drop(new_guard);
+        let dropper = tokio::task::spawn_blocking(move || drop(guard));
+        let parked = Instant::now() + Duration::from_millis(200);
+        while !hold.is_parked() {
+            assert!(Instant::now() < parked, "complete_guard never parked");
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        assert!(
+            !reg.cleanup_acked("ch-1"),
+            "ack must not publish until after abandon starts"
+        );
+
+        let replace_result = replace.await.expect("join");
+        assert!(
+            matches!(
+                replace_result,
+                Err(CoreError::WaitReplaceUnconfirmed { .. })
+            ),
+            "parked ack must cause cleanup timeout"
+        );
+        hold.release();
+        dropper.await.expect("dropper");
+
+        assert!(
+            reg.snapshot("ch-1").is_none()
+                || reg
+                    .snapshot("ch-1")
+                    .is_some_and(|s| s.generation != old_gen),
+            "old generation must not remain stranded"
+        );
+        assert_eq!(reg.provider_io_count(), before_io);
 
         match reg
             .acquire("ch-1", "org", "brief", None, Duration::from_secs(1))
             .await
         {
-            Ok(_) => {}
+            Ok(lease) => {
+                assert_ne!(lease.generation, old_gen);
+                let (_s, g) = lease.into_guard();
+                drop(g);
+            }
             Err(err) => panic!("stranded reservation after timeout/drop race: {err}"),
         }
     }
