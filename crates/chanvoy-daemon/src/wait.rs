@@ -243,6 +243,9 @@ pub async fn wait_with_params(
             remaining,
         )
         .await?;
+    // Subscribe/backfill only after a successful acquire. Tests use
+    // armed_count as the provider-I/O gate.
+    state.wait_owners.note_arm();
     let (session, _guard) = lease.into_guard();
 
     let is_monitored = state

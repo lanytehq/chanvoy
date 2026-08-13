@@ -234,3 +234,188 @@ async fn v2_rpc_cannot_replace_but_gains_refuse_default() {
     let _ = first.wait().await;
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
+
+#[tokio::test]
+#[ignore = "integration: PER-040 process outcome matrix"]
+async fn replace_wait_displaces_old_process() {
+    let env = TestEnv::new("per-040-replace-exact").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    mount_empty_channel(&env, "brief-per-040", "chan-id-per040-replace").await;
+    let daemon = spawn_daemon(&env).await;
+
+    let first = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args(["--json", "wait", "brief-per-040", "--timeout", "30s"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn first wait");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let conflict = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "3s"],
+    )
+    .await;
+    assert_eq!(conflict.status.code(), Some(2));
+    let conflict_json: serde_json::Value = serde_json::from_slice(&conflict.stdout).unwrap();
+    let wait_id = conflict_json["error"]["existing_wait_id"]
+        .as_str()
+        .expect("existing wait id")
+        .to_string();
+
+    let mut replacement = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args([
+            "--json",
+            "wait",
+            "brief-per-040",
+            "--timeout",
+            "20s",
+            "--replace-wait",
+            &wait_id,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn replace wait");
+
+    let first_out = first.wait_with_output().await.expect("first wait exit");
+    assert_eq!(first_out.status.code(), Some(2), "old waiter must exit 2");
+    let first_json: serde_json::Value = serde_json::from_slice(&first_out.stdout).unwrap();
+    assert_eq!(first_json["timeout"], false);
+    assert_eq!(first_json["error"]["class"], "wait_replaced");
+    assert_eq!(first_json["error"]["wait_id"], wait_id);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let third = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+    )
+    .await;
+    assert_eq!(third.status.code(), Some(2));
+    let third_json: serde_json::Value = serde_json::from_slice(&third.stdout).unwrap();
+    assert_eq!(
+        third_json["error"]["class"], "wait_already_active",
+        "replacement must own the key after old cleanup: {third_json}"
+    );
+    assert_ne!(third_json["error"]["existing_wait_id"], wait_id);
+
+    let _ = replacement.start_kill();
+    let _ = replacement.wait().await;
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
+#[tokio::test]
+#[ignore = "integration: PER-040 process outcome matrix"]
+async fn bad_replace_tokens_leave_active_waiter() {
+    let env = TestEnv::new("per-040-replace-bad-tokens").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    mount_empty_channel(&env, "brief-a", "chan-id-a").await;
+    mount_empty_channel(&env, "brief-b", "chan-id-b").await;
+    let daemon = spawn_daemon(&env).await;
+
+    let mut first = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args(["--json", "wait", "brief-a", "--timeout", "30s"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn first wait");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let conflict = run_chanvoy(&env, &["--json", "wait", "brief-a", "--timeout", "2s"]).await;
+    let live_id = serde_json::from_slice::<serde_json::Value>(&conflict.stdout).unwrap()["error"]
+        ["existing_wait_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let stale = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "brief-a",
+            "--timeout",
+            "2s",
+            "--replace-wait",
+            "wait_0123456789abcdef0123456789abcdef",
+        ],
+    )
+    .await;
+    let malformed = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "brief-a",
+            "--timeout",
+            "2s",
+            "--replace-wait",
+            "not-a-wait-id",
+        ],
+    )
+    .await;
+    let other_channel = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "brief-b",
+            "--timeout",
+            "2s",
+            "--replace-wait",
+            &live_id,
+        ],
+    )
+    .await;
+    for (label, out) in [
+        ("stale", stale),
+        ("malformed", malformed),
+        ("other-channel", other_channel),
+    ] {
+        assert_eq!(out.status.code(), Some(2), "{label}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["timeout"], false, "{label}");
+        assert_eq!(
+            value["error"]["class"], "wait_conflict_changed",
+            "{label} => {value}"
+        );
+    }
+
+    let still = run_chanvoy(&env, &["--json", "wait", "brief-a", "--timeout", "2s"]).await;
+    let still_json: serde_json::Value = serde_json::from_slice(&still.stdout).unwrap();
+    assert_eq!(still_json["error"]["class"], "wait_already_active");
+    assert_eq!(still_json["error"]["existing_wait_id"], live_id);
+    assert!(
+        first.try_wait().unwrap().is_none(),
+        "old waiter still armed"
+    );
+
+    let absent = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "brief-b",
+            "--timeout",
+            "2s",
+            "--replace-wait",
+            "wait_ffffffffffffffffffffffffffffffff",
+        ],
+    )
+    .await;
+    let absent_json: serde_json::Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert_eq!(absent_json["error"]["class"], "wait_conflict_changed");
+
+    let _ = first.start_kill();
+    let _ = first.wait().await;
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
