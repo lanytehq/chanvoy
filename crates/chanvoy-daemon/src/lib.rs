@@ -7,21 +7,25 @@ use std::{env, fs, io};
 
 mod wait;
 mod wait_channels;
+mod wait_owner;
 
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
-    now_unix_millis, pid_path_for_profile, rpc_error, rpc_result, socket_path_for_profile,
-    store_attention_state, AckChannelParams, AckResult, AddMemberParams, ArchiveChannelParams,
-    AttentionShowParams, AttentionState, CapabilityClass, Channel, CheckChannelParams, CheckResult,
-    CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind, DaemonEventPayloadInner,
-    DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation, EventBus, GetPostParams,
-    IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, MattermostClient,
-    MattermostWs, NotificationsParams, NotifyParams, PinParams, PinResult, PinnedChannelParams,
-    PostMessageParams, Profile, ProfileStatus, Provider, ReactParams, ReactionResult,
-    ReadChannelParams, ReadDirectMessageParams, ReadThreadParams, SearchParams, SearchResult,
-    ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult,
-    UnreactParams, UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitChannelV2Params,
-    WaitChannelsParams, WaitChannelsResult, WaitResult, WsState, WAIT_CHANNELS_V1_METHOD,
+    now_unix_millis, pid_path_for_profile, rpc_error, rpc_error_with_data, rpc_result,
+    socket_path_for_profile, store_attention_state, AckChannelParams, AckResult, AddMemberParams,
+    ArchiveChannelParams, AttentionShowParams, AttentionState, CapabilityClass, Channel,
+    CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind,
+    DaemonEventPayloadInner, DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation,
+    EventBus, GetPostParams, IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    MattermostClient, MattermostWs, NotificationsParams, NotifyParams, PinParams, PinResult,
+    PinnedChannelParams, PostMessageParams, Profile, ProfileStatus, Provider, ReactParams,
+    ReactionResult, ReadChannelParams, ReadDirectMessageParams, ReadThreadParams, SearchParams,
+    SearchResult, ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter,
+    UnpinParams, UnpinResult, UnreactParams, UnreadNotifications, UnsubscribeParams,
+    WaitChannelParams, WaitChannelV2Params, WaitChannelV3Params, WaitChannelsParams,
+    WaitChannelsResult, WaitResult, WsState, RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED,
+    RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_V1_METHOD,
+    WAIT_CHANNEL_V3_METHOD,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -48,7 +52,11 @@ pub enum DaemonError {
     #[error("no chanvoy daemon is listening at {0}; start one with `chanvoy --profile <name> daemon start`")]
     NotRunning(String),
     #[error("rpc error {code}: {message}")]
-    Rpc { code: i64, message: String },
+    Rpc {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -77,6 +85,7 @@ struct AppState {
     /// once at `start()` from `profile.reduce.use_profile`; a missing
     /// target fails startup (never a silent bare-identity fallback).
     reduce_writer: Option<ReduceWriter>,
+    wait_owners: Arc<wait_owner::WaitOwnerRegistry>,
 }
 
 /// PER-035: a pre-built client bound to the family profile a stream
@@ -383,6 +392,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         attention_state: Arc::new(Mutex::new(attention)),
         identity_drift,
         reduce_writer,
+        wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -473,6 +483,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             }
             _ = &mut shutdown_rx => {
                 cancel_token.cancel();
+                state.wait_owners.cancel_all();
                 let _ = ws_shutdown_tx.send(true);
                 break;
             }
@@ -551,7 +562,18 @@ async fn handle_client(
                 } else {
                     None
                 };
-                let response = dispatch_request(request, &state, &shutdown_tx).await;
+                let response = if is_wait_rpc(&request.method) {
+                    let mut eof_buf = String::new();
+                    tokio::select! {
+                        response = dispatch_request(request, &state, &shutdown_tx) => response,
+                        peek = reader.read_line(&mut eof_buf) => {
+                            let _ = peek?;
+                            break;
+                        }
+                    }
+                } else {
+                    dispatch_request(request, &state, &shutdown_tx).await
+                };
 
                 if let Some(sub_ack) = extract_subscription_id(&response.result) {
                     client_sub_ids.push(sub_ack);
@@ -1148,12 +1170,16 @@ async fn dispatch_request(
                 .unwrap_or(params.timeout_minutes.saturating_mul(60));
             wait::wait_with_params(
                 state,
-                &params.channel,
-                timeout_secs,
-                params.team.as_deref(),
-                None,
-                None,
-                None,
+                wait::WaitRequest {
+                    channel: &params.channel,
+                    timeout_secs,
+                    team: params.team.as_deref(),
+                    contains: None,
+                    pattern: None,
+                    after: None,
+                    replace_wait_id: None,
+                    emit_wait_ids: false,
+                },
             )
             .await
         })
@@ -1163,17 +1189,44 @@ async fn dispatch_request(
             parse_and_call(&request.params, |params: WaitChannelV2Params| async move {
                 wait::wait_with_params(
                     state,
-                    &params.channel,
-                    params.timeout_secs,
-                    params.team.as_deref(),
-                    params.contains.as_deref(),
-                    params.pattern.as_deref(),
-                    params.after.as_deref(),
+                    wait::WaitRequest {
+                        channel: &params.channel,
+                        timeout_secs: params.timeout_secs,
+                        team: params.team.as_deref(),
+                        contains: params.contains.as_deref(),
+                        pattern: params.pattern.as_deref(),
+                        after: params.after.as_deref(),
+                        replace_wait_id: None,
+                        emit_wait_ids: false,
+                    },
                 )
                 .await
             })
             .await
             .map(to_value)
+        }
+        method if method == WAIT_CHANNEL_V3_METHOD => {
+            match serde_json::from_value::<WaitChannelV3Params>(request.params.clone()) {
+                Ok(params) => wait::wait_with_params(
+                    state,
+                    wait::WaitRequest {
+                        channel: &params.channel,
+                        timeout_secs: params.timeout_secs,
+                        team: params.team.as_deref(),
+                        contains: params.contains.as_deref(),
+                        pattern: params.pattern.as_deref(),
+                        after: params.after.as_deref(),
+                        replace_wait_id: params.replace_wait_id.as_deref(),
+                        emit_wait_ids: true,
+                    },
+                )
+                .await
+                .map(to_value)
+                .map_err(DaemonError::from),
+                Err(err) => Err(DaemonError::Core(CoreError::WaitFilterInvalid(format!(
+                    "wait_channel_v3 input: {err}"
+                )))),
+            }
         }
         method if method == WAIT_CHANNELS_V1_METHOD => {
             match serde_json::from_value::<WaitChannelsParams>(request.params.clone()) {
@@ -1361,12 +1414,16 @@ async fn dispatch_request(
         _ => Err(DaemonError::Rpc {
             code: -32601,
             message: format!("unknown method {}", request.method),
+            data: None,
         }),
     };
 
     match response {
         Ok(value) => rpc_result(request.id, value),
-        Err(error) => rpc_error(request.id, error_code(&error), error.to_string()),
+        Err(error) => {
+            let (code, message, data) = error_payload(&error);
+            rpc_error_with_data(request.id, code, message, data)
+        }
     }
 }
 
@@ -1434,17 +1491,87 @@ fn to_value<T: Serialize>(value: T) -> serde_json::Value {
     serde_json::to_value(value).expect("serializable rpc response")
 }
 
+#[cfg(test)]
 fn error_code(error: &DaemonError) -> i64 {
+    error_payload(error).0
+}
+
+fn is_wait_rpc(method: &str) -> bool {
+    matches!(
+        method,
+        "wait_channel" | "wait_channel_v2" | "wait_channels_v1"
+    ) || method == WAIT_CHANNEL_V3_METHOD
+}
+
+fn error_payload(error: &DaemonError) -> (i64, String, Option<serde_json::Value>) {
     match error {
-        DaemonError::Rpc { code, .. } => *code,
-        DaemonError::NotRunning(_) => -32004,
-        DaemonError::AlreadyRunning(_) => -32003,
-        DaemonError::Core(CoreError::WaitTimeout(_)) => -32005,
-        DaemonError::Core(CoreError::RequiresElevatedCapability) => -32006,
-        // PER-038: wait hard failures — distinct from deadman (-32005).
-        DaemonError::Core(CoreError::WaitFilterInvalid(_)) => -32007,
-        DaemonError::Core(CoreError::WaitProviderDegraded { .. }) => -32008,
-        _ => -32000,
+        DaemonError::Rpc {
+            code,
+            message,
+            data,
+        } => (*code, message.clone(), data.clone()),
+        DaemonError::NotRunning(_) => (-32004, error.to_string(), None),
+        DaemonError::AlreadyRunning(_) => (-32003, error.to_string(), None),
+        DaemonError::Core(CoreError::WaitTimeout(_)) => (-32005, error.to_string(), None),
+        DaemonError::Core(CoreError::RequiresElevatedCapability) => {
+            (-32006, error.to_string(), None)
+        }
+        DaemonError::Core(CoreError::WaitFilterInvalid(_)) => (-32007, error.to_string(), None),
+        DaemonError::Core(CoreError::WaitProviderDegraded { .. }) => {
+            (-32008, error.to_string(), None)
+        }
+        DaemonError::Core(CoreError::WaitAlreadyActive {
+            team,
+            channel,
+            existing_wait_id,
+            started_at_ms,
+        }) => (
+            RPC_WAIT_ALREADY_ACTIVE,
+            error.to_string(),
+            Some(serde_json::json!({
+                "class": "wait_already_active",
+                "team": team,
+                "channel": channel,
+                "existing_wait_id": existing_wait_id,
+                "started_at_ms": started_at_ms,
+            })),
+        ),
+        DaemonError::Core(CoreError::WaitConflictChanged { team, channel }) => (
+            RPC_WAIT_CONFLICT_CHANGED,
+            error.to_string(),
+            Some(serde_json::json!({
+                "class": "wait_conflict_changed",
+                "team": team,
+                "channel": channel,
+            })),
+        ),
+        DaemonError::Core(CoreError::WaitReplaced {
+            wait_id,
+            replaced_by_wait_id,
+        }) => (
+            RPC_WAIT_REPLACED,
+            error.to_string(),
+            Some(serde_json::json!({
+                "class": "wait_replaced",
+                "wait_id": wait_id,
+                "replaced_by_wait_id": replaced_by_wait_id,
+            })),
+        ),
+        DaemonError::Core(CoreError::WaitReplaceUnconfirmed {
+            team,
+            channel,
+            existing_wait_id,
+        }) => (
+            RPC_WAIT_REPLACE_UNCONFIRMED,
+            error.to_string(),
+            Some(serde_json::json!({
+                "class": "wait_replace_unconfirmed",
+                "team": team,
+                "channel": channel,
+                "existing_wait_id": existing_wait_id,
+            })),
+        ),
+        _ => (-32000, error.to_string(), None),
     }
 }
 
@@ -1471,6 +1598,22 @@ mod wait_rpc_code_tests {
                 message: "down".into(),
             })),
             -32008
+        );
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitAlreadyActive {
+                team: "org".into(),
+                channel: "ch".into(),
+                existing_wait_id: "wait_aa".into(),
+                started_at_ms: 1,
+            })),
+            RPC_WAIT_ALREADY_ACTIVE
+        );
+        assert_eq!(
+            error_code(&DaemonError::Core(CoreError::WaitReplaced {
+                wait_id: "wait_aa".into(),
+                replaced_by_wait_id: "wait_bb".into(),
+            })),
+            RPC_WAIT_REPLACED
         );
     }
 
@@ -2449,6 +2592,17 @@ impl DaemonClient {
         .await
     }
 
+    /// PER-040: single-waiter wait. New CLI uses this for every
+    /// single-channel wait. Method-not-found is a hard capability
+    /// failure — callers must not fall back to v2.
+    pub async fn wait_channel_v3(
+        &self,
+        params: WaitChannelV3Params,
+    ) -> Result<WaitResult, DaemonError> {
+        self.call(WAIT_CHANNEL_V3_METHOD, serde_json::to_value(params)?)
+            .await
+    }
+
     pub async fn create_channel(
         &self,
         name: &str,
@@ -2561,6 +2715,7 @@ impl DaemonClient {
             return Err(DaemonError::Rpc {
                 code: error.code,
                 message: error.message,
+                data: error.data,
             });
         }
         let result = response.result.unwrap_or(serde_json::Value::Null);

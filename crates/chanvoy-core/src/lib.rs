@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod host_build_info;
 pub mod safe_read;
 pub mod wait_channels;
+pub mod wait_registry;
 
 pub use safe_read::{
     read_caller_named_file, read_credential_file, read_tool_owned_file, SafeReadError,
@@ -33,6 +34,13 @@ pub use wait_channels::{
     validate_wait_channels_params, WaitChannelArm, WaitChannelSelector, WaitChannelsParams,
     WaitChannelsResult, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS,
     WAIT_CHANNELS_UTF8_MAX_BYTES, WAIT_CHANNELS_V1_METHOD,
+};
+
+pub use wait_registry::{
+    can_install_replacement, decide_acquire, new_wait_id, should_release,
+    validate_wait_channel_v3_strings, wait_id_well_formed, WaitAcquireDecision, WaitAcquireIntent,
+    WaitSlotView, REPLACE_CLEANUP_BUDGET_SECS, RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED,
+    RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNEL_V3_METHOD,
 };
 
 /// `CoreError::Api` already exposes this type in the public error enum, so
@@ -283,6 +291,10 @@ pub struct PostReceipt {
 pub struct WaitResult {
     pub channel: String,
     pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_wait_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -304,10 +316,12 @@ pub struct DmConversation {
     pub last_post_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ErrorDetail {
     pub code: i64,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1601,6 +1615,26 @@ pub struct WaitChannelV2Params {
     pub after: Option<String>,
 }
 
+/// PER-040: single-waiter wait. Method name is the capability gate.
+/// New CLI uses this for every single-channel wait and must not fall
+/// back to v2 while claiming ownership enforcement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WaitChannelV3Params {
+    pub channel: String,
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub team: Option<String>,
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub replace_wait_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateChannelParams {
     pub name: String,
@@ -1808,6 +1842,35 @@ pub enum CoreError {
     /// deadman: never reports `timeout:true` at the CLI.
     #[error("wait observation failed for channel {channel}: {message}")]
     WaitProviderDegraded { channel: String, message: String },
+    /// PER-040: another wait on this profile daemon already owns the
+    /// canonical channel. Hard conflict, never a deadman.
+    #[error(
+        "wait already active on this profile daemon for {team}/{channel} \
+         (id {existing_wait_id}); let it finish or retry with --replace-wait {existing_wait_id}"
+    )]
+    WaitAlreadyActive {
+        team: String,
+        channel: String,
+        existing_wait_id: String,
+        started_at_ms: i64,
+    },
+    /// PER-040: compare-and-replace token was stale, malformed, absent,
+    /// or bound to a different channel.
+    #[error("wait replace token does not match the active wait on this profile daemon")]
+    WaitConflictChanged { team: String, channel: String },
+    /// PER-040: this blocked waiter was displaced by compare-and-replace.
+    #[error("wait {wait_id} was replaced on this profile daemon by {replaced_by_wait_id}")]
+    WaitReplaced {
+        wait_id: String,
+        replaced_by_wait_id: String,
+    },
+    /// PER-040: old waiter did not acknowledge cleanup inside the budget.
+    #[error("wait replace cleanup was not confirmed on this profile daemon for {team}/{channel}")]
+    WaitReplaceUnconfirmed {
+        team: String,
+        channel: String,
+        existing_wait_id: String,
+    },
     #[error("profile {0} not found")]
     ProfileNotFound(String),
     /// PER-035: a profile's `reduce.use_profile` names a family profile
@@ -5693,6 +5756,15 @@ pub fn rpc_result(id: Uuid, result: Value) -> JsonRpcResponse {
 }
 
 pub fn rpc_error(id: Uuid, code: i64, message: impl Into<String>) -> JsonRpcResponse {
+    rpc_error_with_data(id, code, message, None)
+}
+
+pub fn rpc_error_with_data(
+    id: Uuid,
+    code: i64,
+    message: impl Into<String>,
+    data: Option<Value>,
+) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id,
@@ -5700,6 +5772,7 @@ pub fn rpc_error(id: Uuid, code: i64, message: impl Into<String>) -> JsonRpcResp
         error: Some(ErrorDetail {
             code,
             message: message.into(),
+            data,
         }),
     }
 }
