@@ -162,11 +162,20 @@ pub fn validate_request_meta(params: &Value) -> Result<String, Box<JsonRpcRespon
             version,
         )));
     }
-    if !meta.contains_key(META_CLIENT_CAPABILITIES) {
-        return Err(Box::new(JsonRpcResponse::invalid_params(
-            Value::Null,
-            format!("params._meta[\"{META_CLIENT_CAPABILITIES}\"] is required"),
-        )));
+    match meta.get(META_CLIENT_CAPABILITIES) {
+        Some(Value::Object(_)) => {}
+        Some(_) => {
+            return Err(Box::new(JsonRpcResponse::invalid_params(
+                Value::Null,
+                format!("params._meta[\"{META_CLIENT_CAPABILITIES}\"] must be an object"),
+            )))
+        }
+        None => {
+            return Err(Box::new(JsonRpcResponse::invalid_params(
+                Value::Null,
+                format!("params._meta[\"{META_CLIENT_CAPABILITIES}\"] is required"),
+            )))
+        }
     }
     Ok(version.to_string())
 }
@@ -278,17 +287,7 @@ pub fn ids_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => x == y,
         (Value::String(x), Value::String(y)) => x == y,
-        (Value::Number(x), Value::String(y)) => x
-            .as_i64()
-            .map(|n| n.to_string() == *y)
-            .or_else(|| x.as_u64().map(|n| n.to_string() == *y))
-            .unwrap_or(false),
-        (Value::String(x), Value::Number(y)) => y
-            .as_i64()
-            .map(|n| n.to_string() == *x)
-            .or_else(|| y.as_u64().map(|n| n.to_string() == *x))
-            .unwrap_or(false),
-        _ => a == b,
+        _ => false,
     }
 }
 
@@ -311,6 +310,13 @@ mod tests {
     fn missing_meta_is_invalid_params() {
         let err = validate_request_meta(&json!({})).unwrap_err();
         assert_eq!(err.error.as_ref().unwrap().code, -32602);
+    }
+
+    #[test]
+    fn ids_are_compared_by_json_type() {
+        assert!(ids_equal(&json!(9), &json!(9)));
+        assert!(ids_equal(&json!("9"), &json!("9")));
+        assert!(!ids_equal(&json!(9), &json!("9")));
     }
 
     #[test]

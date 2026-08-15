@@ -150,6 +150,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_discover_uses_supported_versions() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(&line("server/discover", json!({})), &backend)
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"][0], PROTOCOL_VERSION);
+        assert!(result.get("supportedProtocolVersions").is_none());
+        assert!(result.get("protocolVersion").is_none());
+    }
+
+    #[tokio::test]
     async fn tools_list_is_complete_and_private() {
         let backend = ToolBackend::scripted(vec![]);
         let resp = handle_request(&line("tools/list", json!({})), &backend)

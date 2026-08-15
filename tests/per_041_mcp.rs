@@ -390,7 +390,7 @@ async fn mcp_stdio_cancelled_notification_closes_uds_and_admits_later_wait() {
     });
 
     let mut first = spawn_mcp(&env);
-    let cancelled = {
+    {
         let mut stdin = first.stdin.take().expect("stdin");
         stdin
             .write_all(
@@ -417,19 +417,10 @@ async fn mcp_stdio_cancelled_notification_closes_uds_and_admits_later_wait() {
             .expect("write cancel");
         stdin.write_all(b"\n").await.expect("nl");
         stdin.flush().await.expect("flush");
-        let stdout = first.stdout.take().expect("stdout");
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.expect("cancel result");
+        tokio::time::sleep(Duration::from_millis(150)).await;
         drop(stdin);
         let _ = first.wait().await;
-        serde_json::from_str::<serde_json::Value>(line.trim()).expect("json")
-    };
-    assert_eq!(cancelled["result"]["isError"], true);
-    assert_eq!(
-        cancelled["result"]["structuredContent"]["error"]["timeout"],
-        false
-    );
+    }
 
     let second = run_mcp_keep_stdin(
         &env,

@@ -92,9 +92,6 @@ pub fn validate_mcp_headers(
             "MCP-Protocol-Version is required",
         )));
     };
-    if version != PROTOCOL_VERSION {
-        return Err(Box::new(JsonRpcResponse::unsupported_protocol(id, version)));
-    }
     let Some(method) = header(headers, "mcp-method") else {
         return Err(Box::new(JsonRpcResponse::header_mismatch(
             id,
@@ -128,7 +125,14 @@ pub fn validate_mcp_headers(
                     "MCP-Protocol-Version does not match params._meta protocolVersion",
                 )));
             }
+            if version != PROTOCOL_VERSION {
+                return Err(Box::new(JsonRpcResponse::unsupported_protocol(id, version)));
+            }
         }
+    }
+    if let Err(mut err) = crate::protocol::validate_request_meta(&params) {
+        err.id = id.clone();
+        return Err(err);
     }
     if body_method == "tools/call" {
         let Some(name) = header(headers, "mcp-name") else {
@@ -212,7 +216,8 @@ async fn handle_connection(mut stream: TcpStream, backend: ToolBackend) -> io::R
             };
             let body = serde_json::to_vec(&resp)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            write_http(&mut stream, 200, &body, "application/json").await
+            let status = http_status_for(&resp);
+            write_http(&mut stream, status, &body, "application/json").await
         }
         disconnect = watch_disconnect(&mut stream) => {
             drop(work);
@@ -325,6 +330,13 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, HttpEr
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn http_status_for(resp: &JsonRpcResponse) -> u16 {
+    match resp.error.as_ref().map(|err| err.code) {
+        Some(-32700 | -32600 | -32602 | -32020 | -32022) => 400,
+        _ => 200,
+    }
 }
 
 async fn write_jsonrpc(
@@ -440,12 +452,20 @@ mod tests {
         ]);
         assert!(validate_mcp_headers(&ok, &body).is_ok());
 
-        let bad_ver = hdrs(&[
+        let disagree = hdrs(&[
             ("MCP-Protocol-Version", "2025-03-26"),
             ("Mcp-Method", "tools/list"),
         ]);
-        let err = validate_mcp_headers(&bad_ver, &body).unwrap_err();
-        assert_eq!(err.error.unwrap().code, -32022);
+        let err = validate_mcp_headers(&disagree, &body).unwrap_err();
+        assert_eq!(err.error.as_ref().unwrap().code, -32020);
+
+        let old = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-03-26","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+        let both_old = hdrs(&[
+            ("MCP-Protocol-Version", "2025-03-26"),
+            ("Mcp-Method", "tools/list"),
+        ]);
+        let err = validate_mcp_headers(&both_old, old).unwrap_err();
+        assert_eq!(err.error.as_ref().unwrap().code, -32022);
 
         let mismatch = hdrs(&[
             ("MCP-Protocol-Version", PROTOCOL_VERSION),
@@ -564,6 +584,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loopback_missing_meta_is_http_400() {
+        use crate::backend::ToolBackend;
+        use tokio::io::AsyncReadExt;
+
+        let backend = ToolBackend::scripted(vec![]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_http_listener(backend, listener).await;
+        });
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: tools/list\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+        assert!(text.contains("-32602"));
+    }
+
+    #[tokio::test]
     async fn loopback_header_mismatch_is_jsonrpc_400() {
         use crate::backend::ToolBackend;
         use tokio::io::AsyncReadExt;
@@ -604,7 +651,7 @@ mod tests {
             let _ = serve_http_listener(backend, listener).await;
         });
 
-        let body = list_body();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-03-26","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
         let req = format!(
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1\r\nMCP-Protocol-Version: 2025-03-26\r\nMcp-Method: tools/list\r\nContent-Length: {}\r\n\r\n",
             body.len()
@@ -619,6 +666,48 @@ mod tests {
         assert!(text.contains("-32022"));
         assert!(text.contains("2025-03-26"));
         assert!(text.contains(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn missing_or_malformed_meta_is_invalid_params() {
+        let headers = hdrs(&[
+            ("MCP-Protocol-Version", PROTOCOL_VERSION),
+            ("Mcp-Method", "tools/list"),
+        ]);
+        let absent = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        assert_eq!(
+            validate_mcp_headers(&headers, absent)
+                .unwrap_err()
+                .error
+                .as_ref()
+                .unwrap()
+                .code,
+            -32602
+        );
+        let no_caps = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{PROTOCOL_VERSION}"}}}}}}"#
+        );
+        assert_eq!(
+            validate_mcp_headers(&headers, &no_caps)
+                .unwrap_err()
+                .error
+                .as_ref()
+                .unwrap()
+                .code,
+            -32602
+        );
+        let not_obj = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{PROTOCOL_VERSION}","io.modelcontextprotocol/clientCapabilities":true}}}}}}"#
+        );
+        assert_eq!(
+            validate_mcp_headers(&headers, &not_obj)
+                .unwrap_err()
+                .error
+                .as_ref()
+                .unwrap()
+                .code,
+            -32602
+        );
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::backend::ToolBackend;
 use crate::error::ToolErrorEnvelope;
-use crate::protocol::{failure_value, success_value, PROTOCOL_VERSION, SERVER_NAME};
+use crate::protocol::{failure_value, result_meta, success_value, PROTOCOL_VERSION};
 
 pub const TOOL_NAMES: [&str; 6] = ["whoami", "read_channel", "show", "thread", "wait", "post"];
 
@@ -120,13 +120,12 @@ pub fn tools_list() -> Value {
 
 pub fn server_discover() -> Value {
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "supportedProtocolVersions": [PROTOCOL_VERSION],
-        "server": { "name": SERVER_NAME, "title": "chanvoy" },
+        "resultType": "complete",
+        "supportedVersions": [PROTOCOL_VERSION],
         "capabilities": { "tools": { "listChanged": false } },
-        "tools": tools_list()["tools"],
         "ttlMs": 0,
         "cacheScope": "private",
+        "_meta": result_meta(),
     })
 }
 
@@ -453,6 +452,21 @@ mod tests {
     use super::*;
     use crate::backend::{ScriptedReply, ToolBackend};
     use serde_json::json;
+
+    #[test]
+    fn server_discover_is_the_2026_07_28_shape() {
+        let value = server_discover();
+        assert_eq!(value["resultType"], "complete");
+        assert_eq!(value["supportedVersions"], json!([PROTOCOL_VERSION]));
+        assert_eq!(value["ttlMs"], 0);
+        assert_eq!(value["cacheScope"], "private");
+        assert!(value["capabilities"].is_object());
+        assert!(value["_meta"]["io.modelcontextprotocol/serverInfo"].is_object());
+        assert!(value.get("protocolVersion").is_none());
+        assert!(value.get("supportedProtocolVersions").is_none());
+        assert!(value.get("tools").is_none());
+        assert!(value.get("server").is_none());
+    }
 
     #[test]
     fn tools_list_is_deterministic() {

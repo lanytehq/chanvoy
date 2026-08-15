@@ -78,16 +78,10 @@ where
                                 .is_some_and(|id| ids_equal(id, &cancel_id))
                             {
                                 drop(work);
-                                write_response(
-                                    &mut writer,
-                                    &JsonRpcResponse::result(
-                                        cancel_id,
-                                        failure_value(ToolErrorEnvelope::provider(
-                                            "request cancelled",
-                                        )),
-                                    ),
-                                )
-                                .await?;
+                                let _ = writeln!(
+                                    io::stderr(),
+                                    "chanvoy mcp: request cancelled; dropped in-flight daemon call"
+                                );
                                 continue;
                             }
                         }
@@ -220,21 +214,17 @@ mod tests {
         );
         let cancel =
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#;
-        let input = format!("{wait}{cancel}\n");
+        let list = modern_line(10, "tools/list", json!({}));
+        let input = format!("{wait}{cancel}\n{list}");
         let reader = BufReader::new(input.as_bytes());
         let mut out = Vec::new();
         serve_stdio_io(reader, &mut out, backend).await.unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
-        assert_eq!(parsed["result"]["isError"], true);
-        assert_eq!(
-            parsed["result"]["structuredContent"]["error"]["timeout"],
-            false
-        );
-        assert!(parsed["result"]["structuredContent"]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("cancelled"));
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert!(parsed["result"]["tools"].is_array());
+        assert_eq!(parsed["id"], 10);
     }
 
     #[tokio::test]
