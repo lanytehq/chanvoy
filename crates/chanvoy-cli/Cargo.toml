@@ -16,6 +16,7 @@ publish.workspace = true
 [dependencies]
 chanvoy-core = { path = "../chanvoy-core" }
 chanvoy-daemon = { path = "../chanvoy-daemon" }
+chanvoy-mcp = { path = "../chanvoy-mcp" }
 chrono = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }

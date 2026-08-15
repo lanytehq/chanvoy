@@ -199,6 +199,19 @@ enum CommandSet {
     /// clock skew, and optional channel access. Cursor-neutral — never
     /// posts, acks, advances, or calls `check`.
     Doctor(DoctorArgs),
+    /// MCP 2026-07-28 access face on this profile's daemon (stdio or
+    /// loopback HTTP). Same identity and DaemonClient as the CLI. Blocking
+    /// `wait` does not wake Grok Bot.
+    Mcp(McpArgs),
+}
+
+/// `chanvoy mcp` — stdio by default; `--listen 127.0.0.1:PORT` for HTTP.
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// Bind Streamable HTTP at this address. Must be `127.0.0.1:port`.
+    /// Omit for newline-delimited JSON-RPC on stdio.
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<String>,
 }
 
 /// `chanvoy doctor [channel]` — CHAN-TASK-003.
@@ -1242,6 +1255,7 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
                 },
             )
         }
+        CommandSet::Mcp(args) => handle_mcp(&profile, args).await,
         CommandSet::Wait(args) => handle_wait(&profile, cli.json, args).await,
         CommandSet::Pinned(args) => print_value(
             cli.json,
@@ -1610,6 +1624,26 @@ fn map_post_error(err: CliError, char_count: usize) -> CliError {
     } else {
         err
     }
+}
+
+/// MCP access face. Same profile / DaemonClient as every other verb.
+/// stdio is the default; `--listen` is loopback Streamable HTTP only.
+async fn handle_mcp(profile: &str, args: McpArgs) -> Result<(), CliError> {
+    let backend = chanvoy_mcp::ToolBackend::live(profile);
+    match args.listen {
+        None => chanvoy_mcp::serve_stdio(backend)
+            .await
+            .map_err(|err| CliError::Bootstrap(format!("mcp stdio: {err}")))?,
+        Some(addr) => {
+            if let Err(err) = chanvoy_mcp::parse_loopback_bind(&addr) {
+                return Err(CliError::Bootstrap(err));
+            }
+            chanvoy_mcp::serve_http(backend, &addr)
+                .await
+                .map_err(|err| CliError::Bootstrap(format!("mcp http: {err}")))?
+        }
+    }
+    Ok(())
 }
 
 /// PER-040 wait: always use `wait_channel_v3`. No v2/legacy fallback —
