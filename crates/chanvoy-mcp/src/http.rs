@@ -113,6 +113,9 @@ pub fn validate_mcp_headers(
             "Mcp-Method does not match JSON-RPC method",
         )));
     }
+    if parsed.get("id").is_none() {
+        return Ok(());
+    }
     let params = parsed
         .get("params")
         .cloned()
@@ -211,7 +214,7 @@ async fn handle_connection(mut stream: TcpStream, backend: ToolBackend) -> io::R
     tokio::select! {
         resp = &mut work => {
             let Some(resp) = resp else {
-                write_http(&mut stream, 204, b"", "text/plain").await?;
+                write_http(&mut stream, 202, b"", "text/plain").await?;
                 return Ok(());
             };
             let body = serde_json::to_vec(&resp)
@@ -334,6 +337,7 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 
 fn http_status_for(resp: &JsonRpcResponse) -> u16 {
     match resp.error.as_ref().map(|err| err.code) {
+        Some(-32601) => 404,
         Some(-32700 | -32600 | -32602 | -32020 | -32022) => 400,
         _ => 200,
     }
@@ -357,7 +361,7 @@ async fn write_http(
 ) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
-        204 => "No Content",
+        202 => "Accepted",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
@@ -581,6 +585,67 @@ mod tests {
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn loopback_unknown_method_is_http_404() {
+        use crate::backend::ToolBackend;
+        use tokio::io::AsyncReadExt;
+
+        let backend = ToolBackend::scripted(vec![]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_http_listener(backend, listener).await;
+        });
+
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"nope","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{PROTOCOL_VERSION}","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+        );
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: nope\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("HTTP/1.1 404"), "{text}");
+        assert!(text.contains("-32601"));
+    }
+
+    #[tokio::test]
+    async fn loopback_notification_is_http_202() {
+        use crate::backend::ToolBackend;
+        use tokio::io::AsyncReadExt;
+
+        let backend = ToolBackend::scripted(vec![]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_http_listener(backend, listener).await;
+        });
+
+        let body =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: notifications/cancelled\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("HTTP/1.1 202"), "{text}");
+        let parts: Vec<_> = text.split("\r\n\r\n").collect();
+        assert!(
+            parts.get(1).is_some_and(|b| b.is_empty()),
+            "202 must have no body: {text}"
+        );
     }
 
     #[tokio::test]
