@@ -22,7 +22,7 @@ pub async fn handle_request(raw: &str, backend: &ToolBackend) -> Option<JsonRpcR
             ));
         }
     }
-    if request.jsonrpc.as_deref().is_some_and(|v| v != "2.0") {
+    if request.jsonrpc.as_deref() != Some("2.0") {
         return Some(JsonRpcResponse::invalid_request(
             request.id.clone().unwrap_or(Value::Null),
             "jsonrpc must be \"2.0\"",
@@ -110,5 +110,65 @@ mod tests {
         let backend = ToolBackend::scripted(vec![]);
         let resp = handle_request("{nope", &backend).await.unwrap();
         assert_eq!(resp.error.unwrap().code, -32700);
+    }
+
+    #[tokio::test]
+    async fn missing_jsonrpc_is_invalid_request() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(r#"{"id":1,"method":"tools/list"}"#, &backend)
+            .await
+            .unwrap();
+        assert_eq!(resp.error.unwrap().code, -32600);
+    }
+
+    #[tokio::test]
+    async fn every_listed_tool_dispatches() {
+        use crate::tools::TOOL_NAMES;
+        let replies = vec![
+            (
+                "whoami",
+                ScriptedReply::Ok(json!({"id":"u","username":"bot"})),
+            ),
+            ("read_channel", ScriptedReply::Ok(json!([]))),
+            (
+                "get_post",
+                ScriptedReply::Ok(
+                    json!({"id":"p","user_id":"u","username":"n","message":"m","create_at":1,"root_id":"p"}),
+                ),
+            ),
+            ("read_thread", ScriptedReply::Ok(json!([]))),
+            (
+                "wait_channel_v3",
+                ScriptedReply::Ok(
+                    json!({"channel":"ops","messages":[{"id":"p","user_id":"u","username":"n","message":"m","create_at":1,"root_id":"p"}]}),
+                ),
+            ),
+            ("post_message", ScriptedReply::Ok(json!({"id":"p2"}))),
+        ];
+        let backend = ToolBackend::scripted(replies);
+        let args = [
+            ("whoami", json!({})),
+            ("read_channel", json!({"channel":"ops","since_secs":60})),
+            ("show", json!({"channel":"ops","post_id":"p"})),
+            ("thread", json!({"channel":"ops","post_id":"p"})),
+            (
+                "wait",
+                json!({"mode":"single","channel":"ops","timeout_secs":5}),
+            ),
+            ("post", json!({"channel":"ops","message":"hi"})),
+        ];
+        assert_eq!(TOOL_NAMES.len(), args.len());
+        for (name, arguments) in args {
+            let line = serde_json::to_string(&json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":name,"arguments":arguments}
+            }))
+            .unwrap();
+            let resp = handle_request(&line, &backend).await.unwrap();
+            let result = resp.result.expect(name);
+            assert_eq!(result["isError"], false, "{name}");
+        }
     }
 }

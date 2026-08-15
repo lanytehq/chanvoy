@@ -21,6 +21,89 @@ struct ToolsCallParams {
     arguments: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyArgs {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    channel: String,
+    #[serde(default)]
+    since_secs: Option<u64>,
+    #[serde(default)]
+    after_post_id: Option<String>,
+    #[serde(default)]
+    since_last_mine: bool,
+    #[serde(default)]
+    since_bootstrap: bool,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    advance: bool,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowArgs {
+    channel: String,
+    post_id: String,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadArgs {
+    channel: String,
+    post_id: String,
+    #[serde(default)]
+    latest: bool,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostArgs {
+    channel: String,
+    message: String,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    thread_root_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitSingleArgs {
+    channel: String,
+    timeout_secs: u64,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    contains: Option<String>,
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    replace_wait_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitFanInArgs {
+    arms: Vec<chanvoy_core::WaitChannelArm>,
+    timeout_secs: u64,
+    #[serde(default)]
+    contains: Option<String>,
+    #[serde(default)]
+    pattern: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitMode {
     Single,
@@ -193,14 +276,12 @@ async fn dispatch(
 ) -> Result<Value, ToolErrorEnvelope> {
     match name {
         "whoami" => {
-            require_empty_or_object(&arguments)?;
-            if let Some(obj) = arguments.as_object() {
-                if !obj.is_empty() {
-                    return Err(ToolErrorEnvelope::input(
-                        "whoami accepts an empty object only",
-                    ));
-                }
-            }
+            let value = if arguments.is_null() {
+                json!({})
+            } else {
+                arguments
+            };
+            let _: EmptyArgs = decode_args(value)?;
             backend.whoami().await
         }
         "read_channel" => {
@@ -208,30 +289,50 @@ async fn dispatch(
             backend.read_channel(params).await
         }
         "show" => {
-            let params: GetPostParams = decode_args(arguments)?;
-            if params.channel.is_empty() || params.post_id.is_empty() {
+            let args: ShowArgs = decode_args(arguments)?;
+            if args.channel.is_empty() || args.post_id.is_empty() {
                 return Err(ToolErrorEnvelope::input(
                     "show requires channel and post_id",
                 ));
             }
-            backend.get_post(params).await
+            backend
+                .get_post(GetPostParams {
+                    channel: args.channel,
+                    post_id: args.post_id,
+                    team: args.team,
+                })
+                .await
         }
         "thread" => {
-            let params: ReadThreadParams = decode_args(arguments)?;
-            if params.channel.is_empty() || params.post_id.is_empty() {
+            let args: ThreadArgs = decode_args(arguments)?;
+            if args.channel.is_empty() || args.post_id.is_empty() {
                 return Err(ToolErrorEnvelope::input(
                     "thread requires channel and post_id",
                 ));
             }
-            backend.read_thread(params).await
+            backend
+                .read_thread(ReadThreadParams {
+                    channel: args.channel,
+                    post_id: args.post_id,
+                    latest: args.latest,
+                    team: args.team,
+                })
+                .await
         }
         "wait" => dispatch_wait(arguments, backend).await,
         "post" => {
-            let params: PostMessageParams = decode_args(arguments)?;
-            if params.channel.is_empty() {
+            let args: PostArgs = decode_args(arguments)?;
+            if args.channel.is_empty() {
                 return Err(ToolErrorEnvelope::input("post requires channel"));
             }
-            backend.post_message(params).await
+            backend
+                .post_message(PostMessageParams {
+                    channel: args.channel,
+                    message: args.message,
+                    team: args.team,
+                    thread_root_id: args.thread_root_id,
+                })
+                .await
         }
         other => Err(ToolErrorEnvelope::input(unknown_tool_protocol_error(other))),
     }
@@ -244,24 +345,40 @@ async fn dispatch_wait(
     let (mode, body) = split_wait_mode(arguments)?;
     match mode {
         WaitMode::Single => {
-            let params: WaitChannelV3Params = decode_args(body)?;
-            if params.timeout_secs == 0 {
+            let args: WaitSingleArgs = decode_args(body)?;
+            if args.timeout_secs == 0 {
                 return Err(ToolErrorEnvelope::input(
                     "wait timeout_secs must be greater than zero",
                 ));
             }
             validate_wait_channel_v3_strings(
-                &params.channel,
-                params.team.as_deref(),
-                params.contains.as_deref(),
-                params.pattern.as_deref(),
-                params.after.as_deref(),
+                &args.channel,
+                args.team.as_deref(),
+                args.contains.as_deref(),
+                args.pattern.as_deref(),
+                args.after.as_deref(),
             )
             .map_err(|err| ToolErrorEnvelope::input(err.to_string()))?;
-            backend.wait_channel_v3(params).await
+            backend
+                .wait_channel_v3(WaitChannelV3Params {
+                    channel: args.channel,
+                    timeout_secs: args.timeout_secs,
+                    team: args.team,
+                    contains: args.contains,
+                    pattern: args.pattern,
+                    after: args.after,
+                    replace_wait_id: args.replace_wait_id,
+                })
+                .await
         }
         WaitMode::FanIn => {
-            let params: WaitChannelsParams = decode_args(body)?;
+            let args: WaitFanInArgs = decode_args(body)?;
+            let params = WaitChannelsParams {
+                arms: args.arms,
+                timeout_secs: args.timeout_secs,
+                contains: args.contains,
+                pattern: args.pattern,
+            };
             validate_wait_channels_params(&params)
                 .map_err(|err| ToolErrorEnvelope::input(err.to_string()))?;
             backend.wait_channels_v1(params).await
@@ -293,24 +410,6 @@ fn split_wait_mode(arguments: Value) -> Result<(WaitMode, Value), ToolErrorEnvel
 }
 
 fn parse_read_channel(arguments: Value) -> Result<ReadChannelParams, ToolErrorEnvelope> {
-    #[derive(Deserialize)]
-    struct ReadArgs {
-        channel: String,
-        #[serde(default)]
-        since_secs: Option<u64>,
-        #[serde(default)]
-        after_post_id: Option<String>,
-        #[serde(default)]
-        since_last_mine: bool,
-        #[serde(default)]
-        since_bootstrap: bool,
-        #[serde(default)]
-        limit: Option<u32>,
-        #[serde(default)]
-        advance: bool,
-        #[serde(default)]
-        team: Option<String>,
-    }
     let args: ReadArgs = decode_args(arguments)?;
     if args.channel.is_empty() {
         return Err(ToolErrorEnvelope::input("read_channel requires channel"));
@@ -350,13 +449,6 @@ fn parse_read_channel(arguments: Value) -> Result<ReadChannelParams, ToolErrorEn
 fn decode_args<T: for<'de> Deserialize<'de>>(arguments: Value) -> Result<T, ToolErrorEnvelope> {
     serde_json::from_value(arguments)
         .map_err(|err| ToolErrorEnvelope::input(format!("invalid tool arguments: {err}")))
-}
-
-fn require_empty_or_object(value: &Value) -> Result<(), ToolErrorEnvelope> {
-    match value {
-        Value::Null | Value::Object(_) => Ok(()),
-        _ => Err(ToolErrorEnvelope::input("arguments must be an object")),
-    }
 }
 
 #[cfg(test)]
@@ -473,5 +565,34 @@ mod tests {
         )
         .await;
         assert!(read_out["structuredContent"]["result"].is_array());
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_are_refused_for_every_tool() {
+        let backend = ToolBackend::scripted(vec![]);
+        let cases = [
+            ("whoami", json!({"extra":true})),
+            (
+                "read_channel",
+                json!({"channel":"ops","since_secs":60,"unexpected":1}),
+            ),
+            ("show", json!({"channel":"ops","post_id":"p","extra":"x"})),
+            ("thread", json!({"channel":"ops","post_id":"p","extra":"x"})),
+            (
+                "wait",
+                json!({"mode":"single","channel":"ops","timeout_secs":5,"arms":[]}),
+            ),
+            (
+                "post",
+                json!({"channel":"ops","message":"hi","undeclared":true}),
+            ),
+        ];
+        for (name, args) in cases {
+            let out = call_tool(name, args, &backend).await;
+            assert_eq!(
+                out["structuredContent"]["error"]["class"], "input",
+                "{name}"
+            );
+        }
     }
 }

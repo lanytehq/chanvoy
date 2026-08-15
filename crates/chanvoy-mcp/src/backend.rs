@@ -227,34 +227,39 @@ pub fn map_daemon_error(err: DaemonError, wait: bool) -> ToolErrorEnvelope {
         ),
         DaemonError::Rpc {
             code: RPC_WAIT_DEADMAN,
-            message,
             ..
-        } if wait => ToolErrorEnvelope::deadman(message),
+        } if wait => {
+            ToolErrorEnvelope::deadman("wait reached the deadman with no matching message")
+        }
         DaemonError::Rpc {
             code:
                 RPC_WAIT_ALREADY_ACTIVE
                 | RPC_WAIT_CONFLICT_CHANGED
                 | RPC_WAIT_REPLACED
-                | RPC_WAIT_REPLACE_UNCONFIRMED
-                | RPC_WAIT_INPUT,
-            message,
+                | RPC_WAIT_REPLACE_UNCONFIRMED,
             ..
-        } => ToolErrorEnvelope::input(message),
+        } => ToolErrorEnvelope::input(
+            "wait already active or replace was refused on this profile daemon",
+        ),
+        DaemonError::Rpc {
+            code: RPC_WAIT_INPUT,
+            ..
+        } => ToolErrorEnvelope::input("wait request was refused"),
         DaemonError::Rpc { message, .. } if looks_not_found(&message) => {
-            ToolErrorEnvelope::not_found(message)
+            ToolErrorEnvelope::not_found("requested channel or post was not found")
         }
         DaemonError::Rpc { message, .. }
             if message.contains("wait input error") || message.contains("WaitFilterInvalid") =>
         {
-            ToolErrorEnvelope::input(message)
+            ToolErrorEnvelope::input("wait request was refused")
         }
         DaemonError::NotRunning(_) => {
             ToolErrorEnvelope::provider("no chanvoy daemon is listening for this profile")
         }
-        DaemonError::Rpc { message, .. } => ToolErrorEnvelope::provider(message),
+        DaemonError::Rpc { .. } => ToolErrorEnvelope::provider("provider or daemon call failed"),
         DaemonError::Io(_) => ToolErrorEnvelope::provider("daemon socket closed before a result"),
         DaemonError::Json(_) => ToolErrorEnvelope::provider("daemon returned an unreadable result"),
-        other => ToolErrorEnvelope::provider(other.to_string()),
+        _ => ToolErrorEnvelope::provider("provider or daemon call failed"),
     }
 }
 
@@ -313,5 +318,25 @@ mod tests {
         assert!(!dumped.contains("existing_wait_id"));
         assert_eq!(err.error.class, ErrorClass::Input);
         assert!(!err.error.timeout);
+    }
+
+    #[test]
+    fn daemon_messages_are_not_forwarded() {
+        let err = map_daemon_error(
+            DaemonError::Rpc {
+                code: -32000,
+                message: "Authorization: Bearer SECRETTOKEN request_id=abc123 {\"body\":\"leak\"}"
+                    .into(),
+                data: Some(serde_json::json!({"token":"SECRETTOKEN"})),
+            },
+            false,
+        );
+        let dumped = serde_json::to_string(&err).unwrap();
+        assert!(!dumped.contains("SECRETTOKEN"));
+        assert!(!dumped.contains("request_id"));
+        assert!(!dumped.contains("Bearer"));
+        assert!(!dumped.contains("leak"));
+        assert_eq!(err.error.class, ErrorClass::Provider);
+        assert_eq!(err.error.message, "provider or daemon call failed");
     }
 }
