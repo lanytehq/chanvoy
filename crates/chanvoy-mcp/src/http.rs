@@ -44,23 +44,31 @@ pub fn parse_loopback_bind(raw: &str) -> Result<SocketAddr, String> {
     }
 }
 
+/// Allow only the serialized loopback Origin `http://127.0.0.1` with an
+/// optional numeric port. Userinfo, query, fragment, path, and spoofed
+/// authorities (`http://127.0.0.1:9@evil.example`) are refused.
 pub fn origin_allowed(origin: Option<&str>) -> Result<(), HttpError> {
-    let Some(origin) = origin.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(origin) = origin.filter(|s| !s.is_empty()) else {
         return Err(HttpError::new(403, "Origin header is required"));
     };
-    if origin == "null" || origin == "0" {
+    if origin != origin.trim() {
         return Err(HttpError::new(403, "Origin refused"));
     }
-    let rest = origin
-        .strip_prefix("http://")
-        .ok_or_else(|| HttpError::new(403, "Origin must be http://127.0.0.1"))?;
-    let host = rest.split('/').next().unwrap_or(rest);
-    let host_only = host.split(':').next().unwrap_or(host);
-    if host_only != "127.0.0.1" {
+    const PREFIX: &str = "http://127.0.0.1";
+    if origin == PREFIX {
+        return Ok(());
+    }
+    let Some(port) = origin.strip_prefix("http://127.0.0.1:") else {
         return Err(HttpError::new(
             403,
             "Origin must be http://127.0.0.1 (non-loopback Origin refused)",
         ));
+    };
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(HttpError::new(403, "Origin refused"));
+    }
+    if port.parse::<u16>().is_err() {
+        return Err(HttpError::new(403, "Origin refused"));
     }
     Ok(())
 }
@@ -355,6 +363,29 @@ mod tests {
         assert!(origin_allowed(Some("http://[::1]")).is_err());
         assert!(origin_allowed(Some("http://127.0.0.1")).is_ok());
         assert!(origin_allowed(Some("http://127.0.0.1:9")).is_ok());
+        assert!(origin_allowed(Some("http://127.0.0.1:18041")).is_ok());
+    }
+
+    #[test]
+    fn origin_rejects_spoofed_authority() {
+        for bad in [
+            "http://127.0.0.1:9@evil.example",
+            "http://127.0.0.1@evil.example",
+            "http://user@127.0.0.1",
+            "http://user:pass@127.0.0.1:9",
+            "http://127.0.0.1.evil.example",
+            "http://127.0.0.1/path",
+            "http://127.0.0.1?q=1",
+            "http://127.0.0.1#frag",
+            "http://127.0.0.1:9/",
+            "http://127.0.0.1:abc",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:",
+            " http://127.0.0.1",
+            "http://127.0.0.1 ",
+        ] {
+            assert!(origin_allowed(Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -447,6 +478,32 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
         let req = format!(
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: tools/list\r\nMcp-Name: chanvoy\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn loopback_refuses_spoofed_loopback_origin() {
+        use crate::backend::ToolBackend;
+        use tokio::io::AsyncReadExt;
+
+        let backend = ToolBackend::scripted(vec![]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_http_listener(backend, listener).await;
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1:9@evil.example\r\nMCP-Protocol-Version: {PROTOCOL_VERSION}\r\nMcp-Method: tools/list\r\nMcp-Name: chanvoy\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         let mut stream = TcpStream::connect(addr).await.unwrap();
