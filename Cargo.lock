@@ -192,6 +192,7 @@ version = "0.3.0"
 dependencies = [
  "chanvoy-cli",
  "chanvoy-core",
+ "chanvoy-mcp",
  "chrono",
  "libc",
  "serde_json",

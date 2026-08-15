@@ -20,7 +20,10 @@ pub use error::{ErrorClass, ToolErrorEnvelope};
 pub use http::{
     origin_allowed, parse_loopback_bind, serve_http, serve_http_listener, validate_mcp_headers,
 };
-pub use protocol::PROTOCOL_VERSION;
+pub use protocol::{
+    with_request_meta, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+};
 pub use stdio::{serve_stdio, serve_stdio_io};
 pub use tools::{is_declared_tool, tools_list, TOOL_NAMES};
 

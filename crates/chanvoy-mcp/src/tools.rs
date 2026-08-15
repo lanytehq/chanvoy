@@ -113,23 +113,20 @@ enum WaitMode {
 pub fn tools_list() -> Value {
     json!({
         "tools": TOOL_NAMES.iter().map(|name| tool_descriptor(name)).collect::<Vec<_>>(),
+        "ttlMs": 0,
+        "cacheScope": "private",
     })
 }
 
 pub fn server_discover() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
+        "supportedProtocolVersions": [PROTOCOL_VERSION],
         "server": { "name": SERVER_NAME, "title": "chanvoy" },
-        "tools": tools_list()["tools"],
-    })
-}
-
-pub fn initialize_result() -> Value {
-    json!({
-        "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "Chanvoy MCP is an access face on the local profile daemon. Blocking wait does not wake Grok Bot.",
+        "tools": tools_list()["tools"],
+        "ttlMs": 0,
+        "cacheScope": "private",
     })
 }
 

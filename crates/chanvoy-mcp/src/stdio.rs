@@ -7,7 +7,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::backend::ToolBackend;
 use crate::dispatch::handle_request;
 use crate::error::ToolErrorEnvelope;
-use crate::protocol::{failure_value, JsonRpcResponse};
+use crate::protocol::{
+    cancelled_request_id, failure_value, ids_equal, JsonRpcRequest, JsonRpcResponse,
+};
 
 pub async fn serve_stdio(backend: ToolBackend) -> io::Result<()> {
     let stdin = tokio::io::stdin();
@@ -39,7 +41,13 @@ where
         if line.trim().is_empty() {
             continue;
         }
+        if is_idle_notification(&line) {
+            continue;
+        }
 
+        let current_id = serde_json::from_str::<JsonRpcRequest>(&line)
+            .ok()
+            .and_then(|r| r.id);
         let mut work = Box::pin(handle_request(&line, &backend));
         let mut lookahead = String::new();
         tokio::select! {
@@ -64,6 +72,25 @@ where
                         ));
                     }
                     Ok(_) => {
+                        if let Some(cancel_id) = parse_cancelled(&lookahead) {
+                            if current_id
+                                .as_ref()
+                                .is_some_and(|id| ids_equal(id, &cancel_id))
+                            {
+                                drop(work);
+                                write_response(
+                                    &mut writer,
+                                    &JsonRpcResponse::result(
+                                        cancel_id,
+                                        failure_value(ToolErrorEnvelope::provider(
+                                            "request cancelled",
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
                         if let Some(resp) = work.await {
                             write_response(&mut writer, &resp).await?;
                         }
@@ -74,6 +101,21 @@ where
             }
         }
     }
+}
+
+fn is_idle_notification(line: &str) -> bool {
+    let Ok(req) = serde_json::from_str::<JsonRpcRequest>(line) else {
+        return false;
+    };
+    req.id.is_none()
+}
+
+fn parse_cancelled(line: &str) -> Option<serde_json::Value> {
+    let req: JsonRpcRequest = serde_json::from_str(line).ok()?;
+    if req.id.is_some() || req.method != "notifications/cancelled" {
+        return None;
+    }
+    cancelled_request_id(&req.params)
 }
 
 async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
@@ -104,13 +146,28 @@ fn disconnect_response(line: &str) -> JsonRpcResponse {
 mod tests {
     use super::*;
     use crate::backend::{ScriptedReply, ToolBackend};
+    use crate::protocol::{with_request_meta, PROTOCOL_VERSION};
+    use serde_json::json;
     use tokio::io::BufReader;
+
+    fn modern_line(id: u64, method: &str, params: serde_json::Value) -> String {
+        format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": with_request_meta(params),
+            }))
+            .unwrap()
+        )
+    }
 
     #[tokio::test]
     async fn stdio_tools_list_is_stdout_pure() {
         let backend = ToolBackend::scripted(vec![]);
-        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
-        let reader = BufReader::new(&input[..]);
+        let input = modern_line(1, "tools/list", json!({}));
+        let reader = BufReader::new(input.as_bytes());
         let mut out = Vec::new();
         serve_stdio_io(reader, &mut out, backend).await.unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -121,14 +178,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert!(parsed.get("result").is_some());
         assert!(parsed.get("error").is_none());
+        assert_eq!(parsed["result"]["resultType"], "complete");
+        let _ = PROTOCOL_VERSION;
     }
 
     #[tokio::test]
     async fn stdio_eof_cancels_in_flight_wait() {
         let backend =
             ToolBackend::scripted(vec![("wait_channel_v3", ScriptedReply::HangUntilCancel)]);
-        let input = b"{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"wait\",\"arguments\":{\"mode\":\"single\",\"channel\":\"ops\",\"timeout_secs\":30}}}\n";
-        let reader = BufReader::new(&input[..]);
+        let input = modern_line(
+            9,
+            "tools/call",
+            json!({"name":"wait","arguments":{"mode":"single","channel":"ops","timeout_secs":30}}),
+        );
+        let reader = BufReader::new(input.as_bytes());
         let mut out = Vec::new();
         let err = serve_stdio_io(reader, &mut out, backend)
             .await
@@ -147,10 +210,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdio_cancelled_notification_drops_wait() {
+        let backend =
+            ToolBackend::scripted(vec![("wait_channel_v3", ScriptedReply::HangUntilCancel)]);
+        let wait = modern_line(
+            9,
+            "tools/call",
+            json!({"name":"wait","arguments":{"mode":"single","channel":"ops","timeout_secs":30}}),
+        );
+        let cancel =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#;
+        let input = format!("{wait}{cancel}\n");
+        let reader = BufReader::new(input.as_bytes());
+        let mut out = Vec::new();
+        serve_stdio_io(reader, &mut out, backend).await.unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+        assert_eq!(parsed["result"]["isError"], true);
+        assert_eq!(
+            parsed["result"]["structuredContent"]["error"]["timeout"],
+            false
+        );
+        assert!(parsed["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
+    }
+
+    #[tokio::test]
     async fn wait_daemon_eof_is_not_deadman() {
         let backend = ToolBackend::scripted(vec![("wait_channel_v3", ScriptedReply::Eof)]);
-        let input = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"wait\",\"arguments\":{\"mode\":\"single\",\"channel\":\"ops\",\"timeout_secs\":5}}}\n";
-        let reader = BufReader::new(&input[..]);
+        let input = modern_line(
+            3,
+            "tools/call",
+            json!({"name":"wait","arguments":{"mode":"single","channel":"ops","timeout_secs":5}}),
+        );
+        let reader = BufReader::new(input.as_bytes());
         let mut out = Vec::new();
         serve_stdio_io(reader, &mut out, backend).await.unwrap();
         let parsed: serde_json::Value =

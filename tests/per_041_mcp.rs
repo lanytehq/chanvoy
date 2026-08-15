@@ -7,6 +7,7 @@ use std::time::Duration;
 mod common;
 
 use chanvoy_core::{rpc_error, rpc_result, JsonRpcRequest, WAIT_CHANNEL_V3_METHOD};
+use chanvoy_mcp::with_request_meta;
 use common::{run_chanvoy_with_stdin, TestEnv};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -62,7 +63,7 @@ fn rpc_line(id: u64, method: &str, params: serde_json::Value) -> String {
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
-            "params": params
+            "params": with_request_meta(params)
         }))
         .unwrap()
     )
@@ -348,6 +349,101 @@ async fn mcp_stdio_client_eof_closes_uds_and_admits_later_wait() {
         second["result"]["structuredContent"]["result"]["channel"],
         "ops"
     );
+    server.await.expect("fake daemon");
+}
+
+#[tokio::test]
+async fn mcp_stdio_cancelled_notification_closes_uds_and_admits_later_wait() {
+    let env = TestEnv::new("per-041-notify-cancel").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    let socket_path = env.socket_path();
+    let listener = UnixListener::bind(&socket_path).expect("bind");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("first accept");
+        let (reader, _writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("first request");
+        let first: JsonRpcRequest = serde_json::from_str(line.trim_end()).expect("decode");
+        assert_eq!(first.method, WAIT_CHANNEL_V3_METHOD);
+        let n = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut String::new()))
+            .await
+            .expect("uds must close after cancelled notification")
+            .expect("read after cancel");
+        assert_eq!(n, 0, "first wait connection must be dropped");
+
+        let (stream, _) = listener.accept().await.expect("second accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("second request");
+        let second: JsonRpcRequest = serde_json::from_str(line.trim_end()).expect("decode");
+        assert_eq!(second.method, WAIT_CHANNEL_V3_METHOD);
+        let response = rpc_result(
+            second.id,
+            json!({"channel":"ops","messages":[{"id":"p","user_id":"u","username":"n","message":"hi","create_at":1,"root_id":"p"}]}),
+        );
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+            .await
+            .expect("write match");
+    });
+
+    let mut first = spawn_mcp(&env);
+    let cancelled = {
+        let mut stdin = first.stdin.take().expect("stdin");
+        stdin
+            .write_all(
+                rpc_line(
+                    1,
+                    "tools/call",
+                    json!({
+                        "name":"wait",
+                        "arguments":{"mode":"single","channel":"ops","timeout_secs":30}
+                    }),
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write wait");
+        stdin.flush().await.expect("flush wait");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        stdin
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#
+                    .as_ref(),
+            )
+            .await
+            .expect("write cancel");
+        stdin.write_all(b"\n").await.expect("nl");
+        stdin.flush().await.expect("flush");
+        let stdout = first.stdout.take().expect("stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("cancel result");
+        drop(stdin);
+        let _ = first.wait().await;
+        serde_json::from_str::<serde_json::Value>(line.trim()).expect("json")
+    };
+    assert_eq!(cancelled["result"]["isError"], true);
+    assert_eq!(
+        cancelled["result"]["structuredContent"]["error"]["timeout"],
+        false
+    );
+
+    let second = run_mcp_keep_stdin(
+        &env,
+        &rpc_line(
+            2,
+            "tools/call",
+            json!({
+                "name":"wait",
+                "arguments":{"mode":"single","channel":"ops","timeout_secs":5}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(second["result"]["isError"], false);
     server.await.expect("fake daemon");
 }
 
