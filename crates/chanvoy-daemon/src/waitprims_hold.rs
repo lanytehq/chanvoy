@@ -83,6 +83,7 @@ pub(crate) async fn run_single_channel_first_match(
     // CoreErrors never pass through waitprims ValidationError.
     let (resolved_start, rest_baseline) = resolve_bind_cursor(
         state,
+        wait.session,
         wait.channel,
         wait.predicate.channel_id(),
         wait.after,
@@ -766,8 +767,25 @@ impl Observer for ChanvoyWaitObserver {
     }
 }
 
+/// Race pre-run baseline work against replacement cancel so the lease
+/// guard can drop instead of ignoring cancel until the provider returns.
+pub(crate) async fn race_bind_work<T, F>(session: &WaitSession, work: F) -> Result<T, CoreError>
+where
+    F: std::future::Future<Output = Result<T, CoreError>>,
+{
+    tokio::select! {
+        biased;
+        _ = session.cancel.cancelled() => Err(CoreError::WaitReplaced {
+            wait_id: session.wait_id.clone(),
+            replaced_by_wait_id: session.replaced_by_id(),
+        }),
+        res = work => res,
+    }
+}
+
 pub(crate) async fn resolve_bind_cursor(
     state: &AppState,
+    session: &WaitSession,
     channel: &str,
     channel_id: &str,
     after: Option<&str>,
@@ -778,15 +796,19 @@ pub(crate) async fn resolve_bind_cursor(
             return Err(CoreError::WaitFilterInvalid("wait cursor uncertain".into()));
         }
     }
-    let (scan, baseline) = establish_baseline(state, channel, channel_id, after, deadline).await?;
-    let value = scan.unwrap_or_else(|| EMPTY_AT_ARM_CURSOR.to_string());
-    Ok((
-        Anchor {
-            kind: AnchorKind::ProviderOpaque,
-            value: IdToken::new(value),
-        },
-        baseline,
-    ))
+    race_bind_work(session, async {
+        let (scan, baseline) =
+            establish_baseline(state, channel, channel_id, after, deadline).await?;
+        let value = scan.unwrap_or_else(|| EMPTY_AT_ARM_CURSOR.to_string());
+        Ok((
+            Anchor {
+                kind: AnchorKind::ProviderOpaque,
+                value: IdToken::new(value),
+            },
+            baseline,
+        ))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1151,6 +1173,66 @@ mod tests {
             channel_subject("abc123").as_str()
         );
         assert_ne!(channel_subject("abc123").as_str(), "channel:ops-updates");
+    }
+
+    #[tokio::test]
+    async fn bind_baseline_cancel_releases_lease_for_replacement() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let registry = Arc::new(WaitOwnerRegistry::new());
+        let old = registry
+            .acquire("ch-1", "org", "ops", None, Duration::from_secs(5))
+            .await
+            .expect("admit");
+        let old_id = old.wait_id.clone();
+        let (session, guard) = old.into_guard();
+        let parked = Arc::new(AtomicBool::new(false));
+        let continued = Arc::new(AtomicU64::new(0));
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let work = {
+            let parked = Arc::clone(&parked);
+            let continued = Arc::clone(&continued);
+            let hold = Arc::clone(&hold);
+            async move {
+                race_bind_work(&session, async {
+                    parked.store(true, Ordering::SeqCst);
+                    hold.notified().await;
+                    continued.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            }
+        };
+        let old_task = tokio::spawn(work);
+        let mark = Instant::now() + Duration::from_millis(200);
+        while !parked.load(Ordering::SeqCst) {
+            assert!(Instant::now() < mark, "baseline work never parked");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let replacing = {
+            let registry = Arc::clone(&registry);
+            let old_id = old_id.clone();
+            tokio::spawn(async move {
+                registry
+                    .acquire("ch-1", "org", "ops", Some(&old_id), Duration::from_secs(5))
+                    .await
+            })
+        };
+        let old_result = old_task.await.expect("join old");
+        assert!(
+            matches!(old_result, Err(CoreError::WaitReplaced { ref wait_id, .. }) if wait_id == &old_id),
+            "old waiter must surface WaitReplaced, got {old_result:?}"
+        );
+        drop(guard);
+        let new_lease = replacing.await.expect("join replace").expect("rebind");
+        assert_ne!(new_lease.wait_id, old_id);
+        assert_eq!(
+            continued.load(Ordering::SeqCst),
+            0,
+            "cancelled baseline must not continue provider work"
+        );
+        hold.notify_waiters();
+        assert_eq!(continued.load(Ordering::SeqCst), 0);
+        drop(new_lease);
     }
 
     #[test]
