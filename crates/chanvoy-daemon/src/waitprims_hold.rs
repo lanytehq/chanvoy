@@ -18,10 +18,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use waitprims_async::{run_first_match, BindHandle, Cancel, Clock, Observation, Observer};
 use waitprims_core::{
-    validate_message, validate_raw_documents, ActorRef, AgentWaitMessage, Anchor, AnchorKind,
-    AuthnMode, BaselinePolicy, Canonicalization, CapabilityToken, ContentDigest, DigestAlgorithm,
-    IdToken, JcsDigest, LiveWaitOutcome, LiveWaitRequest, OpaqueRef, OutcomeKind, PayloadRef,
-    PredicateRef, Registration, RegistrationSet, ReplayStatus, Timestamp, WaitBound, WaitEvent,
+    validate_raw_documents, ActorRef, AgentWaitMessage, Anchor, AnchorKind, AuthnMode,
+    BaselinePolicy, Canonicalization, CapabilityToken, ContentDigest, DigestAlgorithm, IdToken,
+    JcsDigest, LiveWaitOutcome, LiveWaitRequest, OpaqueRef, OutcomeKind, PayloadRef, PredicateRef,
+    Registration, RegistrationSet, ReplayStatus, Timestamp, WaitBound, WaitEvent,
 };
 
 use crate::wait::{establish_baseline, one_message_result, wait_rest_from_cursor, WaitPredicate};
@@ -116,15 +116,15 @@ pub(crate) async fn run_single_channel_first_match(
         wait.after,
         clock.project_deadline(wait.deadline),
     )?;
-    let (set, request) = admit_set_and_request(set, request)?;
+    let docs = admit_set_and_request(wait.channel, set, request)?;
 
     let wp_cancel = Cancel::new();
     let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
 
-    let outcome = run_first_match(&set, &request, &observer, &clock, &wp_cancel)
+    let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel)
         .await
         .map_err(map_waitprims_err)?;
-    let outcome = admit_outcome(outcome)?;
+    let outcome = admit_wait_result(&docs, outcome)?;
 
     inner_cancel.cancel();
     release.release();
@@ -250,19 +250,26 @@ pub(crate) fn payload_ref_for(message: &Message) -> String {
     format!("msg:{}", message.id)
 }
 
-pub(crate) fn sidecar_message_bytes(message: &Message) -> Result<Vec<u8>, CoreError> {
-    serde_json::to_vec(message)
-        .map_err(|err| CoreError::WaitFilterInvalid(format!("sidecar message bytes: {err}")))
+fn contract_internal(channel: &str, detail: impl std::fmt::Display) -> CoreError {
+    CoreError::WaitProviderDegraded {
+        channel: channel.to_string(),
+        message: format!("waitprims contract: {detail}"),
+    }
 }
 
-pub(crate) fn content_digest_for(message: &Message) -> ContentDigest {
-    let bytes = sidecar_message_bytes(message).unwrap_or_default();
+pub(crate) fn sidecar_message_bytes(message: &Message) -> Result<Vec<u8>, CoreError> {
+    serde_json::to_vec(message)
+        .map_err(|err| contract_internal("wait", format!("sidecar message bytes: {err}")))
+}
+
+pub(crate) fn content_digest_for(message: &Message) -> Result<ContentDigest, CoreError> {
+    let bytes = sidecar_message_bytes(message)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    ContentDigest {
+    Ok(ContentDigest {
         algorithm: DigestAlgorithm::Sha256,
         value: hex_lower(&hasher.finalize()),
-    }
+    })
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -277,14 +284,15 @@ pub(crate) fn event_from_foreign_message(
     subject_id: &IdToken,
     start: &Anchor,
     sidecar: &MessageSidecar,
-) -> Option<WaitEvent> {
+) -> Result<Option<WaitEvent>, CoreError> {
     if message.user_id == my_user_id {
-        return None;
+        return Ok(None);
     }
     let payload_ref = payload_ref_for(message);
     sidecar.store(&payload_ref, message.clone());
     let observed = timestamp_now();
-    Some(WaitEvent {
+    let digest = content_digest_for(message)?;
+    Ok(Some(WaitEvent {
         event_id: IdToken::new(format!("evt:{}", message.id)),
         registration_id: registration_id.clone(),
         source_instance_ref: OpaqueRef::new("source:chanvoy-daemon"),
@@ -303,12 +311,12 @@ pub(crate) fn event_from_foreign_message(
         causation_id: None,
         payload: PayloadRef {
             payload_ref: OpaqueRef::new(payload_ref),
-            content_digest: content_digest_for(message),
+            content_digest: digest,
             media_type: Some("application/json".into()),
         },
         delivery_ref: None,
         activation_ref: None,
-    })
+    }))
 }
 
 pub(crate) fn translate_outcome(
@@ -487,16 +495,25 @@ pub(crate) fn build_live_documents(
     Ok((set, request))
 }
 
+pub(crate) struct AdmittedWaitDocs {
+    pub channel: String,
+    pub set: RegistrationSet,
+    pub request: LiveWaitRequest,
+    pub set_json: String,
+    pub request_json: String,
+}
+
 pub(crate) fn admit_set_and_request(
+    channel: &str,
     set: RegistrationSet,
     request: LiveWaitRequest,
-) -> Result<(RegistrationSet, LiveWaitRequest), CoreError> {
+) -> Result<AdmittedWaitDocs, CoreError> {
     let set_json = serde_json::to_string(&AgentWaitMessage::RegistrationSet(set))
-        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims set encode: {err}")))?;
+        .map_err(|err| contract_internal(channel, format!("set encode: {err}")))?;
     let req_json = serde_json::to_string(&AgentWaitMessage::LiveWaitRequest(request))
-        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims request encode: {err}")))?;
+        .map_err(|err| contract_internal(channel, format!("request encode: {err}")))?;
     let admitted = validate_raw_documents([&set_json, &req_json])
-        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims admission: {err}")))?;
+        .map_err(|err| contract_internal(channel, format!("set/request admission: {err}")))?;
     let mut set = None;
     let mut request = None;
     for msg in admitted {
@@ -504,41 +521,53 @@ pub(crate) fn admit_set_and_request(
             AgentWaitMessage::RegistrationSet(value) => set = Some(value),
             AgentWaitMessage::LiveWaitRequest(value) => request = Some(value),
             other => {
-                return Err(CoreError::WaitFilterInvalid(format!(
-                    "waitprims admission: unexpected {}",
-                    other.message_type().as_str()
-                )));
+                return Err(contract_internal(
+                    channel,
+                    format!("unexpected {}", other.message_type().as_str()),
+                ));
             }
         }
     }
-    Ok((
-        set.ok_or_else(|| CoreError::WaitFilterInvalid("waitprims admission: missing set".into()))?,
-        request.ok_or_else(|| {
-            CoreError::WaitFilterInvalid("waitprims admission: missing request".into())
-        })?,
-    ))
+    let set = set.ok_or_else(|| contract_internal(channel, "missing set"))?;
+    let request = request.ok_or_else(|| contract_internal(channel, "missing request"))?;
+    let set_json = serde_json::to_string(&AgentWaitMessage::RegistrationSet(set.clone()))
+        .map_err(|err| contract_internal(channel, format!("admitted set encode: {err}")))?;
+    let request_json =
+        serde_json::to_string(&AgentWaitMessage::LiveWaitRequest(request.clone()))
+            .map_err(|err| contract_internal(channel, format!("admitted request encode: {err}")))?;
+    Ok(AdmittedWaitDocs {
+        channel: channel.to_string(),
+        set,
+        request,
+        set_json,
+        request_json,
+    })
 }
 
-pub(crate) fn admit_outcome(outcome: LiveWaitOutcome) -> Result<LiveWaitOutcome, CoreError> {
-    let json = serde_json::to_string(&AgentWaitMessage::LiveWaitOutcome(outcome))
-        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims outcome encode: {err}")))?;
-    let admitted = validate_message(&json).map_err(|err| {
-        CoreError::WaitFilterInvalid(format!("waitprims outcome admission: {err}"))
-    })?;
-    match admitted.into_inner() {
-        AgentWaitMessage::LiveWaitOutcome(value) => Ok(value),
-        other => Err(CoreError::WaitFilterInvalid(format!(
-            "waitprims outcome admission: unexpected {}",
-            other.message_type().as_str()
-        ))),
+pub(crate) fn admit_wait_result(
+    docs: &AdmittedWaitDocs,
+    outcome: LiveWaitOutcome,
+) -> Result<LiveWaitOutcome, CoreError> {
+    let channel = docs.channel.as_str();
+    let outcome_json = serde_json::to_string(&AgentWaitMessage::LiveWaitOutcome(outcome))
+        .map_err(|err| contract_internal(channel, format!("outcome encode: {err}")))?;
+    let admitted = validate_raw_documents([&docs.set_json, &docs.request_json, &outcome_json])
+        .map_err(|err| {
+            contract_internal(channel, format!("set/request/outcome admission: {err}"))
+        })?;
+    for msg in admitted {
+        if let AgentWaitMessage::LiveWaitOutcome(value) = msg.into_inner() {
+            return Ok(value);
+        }
     }
+    Err(contract_internal(channel, "missing admitted outcome"))
 }
 
 #[cfg(test)]
 pub(crate) fn admit_raw(raw: &str) -> Result<AgentWaitMessage, CoreError> {
-    validate_message(raw)
+    waitprims_core::validate_message(raw)
         .map(|admitted| admitted.into_inner())
-        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims admission: {err}")))
+        .map_err(|err| contract_internal("wait", err))
 }
 
 pub(crate) fn registration_digest_hex(registration: &Registration) -> Result<String, CoreError> {
@@ -627,8 +656,14 @@ impl ChanvoyWaitObserver {
                     start,
                     &self.sidecar,
                 ) {
-                    Some(event) => Observation::Event(Box::new(event)),
-                    None => Observation::Idle,
+                    Ok(Some(event)) => Observation::Event(Box::new(event)),
+                    Ok(None) => Observation::Idle,
+                    Err(err) => {
+                        self.remember(err);
+                        Observation::Failed {
+                            reason_code: IdToken::new("sidecar_digest"),
+                        }
+                    }
                 }
             }
             Err(CoreError::WaitTimeout(_)) => Observation::Idle,
@@ -813,6 +848,7 @@ mod tests {
             &start,
             &sidecar
         )
+        .expect("digest")
         .is_none());
         assert!(sidecar.take("msg:p1").is_none());
     }
@@ -834,6 +870,7 @@ mod tests {
             &start,
             &sidecar,
         )
+        .expect("digest")
         .expect("foreign");
         assert_eq!(event.method_id.as_str(), METHOD_ID);
         assert_eq!(event.subject_id.as_str(), "channel:ops");
@@ -891,7 +928,8 @@ mod tests {
             &start,
             &sidecar,
         )
-        .unwrap();
+        .expect("digest")
+        .expect("foreign");
         let session = dummy_session("wait_aa");
         let outcome = LiveWaitOutcome {
             capabilities: vec![],
@@ -1045,14 +1083,14 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit()));
         let recomputed = registration_digest_hex(&set.registrations[0]).expect("recompute");
         assert_eq!(recomputed, set.registration_digest.value);
-        let (admitted_set, admitted_req) = admit_set_and_request(set, request).expect("admit pair");
+        let docs = admit_set_and_request("ops", set, request).expect("admit pair");
         assert_eq!(
-            admitted_set.registrations[0].subject_id.as_str(),
+            docs.set.registrations[0].subject_id.as_str(),
             "channel:ch-canonical"
         );
         assert_eq!(
-            admitted_req.registration_set_ref.as_str(),
-            admitted_set.message_id.as_str()
+            docs.request.registration_set_ref.as_str(),
+            docs.set.message_id.as_str()
         );
     }
 
@@ -1140,7 +1178,7 @@ mod tests {
     #[test]
     fn content_digest_covers_every_sidecar_field() {
         let base = msg("p1", "alice", "hello");
-        let base_digest = content_digest_for(&base).value;
+        let base_digest = content_digest_for(&base).expect("digest").value;
         let mut username = base.clone();
         username.username = "bob".into();
         let mut root = base.clone();
@@ -1151,7 +1189,10 @@ mod tests {
         body.message = "goodbye".into();
         let mut created = base.clone();
         created.create_at = 99;
+        let mut id = base.clone();
+        id.id = "p-other".into();
         for (label, variant) in [
+            ("id", id),
             ("username", username),
             ("root_id", root),
             ("user_id", user),
@@ -1159,7 +1200,7 @@ mod tests {
             ("create_at", created),
         ] {
             assert_ne!(
-                content_digest_for(&variant).value,
+                content_digest_for(&variant).expect("digest").value,
                 base_digest,
                 "{label} must affect content digest"
             );
@@ -1169,12 +1210,60 @@ mod tests {
     #[test]
     fn malformed_registration_set_fails_closed() {
         let err = admit_raw(r#"{"message_type":"registration_set"}"#).unwrap_err();
-        assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
+        assert!(matches!(err, CoreError::WaitProviderDegraded { .. }));
     }
 
     #[test]
     fn malformed_outcome_fails_closed() {
         let err = admit_raw(r#"{"message_type":"live_wait_outcome"}"#).unwrap_err();
-        assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
+        assert!(matches!(err, CoreError::WaitProviderDegraded { .. }));
+    }
+
+    #[test]
+    fn expired_lease_set_and_outcome_fail_closed_together() {
+        let session = dummy_session("wait_lease");
+        let (mut set, request) = build_live_documents(
+            &session,
+            "bot",
+            "ch-canonical",
+            Some("post-abc"),
+            timestamp_now().saturating_add(Duration::from_secs(30)),
+        )
+        .expect("docs");
+        set.registrations[0].lease_expires_at =
+            Timestamp::parse("1970-01-01T00:00:01Z").expect("epoch");
+        let docs = match admit_set_and_request("ops", set, request) {
+            Ok(docs) => docs,
+            Err(err) => {
+                assert!(matches!(err, CoreError::WaitProviderDegraded { .. }));
+                return;
+            }
+        };
+        let outcome = LiveWaitOutcome {
+            capabilities: docs.request.capabilities.clone(),
+            message_id: IdToken::new(format!("{}:outcome", docs.request.message_id.as_str())),
+            correlation_id: docs.request.correlation_id.clone(),
+            created_at: timestamp_now(),
+            actor_ref: docs.request.actor_ref.clone(),
+            causation_id: Some(docs.request.message_id.clone()),
+            grant_ref: None,
+            verification_receipt_ref: None,
+            policy_decision_ref: None,
+            waiter_id: docs.request.waiter_id.clone(),
+            request_ref: docs.request.message_id.clone(),
+            completed_at: timestamp_now(),
+            outcome_kind: OutcomeKind::LogicalDeadman,
+            logical_deadline: Some(docs.request.logical_deadline.clone()),
+            events: Some(Vec::new()),
+            proposed_next_anchor: None,
+            coverage_complete: Some(true),
+            arms: None,
+            reason_code: None,
+        };
+        let err = admit_wait_result(&docs, outcome).unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitProviderDegraded { .. }),
+            "cross-document lease/admission must fail closed as internal, got {err:?}"
+        );
     }
 }
