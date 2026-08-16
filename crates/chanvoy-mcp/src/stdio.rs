@@ -49,48 +49,57 @@ where
             .ok()
             .and_then(|r| r.id);
         let mut work = Box::pin(handle_request(&line, &backend));
-        let mut lookahead = String::new();
-        tokio::select! {
-            biased;
-            resp = &mut work => {
-                if let Some(resp) = resp {
-                    write_response(&mut writer, &resp).await?;
-                }
-            }
-            read = reader.read_line(&mut lookahead) => {
-                match read {
-                    Ok(0) => {
-                        drop(work);
-                        write_response(&mut writer, &disconnect_response(&line)).await?;
-                        let _ = writeln!(
-                            io::stderr(),
-                            "chanvoy mcp: stdin closed; cancelled in-flight daemon call"
-                        );
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "mcp stdin closed during an in-flight call",
-                        ));
+        loop {
+            let mut lookahead = String::new();
+            tokio::select! {
+                biased;
+                resp = &mut work => {
+                    if let Some(resp) = resp {
+                        write_response(&mut writer, &resp).await?;
                     }
-                    Ok(_) => {
-                        if let Some(cancel_id) = parse_cancelled(&lookahead) {
-                            if current_id
-                                .as_ref()
-                                .is_some_and(|id| ids_equal(id, &cancel_id))
-                            {
-                                drop(work);
-                                let _ = writeln!(
-                                    io::stderr(),
-                                    "chanvoy mcp: request cancelled; dropped in-flight daemon call"
-                                );
+                    break;
+                }
+                read = reader.read_line(&mut lookahead) => {
+                    match read {
+                        Ok(0) => {
+                            drop(work);
+                            write_response(&mut writer, &disconnect_response(&line)).await?;
+                            let _ = writeln!(
+                                io::stderr(),
+                                "chanvoy mcp: stdin closed; cancelled in-flight daemon call"
+                            );
+                            return Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                "mcp stdin closed during an in-flight call",
+                            ));
+                        }
+                        Ok(_) => {
+                            if let Some(cancel_id) = parse_cancelled(&lookahead) {
+                                if current_id
+                                    .as_ref()
+                                    .is_some_and(|id| ids_equal(id, &cancel_id))
+                                {
+                                    drop(work);
+                                    let _ = writeln!(
+                                        io::stderr(),
+                                        "chanvoy mcp: request cancelled; dropped in-flight daemon call"
+                                    );
+                                    break;
+                                }
+                                // Id-less nonmatching cancel: keep racing the same wait.
                                 continue;
                             }
+                            if is_idle_notification(&lookahead) {
+                                continue;
+                            }
+                            if let Some(resp) = work.await {
+                                write_response(&mut writer, &resp).await?;
+                            }
+                            pending = Some(lookahead);
+                            break;
                         }
-                        if let Some(resp) = work.await {
-                            write_response(&mut writer, &resp).await?;
-                        }
-                        pending = Some(lookahead);
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => return Err(err),
                 }
             }
         }
@@ -201,6 +210,32 @@ mod tests {
             parsed["result"]["structuredContent"]["error"]["class"],
             "provider"
         );
+    }
+
+    #[tokio::test]
+    async fn stdio_nonmatching_cancel_keeps_racing_until_exact_id() {
+        let backend =
+            ToolBackend::scripted(vec![("wait_channel_v3", ScriptedReply::HangUntilCancel)]);
+        let wait = modern_line(
+            9,
+            "tools/call",
+            json!({"name":"wait","arguments":{"mode":"single","channel":"ops","timeout_secs":30}}),
+        );
+        let wrong =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"9"}}"#;
+        let right =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#;
+        let list = modern_line(10, "tools/list", json!({}));
+        let input = format!("{wait}{wrong}\n{right}\n{list}");
+        let reader = BufReader::new(input.as_bytes());
+        let mut out = Vec::new();
+        serve_stdio_io(reader, &mut out, backend).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<_> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert!(parsed["result"]["tools"].is_array());
+        assert_eq!(parsed["id"], 10);
     }
 
     #[tokio::test]
