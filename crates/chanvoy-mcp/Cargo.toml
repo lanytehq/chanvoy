@@ -4,7 +4,7 @@ version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "MCP bridge scaffold for chanvoy"
+description = "MCP 2026-07-28 access face for the chanvoy profile daemon"
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -15,7 +15,8 @@ publish.workspace = true
 
 [dependencies]
 chanvoy-core = { path = "../chanvoy-core" }
+chanvoy-daemon = { path = "../chanvoy-daemon" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "io-util"] }

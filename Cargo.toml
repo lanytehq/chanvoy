@@ -62,6 +62,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 chanvoy-core = { path = "crates/chanvoy-core" }
+chanvoy-mcp = { path = "crates/chanvoy-mcp" }
 chrono = { workspace = true }
 # libc: PER-008D test harness uses `libc::getsid` to assert the daemon
 # is its own session leader (proof that setsid took effect). Also used

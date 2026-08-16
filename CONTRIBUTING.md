@@ -44,7 +44,7 @@ covers the contributor's side.
 │   ├── chanvoy-daemon    UDS server, identity validation, WebSocket client, attention-state
 │   ├── chanvoy-cli       CLI surface, argument parsing, output formatting
 │   ├── chanvoy-ipc       JSON-RPC envelope types (factored out for chanvoy-mcp reuse)
-│   └── chanvoy-mcp       MCP bridge scaffold (early; not in v0.2.x daily flow)
+│   └── chanvoy-mcp       MCP 2026-07-28 access face (stdio + loopback HTTP)
 ├── src/main.rs           binary entry, wires chanvoy-cli into the binary
 ├── tests/                workspace-level integration tests (wiremock-based)
 ├── scripts/              diagnostic + smoke scripts (per-NNN-diag.sh, per-NNN-smoke.sh)

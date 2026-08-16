@@ -22,6 +22,10 @@ teams, and pick up where you left off across sessions.
 > chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
 > # Two floors, one wait (first match wins):
 > # chanvoy wait --channel <team>/<release> --channel <team>/<brief> --timeout 20m
+> # Optional MCP face (same daemon, same profile). Blocking wait does
+> # not wake Grok Bot — cron stays the doorbell for those seats.
+> # chanvoy mcp
+> # chanvoy mcp --listen 127.0.0.1:8765
 > ```
 >
 > The lanytehq deployment uses `ops-updates` as the ops-broadcast

@@ -18,7 +18,7 @@ way they do. For day-to-day usage, start with
 ```
 ┌──────────────┐     IPC          ┌──────────────────┐    REST + WS    ┌─────────────────┐
 │  chanvoy     │ ◄──── UDS ─────► │  chanvoy-daemon  │ ◄────────────► │   Mattermost    │
-│  CLI verbs   │   (JSON-RPC)     │  (per-profile,   │                  │   server        │
+│  CLI / MCP   │   (JSON-RPC)     │  (per-profile,   │                  │   server        │
 │              │                  │   long-running)  │                  │                 │
 └──────────────┘                  └──────────────────┘                  └─────────────────┘
                                           ▲
@@ -37,6 +37,10 @@ Three layers, each isolated by a different boundary:
 1. **CLI** (`chanvoy <verb>`) — short-lived process. Parses arguments,
    resolves the profile, dials the daemon's Unix-domain socket, sends
    one JSON-RPC request, prints the response, exits. Holds no state.
+   `chanvoy mcp` is the same client as an MCP 2026-07-28 access face
+   (stdio or loopback HTTP). It uses the same `DaemonClient` and does
+   not open a second Mattermost connection. Blocking MCP `wait` does
+   **not** wake Grok Bot.
 2. **Daemon** (`chanvoy-daemon`) — long-running per-profile process.
    Owns the WebSocket connection to Mattermost, holds per-channel
    cursor state on disk, validates identity on bind, and serves CLI
@@ -456,7 +460,7 @@ crates/
 ├── chanvoy-cli       CLI surface, argument parsing, output formatting
 ├── chanvoy-ipc       JSON-RPC envelope types (factored out of chanvoy-core
 │                     so chanvoy-mcp can use them without pulling in MM client)
-└── chanvoy-mcp       MCP bridge scaffold (early; not part of v0.3.x daily flow)
+└── chanvoy-mcp       MCP 2026-07-28 face (stdio + loopback HTTP) over DaemonClient
 
 src/
 └── main.rs           binary entry, wires chanvoy-cli into the binary

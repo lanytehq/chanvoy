@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`chanvoy mcp`.** MCP 2026-07-28 access face on the existing profile
+  daemon (`stdio` by default; `--listen 127.0.0.1:<port>` for loopback
+  Streamable HTTP). Tools: `whoami`, `read_channel`, `show`, `thread`,
+  `wait`, `post`. Same `DaemonClient` as the CLI; no second Mattermost
+  client and no new daemon RPCs. Blocking `wait` does not wake Grok
+  Bot. `wait.mode=single` uses `wait_channel_v3`; `fan_in` uses
+  `wait_channels_v1` (no v2 fallback).
+
 - **`chanvoy wait` single-waiter ownership.** One active wait per
   canonical channel on **this profile daemon**. A second wait without
   `--replace-wait <id>` exits **2** with `wait_already_active` (never

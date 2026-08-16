@@ -192,6 +192,7 @@ version = "0.3.0"
 dependencies = [
  "chanvoy-cli",
  "chanvoy-core",
+ "chanvoy-mcp",
  "chrono",
  "libc",
  "serde_json",
@@ -209,6 +210,7 @@ version = "0.3.0"
 dependencies = [
  "chanvoy-core",
  "chanvoy-daemon",
+ "chanvoy-mcp",
  "chrono",
  "clap",
  "dirs",
@@ -286,6 +288,7 @@ name = "chanvoy-mcp"
 version = "0.3.0"
 dependencies = [
  "chanvoy-core",
+ "chanvoy-daemon",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

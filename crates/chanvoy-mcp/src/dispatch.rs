@@ -1,0 +1,243 @@
+//! One dispatcher for stdio and loopback HTTP.
+
+use serde_json::Value;
+
+use crate::backend::ToolBackend;
+use crate::protocol::{validate_request_meta, JsonRpcRequest, JsonRpcResponse};
+use crate::tools::{
+    call_tool, is_declared_tool, parse_tools_call, server_discover, tools_list,
+    unknown_tool_protocol_error,
+};
+
+pub async fn handle_request(raw: &str, backend: &ToolBackend) -> Option<JsonRpcResponse> {
+    let request: JsonRpcRequest = match serde_json::from_str(raw) {
+        Ok(req) => req,
+        Err(_) => return Some(JsonRpcResponse::parse_error()),
+    };
+    if request.jsonrpc.as_deref() != Some("2.0") {
+        return Some(JsonRpcResponse::invalid_request(
+            request.id.clone().unwrap_or(Value::Null),
+            "jsonrpc must be \"2.0\"",
+        ));
+    }
+    let id = match request.id.clone() {
+        Some(id) => id,
+        None => return None,
+    };
+    match validate_request_meta(&request.params) {
+        Ok(_) => {}
+        Err(mut err) => {
+            err.id = id;
+            return Some(*err);
+        }
+    }
+    Some(dispatch_method(id, &request.method, request.params, backend).await)
+}
+
+pub async fn dispatch_method(
+    id: Value,
+    method: &str,
+    params: Value,
+    backend: &ToolBackend,
+) -> JsonRpcResponse {
+    match method {
+        "initialize" | "notifications/initialized" => JsonRpcResponse::method_not_found(id, method),
+        "server/discover" => JsonRpcResponse::result(id, server_discover()),
+        "tools/list" => JsonRpcResponse::result(id, tools_list()),
+        "tools/call" => match parse_tools_call(&params) {
+            Ok((name, arguments)) => {
+                if !is_declared_tool(&name) {
+                    return JsonRpcResponse::invalid_params(id, unknown_tool_protocol_error(&name));
+                }
+                let result = call_tool(&name, arguments, backend).await;
+                JsonRpcResponse::result(id, result)
+            }
+            Err(message) => JsonRpcResponse::invalid_params(id, message),
+        },
+        other => JsonRpcResponse::method_not_found(id, other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{ScriptedReply, ToolBackend};
+    use crate::protocol::{with_request_meta, PROTOCOL_VERSION, RPC_UNSUPPORTED_PROTOCOL};
+    use serde_json::json;
+
+    fn line(method: &str, params: Value) -> String {
+        serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": with_request_meta(params),
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unknown_method_is_protocol_error() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(&line("nope", json!({})), &backend)
+            .await
+            .unwrap();
+        assert_eq!(resp.error.unwrap().code, -32601);
+    }
+
+    #[tokio::test]
+    async fn initialize_is_not_advertised() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(&line("initialize", json!({})), &backend)
+            .await
+            .unwrap();
+        assert_eq!(resp.error.unwrap().code, -32601);
+    }
+
+    #[tokio::test]
+    async fn missing_meta_is_invalid_params() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+            &backend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_is_32022() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-03-26","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+            &backend,
+        )
+        .await
+        .unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, RPC_UNSUPPORTED_PROTOCOL);
+        assert_eq!(err.data.unwrap()["supported"][0], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_is_protocol_invalid_params() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(
+            &line("tools/call", json!({"name":"notify","arguments":{}})),
+            &backend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn declared_tool_dispatches() {
+        let backend = ToolBackend::scripted(vec![(
+            "whoami",
+            ScriptedReply::Ok(json!({"id":"u","username":"bot"})),
+        )]);
+        let resp = handle_request(
+            &line("tools/call", json!({"name":"whoami","arguments":{}})),
+            &backend,
+        )
+        .await
+        .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["structuredContent"]["result"]["username"], "bot");
+    }
+
+    #[tokio::test]
+    async fn server_discover_uses_supported_versions() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(&line("server/discover", json!({})), &backend)
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"][0], PROTOCOL_VERSION);
+        assert!(result.get("supportedProtocolVersions").is_none());
+        assert!(result.get("protocolVersion").is_none());
+    }
+
+    #[tokio::test]
+    async fn tools_list_is_complete_and_private() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(&line("tools/list", json!({})), &backend)
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "private");
+        assert!(result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].is_string());
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_parse_error() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request("{nope", &backend).await.unwrap();
+        assert_eq!(resp.error.unwrap().code, -32700);
+    }
+
+    #[tokio::test]
+    async fn missing_jsonrpc_is_invalid_request() {
+        let backend = ToolBackend::scripted(vec![]);
+        let resp = handle_request(r#"{"id":1,"method":"tools/list"}"#, &backend)
+            .await
+            .unwrap();
+        assert_eq!(resp.error.unwrap().code, -32600);
+    }
+
+    #[tokio::test]
+    async fn every_listed_tool_dispatches() {
+        use crate::tools::TOOL_NAMES;
+        let replies = vec![
+            (
+                "whoami",
+                ScriptedReply::Ok(json!({"id":"u","username":"bot"})),
+            ),
+            ("read_channel", ScriptedReply::Ok(json!([]))),
+            (
+                "get_post",
+                ScriptedReply::Ok(
+                    json!({"id":"p","user_id":"u","username":"n","message":"m","create_at":1,"root_id":"p"}),
+                ),
+            ),
+            ("read_thread", ScriptedReply::Ok(json!([]))),
+            (
+                "wait_channel_v3",
+                ScriptedReply::Ok(
+                    json!({"channel":"ops","messages":[{"id":"p","user_id":"u","username":"n","message":"m","create_at":1,"root_id":"p"}]}),
+                ),
+            ),
+            ("post_message", ScriptedReply::Ok(json!({"id":"p2"}))),
+        ];
+        let backend = ToolBackend::scripted(replies);
+        let args = [
+            ("whoami", json!({})),
+            ("read_channel", json!({"channel":"ops","since_secs":60})),
+            ("show", json!({"channel":"ops","post_id":"p"})),
+            ("thread", json!({"channel":"ops","post_id":"p"})),
+            (
+                "wait",
+                json!({"mode":"single","channel":"ops","timeout_secs":5}),
+            ),
+            ("post", json!({"channel":"ops","message":"hi"})),
+        ];
+        assert_eq!(TOOL_NAMES.len(), args.len());
+        for (name, arguments) in args {
+            let resp = handle_request(
+                &line("tools/call", json!({"name":name,"arguments":arguments})),
+                &backend,
+            )
+            .await
+            .unwrap();
+            let result = resp.result.expect(name);
+            assert_eq!(result["isError"], false, "{name}");
+            assert_eq!(result["resultType"], "complete", "{name}");
+        }
+    }
+}
