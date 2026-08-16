@@ -320,6 +320,24 @@ pub(crate) fn event_from_foreign_message(
     }))
 }
 
+pub(crate) fn authenticate_sidecar_message(
+    channel: &str,
+    message: &Message,
+    declared: &ContentDigest,
+) -> Result<(), CoreError> {
+    let computed = content_digest_for(message)?;
+    if declared.algorithm != DigestAlgorithm::Sha256
+        || declared.algorithm != computed.algorithm
+        || declared.value != computed.value
+    {
+        return Err(CoreError::WaitProviderDegraded {
+            channel: channel.to_string(),
+            message: "sidecar message digest mismatch".into(),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn translate_outcome(
     outcome: LiveWaitOutcome,
     channel: &str,
@@ -343,6 +361,7 @@ pub(crate) fn translate_outcome(
                     channel: channel.to_string(),
                     message: "matched wait event missing sidecar message".into(),
                 })?;
+            authenticate_sidecar_message(channel, &message, &event.payload.content_digest)?;
             Ok(one_message_result(channel, message))
         }
         OutcomeKind::LogicalDeadman | OutcomeKind::NoChange => {
@@ -978,6 +997,54 @@ mod tests {
         assert_eq!(wr.channel, "ops");
         assert_eq!(wr.messages.len(), 1);
         assert_eq!(wr.messages[0].id, "p3");
+    }
+
+    #[test]
+    fn translate_rejects_sidecar_digest_mismatch() {
+        let sidecar = MessageSidecar::new();
+        let start = Anchor {
+            kind: AnchorKind::ProviderOpaque,
+            value: IdToken::new("anc:tip"),
+        };
+        let mut event = event_from_foreign_message(
+            &msg("p4", "alice", "hi"),
+            "bot",
+            &IdToken::new("reg:1"),
+            &IdToken::new("channel:ops"),
+            &start,
+            &sidecar,
+        )
+        .expect("digest")
+        .expect("foreign");
+        event.payload.content_digest.value = "ab".repeat(32);
+        let session = dummy_session("wait_cc");
+        let outcome = LiveWaitOutcome {
+            capabilities: vec![],
+            message_id: IdToken::new("out"),
+            correlation_id: IdToken::new("c"),
+            created_at: timestamp_now(),
+            actor_ref: ActorRef::new("actor:bot"),
+            causation_id: None,
+            grant_ref: None,
+            verification_receipt_ref: None,
+            policy_decision_ref: None,
+            waiter_id: IdToken::new("wait_cc"),
+            request_ref: IdToken::new("req"),
+            completed_at: timestamp_now(),
+            outcome_kind: OutcomeKind::Events,
+            logical_deadline: None,
+            events: Some(vec![event]),
+            proposed_next_anchor: None,
+            coverage_complete: None,
+            arms: None,
+            reason_code: None,
+        };
+        let err =
+            translate_outcome(outcome, "ops", &sidecar, &session, &Mutex::new(None)).unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitProviderDegraded { ref message, .. } if message.contains("digest")),
+            "mismatched sidecar digest must fail closed, got {err:?}"
+        );
     }
 
     #[test]
