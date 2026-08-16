@@ -224,14 +224,19 @@ pub async fn wait_with_params(
     })
     .await?;
 
-    if let Some(anchor) = after {
+    // Exclusive --after is validated before acquire so a bad cursor is a
+    // bind-time input failure, not a later clean deadman.
+    let after_cursor = if let Some(anchor) = after {
         if anchor.is_empty() {
             return Err(CoreError::WaitFilterInvalid(
                 "empty --after is refused".into(),
             ));
         }
         establish_baseline(state, channel, &resolved.channel_id, Some(anchor), deadline).await?;
-    }
+        Some(anchor.to_string())
+    } else {
+        None
+    };
 
     let remaining = deadline.saturating_duration_since(Instant::now());
     let lease = state
@@ -247,7 +252,7 @@ pub async fn wait_with_params(
     // Subscribe/backfill only after a successful acquire. Tests use
     // armed_count as the provider-I/O gate.
     state.wait_owners.note_arm();
-    let (session, _guard) = lease.into_guard();
+    let (session, guard) = lease.into_guard();
 
     let is_monitored = state
         .profile
@@ -255,24 +260,27 @@ pub async fn wait_with_params(
         .iter()
         .any(|m| m.eq_ignore_ascii_case(channel));
 
-    let inner = async {
-        if is_monitored {
-            wait_push_path(state, channel, team, contains, pattern, after, deadline).await
-        } else {
-            let predicate =
-                WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
-            wait_rest_path(state, channel, &predicate, after, deadline).await
-        }
-    };
+    let predicate =
+        WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
 
-    let result = tokio::select! {
-        biased;
-        _ = session.cancel.cancelled() => Err(CoreError::WaitReplaced {
-            wait_id: session.wait_id.clone(),
-            replaced_by_wait_id: session.replaced_by_id(),
-        }),
-        res = inner => res,
-    };
+    let result = crate::waitprims_hold::run_single_channel_first_match(
+        state,
+        crate::waitprims_hold::FirstMatchWait {
+            channel,
+            team,
+            contains,
+            pattern,
+            after,
+            after_cursor,
+            predicate,
+            is_monitored,
+            deadline,
+            timeout_secs,
+            session: &session,
+            guard,
+        },
+    )
+    .await;
 
     match result {
         Ok(mut wr) if emit_wait_ids => {
@@ -286,7 +294,7 @@ pub async fn wait_with_params(
 
 /// Monitored path: **subscribe first**, then resolve/compile/anchor/backfill
 /// while draining the receiver (devrev D1 / AC-W3).
-async fn wait_push_path(
+pub(crate) async fn wait_push_path(
     state: &AppState,
     channel: &str,
     team: Option<&str>,
@@ -646,7 +654,7 @@ async fn wait_push_path(
     }
 }
 
-async fn wait_rest_path(
+pub(crate) async fn wait_rest_path(
     state: &AppState,
     channel: &str,
     predicate: &WaitPredicate,
@@ -969,7 +977,7 @@ pub(crate) fn drain_bus(
     }
 }
 
-fn one_message_result(channel: &str, message: Message) -> WaitResult {
+pub(crate) fn one_message_result(channel: &str, message: Message) -> WaitResult {
     WaitResult {
         channel: channel.to_string(),
         messages: vec![message],

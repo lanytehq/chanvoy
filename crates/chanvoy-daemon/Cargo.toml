@@ -16,11 +16,13 @@ publish.workspace = true
 [dependencies]
 chanvoy-core = { path = "../chanvoy-core" }
 chanvoy-ipc = { path = "../chanvoy-ipc" }
+chrono = { workspace = true }
 dirs = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -28,3 +30,5 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+waitprims-async = { workspace = true }
+waitprims-core = { workspace = true }

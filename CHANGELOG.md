@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`chanvoy wait` waitprims hold (local A1).** Single-channel
+  `wait_channel_v3` is driven by `waitprims-async::run_first_match`
+  over the existing daemon stream. MCP `wait` single and CLI
+  `chanvoy wait <channel>` keep the same RPC bodies. Multi-channel
+  fan-in and poll stay on their current engines. Local path
+  dependency only — not for origin/main.
+
 - **`chanvoy mcp`.** MCP 2026-07-28 access face on the existing profile
   daemon (`stdio` by default; `--listen 127.0.0.1:<port>` for loopback
   Streamable HTTP). Tools: `whoami`, `read_channel`, `show`, `thread`,

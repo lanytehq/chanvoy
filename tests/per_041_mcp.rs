@@ -358,6 +358,7 @@ async fn mcp_stdio_cancelled_notification_closes_uds_and_admits_later_wait() {
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     let socket_path = env.socket_path();
     let listener = UnixListener::bind(&socket_path).expect("bind");
+    let (wait_inflight_tx, wait_inflight_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("first accept");
         let (reader, _writer) = stream.into_split();
@@ -366,6 +367,7 @@ async fn mcp_stdio_cancelled_notification_closes_uds_and_admits_later_wait() {
         reader.read_line(&mut line).await.expect("first request");
         let first: JsonRpcRequest = serde_json::from_str(line.trim_end()).expect("decode");
         assert_eq!(first.method, WAIT_CHANNEL_V3_METHOD);
+        let _ = wait_inflight_tx.send(());
         let n = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut String::new()))
             .await
             .expect("uds must close after cancelled notification")
@@ -407,7 +409,9 @@ async fn mcp_stdio_cancelled_notification_closes_uds_and_admits_later_wait() {
             .await
             .expect("write wait");
         stdin.flush().await.expect("flush wait");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_inflight_rx
+            .await
+            .expect("daemon must see wait_channel_v3 before cancel");
         stdin
             .write_all(
                 br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#
@@ -444,6 +448,7 @@ async fn mcp_stdio_nonmatching_cancel_does_not_strand_wait() {
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     let socket_path = env.socket_path();
     let listener = UnixListener::bind(&socket_path).expect("bind");
+    let (wait_inflight_tx, wait_inflight_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("first accept");
         let (reader, _writer) = stream.into_split();
@@ -452,6 +457,7 @@ async fn mcp_stdio_nonmatching_cancel_does_not_strand_wait() {
         reader.read_line(&mut line).await.expect("first request");
         let first: JsonRpcRequest = serde_json::from_str(line.trim_end()).expect("decode");
         assert_eq!(first.method, WAIT_CHANNEL_V3_METHOD);
+        let _ = wait_inflight_tx.send(());
         let n = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut String::new()))
             .await
             .expect("uds must close after matching cancel")
@@ -493,7 +499,9 @@ async fn mcp_stdio_nonmatching_cancel_does_not_strand_wait() {
             .await
             .expect("write wait");
         stdin.flush().await.expect("flush wait");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        wait_inflight_rx
+            .await
+            .expect("daemon must see wait_channel_v3 before cancel");
         stdin
             .write_all(
                 br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"9"}}"#

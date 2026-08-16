@@ -8,6 +8,7 @@ use std::{env, fs, io};
 mod wait;
 mod wait_channels;
 mod wait_owner;
+mod waitprims_hold;
 
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
