@@ -1206,9 +1206,9 @@ async fn dispatch_request(
             .await
             .map(to_value)
         }
-        method if method == WAIT_CHANNEL_V3_METHOD => {
+        method if wait::uses_first_match_engine(method) => {
             match serde_json::from_value::<WaitChannelV3Params>(request.params.clone()) {
-                Ok(params) => wait::wait_with_params(
+                Ok(params) => wait::wait_with_params_v3(
                     state,
                     wait::WaitRequest {
                         channel: &params.channel,

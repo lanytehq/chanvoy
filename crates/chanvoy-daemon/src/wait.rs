@@ -224,19 +224,14 @@ pub async fn wait_with_params(
     })
     .await?;
 
-    // Exclusive --after is validated before acquire so a bad cursor is a
-    // bind-time input failure, not a later clean deadman.
-    let after_cursor = if let Some(anchor) = after {
+    if let Some(anchor) = after {
         if anchor.is_empty() {
             return Err(CoreError::WaitFilterInvalid(
                 "empty --after is refused".into(),
             ));
         }
         establish_baseline(state, channel, &resolved.channel_id, Some(anchor), deadline).await?;
-        Some(anchor.to_string())
-    } else {
-        None
-    };
+    }
 
     let remaining = deadline.saturating_duration_since(Instant::now());
     let lease = state
@@ -252,13 +247,88 @@ pub async fn wait_with_params(
     // Subscribe/backfill only after a successful acquire. Tests use
     // armed_count as the provider-I/O gate.
     state.wait_owners.note_arm();
-    let (session, guard) = lease.into_guard();
+    let (session, _guard) = lease.into_guard();
 
     let is_monitored = state
         .profile
         .monitored_channels
         .iter()
         .any(|m| m.eq_ignore_ascii_case(channel));
+
+    let inner = async {
+        if is_monitored {
+            wait_push_path(state, channel, team, contains, pattern, after, deadline).await
+        } else {
+            let predicate =
+                WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
+            wait_rest_path(state, channel, &predicate, after, deadline).await
+        }
+    };
+
+    let result = tokio::select! {
+        biased;
+        _ = session.cancel.cancelled() => Err(CoreError::WaitReplaced {
+            wait_id: session.wait_id.clone(),
+            replaced_by_wait_id: session.replaced_by_id(),
+        }),
+        res = inner => res,
+    };
+
+    match result {
+        Ok(mut wr) if emit_wait_ids => {
+            wr.wait_id = Some(session.wait_id);
+            wr.replaced_wait_id = session.replaced_wait_id;
+            Ok(wr)
+        }
+        other => other,
+    }
+}
+
+/// Whether this RPC method uses the A1 waitprims first-match engine.
+/// Legacy `wait_channel` / `wait_channel_v2` stay on the established paths.
+pub(crate) fn uses_first_match_engine(method: &str) -> bool {
+    method == chanvoy_core::WAIT_CHANNEL_V3_METHOD
+}
+
+/// PER-040 v3 only: first-match hold. Legacy wait RPCs must not call this.
+pub async fn wait_with_params_v3(
+    state: &AppState,
+    req: WaitRequest<'_>,
+) -> Result<WaitResult, CoreError> {
+    let WaitRequest {
+        channel,
+        timeout_secs,
+        team,
+        contains,
+        pattern,
+        after,
+        replace_wait_id,
+        emit_wait_ids,
+    } = req;
+    validate_wait_timeout_secs(timeout_secs)?;
+    validate_wait_channel_v3_strings(channel, team, contains, pattern, after)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    WaitPredicate::compile("pending", "pending", contains, pattern)?;
+
+    let resolved = provider_retry(state, channel, deadline, || async {
+        state.client.resolve_channel(channel, team).await
+    })
+    .await?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lease = state
+        .wait_owners
+        .acquire(
+            &resolved.channel_id,
+            &resolved.team_name,
+            &resolved.channel_name,
+            replace_wait_id,
+            remaining,
+        )
+        .await?;
+    state.wait_owners.note_arm();
+    let (session, guard) = lease.into_guard();
 
     let predicate =
         WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
@@ -267,15 +337,9 @@ pub async fn wait_with_params(
         state,
         crate::waitprims_hold::FirstMatchWait {
             channel,
-            team,
-            contains,
-            pattern,
             after,
-            after_cursor,
             predicate,
-            is_monitored,
             deadline,
-            timeout_secs,
             session: &session,
             guard,
         },
@@ -662,8 +726,29 @@ pub(crate) async fn wait_rest_path(
     deadline: Instant,
 ) -> Result<WaitResult, CoreError> {
     state.wait_owners.note_provider_io();
-    let (mut scan_cursor, rest_baseline) =
+    let (scan_cursor, rest_baseline) =
         establish_baseline(state, channel, predicate.channel_id(), after, deadline).await?;
+    wait_rest_from_cursor(
+        state,
+        channel,
+        predicate,
+        scan_cursor,
+        rest_baseline,
+        deadline,
+    )
+    .await
+}
+
+/// REST observe from an already-resolved exclusive cursor. Does not
+/// re-establish a baseline (A1 bind cursor must be consumed as-is).
+pub(crate) async fn wait_rest_from_cursor(
+    state: &AppState,
+    channel: &str,
+    predicate: &WaitPredicate,
+    mut scan_cursor: Option<String>,
+    rest_baseline: HashSet<String>,
+    deadline: Instant,
+) -> Result<WaitResult, CoreError> {
     let mut processed: HashSet<String> = HashSet::new();
 
     if let Some(ref anchor) = scan_cursor {
@@ -1275,6 +1360,16 @@ mod tests {
             message: "no".into(),
         };
         assert!(!is_retryable_provider(&client_err));
+    }
+
+    #[test]
+    fn first_match_engine_is_v3_only() {
+        assert!(uses_first_match_engine(
+            chanvoy_core::WAIT_CHANNEL_V3_METHOD
+        ));
+        assert!(!uses_first_match_engine("wait_channel"));
+        assert!(!uses_first_match_engine("wait_channel_v2"));
+        assert!(!uses_first_match_engine("wait_channels_v1"));
     }
 
     #[test]

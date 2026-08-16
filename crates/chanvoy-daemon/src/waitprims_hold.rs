@@ -1,11 +1,13 @@
-//! PER-042 A1: drive single-channel `wait_channel_v3` through
+//! A1: drive single-channel `wait_channel_v3` through
 //! `waitprims_async::run_first_match`.
 //!
 //! The adapter lives only in this crate. `chanvoy-core` public types and
-//! `chanvoy-mcp` take no waitprims dependency. Fan-in (`wait_channels_v1`)
-//! stays on its current engine.
+//! `chanvoy-mcp` take no waitprims dependency. Legacy `wait_channel` /
+//! `wait_channel_v2` and fan-in (`wait_channels_v1`) stay on their
+//! established engines. Observation uses the existing Mattermost client
+//! (REST) from a bind-resolved cursor — no per-wait event-bus subscribe.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,9 +24,7 @@ use waitprims_core::{
     Timestamp, WaitBound, WaitEvent,
 };
 
-use crate::wait::{
-    establish_baseline, one_message_result, wait_push_path, wait_rest_path, WaitPredicate,
-};
+use crate::wait::{establish_baseline, one_message_result, wait_rest_from_cursor, WaitPredicate};
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::AppState;
 
@@ -38,15 +38,9 @@ const REASON_REPLACED: &str = "replaced";
 
 pub(crate) struct FirstMatchWait<'a> {
     pub channel: &'a str,
-    pub team: Option<&'a str>,
-    pub contains: Option<&'a str>,
-    pub pattern: Option<&'a str>,
     pub after: Option<&'a str>,
-    pub after_cursor: Option<String>,
     pub predicate: WaitPredicate,
-    pub is_monitored: bool,
     pub deadline: Instant,
-    pub timeout_secs: u64,
     pub session: &'a WaitSession,
     pub guard: WaitGuard,
 }
@@ -64,16 +58,12 @@ pub(crate) async fn run_single_channel_first_match(
     let observer = ChanvoyWaitObserver {
         state: state.clone(),
         channel: wait.channel.to_string(),
-        team: wait.team.map(str::to_string),
-        contains: wait.contains.map(str::to_string),
-        pattern: wait.pattern.map(str::to_string),
         after: wait.after.map(str::to_string),
-        after_cursor: wait.after_cursor.clone(),
         predicate: wait.predicate,
-        is_monitored: wait.is_monitored,
         deadline: wait.deadline,
         my_user_id: state.my_user_id.clone(),
         registration_id: IdToken::new(format!("reg:{}", wait.session.wait_id)),
+        subject_id: IdToken::new(format!("channel:{}", wait.channel)),
         sidecar: sidecar.clone(),
         last_error: Arc::clone(&last_error),
         release: Arc::clone(&release),
@@ -85,8 +75,8 @@ pub(crate) async fn run_single_channel_first_match(
         wait.session,
         &state.my_user_id,
         wait.channel,
-        wait.after_cursor.as_deref(),
-        wait.timeout_secs,
+        wait.after,
+        deadline_from_instant(wait.deadline),
     )?;
 
     let clock = WallClock;
@@ -125,6 +115,12 @@ impl Clock for WallClock {
             }
         }
     }
+}
+
+/// Convert the RPC Instant deadline into a waitprims timestamp using
+/// **remaining** budget so pre-bind work cannot extend the caller's timeout.
+pub(crate) fn deadline_from_instant(deadline: Instant) -> Timestamp {
+    timestamp_now().saturating_add(deadline.saturating_duration_since(Instant::now()))
 }
 
 pub(crate) fn timestamp_now() -> Timestamp {
@@ -220,6 +216,7 @@ pub(crate) fn event_from_foreign_message(
     message: &Message,
     my_user_id: &str,
     registration_id: &IdToken,
+    subject_id: &IdToken,
     start: &Anchor,
     sidecar: &MessageSidecar,
 ) -> Option<WaitEvent> {
@@ -235,7 +232,7 @@ pub(crate) fn event_from_foreign_message(
         source_instance_ref: OpaqueRef::new("source:chanvoy-daemon"),
         method_id: IdToken::new(METHOD_ID),
         subject_kind: IdToken::new("channel"),
-        subject_id: IdToken::new(format!("channel:{}", message.id)),
+        subject_id: subject_id.clone(),
         occurred_at: observed.clone(),
         observed_at: observed,
         start_anchor: start.clone(),
@@ -331,15 +328,14 @@ fn map_waitprims_err(err: waitprims_core::Error) -> CoreError {
     CoreError::WaitFilterInvalid(format!("waitprims request: {err}"))
 }
 
-fn build_live_documents(
+pub(crate) fn build_live_documents(
     session: &WaitSession,
     my_user_id: &str,
     channel: &str,
     after_cursor: Option<&str>,
-    timeout_secs: u64,
+    deadline: Timestamp,
 ) -> Result<(RegistrationSet, LiveWaitRequest), CoreError> {
     let now = timestamp_now();
-    let deadline = now.saturating_add(Duration::from_secs(timeout_secs.max(1)));
     let lease_expires = deadline.saturating_add(Duration::from_secs(3600));
     let waiter_id = IdToken::new(session.wait_id.clone());
     let set_id = IdToken::new(format!("regset:{}", session.wait_id));
@@ -378,6 +374,8 @@ fn build_live_documents(
         baseline_policy,
     };
 
+    let digest = registration_digest_hex(&registration)?;
+
     let set = RegistrationSet {
         capabilities: capabilities.clone(),
         message_id: set_id.clone(),
@@ -401,7 +399,7 @@ fn build_live_documents(
         registration_digest: JcsDigest {
             canonicalization: Canonicalization::Rfc8785,
             algorithm: DigestAlgorithm::Sha256,
-            value: "0".repeat(64),
+            value: digest,
         },
         registrations: vec![registration],
     };
@@ -425,19 +423,34 @@ fn build_live_documents(
     Ok((set, request))
 }
 
+pub(crate) fn registration_digest_hex(registration: &Registration) -> Result<String, CoreError> {
+    let json = serde_json::to_string(std::slice::from_ref(registration)).map_err(|err| {
+        CoreError::WaitFilterInvalid(format!("registration digest serialize: {err}"))
+    })?;
+    waitprims_core::registration_digest(&json)
+        .map_err(|err| CoreError::WaitFilterInvalid(format!("registration digest: {err}")))
+}
+
+/// Map a bind-resolved exclusive cursor to the REST scan start.
+/// The synthetic empty-at-arm token is not a provider post id.
+pub(crate) fn scan_cursor_from_bind(start: &Anchor) -> Option<String> {
+    let value = start.value.as_str();
+    if value == EMPTY_AT_ARM_CURSOR {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 struct ChanvoyWaitObserver {
     state: AppState,
     channel: String,
-    team: Option<String>,
-    contains: Option<String>,
-    pattern: Option<String>,
     after: Option<String>,
-    after_cursor: Option<String>,
     predicate: WaitPredicate,
-    is_monitored: bool,
     deadline: Instant,
     my_user_id: String,
     registration_id: IdToken,
+    subject_id: IdToken,
     sidecar: MessageSidecar,
     last_error: Arc<Mutex<Option<CoreError>>>,
     release: Arc<LeaseRelease>,
@@ -448,6 +461,7 @@ struct ChanvoyWaitObserver {
 struct ChanvoyBind {
     registration_id: IdToken,
     resolved_start: Anchor,
+    rest_baseline: HashSet<String>,
     release: Arc<LeaseRelease>,
     inner_cancel: CancellationToken,
 }
@@ -490,6 +504,7 @@ impl ChanvoyWaitObserver {
                     &message,
                     &self.my_user_id,
                     &self.registration_id,
+                    &self.subject_id,
                     start,
                     &self.sidecar,
                 ) {
@@ -540,12 +555,11 @@ impl Observer for ChanvoyWaitObserver {
     type Bind = ChanvoyBind;
 
     async fn bind(&self, registration: &Registration) -> waitprims_core::Result<Self::Bind> {
-        let resolved = resolve_bind_cursor(
+        let (resolved, rest_baseline) = resolve_bind_cursor(
             &self.state,
             &self.channel,
             self.predicate.channel_id(),
             self.after.as_deref(),
-            self.after_cursor.as_deref(),
             self.deadline,
         )
         .await
@@ -554,6 +568,7 @@ impl Observer for ChanvoyWaitObserver {
         Ok(ChanvoyBind {
             registration_id: registration.registration_id.clone(),
             resolved_start: resolved,
+            rest_baseline,
             release: Arc::clone(&self.release),
             inner_cancel: self.inner_cancel.clone(),
         })
@@ -565,27 +580,16 @@ impl Observer for ChanvoyWaitObserver {
         }
 
         let engine = async {
-            if self.is_monitored {
-                wait_push_path(
-                    &self.state,
-                    &self.channel,
-                    self.team.as_deref(),
-                    self.contains.as_deref(),
-                    self.pattern.as_deref(),
-                    self.after.as_deref(),
-                    self.deadline,
-                )
-                .await
-            } else {
-                wait_rest_path(
-                    &self.state,
-                    &self.channel,
-                    &self.predicate,
-                    self.after.as_deref(),
-                    self.deadline,
-                )
-                .await
-            }
+            self.state.wait_owners.note_provider_io();
+            wait_rest_from_cursor(
+                &self.state,
+                &self.channel,
+                &self.predicate,
+                scan_cursor_from_bind(bind.resolved_start()),
+                bind.rest_baseline.clone(),
+                self.deadline,
+            )
+            .await
         };
 
         // Replacement is a runner cancel (`waitprims` Cancel), not an
@@ -623,36 +627,22 @@ pub(crate) async fn resolve_bind_cursor(
     channel: &str,
     channel_id: &str,
     after: Option<&str>,
-    after_cursor: Option<&str>,
     deadline: Instant,
-) -> Result<Anchor, CoreError> {
-    if let Some(cursor) = after_cursor {
-        if cursor.is_empty() {
-            return Err(CoreError::WaitFilterInvalid("wait cursor uncertain".into()));
-        }
-        return Ok(Anchor {
-            kind: AnchorKind::ProviderOpaque,
-            value: IdToken::new(cursor),
-        });
-    }
+) -> Result<(Anchor, HashSet<String>), CoreError> {
     if let Some(anchor) = after {
         if anchor.is_empty() {
             return Err(CoreError::WaitFilterInvalid("wait cursor uncertain".into()));
         }
-        let (scan, _) =
-            establish_baseline(state, channel, channel_id, Some(anchor), deadline).await?;
-        let value = scan.unwrap_or_else(|| anchor.to_string());
-        return Ok(Anchor {
+    }
+    let (scan, baseline) = establish_baseline(state, channel, channel_id, after, deadline).await?;
+    let value = scan.unwrap_or_else(|| EMPTY_AT_ARM_CURSOR.to_string());
+    Ok((
+        Anchor {
             kind: AnchorKind::ProviderOpaque,
             value: IdToken::new(value),
-        });
-    }
-
-    let (scan, _) = establish_baseline(state, channel, channel_id, None, deadline).await?;
-    Ok(Anchor {
-        kind: AnchorKind::ProviderOpaque,
-        value: IdToken::new(scan.unwrap_or_else(|| EMPTY_AT_ARM_CURSOR.to_string())),
-    })
+        },
+        baseline,
+    ))
 }
 
 #[cfg(test)]
@@ -704,10 +694,12 @@ mod tests {
             value: IdToken::new("anc:tip"),
         };
         let reg = IdToken::new("reg:1");
+        let subject = IdToken::new("channel:ops");
         assert!(event_from_foreign_message(
             &msg("p1", "bot", "hello"),
             "bot",
             &reg,
+            &subject,
             &start,
             &sidecar
         )
@@ -723,15 +715,19 @@ mod tests {
             value: IdToken::new("anc:tip"),
         };
         let reg = IdToken::new("reg:1");
+        let subject = IdToken::new("channel:ops");
         let event = event_from_foreign_message(
             &msg("p2", "alice", "ASSENT"),
             "bot",
             &reg,
+            &subject,
             &start,
             &sidecar,
         )
         .expect("foreign");
         assert_eq!(event.method_id.as_str(), METHOD_ID);
+        assert_eq!(event.subject_id.as_str(), "channel:ops");
+        assert_ne!(event.subject_id.as_str(), "channel:p2");
         assert!(event.delivery_ref.is_none());
         assert!(event.activation_ref.is_none());
         let stored = sidecar
@@ -772,6 +768,7 @@ mod tests {
             &msg("p3", "alice", "hi"),
             "bot",
             &IdToken::new("reg:1"),
+            &IdToken::new("channel:ops"),
             &start,
             &sidecar,
         )
@@ -876,5 +873,56 @@ mod tests {
         };
         assert_eq!(anchor.value.as_str(), "post-abc");
         assert_eq!(anchor.kind, AnchorKind::ProviderOpaque);
+        assert_eq!(scan_cursor_from_bind(&anchor).as_deref(), Some("post-abc"));
+    }
+
+    #[test]
+    fn empty_at_arm_bind_is_not_a_provider_post_id() {
+        let anchor = Anchor {
+            kind: AnchorKind::ProviderOpaque,
+            value: IdToken::new(EMPTY_AT_ARM_CURSOR),
+        };
+        assert!(scan_cursor_from_bind(&anchor).is_none());
+    }
+
+    #[test]
+    fn waitprims_deadline_uses_remaining_budget() {
+        let start = Instant::now();
+        let remaining = Duration::from_secs(4);
+        let ts = deadline_from_instant(start + remaining);
+        let span = timestamp_now().duration_until(&ts);
+        assert!(
+            span <= remaining,
+            "waitprims deadline {span:?} must not exceed remaining {remaining:?}"
+        );
+        assert!(
+            span >= Duration::from_secs(3),
+            "deadline should keep most of the budget, got {span:?}"
+        );
+    }
+
+    #[test]
+    fn registration_digest_is_admissible_sha256() {
+        let session = dummy_session("wait_digest");
+        let (set, _req) = build_live_documents(
+            &session,
+            "bot",
+            "ops",
+            Some("post-abc"),
+            timestamp_now().saturating_add(Duration::from_secs(30)),
+        )
+        .expect("docs");
+        assert_ne!(set.registration_digest.value, "0".repeat(64));
+        assert_eq!(set.registration_digest.value.len(), 64);
+        assert!(set
+            .registration_digest
+            .value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+        let recomputed = registration_digest_hex(&set.registrations[0]).expect("recompute");
+        assert_eq!(recomputed, set.registration_digest.value);
+        let json = serde_json::to_string(&waitprims_core::AgentWaitMessage::RegistrationSet(set))
+            .expect("json");
+        waitprims_core::validate_message(&json).expect("registration_set must admit");
     }
 }
