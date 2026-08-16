@@ -79,15 +79,28 @@ pub(crate) async fn run_single_channel_first_match(
     let sidecar = MessageSidecar::new();
     let last_error = Arc::new(Mutex::new(None));
     let inner_cancel = CancellationToken::new();
+    // Bind-time baseline is resolved here so provider/auth/degraded
+    // CoreErrors never pass through waitprims ValidationError.
+    let (resolved_start, rest_baseline) = resolve_bind_cursor(
+        state,
+        wait.channel,
+        wait.predicate.channel_id(),
+        wait.after,
+        wait.deadline,
+    )
+    .await
+    .map_err(classify_bind_core_error)?;
+
     let observer = ChanvoyWaitObserver {
         state: state.clone(),
         channel: wait.channel.to_string(),
-        after: wait.after.map(str::to_string),
         predicate: wait.predicate,
         deadline: wait.deadline,
         my_user_id: state.my_user_id.clone(),
         registration_id: IdToken::new(format!("reg:{}", wait.session.wait_id)),
         subject_id: channel_subject(wait.channel_id),
+        resolved_start,
+        rest_baseline,
         sidecar: sidecar.clone(),
         last_error: Arc::clone(&last_error),
         release: Arc::clone(&release),
@@ -358,6 +371,12 @@ fn map_waitprims_err(err: waitprims_core::Error) -> CoreError {
     CoreError::WaitFilterInvalid(format!("waitprims request: {err}"))
 }
 
+/// Bind-time `CoreError` values are returned unchanged. Do not rewrite
+/// provider/auth/transport/degraded failures as `WaitFilterInvalid`.
+pub(crate) fn classify_bind_core_error(err: CoreError) -> CoreError {
+    err
+}
+
 pub(crate) fn build_live_documents(
     session: &WaitSession,
     my_user_id: &str,
@@ -475,12 +494,13 @@ pub(crate) fn scan_cursor_from_bind(start: &Anchor) -> Option<String> {
 struct ChanvoyWaitObserver {
     state: AppState,
     channel: String,
-    after: Option<String>,
     predicate: WaitPredicate,
     deadline: Instant,
     my_user_id: String,
     registration_id: IdToken,
     subject_id: IdToken,
+    resolved_start: Anchor,
+    rest_baseline: HashSet<String>,
     sidecar: MessageSidecar,
     last_error: Arc<Mutex<Option<CoreError>>>,
     release: Arc<LeaseRelease>,
@@ -585,20 +605,10 @@ impl Observer for ChanvoyWaitObserver {
     type Bind = ChanvoyBind;
 
     async fn bind(&self, registration: &Registration) -> waitprims_core::Result<Self::Bind> {
-        let (resolved, rest_baseline) = resolve_bind_cursor(
-            &self.state,
-            &self.channel,
-            self.predicate.channel_id(),
-            self.after.as_deref(),
-            self.deadline,
-        )
-        .await
-        .map_err(|err| waitprims_core::ValidationError::new("/start_anchor", err.to_string()))?;
-
         Ok(ChanvoyBind {
             registration_id: registration.registration_id.clone(),
-            resolved_start: resolved,
-            rest_baseline,
+            resolved_start: self.resolved_start.clone(),
+            rest_baseline: self.rest_baseline.clone(),
             release: Arc::clone(&self.release),
             inner_cancel: self.inner_cancel.clone(),
         })
@@ -969,6 +979,44 @@ mod tests {
         let json = serde_json::to_string(&waitprims_core::AgentWaitMessage::RegistrationSet(set))
             .expect("json");
         waitprims_core::validate_message(&json).expect("registration_set must admit");
+    }
+
+    #[test]
+    fn bind_preserves_provider_auth_and_degraded_classes() {
+        use reqwest::StatusCode;
+        let degraded = classify_bind_core_error(CoreError::WaitProviderDegraded {
+            channel: "ops".into(),
+            message: "deadline reached before a successful observation".into(),
+        });
+        assert!(
+            matches!(degraded, CoreError::WaitProviderDegraded { .. }),
+            "degraded must not become WaitFilterInvalid: {degraded:?}"
+        );
+        let auth = classify_bind_core_error(CoreError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            message: "token refused".into(),
+        });
+        assert!(
+            matches!(auth, CoreError::Api { status, .. } if status == StatusCode::UNAUTHORIZED),
+            "auth must not become WaitFilterInvalid: {auth:?}"
+        );
+        let forbidden = classify_bind_core_error(CoreError::Api {
+            status: StatusCode::FORBIDDEN,
+            message: "no".into(),
+        });
+        assert!(matches!(
+            forbidden,
+            CoreError::Api {
+                status: StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+        let timeout = classify_bind_core_error(CoreError::WaitTimeout("ops".into()));
+        assert!(matches!(timeout, CoreError::WaitTimeout(_)));
+        let invalid = classify_bind_core_error(CoreError::WaitFilterInvalid(
+            "wait --after post not found: p1".into(),
+        ));
+        assert!(matches!(invalid, CoreError::WaitFilterInvalid(_)));
     }
 
     #[test]
