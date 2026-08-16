@@ -38,11 +38,35 @@ const REASON_REPLACED: &str = "replaced";
 
 pub(crate) struct FirstMatchWait<'a> {
     pub channel: &'a str,
+    pub channel_id: &'a str,
     pub after: Option<&'a str>,
     pub predicate: WaitPredicate,
     pub deadline: Instant,
     pub session: &'a WaitSession,
     pub guard: WaitGuard,
+}
+
+/// Forwards lease cancellation into waitprims `Cancel`. Abort on drop so a
+/// completed wait does not leave a dormant task parked on the lease token.
+struct CancelForward {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl CancelForward {
+    fn spawn(lease_cancel: CancellationToken, wp: Cancel) -> Self {
+        Self {
+            handle: tokio::spawn(async move {
+                lease_cancel.cancelled().await;
+                wp.trigger();
+            }),
+        }
+    }
+}
+
+impl Drop for CancelForward {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 /// Run one `run_first_match` registration and translate the admitted
@@ -63,7 +87,7 @@ pub(crate) async fn run_single_channel_first_match(
         deadline: wait.deadline,
         my_user_id: state.my_user_id.clone(),
         registration_id: IdToken::new(format!("reg:{}", wait.session.wait_id)),
-        subject_id: IdToken::new(format!("channel:{}", wait.channel)),
+        subject_id: channel_subject(wait.channel_id),
         sidecar: sidecar.clone(),
         last_error: Arc::clone(&last_error),
         release: Arc::clone(&release),
@@ -74,21 +98,14 @@ pub(crate) async fn run_single_channel_first_match(
     let (set, request) = build_live_documents(
         wait.session,
         &state.my_user_id,
-        wait.channel,
+        wait.channel_id,
         wait.after,
         deadline_from_instant(wait.deadline),
     )?;
 
     let clock = WallClock;
     let wp_cancel = Cancel::new();
-    {
-        let lease_cancel = wait.session.cancel.clone();
-        let wp = wp_cancel.clone();
-        tokio::spawn(async move {
-            lease_cancel.cancelled().await;
-            wp.trigger();
-        });
-    }
+    let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
 
     let outcome = run_first_match(&set, &request, &observer, &clock, &wp_cancel)
         .await
@@ -121,6 +138,19 @@ impl Clock for WallClock {
 /// **remaining** budget so pre-bind work cannot extend the caller's timeout.
 pub(crate) fn deadline_from_instant(deadline: Instant) -> Timestamp {
     timestamp_now().saturating_add(deadline.saturating_duration_since(Instant::now()))
+}
+
+pub(crate) fn channel_subject(channel_id: &str) -> IdToken {
+    IdToken::new(format!("channel:{channel_id}"))
+}
+
+/// Provider occurrence time from Mattermost `create_at` (unix ms).
+pub(crate) fn timestamp_from_create_at(create_at: i64) -> Timestamp {
+    let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(create_at) else {
+        return timestamp_now();
+    };
+    Timestamp::parse(&dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+        .unwrap_or_else(|_| timestamp_now())
 }
 
 pub(crate) fn timestamp_now() -> Timestamp {
@@ -233,7 +263,7 @@ pub(crate) fn event_from_foreign_message(
         method_id: IdToken::new(METHOD_ID),
         subject_kind: IdToken::new("channel"),
         subject_id: subject_id.clone(),
-        occurred_at: observed.clone(),
+        occurred_at: timestamp_from_create_at(message.create_at),
         observed_at: observed,
         start_anchor: start.clone(),
         proposed_next_anchor: Anchor {
@@ -650,6 +680,7 @@ mod tests {
     use super::*;
     use crate::wait_owner::WaitOwnerRegistry;
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     fn msg(id: &str, user: &str, body: &str) -> Message {
         Message {
@@ -728,6 +759,15 @@ mod tests {
         assert_eq!(event.method_id.as_str(), METHOD_ID);
         assert_eq!(event.subject_id.as_str(), "channel:ops");
         assert_ne!(event.subject_id.as_str(), "channel:p2");
+        assert_eq!(
+            event.occurred_at,
+            timestamp_from_create_at(1),
+            "occurred_at must be provider create_at"
+        );
+        assert_ne!(
+            event.occurred_at, event.observed_at,
+            "observed_at stays wall-clock, not create_at"
+        );
         assert!(event.delivery_ref.is_none());
         assert!(event.activation_ref.is_none());
         let stored = sidecar
@@ -907,11 +947,16 @@ mod tests {
         let (set, _req) = build_live_documents(
             &session,
             "bot",
-            "ops",
+            "ch-canonical",
             Some("post-abc"),
             timestamp_now().saturating_add(Duration::from_secs(30)),
         )
         .expect("docs");
+        assert_eq!(
+            set.registrations[0].subject_id.as_str(),
+            "channel:ch-canonical"
+        );
+        assert_ne!(set.registrations[0].subject_id.as_str(), "channel:ops");
         assert_ne!(set.registration_digest.value, "0".repeat(64));
         assert_eq!(set.registration_digest.value.len(), 64);
         assert!(set
@@ -924,5 +969,26 @@ mod tests {
         let json = serde_json::to_string(&waitprims_core::AgentWaitMessage::RegistrationSet(set))
             .expect("json");
         waitprims_core::validate_message(&json).expect("registration_set must admit");
+    }
+
+    #[test]
+    fn cancel_forward_aborts_on_drop() {
+        futures_executor_block(async {
+            let lease = CancellationToken::new();
+            let wp = Cancel::new();
+            let fwd = CancelForward::spawn(lease.clone(), wp.clone());
+            drop(fwd);
+            assert!(!wp.is_cancelled());
+            assert!(!lease.is_cancelled());
+        });
+    }
+
+    #[test]
+    fn equivalent_selectors_share_canonical_subject() {
+        assert_eq!(
+            channel_subject("abc123").as_str(),
+            channel_subject("abc123").as_str()
+        );
+        assert_ne!(channel_subject("abc123").as_str(), "channel:ops-updates");
     }
 }

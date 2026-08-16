@@ -337,6 +337,7 @@ pub async fn wait_with_params_v3(
         state,
         crate::waitprims_hold::FirstMatchWait {
             channel,
+            channel_id: &resolved.channel_id,
             after,
             predicate,
             deadline,
