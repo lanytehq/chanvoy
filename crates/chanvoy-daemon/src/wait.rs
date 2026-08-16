@@ -316,6 +316,19 @@ pub async fn wait_with_params_v3(
     })
     .await?;
 
+    // Bind explicit `--after` before any potentially replacing acquire.
+    // Invalid/foreign/missing anchors must fail closed as input/provider
+    // without displacing a live waiter. The resolved cursor is carried
+    // into the runner; the runner must not fetch it again.
+    let prebound_after = if let Some(anchor) = after {
+        let (scan, baseline) =
+            establish_baseline(state, channel, &resolved.channel_id, Some(anchor), deadline)
+                .await?;
+        Some(crate::waitprims_hold::cursor_from_baseline(scan, baseline))
+    } else {
+        None
+    };
+
     let remaining = deadline.saturating_duration_since(Instant::now());
     let lease = state
         .wait_owners
@@ -339,6 +352,7 @@ pub async fn wait_with_params_v3(
             channel,
             channel_id: &resolved.channel_id,
             after,
+            prebound_after,
             predicate,
             deadline,
             session: &session,

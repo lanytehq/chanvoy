@@ -577,3 +577,88 @@ async fn v3_unknown_field_and_oversize_channel_are_input() {
 
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
+
+#[tokio::test]
+#[ignore = "integration: PER-040 process outcome matrix"]
+async fn invalid_or_foreign_after_cannot_replace_active_wait() {
+    let env = TestEnv::new("per-040-replace-bad-after").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    mount_empty_channel(&env, "brief-per-040", "chan-id-per040-badafter").await;
+    env.mock_post_lookup("missing-anchor", "chan-id-per040-badafter", false)
+        .await;
+    env.mock_post_lookup("foreign-anchor", "chan-id-other", true)
+        .await;
+    let daemon = spawn_daemon(&env).await;
+
+    let mut first = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args(["--json", "wait", "brief-per-040", "--timeout", "30s"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn first wait");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let conflict = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+    )
+    .await;
+    let live_id = serde_json::from_slice::<serde_json::Value>(&conflict.stdout).unwrap()["error"]
+        ["existing_wait_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for (label, after) in [("missing", "missing-anchor"), ("foreign", "foreign-anchor")] {
+        let out = run_chanvoy(
+            &env,
+            &[
+                "--json",
+                "wait",
+                "brief-per-040",
+                "--timeout",
+                "2s",
+                "--replace-wait",
+                &live_id,
+                "--after",
+                after,
+            ],
+        )
+        .await;
+        assert_eq!(out.status.code(), Some(2), "{label}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["timeout"], false, "{label} => {value}");
+        assert_eq!(
+            value["error_class"], "input",
+            "{label} must be caller-input, not ownership: {value}"
+        );
+        assert_ne!(
+            value["error"]["class"], "wait_already_active",
+            "{label} must not be reported as already-active: {value}"
+        );
+        assert_ne!(
+            value["error"]["class"], "wait_replaced",
+            "{label} must not replace: {value}"
+        );
+    }
+
+    let still = run_chanvoy(
+        &env,
+        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+    )
+    .await;
+    let still_json: serde_json::Value = serde_json::from_slice(&still.stdout).unwrap();
+    assert_eq!(still_json["error"]["class"], "wait_already_active");
+    assert_eq!(still_json["error"]["existing_wait_id"], live_id);
+    assert!(
+        first.try_wait().unwrap().is_none(),
+        "invalid --after must not displace the live waiter"
+    );
+
+    let _ = first.start_kill();
+    let _ = first.wait().await;
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}

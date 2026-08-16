@@ -40,6 +40,9 @@ pub(crate) struct FirstMatchWait<'a> {
     pub channel: &'a str,
     pub channel_id: &'a str,
     pub after: Option<&'a str>,
+    /// Explicit `--after` bound before ownership acquire. When set, the
+    /// runner must consume this cursor and must not fetch again.
+    pub prebound_after: Option<(Anchor, HashSet<String>)>,
     pub predicate: WaitPredicate,
     pub deadline: Instant,
     pub session: &'a WaitSession,
@@ -79,18 +82,23 @@ pub(crate) async fn run_single_channel_first_match(
     let sidecar = MessageSidecar::new();
     let last_error = Arc::new(Mutex::new(None));
     let inner_cancel = CancellationToken::new();
-    // Bind-time baseline is resolved here so provider/auth/degraded
-    // CoreErrors never pass through waitprims ValidationError.
-    let (resolved_start, rest_baseline) = resolve_bind_cursor(
-        state,
-        wait.session,
-        wait.channel,
-        wait.predicate.channel_id(),
-        wait.after,
-        wait.deadline,
-    )
-    .await
-    .map_err(classify_bind_core_error)?;
+    // Explicit `--after` is bound before acquire. Tip-at-arm still
+    // resolves here so provider/auth/degraded CoreErrors never pass
+    // through waitprims ValidationError, and replacement cancel can
+    // interrupt that remaining provider work.
+    let (resolved_start, rest_baseline) = match wait.prebound_after {
+        Some(bound) => bound,
+        None => resolve_bind_cursor(
+            state,
+            wait.session,
+            wait.channel,
+            wait.predicate.channel_id(),
+            wait.after,
+            wait.deadline,
+        )
+        .await
+        .map_err(classify_bind_core_error)?,
+    };
 
     let observer = ChanvoyWaitObserver {
         state: state.clone(),
@@ -818,16 +826,23 @@ pub(crate) async fn resolve_bind_cursor(
     race_bind_work(session, async {
         let (scan, baseline) =
             establish_baseline(state, channel, channel_id, after, deadline).await?;
-        let value = scan.unwrap_or_else(|| EMPTY_AT_ARM_CURSOR.to_string());
-        Ok((
-            Anchor {
-                kind: AnchorKind::ProviderOpaque,
-                value: IdToken::new(value),
-            },
-            baseline,
-        ))
+        Ok(cursor_from_baseline(scan, baseline))
     })
     .await
+}
+
+pub(crate) fn cursor_from_baseline(
+    scan: Option<String>,
+    baseline: HashSet<String>,
+) -> (Anchor, HashSet<String>) {
+    let value = scan.unwrap_or_else(|| EMPTY_AT_ARM_CURSOR.to_string());
+    (
+        Anchor {
+            kind: AnchorKind::ProviderOpaque,
+            value: IdToken::new(value),
+        },
+        baseline,
+    )
 }
 
 #[cfg(test)]
@@ -1129,6 +1144,17 @@ mod tests {
             value: IdToken::new(EMPTY_AT_ARM_CURSOR),
         };
         assert!(scan_cursor_from_bind(&anchor).is_none());
+    }
+
+    #[test]
+    fn cursor_from_baseline_consumes_explicit_scan() {
+        let mut baseline = HashSet::new();
+        baseline.insert("post-abc".into());
+        let (anchor, rest) = cursor_from_baseline(Some("post-abc".into()), baseline);
+        assert_eq!(anchor.kind, AnchorKind::ProviderOpaque);
+        assert_eq!(anchor.value.as_str(), "post-abc");
+        assert!(rest.contains("post-abc"));
+        assert!(scan_cursor_from_bind(&anchor).as_deref() == Some("post-abc"));
     }
 
     #[test]
