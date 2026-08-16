@@ -4,8 +4,9 @@
 //! The adapter lives only in this crate. `chanvoy-core` public types and
 //! `chanvoy-mcp` take no waitprims dependency. Legacy `wait_channel` /
 //! `wait_channel_v2` and fan-in (`wait_channels_v1`) stay on their
-//! established engines. Observation uses the existing Mattermost client
-//! (REST) from a bind-resolved cursor — no per-wait event-bus subscribe.
+//! established engines. Observation uses the existing daemon stream: the
+//! event bus on monitored channels, REST from a bind-resolved cursor
+//! otherwise. No second Mattermost client or per-wait WebSocket.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,10 @@ use waitprims_core::{
     Registration, RegistrationSet, ReplayStatus, Timestamp, WaitBound, WaitEvent,
 };
 
-use crate::wait::{establish_baseline, one_message_result, wait_rest_from_cursor, WaitPredicate};
+use crate::wait::{
+    establish_baseline, one_message_result, wait_push_from_cursor, wait_rest_from_cursor,
+    WaitPredicate,
+};
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::AppState;
 
@@ -43,6 +47,7 @@ pub(crate) struct FirstMatchWait<'a> {
     /// Explicit `--after` bound before ownership acquire. When set, the
     /// runner must consume this cursor and must not fetch again.
     pub prebound_after: Option<(Anchor, HashSet<String>)>,
+    pub monitored: bool,
     pub predicate: WaitPredicate,
     pub deadline: Instant,
     pub session: &'a WaitSession,
@@ -103,6 +108,8 @@ pub(crate) async fn run_single_channel_first_match(
     let observer = ChanvoyWaitObserver {
         state: state.clone(),
         channel: wait.channel.to_string(),
+        after: wait.after.map(str::to_string),
+        monitored: wait.monitored,
         predicate: wait.predicate,
         deadline: wait.deadline,
         my_user_id: state.my_user_id.clone(),
@@ -132,7 +139,7 @@ pub(crate) async fn run_single_channel_first_match(
 
     let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel)
         .await
-        .map_err(map_waitprims_err)?;
+        .map_err(|err| map_waitprims_err(wait.channel, err))?;
     let outcome = admit_wait_result(&docs, outcome)?;
 
     inner_cancel.cancel();
@@ -418,8 +425,11 @@ pub(crate) fn named_failure(channel: &str, reason: &str) -> CoreError {
     }
 }
 
-fn map_waitprims_err(err: waitprims_core::Error) -> CoreError {
-    CoreError::WaitFilterInvalid(format!("waitprims request: {err}"))
+fn map_waitprims_err(channel: &str, _err: waitprims_core::Error) -> CoreError {
+    CoreError::WaitProviderDegraded {
+        channel: channel.to_string(),
+        message: "waitprims runner failed".into(),
+    }
 }
 
 /// Bind-time `CoreError` values are returned unchanged. Do not rewrite
@@ -620,6 +630,8 @@ pub(crate) fn scan_cursor_from_bind(start: &Anchor) -> Option<String> {
 struct ChanvoyWaitObserver {
     state: AppState,
     channel: String,
+    after: Option<String>,
+    monitored: bool,
     predicate: WaitPredicate,
     deadline: Instant,
     my_user_id: String,
@@ -753,15 +765,27 @@ impl Observer for ChanvoyWaitObserver {
 
         let engine = async {
             self.state.wait_owners.note_provider_io();
-            wait_rest_from_cursor(
-                &self.state,
-                &self.channel,
-                &self.predicate,
-                scan_cursor_from_bind(bind.resolved_start()),
-                bind.rest_baseline.clone(),
-                self.deadline,
-            )
-            .await
+            if self.monitored {
+                wait_push_from_cursor(
+                    &self.state,
+                    &self.channel,
+                    &self.predicate,
+                    self.after.as_deref(),
+                    scan_cursor_from_bind(bind.resolved_start()),
+                    self.deadline,
+                )
+                .await
+            } else {
+                wait_rest_from_cursor(
+                    &self.state,
+                    &self.channel,
+                    &self.predicate,
+                    scan_cursor_from_bind(bind.resolved_start()),
+                    bind.rest_baseline.clone(),
+                    self.deadline,
+                )
+                .await
+            }
         };
 
         // Replacement is a runner cancel (`waitprims` Cancel), not an
@@ -1207,6 +1231,19 @@ mod tests {
             docs.request.registration_set_ref.as_str(),
             docs.set.message_id.as_str()
         );
+    }
+
+    #[test]
+    fn post_admission_runner_failure_is_provider_degraded() {
+        let err = map_waitprims_err("ops", waitprims_core::Error::MalformedJson);
+        match err {
+            CoreError::WaitProviderDegraded { channel, message } => {
+                assert_eq!(channel, "ops");
+                assert_eq!(message, "waitprims runner failed");
+                assert!(!message.contains("malformed"));
+            }
+            other => panic!("runner failure must be provider-degraded, got {other:?}"),
+        }
     }
 
     #[test]
