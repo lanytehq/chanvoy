@@ -18,10 +18,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use waitprims_async::{run_first_match, BindHandle, Cancel, Clock, Observation, Observer};
 use waitprims_core::{
-    ActorRef, Anchor, AnchorKind, AuthnMode, BaselinePolicy, Canonicalization, CapabilityToken,
-    ContentDigest, DigestAlgorithm, IdToken, JcsDigest, LiveWaitOutcome, LiveWaitRequest,
-    OpaqueRef, OutcomeKind, PayloadRef, PredicateRef, Registration, RegistrationSet, ReplayStatus,
-    Timestamp, WaitBound, WaitEvent,
+    validate_message, validate_raw_documents, ActorRef, AgentWaitMessage, Anchor, AnchorKind,
+    AuthnMode, BaselinePolicy, Canonicalization, CapabilityToken, ContentDigest, DigestAlgorithm,
+    IdToken, JcsDigest, LiveWaitOutcome, LiveWaitRequest, OpaqueRef, OutcomeKind, PayloadRef,
+    PredicateRef, Registration, RegistrationSet, ReplayStatus, Timestamp, WaitBound, WaitEvent,
 };
 
 use crate::wait::{establish_baseline, one_message_result, wait_rest_from_cursor, WaitPredicate};
@@ -108,49 +108,63 @@ pub(crate) async fn run_single_channel_first_match(
         observed: AtomicBool::new(false),
     };
 
+    let clock = WallClock::new();
     let (set, request) = build_live_documents(
         wait.session,
         &state.my_user_id,
         wait.channel_id,
         wait.after,
-        deadline_from_instant(wait.deadline),
+        clock.project_deadline(wait.deadline),
     )?;
+    let (set, request) = admit_set_and_request(set, request)?;
 
-    let clock = WallClock;
     let wp_cancel = Cancel::new();
     let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
 
     let outcome = run_first_match(&set, &request, &observer, &clock, &wp_cancel)
         .await
         .map_err(map_waitprims_err)?;
+    let outcome = admit_outcome(outcome)?;
 
     inner_cancel.cancel();
     release.release();
     translate_outcome(outcome, wait.channel, &sidecar, wait.session, &last_error)
 }
 
-/// Production clock. Does not depend on `waitprims-testkit`.
-pub(crate) struct WallClock;
+/// Production clock: one RFC3339 origin plus monotonic Instant elapsed.
+/// Wall-clock steps after construction cannot change the wait budget.
+pub(crate) struct WallClock {
+    pub(crate) origin_instant: Instant,
+    pub(crate) origin_ts: Timestamp,
+}
+
+impl WallClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            origin_instant: Instant::now(),
+            origin_ts: timestamp_now(),
+        }
+    }
+
+    pub(crate) fn project_deadline(&self, deadline: Instant) -> Timestamp {
+        self.origin_ts
+            .saturating_add(deadline.saturating_duration_since(self.origin_instant))
+    }
+}
 
 impl Clock for WallClock {
     fn now(&self) -> Timestamp {
-        timestamp_now()
+        self.origin_ts.saturating_add(self.origin_instant.elapsed())
     }
 
     fn sleep_until(&self, deadline: &Timestamp) -> impl std::future::Future<Output = ()> + Send {
-        let delay = timestamp_now().duration_until(deadline);
+        let delay = self.now().duration_until(deadline);
         async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
         }
     }
-}
-
-/// Convert the RPC Instant deadline into a waitprims timestamp using
-/// **remaining** budget so pre-bind work cannot extend the caller's timeout.
-pub(crate) fn deadline_from_instant(deadline: Instant) -> Timestamp {
-    timestamp_now().saturating_add(deadline.saturating_duration_since(Instant::now()))
 }
 
 pub(crate) fn channel_subject(channel_id: &str) -> IdToken {
@@ -236,14 +250,15 @@ pub(crate) fn payload_ref_for(message: &Message) -> String {
     format!("msg:{}", message.id)
 }
 
+pub(crate) fn sidecar_message_bytes(message: &Message) -> Result<Vec<u8>, CoreError> {
+    serde_json::to_vec(message)
+        .map_err(|err| CoreError::WaitFilterInvalid(format!("sidecar message bytes: {err}")))
+}
+
 pub(crate) fn content_digest_for(message: &Message) -> ContentDigest {
+    let bytes = sidecar_message_bytes(message).unwrap_or_default();
     let mut hasher = Sha256::new();
-    hasher.update(message.id.as_bytes());
-    hasher.update([0]);
-    hasher.update(message.user_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(message.message.as_bytes());
-    hasher.update(message.create_at.to_le_bytes());
+    hasher.update(&bytes);
     ContentDigest {
         algorithm: DigestAlgorithm::Sha256,
         value: hex_lower(&hasher.finalize()),
@@ -289,7 +304,7 @@ pub(crate) fn event_from_foreign_message(
         payload: PayloadRef {
             payload_ref: OpaqueRef::new(payload_ref),
             content_digest: content_digest_for(message),
-            media_type: None,
+            media_type: Some("application/json".into()),
         },
         delivery_ref: None,
         activation_ref: None,
@@ -470,6 +485,60 @@ pub(crate) fn build_live_documents(
         run_deadline: deadline,
     };
     Ok((set, request))
+}
+
+pub(crate) fn admit_set_and_request(
+    set: RegistrationSet,
+    request: LiveWaitRequest,
+) -> Result<(RegistrationSet, LiveWaitRequest), CoreError> {
+    let set_json = serde_json::to_string(&AgentWaitMessage::RegistrationSet(set))
+        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims set encode: {err}")))?;
+    let req_json = serde_json::to_string(&AgentWaitMessage::LiveWaitRequest(request))
+        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims request encode: {err}")))?;
+    let admitted = validate_raw_documents([&set_json, &req_json])
+        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims admission: {err}")))?;
+    let mut set = None;
+    let mut request = None;
+    for msg in admitted {
+        match msg.into_inner() {
+            AgentWaitMessage::RegistrationSet(value) => set = Some(value),
+            AgentWaitMessage::LiveWaitRequest(value) => request = Some(value),
+            other => {
+                return Err(CoreError::WaitFilterInvalid(format!(
+                    "waitprims admission: unexpected {}",
+                    other.message_type().as_str()
+                )));
+            }
+        }
+    }
+    Ok((
+        set.ok_or_else(|| CoreError::WaitFilterInvalid("waitprims admission: missing set".into()))?,
+        request.ok_or_else(|| {
+            CoreError::WaitFilterInvalid("waitprims admission: missing request".into())
+        })?,
+    ))
+}
+
+pub(crate) fn admit_outcome(outcome: LiveWaitOutcome) -> Result<LiveWaitOutcome, CoreError> {
+    let json = serde_json::to_string(&AgentWaitMessage::LiveWaitOutcome(outcome))
+        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims outcome encode: {err}")))?;
+    let admitted = validate_message(&json).map_err(|err| {
+        CoreError::WaitFilterInvalid(format!("waitprims outcome admission: {err}"))
+    })?;
+    match admitted.into_inner() {
+        AgentWaitMessage::LiveWaitOutcome(value) => Ok(value),
+        other => Err(CoreError::WaitFilterInvalid(format!(
+            "waitprims outcome admission: unexpected {}",
+            other.message_type().as_str()
+        ))),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn admit_raw(raw: &str) -> Result<AgentWaitMessage, CoreError> {
+    validate_message(raw)
+        .map(|admitted| admitted.into_inner())
+        .map_err(|err| CoreError::WaitFilterInvalid(format!("waitprims admission: {err}")))
 }
 
 pub(crate) fn registration_digest_hex(registration: &Registration) -> Result<String, CoreError> {
@@ -939,7 +1008,7 @@ mod tests {
     fn waitprims_deadline_uses_remaining_budget() {
         let start = Instant::now();
         let remaining = Duration::from_secs(4);
-        let ts = deadline_from_instant(start + remaining);
+        let ts = WallClock::new().project_deadline(start + remaining);
         let span = timestamp_now().duration_until(&ts);
         assert!(
             span <= remaining,
@@ -954,7 +1023,7 @@ mod tests {
     #[test]
     fn registration_digest_is_admissible_sha256() {
         let session = dummy_session("wait_digest");
-        let (set, _req) = build_live_documents(
+        let (set, request) = build_live_documents(
             &session,
             "bot",
             "ch-canonical",
@@ -976,9 +1045,15 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit()));
         let recomputed = registration_digest_hex(&set.registrations[0]).expect("recompute");
         assert_eq!(recomputed, set.registration_digest.value);
-        let json = serde_json::to_string(&waitprims_core::AgentWaitMessage::RegistrationSet(set))
-            .expect("json");
-        waitprims_core::validate_message(&json).expect("registration_set must admit");
+        let (admitted_set, admitted_req) = admit_set_and_request(set, request).expect("admit pair");
+        assert_eq!(
+            admitted_set.registrations[0].subject_id.as_str(),
+            "channel:ch-canonical"
+        );
+        assert_eq!(
+            admitted_req.registration_set_ref.as_str(),
+            admitted_set.message_id.as_str()
+        );
     }
 
     #[test]
@@ -1038,5 +1113,68 @@ mod tests {
             channel_subject("abc123").as_str()
         );
         assert_ne!(channel_subject("abc123").as_str(), "channel:ops-updates");
+    }
+
+    #[test]
+    fn wall_clock_is_monotonic_projection_of_origin() {
+        let clock = WallClock::new();
+        std::thread::sleep(Duration::from_millis(15));
+        let now = clock.now();
+        let projected = clock
+            .origin_ts
+            .saturating_add(clock.origin_instant.elapsed());
+        let skew = now
+            .duration_until(&projected)
+            .max(projected.duration_until(&now));
+        assert!(
+            skew <= Duration::from_millis(5),
+            "now() must be origin + Instant elapsed, skew={skew:?}"
+        );
+        let later = Instant::now() + Duration::from_secs(8);
+        let budget = clock.project_deadline(later);
+        let remaining = clock.now().duration_until(&budget);
+        assert!(remaining <= Duration::from_secs(8));
+        assert!(remaining >= Duration::from_secs(6));
+    }
+
+    #[test]
+    fn content_digest_covers_every_sidecar_field() {
+        let base = msg("p1", "alice", "hello");
+        let base_digest = content_digest_for(&base).value;
+        let mut username = base.clone();
+        username.username = "bob".into();
+        let mut root = base.clone();
+        root.root_id = "other-root".into();
+        let mut user = base.clone();
+        user.user_id = "other-user".into();
+        let mut body = base.clone();
+        body.message = "goodbye".into();
+        let mut created = base.clone();
+        created.create_at = 99;
+        for (label, variant) in [
+            ("username", username),
+            ("root_id", root),
+            ("user_id", user),
+            ("message", body),
+            ("create_at", created),
+        ] {
+            assert_ne!(
+                content_digest_for(&variant).value,
+                base_digest,
+                "{label} must affect content digest"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_registration_set_fails_closed() {
+        let err = admit_raw(r#"{"message_type":"registration_set"}"#).unwrap_err();
+        assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
+    }
+
+    #[test]
+    fn malformed_outcome_fails_closed() {
+        let err = admit_raw(r#"{"message_type":"live_wait_outcome"}"#).unwrap_err();
+        assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
     }
 }
