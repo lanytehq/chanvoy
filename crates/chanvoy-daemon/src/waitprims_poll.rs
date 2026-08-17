@@ -68,7 +68,10 @@ impl PollCursorStore {
             })
     }
 
-    pub(crate) fn commit(&self, staged: StagedPollAck) -> Result<(), CoreError> {
+    pub(crate) fn persist_candidate(
+        &self,
+        staged: StagedPollAck,
+    ) -> Result<BTreeMap<String, String>, CoreError> {
         let _gate = self
             .persist_gate
             .lock()
@@ -83,11 +86,20 @@ impl PollCursorStore {
             candidate
         };
         persist(&self.profile, &candidate)?;
+        Ok(candidate)
+    }
+
+    pub(crate) fn publish(&self, candidate: BTreeMap<String, String>) -> Result<(), CoreError> {
         *self
             .inner
             .lock()
             .map_err(|_| contract_internal("poll", "cursor store lock"))? = candidate;
         Ok(())
+    }
+
+    pub(crate) fn commit(&self, staged: StagedPollAck) -> Result<(), CoreError> {
+        let candidate = self.persist_candidate(staged)?;
+        self.publish(candidate)
     }
 }
 
@@ -718,6 +730,35 @@ mod tests {
         assert!(meta.is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persist_candidate_does_not_publish_memory_until_publish() {
+        let profile = format!("poll-stage-{}", std::process::id());
+        let store = PollCursorStore::load(&profile).expect("empty");
+        let candidate = store
+            .persist_candidate(StagedPollAck {
+                anchors: BTreeMap::from([("reg:poll:ch".into(), "post-new".into())]),
+            })
+            .expect("disk");
+        assert!(
+            store.get("reg:poll:ch").is_none(),
+            "memory must stay at the last published cursor until publish"
+        );
+        let disk = PollCursorStore::load(&profile).expect("reload");
+        assert_eq!(
+            disk.get("reg:poll:ch")
+                .map(|a| a.value.as_str().to_string()),
+            Some("post-new".into())
+        );
+        store.publish(candidate).expect("publish");
+        assert_eq!(
+            store
+                .get("reg:poll:ch")
+                .map(|a| a.value.as_str().to_string()),
+            Some("post-new".into())
+        );
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
     }
 
     #[test]

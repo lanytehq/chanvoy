@@ -599,17 +599,17 @@ async fn handle_client(
                     .write_all(serde_json::to_string(&response)?.as_bytes())
                     .await?;
                 writer.write_all(b"\n").await?;
-                if let Some(ack) = dispatched.staged_poll_ack {
-                    if response.error.is_none() {
-                        state.poll_cursors.commit(ack).map_err(DaemonError::from)?;
-                    }
-                }
-                if let Some(advance) = dispatched.staged_attention {
-                    if response.error.is_none() {
-                        commit_staged_attention(&state, advance)
-                            .await
-                            .map_err(DaemonError::from)?;
-                    }
+                if response.error.is_none()
+                    && (dispatched.staged_poll_ack.is_some()
+                        || dispatched.staged_attention.is_some())
+                {
+                    commit_staged_read_cursors(
+                        &state,
+                        dispatched.staged_poll_ack,
+                        dispatched.staged_attention,
+                    )
+                    .await
+                    .map_err(DaemonError::from)?;
                 }
                 if let Some(consume) = dispatched.staged_fanin_consume {
                     if response.error.is_none() {
@@ -1607,13 +1607,60 @@ async fn prepare_attention_advance(
     })
 }
 
-async fn commit_staged_attention(
-    state: &AppState,
+fn attention_candidate(
+    current: &chanvoy_core::AttentionState,
+    staged: StagedAttentionAdvance,
+) -> chanvoy_core::AttentionState {
+    let mut next = current.clone();
+    next.channels.insert(staged.key, staged.cursor);
+    next
+}
+
+fn persist_then_publish_attention(
+    persist: impl FnOnce(&chanvoy_core::AttentionState) -> Result<(), CoreError>,
+    live: &mut chanvoy_core::AttentionState,
     staged: StagedAttentionAdvance,
 ) -> Result<(), CoreError> {
-    let mut attention = state.attention_state.lock().await;
-    attention.channels.insert(staged.key, staged.cursor);
-    store_attention_state(&state.profile.name, &attention)?;
+    let candidate = attention_candidate(live, staged);
+    persist(&candidate)?;
+    *live = candidate;
+    Ok(())
+}
+
+async fn commit_staged_read_cursors(
+    state: &AppState,
+    poll: Option<waitprims_poll::StagedPollAck>,
+    attention: Option<StagedAttentionAdvance>,
+) -> Result<(), CoreError> {
+    let mut attn = state.attention_state.lock().await;
+    let Some(advance) = attention else {
+        if let Some(ack) = poll {
+            state.poll_cursors.commit(ack)?;
+        }
+        return Ok(());
+    };
+    let profile = state.profile.name.clone();
+    if poll.is_none() {
+        persist_then_publish_attention(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut attn,
+            advance,
+        )?;
+        return Ok(());
+    }
+    let old = attn.clone();
+    let candidate = attention_candidate(&old, advance);
+    store_attention_state(&profile, &candidate)?;
+    match state.poll_cursors.persist_candidate(poll.expect("poll")) {
+        Ok(poll_map) => {
+            *attn = candidate;
+            state.poll_cursors.publish(poll_map)?;
+        }
+        Err(err) => {
+            let _ = store_attention_state(&profile, &old);
+            return Err(err);
+        }
+    }
     Ok(())
 }
 
@@ -1799,6 +1846,59 @@ mod wait_rpc_code_tests {
         let p: WaitChannelV2Params = serde_json::from_value(v).expect("deserialize");
         assert_eq!(p.timeout_secs, 60);
         assert_eq!(p.contains.as_deref(), Some("ASSENT"));
+    }
+}
+
+#[cfg(test)]
+mod staged_cursor_tests {
+    use super::*;
+
+    fn sample_advance() -> StagedAttentionAdvance {
+        StagedAttentionAdvance {
+            key: "org/ops".into(),
+            cursor: chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-new".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn attention_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention(
+            |_| {
+                Err(CoreError::WaitProviderDegraded {
+                    channel: "poll".into(),
+                    message: "forced persist fail".into(),
+                })
+            },
+            &mut live,
+            sample_advance(),
+        );
+        assert!(err.is_err());
+        assert!(
+            live.channels.is_empty(),
+            "failed persist must leave in-memory attention unchanged"
+        );
+    }
+
+    #[test]
+    fn attention_persist_success_publishes_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        persist_then_publish_attention(|_| Ok(()), &mut live, sample_advance()).expect("ok");
+        assert_eq!(
+            live.channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
     }
 }
 
