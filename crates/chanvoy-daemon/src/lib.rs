@@ -612,6 +612,9 @@ async fn handle_client(
                             .map_err(DaemonError::from)?;
                     }
                 }
+                if let Some(hold) = dispatched.fanin_hold {
+                    hold.release();
+                }
                 line.clear();
             }
             recv_result = async {
@@ -750,6 +753,7 @@ struct DispatchOutcome {
     response: JsonRpcResponse,
     staged_poll_ack: Option<waitprims_poll::StagedPollAck>,
     staged_fanin_consume: Option<waitprims_fanin::StagedFanInConsume>,
+    fanin_hold: Option<std::sync::Arc<waitprims_fanin::FanInHold>>,
 }
 
 async fn dispatch_request(
@@ -774,11 +778,13 @@ async fn dispatch_request(
             ),
             staged_poll_ack: None,
             staged_fanin_consume: None,
+            fanin_hold: None,
         };
     }
 
     let mut staged_poll_ack = None;
     let mut staged_fanin_consume = None;
+    let mut fanin_hold = None;
     let response: Result<serde_json::Value, DaemonError> = match request.method.as_str() {
         "whoami" => state
             .client
@@ -1216,8 +1222,9 @@ async fn dispatch_request(
         method if method == WAIT_CHANNELS_V1_METHOD => {
             match serde_json::from_value::<WaitChannelsParams>(request.params.clone()) {
                 Ok(params) => match wait_channels::wait_channels_with_params(state, params).await {
-                    Ok((result, consume)) => {
+                    Ok((result, consume, hold)) => {
                         staged_fanin_consume = consume;
+                        fanin_hold = hold;
                         Ok(to_value(result))
                     }
                     Err(err) => Err(DaemonError::from(err)),
@@ -1417,6 +1424,7 @@ async fn dispatch_request(
         response,
         staged_poll_ack,
         staged_fanin_consume,
+        fanin_hold,
     }
 }
 

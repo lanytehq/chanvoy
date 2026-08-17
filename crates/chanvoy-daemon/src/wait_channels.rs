@@ -87,6 +87,7 @@ pub async fn wait_channels_with_params(
     (
         WaitChannelsResult,
         Option<crate::waitprims_fanin::StagedFanInConsume>,
+        Option<std::sync::Arc<crate::waitprims_fanin::FanInHold>>,
     ),
     CoreError,
 > {

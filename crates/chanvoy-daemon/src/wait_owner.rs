@@ -121,6 +121,12 @@ pub struct WaitGuard {
     cleanup_notify: Arc<Notify>,
 }
 
+impl WaitGuard {
+    pub(crate) fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+}
+
 impl Default for WaitOwnerRegistry {
     fn default() -> Self {
         Self::new()

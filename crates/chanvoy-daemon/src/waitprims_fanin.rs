@@ -181,9 +181,11 @@ impl Drop for WatcherAbort {
     }
 }
 
-struct MultiRelease {
+pub(crate) struct MultiRelease {
     guards: Mutex<Vec<WaitGuard>>,
 }
+
+pub(crate) type FanInHold = MultiRelease;
 
 impl MultiRelease {
     fn new(guards: Vec<WaitGuard>) -> Arc<Self> {
@@ -192,9 +194,15 @@ impl MultiRelease {
         })
     }
 
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         if let Ok(mut slot) = self.guards.lock() {
             slot.clear();
+        }
+    }
+
+    fn release_except(&self, keep_channel_id: &str) {
+        if let Ok(mut slot) = self.guards.lock() {
+            slot.retain(|guard| guard.channel_id() == keep_channel_id);
         }
     }
 }
@@ -222,7 +230,14 @@ struct FanInObserver {
 pub(crate) async fn wait_channels_first_match(
     state: &AppState,
     params: WaitChannelsParams,
-) -> Result<(WaitChannelsResult, Option<StagedFanInConsume>), CoreError> {
+) -> Result<
+    (
+        WaitChannelsResult,
+        Option<StagedFanInConsume>,
+        Option<Arc<FanInHold>>,
+    ),
+    CoreError,
+> {
     let _tie = TIE_RULE;
     let _ = _tie;
     validate_wait_channels_params(&params)?;
@@ -405,10 +420,9 @@ pub(crate) async fn wait_channels_first_match(
     let _watcher = WatcherAbort::spawn(member_cancels, wp_cancel.clone(), CancellationToken::new());
     let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel).await;
     inner_cancel.cancel();
-    keys.release();
     let outcome = outcome.map_err(|err| map_waitprims_err("fan-in", err))?;
     let outcome = admit_wait_result(&docs, outcome)?;
-    translate_fanin_outcome(
+    let (result, consume) = translate_fanin_outcome(
         outcome,
         &params,
         &sidecar,
@@ -416,7 +430,13 @@ pub(crate) async fn wait_channels_first_match(
         &subjects,
         &state.fanin_replay,
         &sessions,
-    )
+    )?;
+    if let Some(consume) = &consume {
+        keys.release_except(&consume.channel_id);
+    } else {
+        keys.release();
+    }
+    Ok((result, consume, Some(keys)))
 }
 
 fn map_arm_err(selector: &WaitChannelSelector, err: CoreError) -> CoreError {
@@ -915,6 +935,36 @@ mod tests {
         // write/EOF failure never consumes
         assert_eq!(store.peek("ch-1").expect("still there").len(), 1);
         store.consume("ch-1", "p-win").expect("ack write");
+        assert!(store.peek("ch-1").expect("consumed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn winner_hold_blocks_second_acquire_until_release() {
+        use crate::wait_owner::WaitOwnerRegistry;
+        use std::time::Duration;
+        let registry = std::sync::Arc::new(WaitOwnerRegistry::new());
+        let store = FanInReplayStore::new();
+        let first = registry
+            .acquire("ch-1", "org", "ops", None, Duration::from_secs(5))
+            .await
+            .expect("first owner");
+        let (_session, guard) = first.into_guard();
+        let hold = MultiRelease::new(vec![guard]);
+        store.stash("ch-1", replay_msg("p-win")).expect("stash");
+        let second = registry
+            .acquire("ch-1", "org", "ops", None, Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(second, Err(CoreError::WaitAlreadyActive { .. })),
+            "second wait must be refused while winner is still owned"
+        );
+        assert_eq!(store.peek("ch-1").expect("peek").len(), 1);
+        hold.release();
+        store.consume("ch-1", "p-win").expect("ack");
+        let third = registry
+            .acquire("ch-1", "org", "ops", None, Duration::from_secs(1))
+            .await;
+        assert!(third.is_ok(), "released key must admit a later wait");
         assert!(store.peek("ch-1").expect("consumed").is_empty());
     }
 

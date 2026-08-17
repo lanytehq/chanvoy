@@ -661,9 +661,6 @@ mod tests {
 
     #[test]
     fn over_bound_page_returns_every_post_including_self() {
-        // Old defect: poll returned only outcome.events, so a page that
-        // saturated max_bytes was silently truncated. The read must
-        // return the fetched page even if the poll event list is short.
         let page = vec![
             page_msg("p-self", "bot", "own post"),
             page_msg("p-a", "alice", "one"),
