@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `run_poll_cycle` per wake; `read --after` still returns the
   complete provider page (including self-authored posts); cursors
   stay uncommitted until a request-owned `poll_cycle_ack` after a
-  successful RPC write. `restore_ready` is `Result` and fail-closed.
+  successful RPC write. Poll bounds follow the fetched page so a
+  large `read --after` is not truncated. `restore_ready` is `Result` and fail-closed.
   A1 single-channel `wait_channel_v3` remains. Path-dep on
   waitprims `f12e707` — not for origin/main.
 

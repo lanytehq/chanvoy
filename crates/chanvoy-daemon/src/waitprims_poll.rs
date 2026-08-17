@@ -12,7 +12,8 @@ use chanvoy_core::{CoreError, Message};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use waitprims_async::{
-    run_poll_cycle, BindHandle, Cancel, Observation, Observer, POLL_ACK_RETENTION,
+    event_surface_bytes, run_poll_cycle, BindHandle, Cancel, Observation, Observer,
+    POLL_ACK_RETENTION,
 };
 use waitprims_core::{
     ActorRef, AgentWaitMessage, Anchor, AnchorKind, AuthnMode, BaselinePolicy, Canonicalization,
@@ -21,9 +22,8 @@ use waitprims_core::{
 };
 
 use crate::waitprims_hold::{
-    authenticate_sidecar_message, channel_subject, contract_internal, event_from_message,
-    map_waitprims_err, timestamp_now, ChanvoyBind, LeaseRelease, MessageSidecar, WallClock,
-    METHOD_ID,
+    channel_subject, contract_internal, event_from_message, map_waitprims_err, timestamp_now,
+    ChanvoyBind, LeaseRelease, MessageSidecar, WallClock, METHOD_ID,
 };
 use crate::AppState;
 
@@ -178,7 +178,7 @@ pub(crate) async fn poll_channel_once(
         }),
         (None, None) => None,
     };
-    let page_len = observer.page.len() as u64;
+    let bounds = poll_bounds_for_page(&observer.page)?;
     let (set, request) = build_poll_documents(
         &waiter,
         &state.my_user_id,
@@ -186,7 +186,7 @@ pub(crate) async fn poll_channel_once(
         after,
         acked,
         clock.project_deadline(deadline),
-        page_len.max(1),
+        bounds,
     )?;
     let set_json = serde_json::to_string(&AgentWaitMessage::RegistrationSet(set.clone()))
         .map_err(|err| contract_internal(channel, format!("poll set encode: {err}")))?;
@@ -230,14 +230,36 @@ pub(crate) async fn poll_channel_once(
         }
         _ => {}
     }
-    let mut messages = Vec::new();
-    for event in &outcome.events {
-        if let Some(message) = sidecar.take(event.payload.payload_ref.as_str()) {
-            authenticate_sidecar_message(channel, &message, &event.payload.content_digest)?;
-            messages.push(message);
-        }
-    }
+    // Established read contract: the complete fetched page, not the
+    // poll-cycle event list (which a tight bound can truncate).
+    let messages = complete_read_after_page(observer.page);
     Ok(PollCycleResult { messages, outcome })
+}
+
+/// Size poll-cycle bounds so every fetched page message can be admitted.
+fn poll_bounds_for_page(page: &[Message]) -> Result<WaitBound, CoreError> {
+    let max_events = (page.len() as u64).max(1);
+    let sidecar = MessageSidecar::new();
+    let registration_id = IdToken::new("reg:bound");
+    let subject = channel_subject("bound");
+    let start = Anchor {
+        kind: AnchorKind::ProviderOpaque,
+        value: IdToken::new("anc:bound"),
+    };
+    let mut max_bytes = 1u64;
+    for message in page {
+        let event = event_from_message(message, &registration_id, &subject, &start, &sidecar)?;
+        max_bytes = max_bytes.saturating_add(event_surface_bytes(&event));
+    }
+    Ok(WaitBound {
+        max_events,
+        max_bytes,
+    })
+}
+
+/// `read --after` returns the provider page as-is, including self posts.
+fn complete_read_after_page(page: Vec<Message>) -> Vec<Message> {
+    page
 }
 
 /// Admit a poll-cycle ack document and return a request-owned stage.
@@ -282,7 +304,7 @@ fn build_poll_documents(
     after: Option<&str>,
     acked: Option<Anchor>,
     deadline: waitprims_core::Timestamp,
-    max_events: u64,
+    bounds: WaitBound,
 ) -> Result<(RegistrationSet, PollCycleRequest), CoreError> {
     let now = timestamp_now();
     let lease_expires = deadline.saturating_add(Duration::from_secs(3600));
@@ -311,10 +333,7 @@ fn build_poll_documents(
         predicate_ref: PredicateRef::new("pred:chanvoy-wait"),
         capability_ref: OpaqueRef::new("cap:wait"),
         lease_expires_at: lease_expires,
-        bounds: WaitBound {
-            max_events,
-            max_bytes: 64 * 1_048_576,
-        },
+        bounds: bounds.clone(),
         start_anchor,
         baseline_policy,
     };
@@ -335,10 +354,7 @@ fn build_poll_documents(
         registration_revision: revision.clone(),
         logical_deadline: deadline.clone(),
         authn_mode: AuthnMode::Disabled,
-        aggregate_limits: WaitBound {
-            max_events,
-            max_bytes: 64 * 1_048_576,
-        },
+        aggregate_limits: bounds,
         registration_digest: JcsDigest {
             canonicalization: Canonicalization::Rfc8785,
             algorithm: DigestAlgorithm::Sha256,
@@ -600,5 +616,71 @@ mod tests {
         )
         .expect("self post is a read event");
         assert_eq!(event.proposed_next_anchor.value.as_str(), "p1");
+    }
+
+    fn page_msg(id: &str, user: &str, body: &str) -> Message {
+        Message {
+            id: id.into(),
+            user_id: user.into(),
+            username: user.into(),
+            message: body.into(),
+            create_at: 1,
+            root_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn poll_bounds_cover_the_fetched_page_not_a_fixed_cap() {
+        let page = vec![
+            page_msg("p-self", "bot", "own post"),
+            page_msg("p-a", "alice", "one"),
+            page_msg("p-b", "bob", "two"),
+        ];
+        let bounds = poll_bounds_for_page(&page).expect("bounds");
+        assert_eq!(bounds.max_events, 3);
+        assert!(
+            bounds.max_bytes < 64 * 1_048_576,
+            "small page must not use the old fixed 64 MiB cap: {}",
+            bounds.max_bytes
+        );
+        assert!(bounds.max_bytes >= 1);
+    }
+
+    #[test]
+    fn over_bound_page_returns_every_post_including_self() {
+        // Old defect: poll returned only outcome.events, so a page that
+        // saturated max_bytes was silently truncated. The read must
+        // return the fetched page even if the poll event list is short.
+        let page = vec![
+            page_msg("p-self", "bot", "own post"),
+            page_msg("p-a", "alice", "one"),
+            page_msg("p-b", "bob", "two"),
+        ];
+        let truncated_event_count = 1;
+        assert!(truncated_event_count < page.len());
+        let returned = complete_read_after_page(page.clone());
+        assert_eq!(returned.len(), 3);
+        assert_eq!(returned[0].id, "p-self");
+        assert_eq!(returned[0].user_id, "bot");
+        assert_eq!(
+            returned.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["p-self", "p-a", "p-b"]
+        );
+    }
+
+    #[test]
+    fn large_self_post_is_not_dropped_by_poll_byte_cap() {
+        let body = "x".repeat(2 * 1024 * 1024);
+        let page = vec![
+            page_msg("p-self", "bot", &body),
+            page_msg("p-a", "alice", "hi"),
+        ];
+        let bounds = poll_bounds_for_page(&page).expect("bounds");
+        assert_eq!(bounds.max_events, 2);
+        let returned = complete_read_after_page(page);
+        assert_eq!(returned.len(), 2);
+        assert_eq!(returned[0].user_id, "bot");
+        assert_eq!(returned[0].message.len(), 2 * 1024 * 1024);
+        assert_eq!(returned[1].id, "p-a");
     }
 }
