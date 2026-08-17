@@ -50,6 +50,21 @@ struct FanArm {
     retained: Vec<chanvoy_core::Message>,
 }
 
+async fn wait_any_cancel(tokens: &[CancellationToken]) {
+    if tokens.is_empty() {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for token in tokens {
+        let token = token.clone();
+        set.spawn(async move {
+            token.cancelled().await;
+        });
+    }
+    let _ = set.join_next().await;
+}
+
 fn retained_may_restore(after_eligible: Option<&HashSet<String>>, post_id: &str) -> bool {
     match after_eligible {
         None => true,
@@ -184,6 +199,12 @@ impl MultiRelease {
     }
 }
 
+impl Drop for MultiRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct FanInObserver {
     state: AppState,
     arms: HashMap<String, FanArm>,
@@ -217,7 +238,7 @@ pub(crate) async fn wait_channels_first_match(
     drain_bus(&mut rx, &mut bus, "fan-in")?;
 
     let mut resolved_keys = Vec::new();
-    let mut arms = Vec::new();
+    let mut pending = Vec::new();
     let mut seen = HashSet::new();
     for arm in &params.arms {
         let selector = arm.selector();
@@ -233,76 +254,12 @@ pub(crate) async fn wait_channels_first_match(
                 "duplicate wait arm {qualified} (same canonical channel as another arm)"
             )));
         }
-        let baseline_fut = establish_baseline(
-            state,
-            &qualified,
-            &resolved.channel_id,
-            arm.after.as_deref(),
-            deadline,
-        );
-        let (scan, mut baseline) =
-            crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", baseline_fut)
-                .await
-                .map_err(|err| map_arm_err(&selector, err))?;
-        let after_eligible = if let Some(after) = arm.after.as_deref() {
-            let ch = resolved.channel_id.clone();
-            let a = after.to_string();
-            let page_fut = provider_retry(state, &qualified, deadline, || {
-                let ch = ch.clone();
-                let a = a.clone();
-                async move { state.client.posts_after_by_channel_id(&ch, &a).await }
-            });
-            let page =
-                crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", page_fut)
-                    .await
-                    .map_err(|err| map_arm_err(&selector, err))?;
-            Some(page.into_iter().map(|m| m.id).collect())
-        } else {
-            None
-        };
-        drain_bus(&mut rx, &mut bus, "fan-in")?;
-        let mut retained: Vec<chanvoy_core::Message> = bus
-            .iter()
-            .filter_map(|ev| match &ev.payload {
-                chanvoy_core::DaemonEventPayloadInner::Inbound(p)
-                    if p.channel_id == resolved.channel_id =>
-                {
-                    Some(inbound_to_message(p))
-                }
-                _ => None,
-            })
-            .collect();
-        for message in state.fanin_replay.peek(&resolved.channel_id)? {
-            if !retained.iter().any(|have| have.id == message.id) {
-                retained.push(message);
-            }
-        }
-        for msg in &retained {
-            baseline.remove(&msg.id);
-        }
-        let prebound = Some(cursor_from_baseline(scan, baseline));
-        let predicate = WaitPredicate::compile(
-            &state.my_user_id,
-            &resolved.channel_id,
-            params.contains.as_deref(),
-            params.pattern.as_deref(),
-        )?;
         resolved_keys.push((
             resolved.channel_id.clone(),
             resolved.team_name.clone(),
             resolved.channel_name.clone(),
         ));
-        arms.push(FanArm {
-            selector,
-            channel_id: resolved.channel_id,
-            channel: qualified,
-            after: arm.after.clone(),
-            prebound,
-            after_eligible,
-            monitored: channel_is_monitored(state, &arm.selector().channel),
-            predicate,
-            retained,
-        });
+        pending.push((selector, qualified, resolved.channel_id, arm.after.clone()));
     }
 
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -324,6 +281,91 @@ pub(crate) async fn wait_channels_first_match(
     }
     let session = session.expect("fan-in requires arms");
     let keys = MultiRelease::new(guards);
+
+    let mut built = Vec::new();
+    for (selector, qualified, channel_id, after) in pending {
+        let monitored = channel_is_monitored(state, selector.channel.as_str());
+        let baseline_fut =
+            establish_baseline(state, &qualified, &channel_id, after.as_deref(), deadline);
+        tokio::select! {
+            biased;
+            _ = wait_any_cancel(&member_cancels) => {
+                return Err(CoreError::WaitReplaced {
+                    wait_id: String::new(),
+                    replaced_by_wait_id: String::new(),
+                });
+            }
+            result = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", baseline_fut) => {
+                let (scan, baseline) = result.map_err(|err| map_arm_err(&selector, err))?;
+                let after_eligible = if let Some(after) = after.as_deref() {
+                    let ch = channel_id.clone();
+                    let a = after.to_string();
+                    let page_fut = provider_retry(state, &qualified, deadline, || {
+                        let ch = ch.clone();
+                        let a = a.clone();
+                        async move { state.client.posts_after_by_channel_id(&ch, &a).await }
+                    });
+                    tokio::select! {
+                        biased;
+                        _ = wait_any_cancel(&member_cancels) => {
+                            return Err(CoreError::WaitReplaced {
+                                wait_id: String::new(),
+                                replaced_by_wait_id: String::new(),
+                            });
+                        }
+                        page = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", page_fut) => {
+                            Some(page.map_err(|err| map_arm_err(&selector, err))?.into_iter().map(|m| m.id).collect())
+                        }
+                    }
+                } else {
+                    None
+                };
+                let predicate = WaitPredicate::compile(
+                    &state.my_user_id,
+                    &channel_id,
+                    params.contains.as_deref(),
+                    params.pattern.as_deref(),
+                )?;
+                built.push(FanArm {
+                    selector,
+                    channel_id,
+                    channel: qualified,
+                    after,
+                    prebound: Some(cursor_from_baseline(scan, baseline)),
+                    after_eligible,
+                    monitored,
+                    predicate,
+                    retained: Vec::new(),
+                });
+            }
+        }
+    }
+    drain_bus(&mut rx, &mut bus, "fan-in")?;
+    for arm in &mut built {
+        let mut retained: Vec<chanvoy_core::Message> = bus
+            .iter()
+            .filter_map(|ev| match &ev.payload {
+                chanvoy_core::DaemonEventPayloadInner::Inbound(p)
+                    if p.channel_id == arm.channel_id =>
+                {
+                    Some(inbound_to_message(p))
+                }
+                _ => None,
+            })
+            .collect();
+        for message in state.fanin_replay.peek(&arm.channel_id)? {
+            if !retained.iter().any(|have| have.id == message.id) {
+                retained.push(message);
+            }
+        }
+        if let Some((_, baseline)) = arm.prebound.as_mut() {
+            for msg in &retained {
+                baseline.remove(&msg.id);
+            }
+        }
+        arm.retained = retained;
+    }
+    let arms = built;
 
     let mut arm_map = HashMap::new();
     let mut subjects = Vec::new();

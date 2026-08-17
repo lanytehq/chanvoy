@@ -16,6 +16,7 @@ publish.workspace = true
 [dependencies]
 chanvoy-core = { path = "../chanvoy-core" }
 chanvoy-ipc = { path = "../chanvoy-ipc" }
+libc = "0.2"
 chrono = { workspace = true }
 dirs = { workspace = true }
 regex = { workspace = true }

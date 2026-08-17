@@ -97,29 +97,42 @@ fn poll_cursor_path(profile: &str) -> std::path::PathBuf {
 
 fn load_persisted(profile: &str) -> Result<BTreeMap<String, String>, CoreError> {
     let path = poll_cursor_path(profile);
-    match std::fs::read_to_string(&path) {
+    match chanvoy_core::read_tool_owned_file(&path, chanvoy_core::DEFAULT_MAX_BYTES) {
         Ok(raw) => serde_json::from_str(&raw)
             .map_err(|err| contract_internal("poll", format!("cursor decode: {err}"))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(err) => Err(contract_internal("poll", format!("cursor read: {err}"))),
+        Err(err) if err.is_not_found() => Ok(BTreeMap::new()),
+        Err(err) => Err(CoreError::from(err)),
     }
 }
 
 fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = chanvoy_core::default_chanvoy_config_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|err| contract_internal("poll", format!("cursor dir: {err}")))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|err| contract_internal("poll", format!("cursor dir mode: {err}")))?;
     let path = poll_cursor_path(profile);
-    let tmp = path.with_extension("json.tmp");
+    let tmp = dir.join(format!(
+        "poll-cursors-{profile}.{}.tmp",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
     let raw = serde_json::to_string(map)
         .map_err(|err| contract_internal("poll", format!("cursor encode: {err}")))?;
-    std::fs::write(&tmp, raw)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|err| contract_internal("poll", format!("cursor tmp create: {err}")))?;
+    file.write_all(raw.as_bytes())
         .map_err(|err| contract_internal("poll", format!("cursor tmp write: {err}")))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-        .map_err(|err| contract_internal("poll", format!("cursor tmp mode: {err}")))?;
+    file.sync_all()
+        .map_err(|err| contract_internal("poll", format!("cursor tmp sync: {err}")))?;
+    drop(file);
     std::fs::rename(&tmp, &path)
         .map_err(|err| contract_internal("poll", format!("cursor persist: {err}")))?;
     Ok(())
@@ -682,5 +695,61 @@ mod tests {
         assert_eq!(returned[0].user_id, "bot");
         assert_eq!(returned[0].message.len(), 2 * 1024 * 1024);
         assert_eq!(returned[1].id, "p-a");
+    }
+
+    #[test]
+    fn persist_creates_owner_only_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let profile = format!("poll-mode-{}", std::process::id());
+        let store = PollCursorStore::load(&profile).expect("empty");
+        store
+            .commit(StagedPollAck {
+                anchors: BTreeMap::from([("reg:poll:ch".into(), "post-a".into())]),
+            })
+            .expect("persist");
+        let path = poll_cursor_path(&profile);
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_regular_cursor_file_fails_closed() {
+        let profile = format!("poll-dir-{}", std::process::id());
+        let path = poll_cursor_path(&profile);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::create_dir(&path).expect("dir");
+        let err = match PollCursorStore::load(&profile) {
+            Ok(_) => panic!("directory must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, CoreError::SafeRead(chanvoy_core::SafeReadError::NonRegular { .. })),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn oversized_cursor_file_fails_closed() {
+        let profile = format!("poll-big-{}", std::process::id());
+        let path = poll_cursor_path(&profile);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let oversized = vec![b'x'; (chanvoy_core::DEFAULT_MAX_BYTES as usize) + 8];
+        std::fs::write(&path, oversized).expect("write");
+        let err = match PollCursorStore::load(&profile) {
+            Ok(_) => panic!("oversized must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, CoreError::SafeRead(chanvoy_core::SafeReadError::TooLarge { .. })),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
