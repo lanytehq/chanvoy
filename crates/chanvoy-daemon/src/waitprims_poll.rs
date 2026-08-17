@@ -132,20 +132,23 @@ impl PollCursorStore {
         Ok(())
     }
 
-    /// One durable commit for poll + attention. Holds the persist gate
-    /// through persist and poll-memory publish. Restart recovers the pair
-    /// from the txn if individual files were not rewritten.
+    /// One durable commit for poll + attention. Recovers a pending redo
+    /// into `live_attention` before the caller-supplied builder sees it,
+    /// so a later channel cannot snapshot a stale map and roll back a
+    /// recovered cursor. Holds the persist gate through persist and
+    /// poll-memory publish.
     pub(crate) fn commit_combined(
         &self,
         staged: StagedPollAck,
         live_attention: &mut AttentionState,
-        candidate: AttentionState,
+        build_candidate: impl FnOnce(&AttentionState) -> AttentionState,
     ) -> Result<(), CoreError> {
         let _gate = self
             .persist_gate
             .lock()
             .map_err(|_| contract_internal("poll", "persist lock"))?;
         self.apply_pending_txn_inner(live_attention)?;
+        let candidate = build_candidate(live_attention);
         let poll = {
             let map = self
                 .inner
@@ -183,10 +186,7 @@ impl PollCursorStore {
         self.apply_pending_txn_inner(attention)
     }
 
-    fn apply_pending_txn_inner(
-        &self,
-        attention: &mut AttentionState,
-    ) -> Result<bool, CoreError> {
+    fn apply_pending_txn_inner(&self, attention: &mut AttentionState) -> Result<bool, CoreError> {
         let Some(txn) = load_combined_txn(&self.profile)? else {
             return Ok(false);
         };
@@ -621,11 +621,9 @@ impl PollObserver {
                 }
                 Err(err) => {
                     let _ = self.last_error.lock().map(|mut slot| *slot = Some(err));
-                    return Err(waitprims_core::ValidationError::new(
-                        "/bind",
-                        "sidecar_digest",
-                    )
-                    .into());
+                    return Err(
+                        waitprims_core::ValidationError::new("/bind", "sidecar_digest").into(),
+                    );
                 }
             }
         }
@@ -967,7 +965,11 @@ mod tests {
         let attn_path = chanvoy_core::attention_state_path(&profile);
         assert!(attn_path.is_file());
         assert_eq!(
-            std::fs::metadata(&attn_path).expect("stat").permissions().mode() & 0o777,
+            std::fs::metadata(&attn_path)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         clear_combined_txn(&profile).expect("clear");
@@ -994,14 +996,13 @@ mod tests {
                 channel_name: "ops".into(),
             },
         );
-        let candidate = attn.clone();
         store
             .commit_combined(
                 StagedPollAck {
                     anchors: BTreeMap::from([("reg:poll:ch".into(), "p-old".into())]),
                 },
                 &mut attn,
-                candidate,
+                |live| live.clone(),
             )
             .expect("combined");
         store
@@ -1022,6 +1023,91 @@ mod tests {
             Some("p-new".into())
         );
         let _ = std::fs::remove_file(poll_cursor_path(&profile));
+        let _ = std::fs::remove_file(combined_txn_path(&profile));
+    }
+
+    fn sample_cursor(post_id: &str, channel: &str) -> chanvoy_core::ChannelCursorState {
+        chanvoy_core::ChannelCursorState {
+            last_seen_post_id: Some(post_id.into()),
+            updated_at: Some(1),
+            last_known_stale: false,
+            last_checked_at: None,
+            channel_id: channel.into(),
+            team_id: "t".into(),
+            team_name: "org".into(),
+            channel_name: channel.into(),
+        }
+    }
+
+    #[test]
+    fn combined_read_recovers_pending_before_later_channel_candidate() {
+        let profile = format!("poll-interleave-{}", std::process::id());
+        let mut recovered = chanvoy_core::AttentionState::default();
+        recovered
+            .channels
+            .insert("org/ops".into(), sample_cursor("p-attn", "ops"));
+        persist_combined_txn(
+            &profile,
+            &CombinedReadCursorTxn {
+                attention: recovered,
+                poll: BTreeMap::from([("reg:ops".into(), "p-ops".into())]),
+            },
+        )
+        .expect("pending txn left after failed materialize");
+        let store = PollCursorStore::load(&profile).expect("empty poll file");
+        let mut live = chanvoy_core::AttentionState::default();
+        store
+            .commit_combined(
+                StagedPollAck {
+                    anchors: BTreeMap::from([("reg:other".into(), "p-other".into())]),
+                },
+                &mut live,
+                |current| {
+                    let mut next = current.clone();
+                    next.channels
+                        .insert("org/other".into(), sample_cursor("p-other", "other"));
+                    next
+                },
+            )
+            .expect("later combined read");
+        assert_eq!(
+            live.channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-attn"),
+            "recovered attention cursor must survive a later channel"
+        );
+        assert_eq!(
+            live.channels
+                .get("org/other")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-other")
+        );
+        assert_eq!(
+            store.get("reg:ops").map(|a| a.value.as_str().to_string()),
+            Some("p-ops".into())
+        );
+        assert_eq!(
+            store.get("reg:other").map(|a| a.value.as_str().to_string()),
+            Some("p-other".into())
+        );
+        let reloaded = chanvoy_core::load_attention_state(&profile).expect("disk");
+        assert_eq!(
+            reloaded
+                .channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-attn")
+        );
+        assert_eq!(
+            reloaded
+                .channels
+                .get("org/other")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-other")
+        );
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
+        let _ = std::fs::remove_file(chanvoy_core::attention_state_path(&profile));
         let _ = std::fs::remove_file(combined_txn_path(&profile));
     }
 
@@ -1168,7 +1254,10 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            matches!(err, CoreError::SafeRead(chanvoy_core::SafeReadError::NonRegular { .. })),
+            matches!(
+                err,
+                CoreError::SafeRead(chanvoy_core::SafeReadError::NonRegular { .. })
+            ),
             "{err:?}"
         );
         let _ = std::fs::remove_dir_all(path);
@@ -1188,7 +1277,10 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            matches!(err, CoreError::SafeRead(chanvoy_core::SafeReadError::TooLarge { .. })),
+            matches!(
+                err,
+                CoreError::SafeRead(chanvoy_core::SafeReadError::TooLarge { .. })
+            ),
             "{err:?}"
         );
         let _ = std::fs::remove_file(path);

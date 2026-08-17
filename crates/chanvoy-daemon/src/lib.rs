@@ -1621,15 +1621,25 @@ fn attention_candidate(
     next
 }
 
+fn persist_then_publish_attention_state(
+    persist: impl FnOnce(&chanvoy_core::AttentionState) -> Result<(), CoreError>,
+    live: &mut chanvoy_core::AttentionState,
+    build: impl FnOnce(&chanvoy_core::AttentionState) -> chanvoy_core::AttentionState,
+) -> Result<(), CoreError> {
+    let candidate = build(live);
+    persist(&candidate)?;
+    *live = candidate;
+    Ok(())
+}
+
 fn persist_then_publish_attention(
     persist: impl FnOnce(&chanvoy_core::AttentionState) -> Result<(), CoreError>,
     live: &mut chanvoy_core::AttentionState,
     staged: StagedAttentionAdvance,
 ) -> Result<(), CoreError> {
-    let candidate = attention_candidate(live, staged);
-    persist(&candidate)?;
-    *live = candidate;
-    Ok(())
+    persist_then_publish_attention_state(persist, live, move |current| {
+        attention_candidate(current, staged)
+    })
 }
 
 async fn commit_staged_read_cursors(
@@ -1654,10 +1664,11 @@ async fn commit_staged_read_cursors(
         )?;
         return Ok(());
     }
-    let candidate = attention_candidate(&attn, advance);
     state
         .poll_cursors
-        .commit_combined(poll.expect("poll"), &mut attn, candidate)?;
+        .commit_combined(poll.expect("poll"), &mut attn, |current| {
+            attention_candidate(current, advance)
+        })?;
     Ok(())
 }
 
@@ -1897,6 +1908,100 @@ mod staged_cursor_tests {
             Some("p-new")
         );
     }
+
+    fn forced_persist_err() -> CoreError {
+        CoreError::WaitProviderDegraded {
+            channel: "attn".into(),
+            message: "forced persist fail".into(),
+        }
+    }
+
+    #[test]
+    fn ordinary_cursor_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.channels
+                    .insert("org/ops".into(), sample_advance().cursor);
+                next
+            },
+        );
+        assert!(err.is_err());
+        assert!(live.channels.is_empty());
+    }
+
+    #[test]
+    fn notification_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.mentions = chanvoy_core::MentionCursorState {
+                    last_seen_post_id: Some("mention-1".into()),
+                    updated_at: Some(1),
+                };
+                next
+            },
+        );
+        assert!(err.is_err());
+        assert!(live.mentions.last_seen_post_id.is_none());
+    }
+
+    #[test]
+    fn seed_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.channels
+                    .insert("org/seed".into(), sample_advance().cursor);
+                next
+            },
+        );
+        assert!(err.is_err());
+        assert!(live.channels.is_empty());
+    }
+
+    #[test]
+    fn staleness_persist_failure_does_not_publish_verdict() {
+        let mut live = chanvoy_core::AttentionState::default();
+        live.channels.insert(
+            "org/ops".into(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-old".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        );
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                if let Some(cursor) = next.channels.get_mut("org/ops") {
+                    cursor.last_known_stale = true;
+                    cursor.last_checked_at = Some(9);
+                }
+                next
+            },
+        );
+        assert!(err.is_err());
+        let cursor = live.channels.get("org/ops").expect("kept");
+        assert!(!cursor.last_known_stale);
+        assert!(cursor.last_checked_at.is_none());
+    }
 }
 
 fn require_elevated_profile(profile: &Profile) -> Result<(), CoreError> {
@@ -2075,21 +2180,25 @@ async fn record_channel_cursor(
     // Every cursor-write path is a staleness-clearing event per the
     // PER-008B D1 guardrail: the new cursor value is fresh, by definition
     // not stale, and has not yet been checked.
-    attention.channels.insert(
-        key,
-        chanvoy_core::ChannelCursorState {
-            last_seen_post_id: Some(post_id.to_string()),
-            updated_at: Some(chanvoy_core::now_unix_millis()),
-            last_known_stale: false,
-            last_checked_at: None,
-            channel_id: resolved.channel_id,
-            team_id: resolved.team_id,
-            team_name: resolved.team_name,
-            channel_name: resolved.channel_name,
+    let cursor = chanvoy_core::ChannelCursorState {
+        last_seen_post_id: Some(post_id.to_string()),
+        updated_at: Some(chanvoy_core::now_unix_millis()),
+        last_known_stale: false,
+        last_checked_at: None,
+        channel_id: resolved.channel_id,
+        team_id: resolved.team_id,
+        team_name: resolved.team_name,
+        channel_name: resolved.channel_name,
+    };
+    persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        move |current| {
+            let mut next = current.clone();
+            next.channels.insert(key, cursor);
+            next
         },
-    );
-    store_attention_state(&state.profile.name, &attention)?;
-    Ok(())
+    )
 }
 
 async fn record_notifications_cursor(
@@ -2101,12 +2210,19 @@ async fn record_notifications_cursor(
     };
 
     let mut attention = complete_pending_then_lock_attention(state).await?;
-    attention.mentions = chanvoy_core::MentionCursorState {
+    let mentions = chanvoy_core::MentionCursorState {
         last_seen_post_id: Some(last.message.id.clone()),
         updated_at: Some(chanvoy_core::now_unix_millis()),
     };
-    store_attention_state(&state.profile.name, &attention)?;
-    Ok(())
+    persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        move |current| {
+            let mut next = current.clone();
+            next.mentions = mentions;
+            next
+        },
+    )
 }
 
 /// Record a channel cursor only if none already exists for that channel.
@@ -2128,20 +2244,25 @@ async fn record_channel_cursor_if_absent(
         return Ok(false);
     }
     // A freshly-seeded cursor is by definition non-stale and unchecked.
-    attention.channels.insert(
-        key,
-        chanvoy_core::ChannelCursorState {
-            last_seen_post_id: Some(post_id.to_string()),
-            updated_at: Some(chanvoy_core::now_unix_millis()),
-            last_known_stale: false,
-            last_checked_at: None,
-            channel_id: resolved.channel_id,
-            team_id: resolved.team_id,
-            team_name: resolved.team_name,
-            channel_name: resolved.channel_name,
+    let cursor = chanvoy_core::ChannelCursorState {
+        last_seen_post_id: Some(post_id.to_string()),
+        updated_at: Some(chanvoy_core::now_unix_millis()),
+        last_known_stale: false,
+        last_checked_at: None,
+        channel_id: resolved.channel_id,
+        team_id: resolved.team_id,
+        team_name: resolved.team_name,
+        channel_name: resolved.channel_name,
+    };
+    persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        move |current| {
+            let mut next = current.clone();
+            next.channels.insert(key, cursor);
+            next
         },
-    );
-    store_attention_state(&state.profile.name, &attention)?;
+    )?;
     Ok(true)
 }
 
@@ -2191,12 +2312,22 @@ async fn record_staleness_verdict(
             return;
         }
     };
-    let Some(cursor) = attention.channels.get_mut(&key) else {
+    if !attention.channels.contains_key(&key) {
         return;
-    };
-    cursor.last_known_stale = stale;
-    cursor.last_checked_at = Some(chanvoy_core::now_unix_millis());
-    if let Err(err) = store_attention_state(&state.profile.name, &attention) {
+    }
+    let checked_at = chanvoy_core::now_unix_millis();
+    if let Err(err) = persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        |current| {
+            let mut next = current.clone();
+            if let Some(cursor) = next.channels.get_mut(&key) {
+                cursor.last_known_stale = stale;
+                cursor.last_checked_at = Some(checked_at);
+            }
+            next
+        },
+    ) {
         tracing::warn!(
             profile = %state.profile.name,
             channel = %channel,
