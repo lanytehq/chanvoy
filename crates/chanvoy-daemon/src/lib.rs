@@ -90,6 +90,7 @@ struct AppState {
     reduce_writer: Option<ReduceWriter>,
     wait_owners: Arc<wait_owner::WaitOwnerRegistry>,
     poll_cursors: waitprims_poll::PollCursorStore,
+    fanin_replay: waitprims_fanin::FanInReplayStore,
 }
 
 /// PER-035: a pre-built client bound to the family profile a stream
@@ -399,6 +400,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
         poll_cursors: waitprims_poll::PollCursorStore::load(&profile.name)
             .map_err(DaemonError::from)?,
+        fanin_replay: waitprims_fanin::FanInReplayStore::new(),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -602,6 +604,14 @@ async fn handle_client(
                         state.poll_cursors.commit(ack).map_err(DaemonError::from)?;
                     }
                 }
+                if let Some(consume) = dispatched.staged_fanin_consume {
+                    if response.error.is_none() {
+                        state
+                            .fanin_replay
+                            .consume(&consume.channel_id, &consume.post_id)
+                            .map_err(DaemonError::from)?;
+                    }
+                }
                 line.clear();
             }
             recv_result = async {
@@ -739,6 +749,7 @@ const LOCAL_ONLY_METHODS: &[&str] = &[
 struct DispatchOutcome {
     response: JsonRpcResponse,
     staged_poll_ack: Option<waitprims_poll::StagedPollAck>,
+    staged_fanin_consume: Option<waitprims_fanin::StagedFanInConsume>,
 }
 
 async fn dispatch_request(
@@ -762,10 +773,12 @@ async fn dispatch_request(
                 "identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.".to_string(),
             ),
             staged_poll_ack: None,
+            staged_fanin_consume: None,
         };
     }
 
     let mut staged_poll_ack = None;
+    let mut staged_fanin_consume = None;
     let response: Result<serde_json::Value, DaemonError> = match request.method.as_str() {
         "whoami" => state
             .client
@@ -1202,10 +1215,13 @@ async fn dispatch_request(
         }
         method if method == WAIT_CHANNELS_V1_METHOD => {
             match serde_json::from_value::<WaitChannelsParams>(request.params.clone()) {
-                Ok(params) => wait_channels::wait_channels_with_params(state, params)
-                    .await
-                    .map(to_value)
-                    .map_err(DaemonError::from),
+                Ok(params) => match wait_channels::wait_channels_with_params(state, params).await {
+                    Ok((result, consume)) => {
+                        staged_fanin_consume = consume;
+                        Ok(to_value(result))
+                    }
+                    Err(err) => Err(DaemonError::from(err)),
+                },
                 Err(err) => Err(DaemonError::Core(CoreError::WaitFilterInvalid(format!(
                     "wait_channels_v1 input: {err}"
                 )))),
@@ -1400,6 +1416,7 @@ async fn dispatch_request(
     DispatchOutcome {
         response,
         staged_poll_ack,
+        staged_fanin_consume,
     }
 }
 

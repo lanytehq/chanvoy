@@ -83,7 +83,13 @@ impl FanInRetain {
 pub async fn wait_channels_with_params(
     state: &AppState,
     params: WaitChannelsParams,
-) -> Result<WaitChannelsResult, CoreError> {
+) -> Result<
+    (
+        WaitChannelsResult,
+        Option<crate::waitprims_fanin::StagedFanInConsume>,
+    ),
+    CoreError,
+> {
     crate::waitprims_fanin::wait_channels_first_match(state, params).await
 }
 

@@ -57,6 +57,115 @@ fn retained_may_restore(after_eligible: Option<&HashSet<String>>, post_id: &str)
     }
 }
 
+/// Request-independent fan-in replay. Tie losers and unused restored
+/// matches stay here until a later wait's successful RPC write consumes
+/// them.
+#[derive(Clone, Default)]
+pub(crate) struct FanInReplayStore {
+    inner: Arc<Mutex<HashMap<String, VecDeque<chanvoy_core::Message>>>>,
+}
+
+impl FanInReplayStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn stash(
+        &self,
+        channel_id: &str,
+        message: chanvoy_core::Message,
+    ) -> Result<(), CoreError> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| contract_internal("fan-in", "replay lock"))?;
+        let queue = map.entry(channel_id.to_string()).or_default();
+        if queue.iter().any(|have| have.id == message.id) {
+            return Ok(());
+        }
+        queue.push_back(message);
+        Ok(())
+    }
+
+    pub(crate) fn peek(&self, channel_id: &str) -> Result<Vec<chanvoy_core::Message>, CoreError> {
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| contract_internal("fan-in", "replay lock"))?;
+        Ok(map
+            .get(channel_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn consume(&self, channel_id: &str, post_id: &str) -> Result<(), CoreError> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| contract_internal("fan-in", "replay lock"))?;
+        let Some(queue) = map.get_mut(channel_id) else {
+            return Ok(());
+        };
+        queue.retain(|message| message.id != post_id);
+        if queue.is_empty() {
+            map.remove(channel_id);
+        }
+        Ok(())
+    }
+}
+
+/// Consume a replayed match only after the RPC write succeeds.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedFanInConsume {
+    pub channel_id: String,
+    pub post_id: String,
+}
+
+/// Abort the member-cancel watcher on drop, including client EOF.
+struct WatcherAbort {
+    stop: CancellationToken,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl WatcherAbort {
+    fn spawn(
+        member_cancels: Vec<CancellationToken>,
+        any_cancel: Cancel,
+        stop: CancellationToken,
+    ) -> Self {
+        let watcher_stop = stop.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = watcher_stop.cancelled() => {}
+                _ = async {
+                    let mut set = tokio::task::JoinSet::new();
+                    for token in member_cancels {
+                        set.spawn(async move {
+                            token.cancelled().await;
+                        });
+                    }
+                    let _ = set.join_next().await;
+                } => {
+                    any_cancel.trigger();
+                }
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for WatcherAbort {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 struct MultiRelease {
     guards: Mutex<Vec<WaitGuard>>,
 }
@@ -92,7 +201,7 @@ struct FanInObserver {
 pub(crate) async fn wait_channels_first_match(
     state: &AppState,
     params: WaitChannelsParams,
-) -> Result<WaitChannelsResult, CoreError> {
+) -> Result<(WaitChannelsResult, Option<StagedFanInConsume>), CoreError> {
     let _tie = TIE_RULE;
     let _ = _tie;
     validate_wait_channels_params(&params)?;
@@ -152,7 +261,7 @@ pub(crate) async fn wait_channels_first_match(
             None
         };
         drain_bus(&mut rx, &mut bus, "fan-in")?;
-        let retained: Vec<chanvoy_core::Message> = bus
+        let mut retained: Vec<chanvoy_core::Message> = bus
             .iter()
             .filter_map(|ev| match &ev.payload {
                 chanvoy_core::DaemonEventPayloadInner::Inbound(p)
@@ -163,6 +272,11 @@ pub(crate) async fn wait_channels_first_match(
                 _ => None,
             })
             .collect();
+        for message in state.fanin_replay.peek(&resolved.channel_id)? {
+            if !retained.iter().any(|have| have.id == message.id) {
+                retained.push(message);
+            }
+        }
         for msg in &retained {
             baseline.remove(&msg.id);
         }
@@ -251,28 +365,8 @@ pub(crate) async fn wait_channels_first_match(
     };
     let wp_cancel = Cancel::new();
     let _fwd = CancelForward::spawn(lease_cancel, wp_cancel.clone());
-    let any_cancel = wp_cancel.clone();
-    let watcher_done = CancellationToken::new();
-    let watcher_stop = watcher_done.clone();
-    let watcher = tokio::spawn(async move {
-        tokio::select! {
-            _ = watcher_stop.cancelled() => {}
-            _ = async {
-                let mut set = tokio::task::JoinSet::new();
-                for token in member_cancels {
-                    set.spawn(async move {
-                        token.cancelled().await;
-                    });
-                }
-                let _ = set.join_next().await;
-            } => {
-                any_cancel.trigger();
-            }
-        }
-    });
+    let _watcher = WatcherAbort::spawn(member_cancels, wp_cancel.clone(), CancellationToken::new());
     let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel).await;
-    watcher_done.cancel();
-    watcher.abort();
     inner_cancel.cancel();
     keys.release();
     let outcome = outcome.map_err(|err| map_waitprims_err("fan-in", err))?;
@@ -414,7 +508,7 @@ fn translate_fanin_outcome(
     sidecar: &MessageSidecar,
     last_error: &Mutex<Option<CoreError>>,
     subjects: &[(String, WaitChannelSelector, String)],
-) -> Result<WaitChannelsResult, CoreError> {
+) -> Result<(WaitChannelsResult, Option<StagedFanInConsume>), CoreError> {
     let channels: Vec<WaitChannelSelector> = params.arms.iter().map(|a| a.selector()).collect();
     match outcome.outcome_kind {
         OutcomeKind::Events | OutcomeKind::Partial => {
@@ -429,12 +523,19 @@ fn translate_fanin_outcome(
                 })?;
             authenticate_sidecar_message("fan-in", &message, &event.payload.content_digest)?;
             let subject = event.subject_id.as_str();
-            let selector = subjects
+            let (selector, channel_id) = subjects
                 .iter()
                 .find(|(s, _, _)| s == subject)
-                .map(|(_, sel, _)| sel.clone())
+                .map(|(_, sel, channel_id)| (sel.clone(), channel_id.clone()))
                 .ok_or_else(|| contract_internal("fan-in", "matched subject has no arm"))?;
-            Ok(WaitChannelsResult::match_one(channels, selector, message))
+            let consume = StagedFanInConsume {
+                channel_id,
+                post_id: message.id.clone(),
+            };
+            Ok((
+                WaitChannelsResult::match_one(channels, selector, message),
+                Some(consume),
+            ))
         }
         OutcomeKind::LogicalDeadman | OutcomeKind::NoChange => {
             Err(CoreError::WaitTimeout("fan-in".into()))
@@ -511,7 +612,7 @@ impl Observer for FanInObserver {
             if !retained_may_restore(arm.after_eligible.as_ref(), &message.id) {
                 continue;
             }
-            if let Ok(Some(event)) = event_from_foreign_message(
+            match event_from_foreign_message(
                 message,
                 &self.my_user_id,
                 &registration.registration_id,
@@ -519,7 +620,17 @@ impl Observer for FanInObserver {
                 &resolved_start,
                 &self.sidecar,
             ) {
-                let _ = self.restore_ready(&bind, Observation::Event(Box::new(event)));
+                Ok(None) => {}
+                Ok(Some(event)) => {
+                    self.restore_ready(&bind, Observation::Event(Box::new(event)))?;
+                }
+                Err(_) => {
+                    return Err(waitprims_core::ValidationError::new(
+                        "/bind",
+                        "sidecar_digest",
+                    )
+                    .into());
+                }
             }
         }
         Ok(bind)
@@ -605,6 +716,21 @@ impl Observer for FanInObserver {
     fn restore_ready(&self, bind: &Self::Bind, obs: Observation) -> waitprims_core::Result<()> {
         if matches!(obs, Observation::Idle) {
             return Ok(());
+        }
+        if let Observation::Event(event) = &obs {
+            let channel_id = bind
+                .subject_id
+                .as_str()
+                .strip_prefix("channel:")
+                .unwrap_or(bind.subject_id.as_str());
+            if let Some(message) = self.sidecar.get(event.payload.payload_ref.as_str()) {
+                self.state
+                    .fanin_replay
+                    .stash(channel_id, message)
+                    .map_err(|_| {
+                        waitprims_core::ValidationError::new("/restore_ready", "replay_store")
+                    })?;
+            }
         }
         let key = bind.registration_id().as_str().to_string();
         let mut slots = self
@@ -693,5 +819,53 @@ mod tests {
         assert!(retained_may_restore(Some(&eligible), "post-after"));
         assert!(!retained_may_restore(Some(&eligible), "post-before"));
         assert!(retained_may_restore(None, "post-before"));
+    }
+
+    fn replay_msg(id: &str) -> chanvoy_core::Message {
+        chanvoy_core::Message {
+            id: id.into(),
+            user_id: "alice".into(),
+            username: "alice".into(),
+            message: "body".into(),
+            create_at: 1,
+            root_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn fanin_replay_store_survives_request_and_consumes_on_ack() {
+        let store = FanInReplayStore::new();
+        store.stash("ch-1", replay_msg("p-loser")).expect("stash");
+        store.stash("ch-1", replay_msg("p-loser")).expect("dedupe");
+        assert_eq!(store.peek("ch-1").expect("peek").len(), 1);
+        store.consume("ch-1", "p-loser").expect("consume");
+        assert!(store.peek("ch-1").expect("empty").is_empty());
+    }
+
+    #[tokio::test]
+    async fn member_cancel_watcher_aborts_on_drop() {
+        let parked = CancellationToken::new();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_task = started.clone();
+        let finished_task = finished.clone();
+        let parked_task = parked.clone();
+        let handle = tokio::spawn(async move {
+            started_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            parked_task.cancelled().await;
+            finished_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let guard = WatcherAbort {
+            stop: CancellationToken::new(),
+            handle: Some(handle),
+        };
+        tokio::task::yield_now().await;
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "aborted watcher must not complete the parked wait"
+        );
     }
 }

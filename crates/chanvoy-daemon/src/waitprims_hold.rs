@@ -268,6 +268,13 @@ impl MessageSidecar {
             .ok()
             .and_then(|mut map| map.remove(payload_ref))
     }
+
+    pub(crate) fn get(&self, payload_ref: &str) -> Option<Message> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|map| map.get(payload_ref).cloned())
+    }
 }
 
 pub(crate) fn payload_ref_for(message: &Message) -> String {
