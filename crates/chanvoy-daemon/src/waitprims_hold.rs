@@ -300,23 +300,20 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Filter self-authored posts before constructing `Observation::Event`.
-pub(crate) fn event_from_foreign_message(
+/// Sidecar a provider message as a waitprims event. Includes self-authored
+/// posts — callers that must ignore self use [`event_from_foreign_message`].
+pub(crate) fn event_from_message(
     message: &Message,
-    my_user_id: &str,
     registration_id: &IdToken,
     subject_id: &IdToken,
     start: &Anchor,
     sidecar: &MessageSidecar,
-) -> Result<Option<WaitEvent>, CoreError> {
-    if message.user_id == my_user_id {
-        return Ok(None);
-    }
+) -> Result<WaitEvent, CoreError> {
     let payload_ref = payload_ref_for(message);
     sidecar.store(&payload_ref, message.clone());
     let observed = timestamp_now();
     let digest = content_digest_for(message)?;
-    Ok(Some(WaitEvent {
+    Ok(WaitEvent {
         event_id: IdToken::new(format!("evt:{}", message.id)),
         registration_id: registration_id.clone(),
         source_instance_ref: OpaqueRef::new("source:chanvoy-daemon"),
@@ -340,7 +337,22 @@ pub(crate) fn event_from_foreign_message(
         },
         delivery_ref: None,
         activation_ref: None,
-    }))
+    })
+}
+
+/// Filter self-authored posts before constructing `Observation::Event`.
+pub(crate) fn event_from_foreign_message(
+    message: &Message,
+    my_user_id: &str,
+    registration_id: &IdToken,
+    subject_id: &IdToken,
+    start: &Anchor,
+    sidecar: &MessageSidecar,
+) -> Result<Option<WaitEvent>, CoreError> {
+    if message.user_id == my_user_id {
+        return Ok(None);
+    }
+    event_from_message(message, registration_id, subject_id, start, sidecar).map(Some)
 }
 
 pub(crate) fn authenticate_sidecar_message(

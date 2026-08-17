@@ -397,7 +397,8 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         identity_drift,
         reduce_writer,
         wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
-        poll_cursors: waitprims_poll::PollCursorStore::load(&profile.name),
+        poll_cursors: waitprims_poll::PollCursorStore::load(&profile.name)
+            .map_err(DaemonError::from)?,
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -567,10 +568,10 @@ async fn handle_client(
                 } else {
                     None
                 };
-                let response = if is_wait_rpc(&request.method) {
+                let dispatched = if is_wait_rpc(&request.method) {
                     let mut eof_buf = String::new();
                     tokio::select! {
-                        response = dispatch_request(request, &state, &shutdown_tx) => response,
+                        dispatched = dispatch_request(request, &state, &shutdown_tx) => dispatched,
                         peek = reader.read_line(&mut eof_buf) => {
                             let _ = peek?;
                             break;
@@ -579,6 +580,7 @@ async fn handle_client(
                 } else {
                     dispatch_request(request, &state, &shutdown_tx).await
                 };
+                let response = dispatched.response;
 
                 if let Some(sub_ack) = extract_subscription_id(&response.result) {
                     client_sub_ids.push(sub_ack);
@@ -595,10 +597,10 @@ async fn handle_client(
                     .write_all(serde_json::to_string(&response)?.as_bytes())
                     .await?;
                 writer.write_all(b"\n").await?;
-                if response.error.is_none() {
-                    state.poll_cursors.commit_staged().map_err(DaemonError::from)?;
-                } else {
-                    state.poll_cursors.drop_staged();
+                if let Some(ack) = dispatched.staged_poll_ack {
+                    if response.error.is_none() {
+                        state.poll_cursors.commit(ack).map_err(DaemonError::from)?;
+                    }
                 }
                 line.clear();
             }
@@ -734,11 +736,16 @@ const LOCAL_ONLY_METHODS: &[&str] = &[
     "shutdown",
 ];
 
+struct DispatchOutcome {
+    response: JsonRpcResponse,
+    staged_poll_ack: Option<waitprims_poll::StagedPollAck>,
+}
+
 async fn dispatch_request(
     request: JsonRpcRequest,
     state: &AppState,
     shutdown_tx: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
-) -> JsonRpcResponse {
+) -> DispatchOutcome {
     // PER-014 drift gate. If the post-bind probe (or any later
     // `daemon_status` probe) caught the bot's Mattermost identity
     // diverging from the configured `bot_username`, network-backed RPCs
@@ -748,13 +755,17 @@ async fn dispatch_request(
     // drift-floor framing (#per-014, 2026-04-27).
     let method = request.method.as_str();
     if state.identity_drift.load(Ordering::Relaxed) && !LOCAL_ONLY_METHODS.contains(&method) {
-        return rpc_error(
-            request.id,
-            -32_000,
-            "identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.".to_string(),
-        );
+        return DispatchOutcome {
+            response: rpc_error(
+                request.id,
+                -32_000,
+                "identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.".to_string(),
+            ),
+            staged_poll_ack: None,
+        };
     }
 
+    let mut staged_poll_ack = None;
     let response: Result<serde_json::Value, DaemonError> = match request.method.as_str() {
         "whoami" => state
             .client
@@ -780,80 +791,17 @@ async fn dispatch_request(
             .await
             .map(to_value)
             .map_err(DaemonError::from),
-        "read_channel" => parse_and_call(&request.params, |params: ReadChannelParams| async move {
-            let team = params.team.as_deref();
-            // PER-023 Scope §2 + AC #2a: bootstrap mode hits MM directly
-            // for bounded-most-recent-N posts (default N=50, --limit
-            // override). Mode-independent of --since/--after/etc.; CLI
-            // enforces mutual exclusion.
-            let mut messages = if params.since_bootstrap {
-                let limit = params.limit.unwrap_or(50);
-                state
-                    .client
-                    .read_channel_most_recent(&params.channel, limit, team)
-                    .await?
-            } else if let Some(after_post_id) = params.after_post_id {
-                let resolved = state.client.resolve_channel(&params.channel, team).await?;
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                let cycle = waitprims_poll::poll_channel_once(
-                    state,
-                    &state.poll_cursors,
-                    &params.channel,
-                    &resolved.channel_id,
-                    Some(&after_post_id),
-                    deadline,
-                )
-                .await?;
-                waitprims_poll::ack_poll_cycle(
-                    &state.poll_cursors,
-                    &cycle.outcome,
-                    &format!("poll:{}", resolved.channel_id),
-                    &state.my_user_id,
-                )?;
-                cycle.messages
-            } else if params.since_last_mine {
-                state
-                    .client
-                    .read_channel_since_last_mine(&params.channel, team)
-                    .await?
-            } else if let Some(secs) = params.since_secs {
-                state
-                    .client
-                    .read_channel_since_secs(&params.channel, secs, team)
-                    .await?
-            } else {
-                state
-                    .client
-                    .read_channel(&params.channel, params.since_minutes.unwrap_or(60), team)
-                    .await?
-            };
-            // PER-023 Scope §2 + AC #2a: general --limit truncates the
-            // existing read-mode result set (hard cap; no full-window
-            // pagination semantics added by PER-023). Bootstrap already
-            // applied the limit at the API layer, so this no-ops there.
-            if let Some(limit) = params.limit {
-                if !params.since_bootstrap {
-                    let limit = limit as usize;
-                    if messages.len() > limit {
-                        // Keep the most-recent N — sort is ascending by
-                        // create_at, so truncate from the front.
-                        let drop = messages.len() - limit;
-                        messages.drain(..drop);
-                    }
+        "read_channel" => match serde_json::from_value::<ReadChannelParams>(request.params.clone())
+        {
+            Ok(params) => match read_channel_rpc(state, params).await {
+                Ok((messages, ack)) => {
+                    staged_poll_ack = ack;
+                    Ok(to_value(messages))
                 }
-            }
-            // PER-023 Scope §4 + AC #4: --advance advances the cursor
-            // to the latest post **returned** (mode-independent rule).
-            // No-op when zero posts returned.
-            if params.advance {
-                if let Some(latest) = messages.last() {
-                    record_channel_cursor(state, &params.channel, &latest.id, team).await?;
-                }
-            }
-            Ok::<_, CoreError>(messages)
-        })
-        .await
-        .map(to_value),
+                Err(err) => Err(DaemonError::from(err)),
+            },
+            Err(err) => Err(DaemonError::from(err)),
+        },
         "pinned_channel" => {
             parse_and_call(&request.params, |params: PinnedChannelParams| async move {
                 state
@@ -1442,12 +1390,16 @@ async fn dispatch_request(
         }),
     };
 
-    match response {
+    let response = match response {
         Ok(value) => rpc_result(request.id, value),
         Err(error) => {
             let (code, message, data) = error_payload(&error);
             rpc_error_with_data(request.id, code, message, data)
         }
+    };
+    DispatchOutcome {
+        response,
+        staged_poll_ack,
     }
 }
 
@@ -1499,6 +1451,83 @@ fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> 
             message: format!("could not read the thread for post {requested_post_id}"),
         },
     }
+}
+
+async fn read_channel_rpc(
+    state: &AppState,
+    params: ReadChannelParams,
+) -> Result<(Vec<chanvoy_core::Message>, Option<waitprims_poll::StagedPollAck>), CoreError> {
+    let team = params.team.as_deref();
+    // PER-023 Scope §2 + AC #2a: bootstrap mode hits MM directly
+    // for bounded-most-recent-N posts (default N=50, --limit
+    // override). Mode-independent of --since/--after/etc.; CLI
+    // enforces mutual exclusion.
+    let mut staged = None;
+    let mut messages = if params.since_bootstrap {
+        let limit = params.limit.unwrap_or(50);
+        state
+            .client
+            .read_channel_most_recent(&params.channel, limit, team)
+            .await?
+    } else if let Some(after_post_id) = params.after_post_id {
+        let resolved = state.client.resolve_channel(&params.channel, team).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let cycle = waitprims_poll::poll_channel_once(
+            state,
+            &state.poll_cursors,
+            &params.channel,
+            &resolved.channel_id,
+            Some(&after_post_id),
+            team,
+            deadline,
+        )
+        .await?;
+        staged = Some(waitprims_poll::ack_poll_cycle(
+            &cycle.outcome,
+            &format!("poll:{}", resolved.channel_id),
+            &state.my_user_id,
+        )?);
+        cycle.messages
+    } else if params.since_last_mine {
+        state
+            .client
+            .read_channel_since_last_mine(&params.channel, team)
+            .await?
+    } else if let Some(secs) = params.since_secs {
+        state
+            .client
+            .read_channel_since_secs(&params.channel, secs, team)
+            .await?
+    } else {
+        state
+            .client
+            .read_channel(&params.channel, params.since_minutes.unwrap_or(60), team)
+            .await?
+    };
+    // PER-023 Scope §2 + AC #2a: general --limit truncates the
+    // existing read-mode result set (hard cap; no full-window
+    // pagination semantics added by PER-023). Bootstrap already
+    // applied the limit at the API layer, so this no-ops there.
+    if let Some(limit) = params.limit {
+        if !params.since_bootstrap {
+            let limit = limit as usize;
+            if messages.len() > limit {
+                // Keep the most-recent N — sort is ascending by
+                // create_at, so truncate from the front.
+                let drop = messages.len() - limit;
+                messages.drain(..drop);
+            }
+        }
+    }
+    // PER-023 Scope §4 + AC #4: --advance advances the cursor
+    // to the latest post **returned** (mode-independent rule).
+    // No-op when zero posts returned.
+    if params.advance {
+        if let Some(latest) = messages.last() {
+            record_channel_cursor(state, &params.channel, &latest.id, team).await?;
+        }
+    }
+    Ok((messages, staged))
 }
 
 async fn parse_and_call<P, F, Fut, T>(params: &serde_json::Value, func: F) -> Result<T, DaemonError>

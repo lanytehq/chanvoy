@@ -36,8 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`chanvoy wait` waitprims hold (local A2).** Fan-in
   `wait_channels_v1` is one `run_first_match` registration set
   (tie = registration order). Grok-bot / no-listener uses one
-  `run_poll_cycle` per wake; cursors stay uncommitted until
-  `poll_cycle_ack`. `restore_ready` is `Result` and fail-closed.
+  `run_poll_cycle` per wake; `read --after` still returns the
+  complete provider page (including self-authored posts); cursors
+  stay uncommitted until a request-owned `poll_cycle_ack` after a
+  successful RPC write. `restore_ready` is `Result` and fail-closed.
   A1 single-channel `wait_channel_v3` remains. Path-dep on
   waitprims `f12e707` — not for origin/main.
 

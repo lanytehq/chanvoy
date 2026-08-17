@@ -44,9 +44,17 @@ struct FanArm {
     channel: String,
     after: Option<String>,
     prebound: Option<(Anchor, HashSet<String>)>,
+    after_eligible: Option<HashSet<String>>,
     monitored: bool,
     predicate: WaitPredicate,
     retained: Vec<chanvoy_core::Message>,
+}
+
+fn retained_may_restore(after_eligible: Option<&HashSet<String>>, post_id: &str) -> bool {
+    match after_eligible {
+        None => true,
+        Some(set) => set.contains(post_id),
+    }
 }
 
 struct MultiRelease {
@@ -127,6 +135,22 @@ pub(crate) async fn wait_channels_first_match(
             crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", baseline_fut)
                 .await
                 .map_err(|err| map_arm_err(&selector, err))?;
+        let after_eligible = if let Some(after) = arm.after.as_deref() {
+            let ch = resolved.channel_id.clone();
+            let a = after.to_string();
+            let page_fut = provider_retry(state, &qualified, deadline, || {
+                let ch = ch.clone();
+                let a = a.clone();
+                async move { state.client.posts_after_by_channel_id(&ch, &a).await }
+            });
+            let page =
+                crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", page_fut)
+                    .await
+                    .map_err(|err| map_arm_err(&selector, err))?;
+            Some(page.into_iter().map(|m| m.id).collect())
+        } else {
+            None
+        };
         drain_bus(&mut rx, &mut bus, "fan-in")?;
         let retained: Vec<chanvoy_core::Message> = bus
             .iter()
@@ -160,6 +184,7 @@ pub(crate) async fn wait_channels_first_match(
             channel: qualified,
             after: arm.after.clone(),
             prebound,
+            after_eligible,
             monitored: channel_is_monitored(state, &arm.selector().channel),
             predicate,
             retained,
@@ -227,22 +252,31 @@ pub(crate) async fn wait_channels_first_match(
     let wp_cancel = Cancel::new();
     let _fwd = CancelForward::spawn(lease_cancel, wp_cancel.clone());
     let any_cancel = wp_cancel.clone();
-    tokio::spawn(async move {
-        let mut set = tokio::task::JoinSet::new();
-        for token in member_cancels {
-            set.spawn(async move {
-                token.cancelled().await;
-            });
+    let watcher_done = CancellationToken::new();
+    let watcher_stop = watcher_done.clone();
+    let watcher = tokio::spawn(async move {
+        tokio::select! {
+            _ = watcher_stop.cancelled() => {}
+            _ = async {
+                let mut set = tokio::task::JoinSet::new();
+                for token in member_cancels {
+                    set.spawn(async move {
+                        token.cancelled().await;
+                    });
+                }
+                let _ = set.join_next().await;
+            } => {
+                any_cancel.trigger();
+            }
         }
-        let _ = set.join_next().await;
-        any_cancel.trigger();
     });
-    let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel)
-        .await
-        .map_err(|err| map_waitprims_err("fan-in", err))?;
-    let outcome = admit_wait_result(&docs, outcome)?;
+    let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel).await;
+    watcher_done.cancel();
+    watcher.abort();
     inner_cancel.cancel();
     keys.release();
+    let outcome = outcome.map_err(|err| map_waitprims_err("fan-in", err))?;
+    let outcome = admit_wait_result(&docs, outcome)?;
     translate_fanin_outcome(outcome, &params, &sidecar, &last_error, &subjects)
 }
 
@@ -474,6 +508,9 @@ impl Observer for FanInObserver {
             if !arm.predicate.matches_message(message) {
                 continue;
             }
+            if !retained_may_restore(arm.after_eligible.as_ref(), &message.id) {
+                continue;
+            }
             if let Ok(Some(event)) = event_from_foreign_message(
                 message,
                 &self.my_user_id,
@@ -647,5 +684,14 @@ mod tests {
         );
         let timeout = map_arm_err(&sel, CoreError::WaitTimeout("other".into()));
         assert!(matches!(timeout, CoreError::WaitTimeout(_)));
+    }
+
+    #[test]
+    fn explicit_after_retained_needs_posts_after_eligibility() {
+        let mut eligible = HashSet::new();
+        eligible.insert("post-after".into());
+        assert!(retained_may_restore(Some(&eligible), "post-after"));
+        assert!(!retained_may_restore(Some(&eligible), "post-before"));
+        assert!(retained_may_restore(None, "post-before"));
     }
 }

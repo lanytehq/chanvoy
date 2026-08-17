@@ -20,14 +20,10 @@ use waitprims_core::{
     PollCycleOutcome, PollCycleRequest, PredicateRef, Registration, RegistrationSet, WaitBound,
 };
 
-use crate::wait::{
-    channel_is_monitored, establish_baseline, wait_push_from_cursor, wait_rest_from_cursor,
-    WaitPredicate,
-};
 use crate::waitprims_hold::{
-    authenticate_sidecar_message, channel_subject, classify_bind_core_error, contract_internal,
-    cursor_from_baseline, event_from_foreign_message, map_waitprims_err, scan_cursor_from_bind,
-    timestamp_now, ChanvoyBind, LeaseRelease, MessageSidecar, WallClock, METHOD_ID,
+    authenticate_sidecar_message, channel_subject, contract_internal, event_from_message,
+    map_waitprims_err, timestamp_now, ChanvoyBind, LeaseRelease, MessageSidecar, WallClock,
+    METHOD_ID,
 };
 use crate::AppState;
 
@@ -36,23 +32,29 @@ pub(crate) fn poll_ack_retention_is_fail_closed() -> bool {
     POLL_ACK_RETENTION.contains("not committed until poll_cycle_ack")
 }
 
+/// Request-owned poll acknowledgement. Commit only after the same
+/// connection has written the matching RPC response.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedPollAck {
+    anchors: BTreeMap<String, String>,
+}
+
 /// Last-acked cursors. Never advanced by an unacked outcome. Persisted
 /// under the profile config dir so a restart cannot skip an unacked cycle.
 #[derive(Clone)]
 pub(crate) struct PollCursorStore {
     profile: String,
     inner: Arc<Mutex<BTreeMap<String, String>>>,
-    pending: Arc<Mutex<Option<BTreeMap<String, String>>>>,
+    persist_gate: Arc<Mutex<()>>,
 }
 
 impl PollCursorStore {
-    pub(crate) fn load(profile: &str) -> Self {
-        let map = load_persisted(profile);
-        Self {
+    pub(crate) fn load(profile: &str) -> Result<Self, CoreError> {
+        Ok(Self {
             profile: profile.to_string(),
-            inner: Arc::new(Mutex::new(map)),
-            pending: Arc::new(Mutex::new(None)),
-        }
+            inner: Arc::new(Mutex::new(load_persisted(profile)?)),
+            persist_gate: Arc::new(Mutex::new(())),
+        })
     }
 
     pub(crate) fn get(&self, registration_id: &str) -> Option<Anchor> {
@@ -66,50 +68,26 @@ impl PollCursorStore {
             })
     }
 
-    #[cfg(test)]
-    pub(crate) fn commit(&self, anchors: BTreeMap<String, Anchor>) -> Result<(), CoreError> {
-        let mut map = self
-            .inner
+    pub(crate) fn commit(&self, staged: StagedPollAck) -> Result<(), CoreError> {
+        let _gate = self
+            .persist_gate
             .lock()
-            .map_err(|_| contract_internal("poll", "cursor store lock"))?;
-        for (key, anchor) in anchors {
-            map.insert(key, anchor.value.as_str().to_string());
-        }
-        persist(&self.profile, &map)
-    }
-
-    pub(crate) fn stage(&self, anchors: BTreeMap<String, Anchor>) {
-        if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(
-                anchors
-                    .into_iter()
-                    .map(|(k, a)| (k, a.value.as_str().to_string()))
-                    .collect(),
-            );
-        }
-    }
-
-    pub(crate) fn commit_staged(&self) -> Result<(), CoreError> {
-        let staged = self
-            .pending
-            .lock()
-            .map_err(|_| contract_internal("poll", "pending lock"))?
-            .take();
-        let Some(staged) = staged else {
-            return Ok(());
+            .map_err(|_| contract_internal("poll", "persist lock"))?;
+        let candidate = {
+            let map = self
+                .inner
+                .lock()
+                .map_err(|_| contract_internal("poll", "cursor store lock"))?;
+            let mut candidate = map.clone();
+            candidate.extend(staged.anchors);
+            candidate
         };
-        let mut map = self
+        persist(&self.profile, &candidate)?;
+        *self
             .inner
             .lock()
-            .map_err(|_| contract_internal("poll", "cursor store lock"))?;
-        map.extend(staged);
-        persist(&self.profile, &map)
-    }
-
-    pub(crate) fn drop_staged(&self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            *pending = None;
-        }
+            .map_err(|_| contract_internal("poll", "cursor store lock"))? = candidate;
+        Ok(())
     }
 }
 
@@ -117,12 +95,14 @@ fn poll_cursor_path(profile: &str) -> std::path::PathBuf {
     chanvoy_core::default_chanvoy_config_dir().join(format!("poll-cursors-{profile}.json"))
 }
 
-fn load_persisted(profile: &str) -> BTreeMap<String, String> {
+fn load_persisted(profile: &str) -> Result<BTreeMap<String, String>, CoreError> {
     let path = poll_cursor_path(profile);
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|err| contract_internal("poll", format!("cursor decode: {err}"))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(err) => Err(contract_internal("poll", format!("cursor read: {err}"))),
+    }
 }
 
 fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreError> {
@@ -130,14 +110,16 @@ fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreErro
     let dir = chanvoy_core::default_chanvoy_config_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|err| contract_internal("poll", format!("cursor dir: {err}")))?;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|err| contract_internal("poll", format!("cursor dir mode: {err}")))?;
     let path = poll_cursor_path(profile);
     let tmp = path.with_extension("json.tmp");
     let raw = serde_json::to_string(map)
         .map_err(|err| contract_internal("poll", format!("cursor encode: {err}")))?;
     std::fs::write(&tmp, raw)
         .map_err(|err| contract_internal("poll", format!("cursor tmp write: {err}")))?;
-    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .map_err(|err| contract_internal("poll", format!("cursor tmp mode: {err}")))?;
     std::fs::rename(&tmp, &path)
         .map_err(|err| contract_internal("poll", format!("cursor persist: {err}")))?;
     Ok(())
@@ -149,34 +131,39 @@ pub(crate) struct PollCycleResult {
 }
 
 /// One no-listener poll cycle. Does not commit cursors. Caller must
-/// [`ack_poll_cycle`] after consuming messages.
+/// [`ack_poll_cycle`] after the matching RPC write succeeds.
 pub(crate) async fn poll_channel_once(
     state: &AppState,
     store: &PollCursorStore,
     channel: &str,
     channel_id: &str,
     after: Option<&str>,
+    team: Option<&str>,
     deadline: Instant,
 ) -> Result<PollCycleResult, CoreError> {
     let _retention = POLL_ACK_RETENTION;
     let _ = _retention;
-    let predicate = WaitPredicate::compile(&state.my_user_id, channel_id, None, None)?;
+    // Preserve established `read --after` semantics: the complete
+    // provider page after the anchor, including self-authored posts.
+    let page = match after {
+        Some(anchor) => {
+            state
+                .client
+                .read_channel_after(channel, anchor, team)
+                .await?
+        }
+        None => Vec::new(),
+    };
     let sidecar = MessageSidecar::new();
     let last_error = Arc::new(Mutex::new(None));
     let inner_cancel = CancellationToken::new();
     let observer = PollObserver {
-        state: state.clone(),
-        channel: channel.to_string(),
-        channel_id: channel_id.to_string(),
-        after: after.map(str::to_string),
-        monitored: channel_is_monitored(state, channel),
-        predicate,
-        deadline,
-        my_user_id: state.my_user_id.clone(),
+        page,
         sidecar: sidecar.clone(),
         last_error: Arc::clone(&last_error),
         inner_cancel: inner_cancel.clone(),
         restored: Mutex::new(Vec::new()),
+        page_loaded: Mutex::new(false),
     };
     let clock = WallClock::new();
     let waiter = format!("poll:{}", channel_id);
@@ -191,6 +178,7 @@ pub(crate) async fn poll_channel_once(
         }),
         (None, None) => None,
     };
+    let page_len = observer.page.len() as u64;
     let (set, request) = build_poll_documents(
         &waiter,
         &state.my_user_id,
@@ -198,6 +186,7 @@ pub(crate) async fn poll_channel_once(
         after,
         acked,
         clock.project_deadline(deadline),
+        page_len.max(1),
     )?;
     let set_json = serde_json::to_string(&AgentWaitMessage::RegistrationSet(set.clone()))
         .map_err(|err| contract_internal(channel, format!("poll set encode: {err}")))?;
@@ -251,14 +240,13 @@ pub(crate) async fn poll_channel_once(
     Ok(PollCycleResult { messages, outcome })
 }
 
-/// Commit only the supplied anchors. An unacked outcome must not have
-/// called this.
+/// Admit a poll-cycle ack document and return a request-owned stage.
+/// The caller commits only after the matching RPC write succeeds.
 pub(crate) fn ack_poll_cycle(
-    store: &PollCursorStore,
     outcome: &PollCycleOutcome,
     waiter: &str,
     my_user_id: &str,
-) -> Result<(), CoreError> {
+) -> Result<StagedPollAck, CoreError> {
     let ack = PollCycleAck {
         capabilities: vec![CapabilityToken::new("contract: agent-wait/v0")],
         message_id: IdToken::new(format!("ack:{}", outcome.message_id.as_str())),
@@ -278,8 +266,13 @@ pub(crate) fn ack_poll_cycle(
         .map_err(|err| contract_internal("poll", format!("ack encode: {err}")))?;
     waitprims_core::validate_message(&json)
         .map_err(|err| contract_internal("poll", format!("ack admission: {err}")))?;
-    store.stage(outcome.retained_through.clone());
-    Ok(())
+    Ok(StagedPollAck {
+        anchors: outcome
+            .retained_through
+            .iter()
+            .map(|(k, a)| (k.clone(), a.value.as_str().to_string()))
+            .collect(),
+    })
 }
 
 fn build_poll_documents(
@@ -289,6 +282,7 @@ fn build_poll_documents(
     after: Option<&str>,
     acked: Option<Anchor>,
     deadline: waitprims_core::Timestamp,
+    max_events: u64,
 ) -> Result<(RegistrationSet, PollCycleRequest), CoreError> {
     let now = timestamp_now();
     let lease_expires = deadline.saturating_add(Duration::from_secs(3600));
@@ -318,8 +312,8 @@ fn build_poll_documents(
         capability_ref: OpaqueRef::new("cap:wait"),
         lease_expires_at: lease_expires,
         bounds: WaitBound {
-            max_events: 32,
-            max_bytes: 1_048_576,
+            max_events,
+            max_bytes: 64 * 1_048_576,
         },
         start_anchor,
         baseline_policy,
@@ -342,8 +336,8 @@ fn build_poll_documents(
         logical_deadline: deadline.clone(),
         authn_mode: AuthnMode::Disabled,
         aggregate_limits: WaitBound {
-            max_events: 32,
-            max_bytes: 1_048_576,
+            max_events,
+            max_bytes: 64 * 1_048_576,
         },
         registration_digest: JcsDigest {
             canonicalization: Canonicalization::Rfc8785,
@@ -382,18 +376,63 @@ fn build_poll_documents(
 }
 
 struct PollObserver {
-    state: AppState,
-    channel: String,
-    channel_id: String,
-    after: Option<String>,
-    monitored: bool,
-    predicate: WaitPredicate,
-    deadline: Instant,
-    my_user_id: String,
+    page: Vec<Message>,
     sidecar: MessageSidecar,
     last_error: Arc<Mutex<Option<CoreError>>>,
     inner_cancel: CancellationToken,
     restored: Mutex<Vec<Observation>>,
+    page_loaded: Mutex<bool>,
+}
+
+impl PollObserver {
+    fn take_restored(&self) -> Option<Observation> {
+        self.restored.lock().ok().and_then(|mut q| {
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        })
+    }
+
+    fn enqueue_page(&self, bind: &ChanvoyBind) -> waitprims_core::Result<()> {
+        let mut loaded = self
+            .page_loaded
+            .lock()
+            .map_err(|_| waitprims_core::ValidationError::new("/bind", "lock_poisoned"))?;
+        if *loaded {
+            return Ok(());
+        }
+        *loaded = true;
+        drop(loaded);
+        for message in &self.page {
+            match event_from_message(
+                message,
+                bind.registration_id(),
+                &channel_subject(
+                    bind.subject_id
+                        .as_str()
+                        .strip_prefix("channel:")
+                        .unwrap_or(bind.subject_id.as_str()),
+                ),
+                bind.resolved_start(),
+                &self.sidecar,
+            ) {
+                Ok(event) => {
+                    self.restore_ready(bind, Observation::Event(Box::new(event)))?;
+                }
+                Err(err) => {
+                    let _ = self.last_error.lock().map(|mut slot| *slot = Some(err));
+                    return Err(waitprims_core::ValidationError::new(
+                        "/bind",
+                        "sidecar_digest",
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Observer for PollObserver {
@@ -403,110 +442,28 @@ impl Observer for PollObserver {
         &self,
         registration: &waitprims_core::Registration,
     ) -> waitprims_core::Result<Self::Bind> {
-        let after = registration
-            .start_anchor
-            .as_ref()
-            .map(|anchor| anchor.value.as_str().to_string());
-        let (scan, baseline) = establish_baseline(
-            &self.state,
-            &self.channel,
-            &self.channel_id,
-            after.as_deref(),
-            self.deadline,
-        )
-        .await
-        .map_err(|err| {
-            let _ = self
-                .last_error
-                .lock()
-                .map(|mut slot| *slot = Some(classify_bind_core_error(err)));
-            waitprims_core::ValidationError::new("/bind", "provider")
-        })?;
-        let (resolved_start, rest_baseline) = cursor_from_baseline(scan, baseline);
-        Ok(ChanvoyBind {
+        let resolved_start = registration.start_anchor.clone().unwrap_or(Anchor {
+            kind: AnchorKind::ProviderOpaque,
+            value: IdToken::new("anc:empty-at-arm"),
+        });
+        let bind = ChanvoyBind {
             registration_id: registration.registration_id.clone(),
             subject_id: registration.subject_id.clone(),
             resolved_start,
-            rest_baseline,
+            rest_baseline: Default::default(),
             release: Arc::new(LeaseRelease::noop()),
             inner_cancel: self.inner_cancel.clone(),
-        })
+        };
+        self.enqueue_page(&bind)?;
+        Ok(bind)
     }
 
     async fn next(&self, bind: &Self::Bind) -> waitprims_core::Result<Observation> {
-        if let Some(obs) = self.restored.lock().ok().and_then(|mut q| {
-            if q.is_empty() {
-                None
-            } else {
-                Some(q.remove(0))
-            }
-        }) {
-            return Ok(obs);
+        let _ = bind;
+        if self.inner_cancel.is_cancelled() {
+            return Ok(Observation::Idle);
         }
-        let engine = async {
-            if self.monitored {
-                wait_push_from_cursor(
-                    &self.state,
-                    &self.channel,
-                    &self.predicate,
-                    self.after.as_deref(),
-                    scan_cursor_from_bind(bind.resolved_start()),
-                    self.deadline,
-                )
-                .await
-            } else {
-                wait_rest_from_cursor(
-                    &self.state,
-                    &self.channel,
-                    &self.predicate,
-                    scan_cursor_from_bind(bind.resolved_start()),
-                    bind.rest_baseline.clone(),
-                    self.deadline,
-                )
-                .await
-            }
-        };
-        let result = tokio::select! {
-            biased;
-            _ = self.inner_cancel.cancelled() => return Ok(Observation::Idle),
-            res = engine => res,
-        };
-        match result {
-            Ok(wr) => {
-                let Some(message) = wr.messages.into_iter().next() else {
-                    return Ok(Observation::Idle);
-                };
-                match event_from_foreign_message(
-                    &message,
-                    &self.my_user_id,
-                    bind.registration_id(),
-                    &channel_subject(
-                        bind.subject_id
-                            .as_str()
-                            .strip_prefix("channel:")
-                            .unwrap_or(bind.subject_id.as_str()),
-                    ),
-                    bind.resolved_start(),
-                    &self.sidecar,
-                ) {
-                    Ok(Some(event)) => Ok(Observation::Event(Box::new(event))),
-                    Ok(None) => Ok(Observation::Idle),
-                    Err(err) => {
-                        let _ = self.last_error.lock().map(|mut slot| *slot = Some(err));
-                        Ok(Observation::Failed {
-                            reason_code: IdToken::new("sidecar_digest"),
-                        })
-                    }
-                }
-            }
-            Err(CoreError::WaitTimeout(_)) => Ok(Observation::Idle),
-            Err(err) => {
-                let _ = self.last_error.lock().map(|mut slot| *slot = Some(err));
-                Ok(Observation::Degraded {
-                    reason_code: IdToken::new("provider_degraded"),
-                })
-            }
-        }
+        Ok(self.take_restored().unwrap_or(Observation::Idle))
     }
 
     async fn cancel(&self, _bind: &Self::Bind) -> waitprims_core::Result<()> {
@@ -515,13 +472,7 @@ impl Observer for PollObserver {
     }
 
     fn poll_ready(&self, _bind: &Self::Bind) -> Option<Observation> {
-        self.restored.lock().ok().and_then(|mut q| {
-            if q.is_empty() {
-                None
-            } else {
-                Some(q.remove(0))
-            }
-        })
+        self.take_restored()
     }
 
     fn restore_ready(&self, _bind: &Self::Bind, obs: Observation) -> waitprims_core::Result<()> {
@@ -549,16 +500,14 @@ mod tests {
     #[test]
     fn unacked_outcome_does_not_advance_store() {
         let profile = format!("poll-test-{}", std::process::id());
-        let store = PollCursorStore::load(&profile);
+        let store = PollCursorStore::load(&profile).expect("empty store");
         assert!(store.get("reg:poll:ch").is_none());
-        let proposed = Anchor {
-            kind: AnchorKind::ProviderOpaque,
-            value: IdToken::new("post-new"),
-        };
         store
-            .commit(BTreeMap::from([("reg:poll:ch".into(), proposed)]))
+            .commit(StagedPollAck {
+                anchors: BTreeMap::from([("reg:poll:ch".into(), "post-new".into())]),
+            })
             .expect("persist");
-        let reloaded = PollCursorStore::load(&profile);
+        let reloaded = PollCursorStore::load(&profile).expect("reload");
         assert_eq!(
             reloaded
                 .get("reg:poll:ch")
@@ -566,5 +515,90 @@ mod tests {
             Some("post-new".into())
         );
         let _ = std::fs::remove_file(poll_cursor_path(&profile));
+    }
+
+    #[test]
+    fn corrupt_cursor_file_fails_closed() {
+        let profile = format!("poll-corrupt-{}", std::process::id());
+        let path = poll_cursor_path(&profile);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, "not-json").expect("write garbage");
+        let err = match PollCursorStore::load(&profile) {
+            Ok(_) => panic!("corrupt must fail"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, CoreError::WaitProviderDegraded { .. }));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persist_failure_does_not_advance_memory() {
+        let profile = format!("poll-persist-fail-{}", std::process::id());
+        let store = PollCursorStore::load(&profile).expect("empty store");
+        store
+            .commit(StagedPollAck {
+                anchors: BTreeMap::from([("reg:poll:ch".into(), "post-old".into())]),
+            })
+            .expect("first persist");
+        let path = poll_cursor_path(&profile);
+        std::fs::remove_file(&path).expect("remove file");
+        std::fs::create_dir(&path).expect("block persist path");
+        let err = store.commit(StagedPollAck {
+            anchors: BTreeMap::from([("reg:poll:ch".into(), "post-new".into())]),
+        });
+        assert!(err.is_err(), "persist over a directory must fail");
+        assert_eq!(
+            store
+                .get("reg:poll:ch")
+                .map(|a| a.value.as_str().to_string()),
+            Some("post-old".into())
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn ack_is_request_owned_and_does_not_touch_store() {
+        let profile = format!("poll-ack-owned-{}", std::process::id());
+        let store = PollCursorStore::load(&profile).expect("empty");
+        let staged = StagedPollAck {
+            anchors: BTreeMap::from([("reg:poll:ch".into(), "post-a".into())]),
+        };
+        assert!(store.get("reg:poll:ch").is_none());
+        store.commit(staged).expect("commit explicit");
+        assert_eq!(
+            store
+                .get("reg:poll:ch")
+                .map(|a| a.value.as_str().to_string()),
+            Some("post-a".into())
+        );
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
+    }
+
+    #[test]
+    fn event_from_message_includes_self_posts() {
+        let sidecar = MessageSidecar::new();
+        let me = "user-me";
+        let message = Message {
+            id: "p1".into(),
+            user_id: me.into(),
+            username: "me".into(),
+            message: "own post".into(),
+            create_at: 1,
+            root_id: "p1".into(),
+        };
+        let event = event_from_message(
+            &message,
+            &IdToken::new("reg:1"),
+            &channel_subject("ch"),
+            &Anchor {
+                kind: AnchorKind::ProviderOpaque,
+                value: IdToken::new("after"),
+            },
+            &sidecar,
+        )
+        .expect("self post is a read event");
+        assert_eq!(event.proposed_next_anchor.value.as_str(), "p1");
     }
 }
