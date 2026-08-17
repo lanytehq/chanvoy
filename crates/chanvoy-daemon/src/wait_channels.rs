@@ -84,6 +84,14 @@ pub async fn wait_channels_with_params(
     state: &AppState,
     params: WaitChannelsParams,
 ) -> Result<WaitChannelsResult, CoreError> {
+    crate::waitprims_fanin::wait_channels_first_match(state, params).await
+}
+
+#[allow(dead_code)]
+async fn wait_channels_legacy_unused(
+    state: &AppState,
+    params: WaitChannelsParams,
+) -> Result<WaitChannelsResult, CoreError> {
     validate_wait_channels_params(&params)?;
     WaitPredicate::compile(
         "pending",

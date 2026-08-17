@@ -33,11 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`chanvoy wait` waitprims hold (local A2).** Fan-in
+  `wait_channels_v1` is one `run_first_match` registration set
+  (tie = registration order). Grok-bot / no-listener uses one
+  `run_poll_cycle` per wake; cursors stay uncommitted until
+  `poll_cycle_ack`. `restore_ready` is `Result` and fail-closed.
+  A1 single-channel `wait_channel_v3` remains. Path-dep on
+  waitprims `f12e707` — not for origin/main.
+
 - **`chanvoy wait` waitprims hold (local A1).** Single-channel
   `wait_channel_v3` is driven by `waitprims-async::run_first_match`
   over the existing daemon stream. MCP `wait` single and CLI
-  `chanvoy wait <channel>` keep the same RPC bodies. Multi-channel
-  fan-in and poll stay on their current engines. Local path
+  `chanvoy wait <channel>` keep the same RPC bodies. Local path
   dependency only — not for origin/main.
 
 - **`chanvoy mcp`.** MCP 2026-07-28 access face on the existing profile

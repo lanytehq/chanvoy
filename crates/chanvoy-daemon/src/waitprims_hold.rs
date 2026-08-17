@@ -3,10 +3,11 @@
 //!
 //! The adapter lives only in this crate. `chanvoy-core` public types and
 //! `chanvoy-mcp` take no waitprims dependency. Legacy `wait_channel` /
-//! `wait_channel_v2` and fan-in (`wait_channels_v1`) stay on their
-//! established engines. Observation uses the existing daemon stream: the
-//! event bus on monitored channels, REST from a bind-resolved cursor
-//! otherwise. No second Mattermost client or per-wait WebSocket.
+//! `wait_channel_v2` stay on their established engines. A2 fan-in
+//! (`wait_channels_v1`) uses multi-arm `run_first_match`. Observation
+//! uses the existing daemon stream: the event bus on monitored
+//! channels, REST from a bind-resolved cursor otherwise. No second
+//! Mattermost client or per-wait WebSocket.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,12 +57,12 @@ pub(crate) struct FirstMatchWait<'a> {
 
 /// Forwards lease cancellation into waitprims `Cancel`. Abort on drop so a
 /// completed wait does not leave a dormant task parked on the lease token.
-struct CancelForward {
+pub(crate) struct CancelForward {
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl CancelForward {
-    fn spawn(lease_cancel: CancellationToken, wp: Cancel) -> Self {
+    pub(crate) fn spawn(lease_cancel: CancellationToken, wp: Cancel) -> Self {
         Self {
             handle: tokio::spawn(async move {
                 lease_cancel.cancelled().await;
@@ -122,6 +123,7 @@ pub(crate) async fn run_single_channel_first_match(
         release: Arc::clone(&release),
         inner_cancel: inner_cancel.clone(),
         observed: AtomicBool::new(false),
+        restored: Mutex::new(HashMap::new()),
     };
 
     let clock = WallClock::new();
@@ -218,6 +220,12 @@ impl LeaseRelease {
         }
     }
 
+    pub(crate) fn noop() -> Self {
+        Self {
+            guard: Mutex::new(None),
+        }
+    }
+
     pub(crate) fn release(&self) {
         if let Ok(mut slot) = self.guard.lock() {
             slot.take();
@@ -266,7 +274,7 @@ pub(crate) fn payload_ref_for(message: &Message) -> String {
     format!("msg:{}", message.id)
 }
 
-fn contract_internal(channel: &str, detail: impl std::fmt::Display) -> CoreError {
+pub(crate) fn contract_internal(channel: &str, detail: impl std::fmt::Display) -> CoreError {
     CoreError::WaitProviderDegraded {
         channel: channel.to_string(),
         message: format!("waitprims contract: {detail}"),
@@ -425,7 +433,7 @@ pub(crate) fn named_failure(channel: &str, reason: &str) -> CoreError {
     }
 }
 
-fn map_waitprims_err(channel: &str, _err: waitprims_core::Error) -> CoreError {
+pub(crate) fn map_waitprims_err(channel: &str, _err: waitprims_core::Error) -> CoreError {
     CoreError::WaitProviderDegraded {
         channel: channel.to_string(),
         message: "waitprims runner failed".into(),
@@ -644,14 +652,16 @@ struct ChanvoyWaitObserver {
     release: Arc<LeaseRelease>,
     inner_cancel: CancellationToken,
     observed: AtomicBool,
+    restored: Mutex<HashMap<String, std::collections::VecDeque<Observation>>>,
 }
 
-struct ChanvoyBind {
-    registration_id: IdToken,
-    resolved_start: Anchor,
-    rest_baseline: HashSet<String>,
-    release: Arc<LeaseRelease>,
-    inner_cancel: CancellationToken,
+pub(crate) struct ChanvoyBind {
+    pub(crate) registration_id: IdToken,
+    pub(crate) subject_id: IdToken,
+    pub(crate) resolved_start: Anchor,
+    pub(crate) rest_baseline: HashSet<String>,
+    pub(crate) release: Arc<LeaseRelease>,
+    pub(crate) inner_cancel: CancellationToken,
 }
 
 impl Drop for ChanvoyBind {
@@ -672,6 +682,15 @@ impl BindHandle for ChanvoyBind {
 }
 
 impl ChanvoyWaitObserver {
+    fn take_restored(&self, bind: &ChanvoyBind) -> Option<Observation> {
+        let key = bind.registration_id().as_str();
+        self.restored
+            .lock()
+            .ok()?
+            .get_mut(key)
+            .and_then(std::collections::VecDeque::pop_front)
+    }
+
     fn remember(&self, err: CoreError) {
         if let Ok(mut slot) = self.last_error.lock() {
             *slot = Some(err);
@@ -751,6 +770,7 @@ impl Observer for ChanvoyWaitObserver {
     async fn bind(&self, registration: &Registration) -> waitprims_core::Result<Self::Bind> {
         Ok(ChanvoyBind {
             registration_id: registration.registration_id.clone(),
+            subject_id: registration.subject_id.clone(),
             resolved_start: self.resolved_start.clone(),
             rest_baseline: self.rest_baseline.clone(),
             release: Arc::clone(&self.release),
@@ -759,6 +779,9 @@ impl Observer for ChanvoyWaitObserver {
     }
 
     async fn next(&self, bind: &Self::Bind) -> waitprims_core::Result<Observation> {
+        if let Some(obs) = self.take_restored(bind) {
+            return Ok(obs);
+        }
         if self.observed.swap(true, Ordering::SeqCst) {
             return Ok(Observation::Idle);
         }
@@ -808,13 +831,21 @@ impl Observer for ChanvoyWaitObserver {
         Ok(())
     }
 
-    fn poll_ready(&self, _bind: &Self::Bind) -> Option<Observation> {
-        None
+    fn poll_ready(&self, bind: &Self::Bind) -> Option<Observation> {
+        self.take_restored(bind)
     }
 
-    fn restore_ready(&self, _bind: &Self::Bind, _obs: Observation) {
-        // A1 does not dequeue from poll_ready. Required by the Observer
-        // contract; single-registration first-match never needs replay.
+    fn restore_ready(&self, bind: &Self::Bind, obs: Observation) -> waitprims_core::Result<()> {
+        if matches!(obs, Observation::Idle) {
+            return Ok(());
+        }
+        let key = bind.registration_id().as_str().to_string();
+        let mut slots = self
+            .restored
+            .lock()
+            .map_err(|_| waitprims_core::ValidationError::new("/restore_ready", "lock_poisoned"))?;
+        slots.entry(key).or_default().push_back(obs);
+        Ok(())
     }
 }
 

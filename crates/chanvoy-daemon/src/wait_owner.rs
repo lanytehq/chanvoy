@@ -370,6 +370,31 @@ impl WaitOwnerRegistry {
         }
     }
 
+    /// Acquire every key or release those already taken. Refusal happens
+    /// before the caller starts additional provider observation.
+    pub async fn acquire_all(
+        self: &Arc<Self>,
+        keys: &[(String, String, String)],
+        remaining: Duration,
+    ) -> Result<Vec<WaitLease>, CoreError> {
+        let mut held = Vec::with_capacity(keys.len());
+        for (channel_id, team, channel) in keys {
+            match self
+                .acquire(channel_id, team, channel, None, remaining)
+                .await
+            {
+                Ok(lease) => held.push(lease),
+                Err(err) => {
+                    for lease in held {
+                        drop(lease.into_guard());
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(held)
+    }
+
     fn install_locked(
         self: &Arc<Self>,
         inner: &mut Inner,
