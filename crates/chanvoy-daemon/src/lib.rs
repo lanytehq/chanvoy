@@ -1656,9 +1656,7 @@ async fn commit_staged_read_cursors(
     let candidate = attention_candidate(&attn, advance);
     state
         .poll_cursors
-        .commit_combined(poll.expect("poll"), &candidate)?;
-    *attn = candidate;
-    let _ = store_attention_state(&profile, &attn);
+        .commit_combined(poll.expect("poll"), &mut attn, candidate)?;
     Ok(())
 }
 

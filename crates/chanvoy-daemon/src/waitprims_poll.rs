@@ -127,7 +127,8 @@ impl PollCursorStore {
     pub(crate) fn commit_combined(
         &self,
         staged: StagedPollAck,
-        attention: &AttentionState,
+        live_attention: &mut AttentionState,
+        candidate: AttentionState,
     ) -> Result<(), CoreError> {
         let _gate = self
             .persist_gate
@@ -145,15 +146,17 @@ impl PollCursorStore {
         persist_combined_txn(
             &self.profile,
             &CombinedReadCursorTxn {
-                attention: attention.clone(),
+                attention: candidate.clone(),
                 poll: poll.clone(),
             },
         )?;
+        materialize_canonical(&self.profile, &candidate, &poll)?;
         *self
             .inner
             .lock()
-            .map_err(|_| contract_internal("poll", "cursor store lock"))? = poll.clone();
-        let _ = persist(&self.profile, &poll);
+            .map_err(|_| contract_internal("poll", "cursor store lock"))? = poll;
+        *live_attention = candidate;
+        clear_combined_txn(&self.profile)?;
         Ok(())
     }
 
@@ -164,10 +167,10 @@ impl PollCursorStore {
         let Some(txn) = load_combined_txn(&self.profile)? else {
             return Ok(false);
         };
-        *attention = txn.attention.clone();
-        self.publish(txn.poll.clone())?;
-        let _ = persist(&self.profile, &txn.poll);
-        let _ = chanvoy_core::store_attention_state(&self.profile, attention);
+        materialize_canonical(&self.profile, &txn.attention, &txn.poll)?;
+        *attention = txn.attention;
+        self.publish(txn.poll)?;
+        clear_combined_txn(&self.profile)?;
         Ok(true)
     }
 }
@@ -186,6 +189,24 @@ fn persist_combined_txn(profile: &str, txn: &CombinedReadCursorTxn) -> Result<()
     let raw = serde_json::to_string(txn)
         .map_err(|err| contract_internal("poll", format!("txn encode: {err}")))?;
     persist_bytes(&combined_txn_path(profile), raw.as_bytes())
+}
+
+fn materialize_canonical(
+    profile: &str,
+    attention: &AttentionState,
+    poll: &BTreeMap<String, String>,
+) -> Result<(), CoreError> {
+    persist(profile, poll)?;
+    chanvoy_core::store_attention_state(profile, attention).map(|_| ())
+}
+
+fn clear_combined_txn(profile: &str) -> Result<(), CoreError> {
+    let path = combined_txn_path(profile);
+    match std::fs::remove_file(&path) {
+        Ok(()) => fsync_dir(&chanvoy_core::default_chanvoy_config_dir()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(contract_internal("poll", format!("txn clear: {err}"))),
+    }
 }
 
 fn load_combined_txn(profile: &str) -> Result<Option<CombinedReadCursorTxn>, CoreError> {
@@ -877,8 +898,57 @@ mod tests {
                 .map(|a| a.value.as_str().to_string()),
             Some("p-poll".into())
         );
-        let _ = std::fs::remove_file(combined_txn_path(&profile));
+        assert!(
+            !combined_txn_path(&profile).exists(),
+            "recovery must clear the redo record"
+        );
         let _ = std::fs::remove_file(poll_cursor_path(&profile));
+    }
+
+    #[test]
+    fn later_poll_only_commit_survives_restart_after_combined() {
+        let profile = format!("poll-later-{}", std::process::id());
+        let store = PollCursorStore::load(&profile).expect("empty");
+        let mut attn = chanvoy_core::AttentionState::default();
+        attn.channels.insert(
+            "org/ops".into(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-attn".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        );
+        let candidate = attn.clone();
+        store
+            .commit_combined(
+                StagedPollAck {
+                    anchors: BTreeMap::from([("reg:poll:ch".into(), "p-old".into())]),
+                },
+                &mut attn,
+                candidate,
+            )
+            .expect("combined");
+        store
+            .commit(StagedPollAck {
+                anchors: BTreeMap::from([("reg:poll:ch".into(), "p-new".into())]),
+            })
+            .expect("later poll");
+        let reloaded = PollCursorStore::load(&profile).expect("reload");
+        let mut restored = chanvoy_core::AttentionState::default();
+        assert!(!reloaded.apply_pending_txn(&mut restored).expect("no txn"));
+        assert_eq!(
+            reloaded
+                .get("reg:poll:ch")
+                .map(|a| a.value.as_str().to_string()),
+            Some("p-new".into())
+        );
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
+        let _ = std::fs::remove_file(combined_txn_path(&profile));
     }
 
     #[test]
