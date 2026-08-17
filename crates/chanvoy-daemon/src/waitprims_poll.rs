@@ -197,7 +197,9 @@ fn materialize_canonical(
     poll: &BTreeMap<String, String>,
 ) -> Result<(), CoreError> {
     persist(profile, poll)?;
-    chanvoy_core::store_attention_state(profile, attention).map(|_| ())
+    let raw = serde_json::to_string_pretty(attention)
+        .map_err(|err| contract_internal("poll", format!("attention encode: {err}")))?;
+    persist_bytes(&chanvoy_core::attention_state_path(profile), raw.as_bytes())
 }
 
 fn clear_combined_txn(profile: &str) -> Result<(), CoreError> {
@@ -903,6 +905,52 @@ mod tests {
             "recovery must clear the redo record"
         );
         let _ = std::fs::remove_file(poll_cursor_path(&profile));
+    }
+
+    #[test]
+    fn txn_clear_is_after_both_durable_materializations() {
+        use std::os::unix::fs::PermissionsExt;
+        let profile = format!("poll-mat-{}", std::process::id());
+        let mut attention = chanvoy_core::AttentionState::default();
+        attention.channels.insert(
+            "org/ops".into(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-attn".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        );
+        let poll = BTreeMap::from([("reg:poll:ch".into(), "p-poll".into())]);
+        persist_combined_txn(
+            &profile,
+            &CombinedReadCursorTxn {
+                attention: attention.clone(),
+                poll: poll.clone(),
+            },
+        )
+        .expect("txn");
+        assert!(combined_txn_path(&profile).exists());
+        materialize_canonical(&profile, &attention, &poll).expect("both stores");
+        assert!(
+            combined_txn_path(&profile).exists(),
+            "txn must remain until both canonical files are durable"
+        );
+        assert!(poll_cursor_path(&profile).is_file());
+        let attn_path = chanvoy_core::attention_state_path(&profile);
+        assert!(attn_path.is_file());
+        assert_eq!(
+            std::fs::metadata(&attn_path).expect("stat").permissions().mode() & 0o777,
+            0o600
+        );
+        clear_combined_txn(&profile).expect("clear");
+        assert!(!combined_txn_path(&profile).exists());
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
+        let _ = std::fs::remove_file(attn_path);
     }
 
     #[test]
