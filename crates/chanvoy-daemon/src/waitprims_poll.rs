@@ -69,6 +69,12 @@ impl PollCursorStore {
             })
     }
 
+    #[cfg(test)]
+    fn commit_poll(&self, staged: StagedPollAck) -> Result<(), CoreError> {
+        let mut attention = AttentionState::default();
+        self.commit(staged, &mut attention)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn persist_candidate(
         &self,
@@ -99,11 +105,16 @@ impl PollCursorStore {
         Ok(())
     }
 
-    pub(crate) fn commit(&self, staged: StagedPollAck) -> Result<(), CoreError> {
+    pub(crate) fn commit(
+        &self,
+        staged: StagedPollAck,
+        attention: &mut AttentionState,
+    ) -> Result<(), CoreError> {
         let _gate = self
             .persist_gate
             .lock()
             .map_err(|_| contract_internal("poll", "persist lock"))?;
+        self.apply_pending_txn_inner(attention)?;
         let candidate = {
             let map = self
                 .inner
@@ -134,6 +145,7 @@ impl PollCursorStore {
             .persist_gate
             .lock()
             .map_err(|_| contract_internal("poll", "persist lock"))?;
+        self.apply_pending_txn_inner(live_attention)?;
         let poll = {
             let map = self
                 .inner
@@ -161,6 +173,17 @@ impl PollCursorStore {
     }
 
     pub(crate) fn apply_pending_txn(
+        &self,
+        attention: &mut AttentionState,
+    ) -> Result<bool, CoreError> {
+        let _gate = self
+            .persist_gate
+            .lock()
+            .map_err(|_| contract_internal("poll", "persist lock"))?;
+        self.apply_pending_txn_inner(attention)
+    }
+
+    fn apply_pending_txn_inner(
         &self,
         attention: &mut AttentionState,
     ) -> Result<bool, CoreError> {
@@ -678,7 +701,7 @@ mod tests {
         let store = PollCursorStore::load(&profile).expect("empty store");
         assert!(store.get("reg:poll:ch").is_none());
         store
-            .commit(StagedPollAck {
+            .commit_poll(StagedPollAck {
                 anchors: BTreeMap::from([("reg:poll:ch".into(), "post-new".into())]),
             })
             .expect("persist");
@@ -713,14 +736,14 @@ mod tests {
         let profile = format!("poll-persist-fail-{}", std::process::id());
         let store = PollCursorStore::load(&profile).expect("empty store");
         store
-            .commit(StagedPollAck {
+            .commit_poll(StagedPollAck {
                 anchors: BTreeMap::from([("reg:poll:ch".into(), "post-old".into())]),
             })
             .expect("first persist");
         let path = poll_cursor_path(&profile);
         std::fs::remove_file(&path).expect("remove file");
         std::fs::create_dir(&path).expect("block persist path");
-        let err = store.commit(StagedPollAck {
+        let err = store.commit_poll(StagedPollAck {
             anchors: BTreeMap::from([("reg:poll:ch".into(), "post-new".into())]),
         });
         assert!(err.is_err(), "persist over a directory must fail");
@@ -741,7 +764,7 @@ mod tests {
             anchors: BTreeMap::from([("reg:poll:ch".into(), "post-a".into())]),
         };
         assert!(store.get("reg:poll:ch").is_none());
-        store.commit(staged).expect("commit explicit");
+        store.commit_poll(staged).expect("commit explicit");
         assert_eq!(
             store
                 .get("reg:poll:ch")
@@ -846,7 +869,7 @@ mod tests {
         let profile = format!("poll-mode-{}", std::process::id());
         let store = PollCursorStore::load(&profile).expect("empty");
         store
-            .commit(StagedPollAck {
+            .commit_poll(StagedPollAck {
                 anchors: BTreeMap::from([("reg:poll:ch".into(), "post-a".into())]),
             })
             .expect("persist");
@@ -982,9 +1005,12 @@ mod tests {
             )
             .expect("combined");
         store
-            .commit(StagedPollAck {
-                anchors: BTreeMap::from([("reg:poll:ch".into(), "p-new".into())]),
-            })
+            .commit(
+                StagedPollAck {
+                    anchors: BTreeMap::from([("reg:poll:ch".into(), "p-new".into())]),
+                },
+                &mut attn,
+            )
             .expect("later poll");
         let reloaded = PollCursorStore::load(&profile).expect("reload");
         let mut restored = chanvoy_core::AttentionState::default();
@@ -1000,6 +1026,60 @@ mod tests {
     }
 
     #[test]
+    fn pending_txn_is_completed_before_later_poll_commit() {
+        let profile = format!("poll-pending-{}", std::process::id());
+        let mut attention = chanvoy_core::AttentionState::default();
+        attention.channels.insert(
+            "org/ops".into(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-attn".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        );
+        persist_combined_txn(
+            &profile,
+            &CombinedReadCursorTxn {
+                attention: attention.clone(),
+                poll: BTreeMap::from([("reg:old".into(), "p-old".into())]),
+            },
+        )
+        .expect("pending txn");
+        let store = PollCursorStore::load(&profile).expect("empty file");
+        let mut live = chanvoy_core::AttentionState::default();
+        store
+            .commit(
+                StagedPollAck {
+                    anchors: BTreeMap::from([("reg:new".into(), "p-new".into())]),
+                },
+                &mut live,
+            )
+            .expect("later commit completes redo then writes");
+        assert!(!combined_txn_path(&profile).exists());
+        assert_eq!(
+            live.channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-attn")
+        );
+        assert_eq!(
+            store.get("reg:old").map(|a| a.value.as_str().to_string()),
+            Some("p-old".into())
+        );
+        assert_eq!(
+            store.get("reg:new").map(|a| a.value.as_str().to_string()),
+            Some("p-new".into())
+        );
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
+        let _ = std::fs::remove_file(chanvoy_core::attention_state_path(&profile));
+    }
+
+    #[test]
     fn concurrent_commits_do_not_drop_an_ack() {
         let profile = format!("poll-conc-{}", std::process::id());
         let store = std::sync::Arc::new(PollCursorStore::load(&profile).expect("empty"));
@@ -1007,13 +1087,13 @@ mod tests {
             let a = store.clone();
             let b = store.clone();
             scope.spawn(move || {
-                a.commit(StagedPollAck {
+                a.commit_poll(StagedPollAck {
                     anchors: BTreeMap::from([("reg:a".into(), "pa".into())]),
                 })
                 .expect("a");
             });
             scope.spawn(move || {
-                b.commit(StagedPollAck {
+                b.commit_poll(StagedPollAck {
                     anchors: BTreeMap::from([("reg:b".into(), "pb".into())]),
                 })
                 .expect("b");
@@ -1066,7 +1146,7 @@ mod tests {
         let profile = format!("poll-dirsync-{}", std::process::id());
         let store = PollCursorStore::load(&profile).expect("empty");
         store
-            .commit(StagedPollAck {
+            .commit_poll(StagedPollAck {
                 anchors: BTreeMap::from([("reg:poll:ch".into(), "post-a".into())]),
             })
             .expect("persist with dir sync");

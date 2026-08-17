@@ -1640,12 +1640,13 @@ async fn commit_staged_read_cursors(
     let mut attn = state.attention_state.lock().await;
     let Some(advance) = attention else {
         if let Some(ack) = poll {
-            state.poll_cursors.commit(ack)?;
+            state.poll_cursors.commit(ack, &mut attn)?;
         }
         return Ok(());
     };
     let profile = state.profile.name.clone();
     if poll.is_none() {
+        state.poll_cursors.apply_pending_txn(&mut attn)?;
         persist_then_publish_attention(
             |candidate| store_attention_state(&profile, candidate).map(|_| ()),
             &mut attn,
