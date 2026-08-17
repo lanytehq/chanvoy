@@ -573,7 +573,7 @@ fn redact_arm_error(message: &str) -> String {
     }
 }
 
-async fn with_bus_drain<T, Fut>(
+pub(crate) async fn with_bus_drain<T, Fut>(
     rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
     bus: &mut VecDeque<Arc<DaemonEvent>>,
     label: &str,

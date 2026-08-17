@@ -105,16 +105,28 @@ pub(crate) async fn wait_channels_first_match(
     for arm in &params.arms {
         let selector = arm.selector();
         let qualified = selector.qualified();
-        let resolved = provider_retry(state, &qualified, deadline, || async {
+        let resolve = provider_retry(state, &qualified, deadline, || async {
             state.client.resolve_channel(&qualified, None).await
-        })
-        .await
-        .map_err(|err| map_arm_err(&selector, err))?;
+        });
+        let resolved = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", resolve)
+            .await
+            .map_err(|err| map_arm_err(&selector, err))?;
         if !seen.insert(resolved.channel_id.clone()) {
             return Err(CoreError::WaitFilterInvalid(format!(
                 "duplicate wait arm {qualified} (same canonical channel as another arm)"
             )));
         }
+        let baseline_fut = establish_baseline(
+            state,
+            &qualified,
+            &resolved.channel_id,
+            arm.after.as_deref(),
+            deadline,
+        );
+        let (scan, mut baseline) =
+            crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", baseline_fut)
+                .await
+                .map_err(|err| map_arm_err(&selector, err))?;
         drain_bus(&mut rx, &mut bus, "fan-in")?;
         let retained: Vec<chanvoy_core::Message> = bus
             .iter()
@@ -127,21 +139,10 @@ pub(crate) async fn wait_channels_first_match(
                 _ => None,
             })
             .collect();
-        let prebound = {
-            let (scan, mut baseline) = establish_baseline(
-                state,
-                &qualified,
-                &resolved.channel_id,
-                arm.after.as_deref(),
-                deadline,
-            )
-            .await
-            .map_err(|err| map_arm_err(&selector, err))?;
-            for msg in &retained {
-                baseline.remove(&msg.id);
-            }
-            Some(cursor_from_baseline(scan, baseline))
-        };
+        for msg in &retained {
+            baseline.remove(&msg.id);
+        }
+        let prebound = Some(cursor_from_baseline(scan, baseline));
         let predicate = WaitPredicate::compile(
             &state.my_user_id,
             &resolved.channel_id,
@@ -173,8 +174,10 @@ pub(crate) async fn wait_channels_first_match(
     state.wait_owners.note_arm();
     let mut guards = Vec::new();
     let mut session = None;
+    let mut member_cancels = Vec::new();
     for lease in leases {
         let (sess, guard) = lease.into_guard();
+        member_cancels.push(sess.cancel.clone());
         if session.is_none() {
             session = Some(sess);
         }
@@ -223,6 +226,17 @@ pub(crate) async fn wait_channels_first_match(
     };
     let wp_cancel = Cancel::new();
     let _fwd = CancelForward::spawn(lease_cancel, wp_cancel.clone());
+    let any_cancel = wp_cancel.clone();
+    tokio::spawn(async move {
+        let mut set = tokio::task::JoinSet::new();
+        for token in member_cancels {
+            set.spawn(async move {
+                token.cancelled().await;
+            });
+        }
+        let _ = set.join_next().await;
+        any_cancel.trigger();
+    });
     let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel)
         .await
         .map_err(|err| map_waitprims_err("fan-in", err))?;
@@ -457,6 +471,9 @@ impl Observer for FanInObserver {
             inner_cancel: self.inner_cancel.clone(),
         };
         for message in &arm.retained {
+            if !arm.predicate.matches_message(message) {
+                continue;
+            }
             if let Ok(Some(event)) = event_from_foreign_message(
                 message,
                 &self.my_user_id,

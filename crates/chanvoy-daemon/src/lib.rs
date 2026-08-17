@@ -595,6 +595,11 @@ async fn handle_client(
                     .write_all(serde_json::to_string(&response)?.as_bytes())
                     .await?;
                 writer.write_all(b"\n").await?;
+                if response.error.is_none() {
+                    state.poll_cursors.commit_staged().map_err(DaemonError::from)?;
+                } else {
+                    state.poll_cursors.drop_staged();
+                }
                 line.clear();
             }
             recv_result = async {

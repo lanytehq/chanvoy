@@ -42,6 +42,7 @@ pub(crate) fn poll_ack_retention_is_fail_closed() -> bool {
 pub(crate) struct PollCursorStore {
     profile: String,
     inner: Arc<Mutex<BTreeMap<String, String>>>,
+    pending: Arc<Mutex<Option<BTreeMap<String, String>>>>,
 }
 
 impl PollCursorStore {
@@ -50,6 +51,7 @@ impl PollCursorStore {
         Self {
             profile: profile.to_string(),
             inner: Arc::new(Mutex::new(map)),
+            pending: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -64,12 +66,49 @@ impl PollCursorStore {
             })
     }
 
-    pub(crate) fn commit(&self, anchors: BTreeMap<String, Anchor>) {
-        if let Ok(mut map) = self.inner.lock() {
-            for (key, anchor) in anchors {
-                map.insert(key, anchor.value.as_str().to_string());
-            }
-            persist(&self.profile, &map);
+    #[cfg(test)]
+    pub(crate) fn commit(&self, anchors: BTreeMap<String, Anchor>) -> Result<(), CoreError> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| contract_internal("poll", "cursor store lock"))?;
+        for (key, anchor) in anchors {
+            map.insert(key, anchor.value.as_str().to_string());
+        }
+        persist(&self.profile, &map)
+    }
+
+    pub(crate) fn stage(&self, anchors: BTreeMap<String, Anchor>) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = Some(
+                anchors
+                    .into_iter()
+                    .map(|(k, a)| (k, a.value.as_str().to_string()))
+                    .collect(),
+            );
+        }
+    }
+
+    pub(crate) fn commit_staged(&self) -> Result<(), CoreError> {
+        let staged = self
+            .pending
+            .lock()
+            .map_err(|_| contract_internal("poll", "pending lock"))?
+            .take();
+        let Some(staged) = staged else {
+            return Ok(());
+        };
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| contract_internal("poll", "cursor store lock"))?;
+        map.extend(staged);
+        persist(&self.profile, &map)
+    }
+
+    pub(crate) fn drop_staged(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = None;
         }
     }
 }
@@ -86,14 +125,22 @@ fn load_persisted(profile: &str) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn persist(profile: &str, map: &BTreeMap<String, String>) {
+fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = chanvoy_core::default_chanvoy_config_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| contract_internal("poll", format!("cursor dir: {err}")))?;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     let path = poll_cursor_path(profile);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(raw) = serde_json::to_string(map) {
-        let _ = std::fs::write(path, raw);
-    }
+    let tmp = path.with_extension("json.tmp");
+    let raw = serde_json::to_string(map)
+        .map_err(|err| contract_internal("poll", format!("cursor encode: {err}")))?;
+    std::fs::write(&tmp, raw)
+        .map_err(|err| contract_internal("poll", format!("cursor tmp write: {err}")))?;
+    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    std::fs::rename(&tmp, &path)
+        .map_err(|err| contract_internal("poll", format!("cursor persist: {err}")))?;
+    Ok(())
 }
 
 pub(crate) struct PollCycleResult {
@@ -134,12 +181,22 @@ pub(crate) async fn poll_channel_once(
     let clock = WallClock::new();
     let waiter = format!("poll:{}", channel_id);
     let registration_id = format!("reg:{waiter}");
+    let stored = store.get(&registration_id);
+    let acked = match (after, stored.as_ref()) {
+        (Some(explicit), Some(stored)) if stored.value.as_str() != explicit => None,
+        (_, Some(_)) => stored,
+        (Some(explicit), None) => Some(Anchor {
+            kind: AnchorKind::ProviderOpaque,
+            value: IdToken::new(explicit),
+        }),
+        (None, None) => None,
+    };
     let (set, request) = build_poll_documents(
         &waiter,
         &state.my_user_id,
         channel_id,
         after,
-        store.get(&registration_id),
+        acked,
         clock.project_deadline(deadline),
     )?;
     let set_json = serde_json::to_string(&AgentWaitMessage::RegistrationSet(set.clone()))
@@ -169,6 +226,21 @@ pub(crate) async fn poll_channel_once(
         .await
         .map_err(|err| map_waitprims_err(channel, err))?;
     inner_cancel.cancel();
+    if let Some(err) = last_error.lock().ok().and_then(|mut slot| slot.take()) {
+        return Err(err);
+    }
+    match outcome.outcome_kind {
+        waitprims_core::OutcomeKind::Failed
+        | waitprims_core::OutcomeKind::CoverageDegraded
+        | waitprims_core::OutcomeKind::Refused
+        | waitprims_core::OutcomeKind::ReauthenticationRequired => {
+            return Err(CoreError::WaitProviderDegraded {
+                channel: channel.to_string(),
+                message: "poll cycle failed".into(),
+            });
+        }
+        _ => {}
+    }
     let mut messages = Vec::new();
     for event in &outcome.events {
         if let Some(message) = sidecar.take(event.payload.payload_ref.as_str()) {
@@ -206,7 +278,7 @@ pub(crate) fn ack_poll_cycle(
         .map_err(|err| contract_internal("poll", format!("ack encode: {err}")))?;
     waitprims_core::validate_message(&json)
         .map_err(|err| contract_internal("poll", format!("ack admission: {err}")))?;
-    store.commit(outcome.retained_through.clone());
+    store.stage(outcome.retained_through.clone());
     Ok(())
 }
 
@@ -483,7 +555,9 @@ mod tests {
             kind: AnchorKind::ProviderOpaque,
             value: IdToken::new("post-new"),
         };
-        store.commit(BTreeMap::from([("reg:poll:ch".into(), proposed)]));
+        store
+            .commit(BTreeMap::from([("reg:poll:ch".into(), proposed)]))
+            .expect("persist");
         let reloaded = PollCursorStore::load(&profile);
         assert_eq!(
             reloaded
