@@ -47,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Selected fan-in matches stay in replay until the RPC write succeeds.
   The winning fan-in arm stays owned until that write completes.
   `read --advance` and poll cursors apply only after a successful RPC
-  write; attention persist happens before in-memory publish; poll persist
-  fsyncs the parent directory after rename. `restore_ready` is `Result` and fail-closed.
+  write; a combined poll+attention commit uses one recoverable txn;
+  poll persist fsyncs the parent directory after rename. `restore_ready` is `Result` and fail-closed.
   A1 single-channel `wait_channel_v3` remains. Path-dep on
   waitprims `f12e707` — not for origin/main.
 

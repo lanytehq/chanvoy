@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chanvoy_core::{CoreError, Message};
+use chanvoy_core::{AttentionState, CoreError, Message};
+use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use waitprims_async::{
@@ -68,6 +69,7 @@ impl PollCursorStore {
             })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn persist_candidate(
         &self,
         staged: StagedPollAck,
@@ -98,8 +100,102 @@ impl PollCursorStore {
     }
 
     pub(crate) fn commit(&self, staged: StagedPollAck) -> Result<(), CoreError> {
-        let candidate = self.persist_candidate(staged)?;
-        self.publish(candidate)
+        let _gate = self
+            .persist_gate
+            .lock()
+            .map_err(|_| contract_internal("poll", "persist lock"))?;
+        let candidate = {
+            let map = self
+                .inner
+                .lock()
+                .map_err(|_| contract_internal("poll", "cursor store lock"))?;
+            let mut candidate = map.clone();
+            candidate.extend(staged.anchors);
+            candidate
+        };
+        persist(&self.profile, &candidate)?;
+        *self
+            .inner
+            .lock()
+            .map_err(|_| contract_internal("poll", "cursor store lock"))? = candidate;
+        Ok(())
+    }
+
+    /// One durable commit for poll + attention. Holds the persist gate
+    /// through persist and poll-memory publish. Restart recovers the pair
+    /// from the txn if individual files were not rewritten.
+    pub(crate) fn commit_combined(
+        &self,
+        staged: StagedPollAck,
+        attention: &AttentionState,
+    ) -> Result<(), CoreError> {
+        let _gate = self
+            .persist_gate
+            .lock()
+            .map_err(|_| contract_internal("poll", "persist lock"))?;
+        let poll = {
+            let map = self
+                .inner
+                .lock()
+                .map_err(|_| contract_internal("poll", "cursor store lock"))?;
+            let mut poll = map.clone();
+            poll.extend(staged.anchors);
+            poll
+        };
+        persist_combined_txn(
+            &self.profile,
+            &CombinedReadCursorTxn {
+                attention: attention.clone(),
+                poll: poll.clone(),
+            },
+        )?;
+        *self
+            .inner
+            .lock()
+            .map_err(|_| contract_internal("poll", "cursor store lock"))? = poll.clone();
+        let _ = persist(&self.profile, &poll);
+        Ok(())
+    }
+
+    pub(crate) fn apply_pending_txn(
+        &self,
+        attention: &mut AttentionState,
+    ) -> Result<bool, CoreError> {
+        let Some(txn) = load_combined_txn(&self.profile)? else {
+            return Ok(false);
+        };
+        *attention = txn.attention.clone();
+        self.publish(txn.poll.clone())?;
+        let _ = persist(&self.profile, &txn.poll);
+        let _ = chanvoy_core::store_attention_state(&self.profile, attention);
+        Ok(true)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CombinedReadCursorTxn {
+    attention: AttentionState,
+    poll: BTreeMap<String, String>,
+}
+
+fn combined_txn_path(profile: &str) -> std::path::PathBuf {
+    chanvoy_core::default_chanvoy_config_dir().join(format!("read-cursors-{profile}.txn.json"))
+}
+
+fn persist_combined_txn(profile: &str, txn: &CombinedReadCursorTxn) -> Result<(), CoreError> {
+    let raw = serde_json::to_string(txn)
+        .map_err(|err| contract_internal("poll", format!("txn encode: {err}")))?;
+    persist_bytes(&combined_txn_path(profile), raw.as_bytes())
+}
+
+fn load_combined_txn(profile: &str) -> Result<Option<CombinedReadCursorTxn>, CoreError> {
+    let path = combined_txn_path(profile);
+    match chanvoy_core::read_tool_owned_file(&path, chanvoy_core::DEFAULT_MAX_BYTES) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|err| contract_internal("poll", format!("txn decode: {err}"))),
+        Err(err) if err.is_not_found() => Ok(None),
+        Err(err) => Err(CoreError::from(err)),
     }
 }
 
@@ -118,6 +214,12 @@ fn load_persisted(profile: &str) -> Result<BTreeMap<String, String>, CoreError> 
 }
 
 fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreError> {
+    let raw = serde_json::to_string(map)
+        .map_err(|err| contract_internal("poll", format!("cursor encode: {err}")))?;
+    persist_bytes(&poll_cursor_path(profile), raw.as_bytes())
+}
+
+fn persist_bytes(path: &std::path::Path, raw: &[u8]) -> Result<(), CoreError> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = chanvoy_core::default_chanvoy_config_dir();
@@ -125,14 +227,14 @@ fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreErro
         .map_err(|err| contract_internal("poll", format!("cursor dir: {err}")))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|err| contract_internal("poll", format!("cursor dir mode: {err}")))?;
-    let path = poll_cursor_path(profile);
     let tmp = dir.join(format!(
-        "poll-cursors-{profile}.{}.tmp",
+        "{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cursor"),
         std::process::id()
     ));
     let _ = std::fs::remove_file(&tmp);
-    let raw = serde_json::to_string(map)
-        .map_err(|err| contract_internal("poll", format!("cursor encode: {err}")))?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -140,12 +242,12 @@ fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreErro
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)
         .map_err(|err| contract_internal("poll", format!("cursor tmp create: {err}")))?;
-    file.write_all(raw.as_bytes())
+    file.write_all(raw)
         .map_err(|err| contract_internal("poll", format!("cursor tmp write: {err}")))?;
     file.sync_all()
         .map_err(|err| contract_internal("poll", format!("cursor tmp sync: {err}")))?;
     drop(file);
-    std::fs::rename(&tmp, &path)
+    std::fs::rename(&tmp, path)
         .map_err(|err| contract_internal("poll", format!("cursor persist: {err}")))?;
     fsync_dir(&dir)?;
     Ok(())
@@ -730,6 +832,84 @@ mod tests {
         assert!(meta.is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn combined_txn_recovers_both_stores_on_reload() {
+        let profile = format!("poll-txn-{}", std::process::id());
+        let mut attention = chanvoy_core::AttentionState::default();
+        attention.channels.insert(
+            "org/ops".into(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-attn".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        );
+        let poll = BTreeMap::from([("reg:poll:ch".into(), "p-poll".into())]);
+        persist_combined_txn(
+            &profile,
+            &CombinedReadCursorTxn {
+                attention: attention.clone(),
+                poll: poll.clone(),
+            },
+        )
+        .expect("txn");
+        let store = PollCursorStore::load(&profile).expect("empty poll file");
+        assert!(store.get("reg:poll:ch").is_none());
+        let mut restored = chanvoy_core::AttentionState::default();
+        assert!(store.apply_pending_txn(&mut restored).expect("apply"));
+        assert_eq!(
+            restored
+                .channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-attn")
+        );
+        assert_eq!(
+            store
+                .get("reg:poll:ch")
+                .map(|a| a.value.as_str().to_string()),
+            Some("p-poll".into())
+        );
+        let _ = std::fs::remove_file(combined_txn_path(&profile));
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
+    }
+
+    #[test]
+    fn concurrent_commits_do_not_drop_an_ack() {
+        let profile = format!("poll-conc-{}", std::process::id());
+        let store = std::sync::Arc::new(PollCursorStore::load(&profile).expect("empty"));
+        std::thread::scope(|scope| {
+            let a = store.clone();
+            let b = store.clone();
+            scope.spawn(move || {
+                a.commit(StagedPollAck {
+                    anchors: BTreeMap::from([("reg:a".into(), "pa".into())]),
+                })
+                .expect("a");
+            });
+            scope.spawn(move || {
+                b.commit(StagedPollAck {
+                    anchors: BTreeMap::from([("reg:b".into(), "pb".into())]),
+                })
+                .expect("b");
+            });
+        });
+        assert_eq!(
+            store.get("reg:a").map(|x| x.value.as_str().to_string()),
+            Some("pa".into())
+        );
+        assert_eq!(
+            store.get("reg:b").map(|x| x.value.as_str().to_string()),
+            Some("pb".into())
+        );
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
     }
 
     #[test]

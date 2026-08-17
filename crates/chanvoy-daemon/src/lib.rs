@@ -385,6 +385,12 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         }
     }
 
+    let poll_cursors =
+        waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
+    poll_cursors
+        .apply_pending_txn(&mut attention)
+        .map_err(DaemonError::from)?;
+
     let state = Arc::new(AppState {
         profile: profile.clone(),
         client,
@@ -398,8 +404,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         identity_drift,
         reduce_writer,
         wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
-        poll_cursors: waitprims_poll::PollCursorStore::load(&profile.name)
-            .map_err(DaemonError::from)?,
+        poll_cursors,
         fanin_replay: waitprims_fanin::FanInReplayStore::new(),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -1648,19 +1653,12 @@ async fn commit_staged_read_cursors(
         )?;
         return Ok(());
     }
-    let old = attn.clone();
-    let candidate = attention_candidate(&old, advance);
-    store_attention_state(&profile, &candidate)?;
-    match state.poll_cursors.persist_candidate(poll.expect("poll")) {
-        Ok(poll_map) => {
-            *attn = candidate;
-            state.poll_cursors.publish(poll_map)?;
-        }
-        Err(err) => {
-            let _ = store_attention_state(&profile, &old);
-            return Err(err);
-        }
-    }
+    let candidate = attention_candidate(&attn, advance);
+    state
+        .poll_cursors
+        .commit_combined(poll.expect("poll"), &candidate)?;
+    *attn = candidate;
+    let _ = store_attention_state(&profile, &attn);
     Ok(())
 }
 
