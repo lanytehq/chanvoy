@@ -292,10 +292,7 @@ pub(crate) async fn wait_channels_first_match(
         sessions.push(sess);
         guards.push(guard);
     }
-    let session = sessions
-        .first()
-        .cloned()
-        .expect("fan-in requires arms");
+    let session = sessions.first().cloned().expect("fan-in requires arms");
     let keys = MultiRelease::new(guards);
 
     let mut built = Vec::new();
@@ -707,11 +704,9 @@ impl Observer for FanInObserver {
                     self.restore_ready(&bind, Observation::Event(Box::new(event)))?;
                 }
                 Err(_) => {
-                    return Err(waitprims_core::ValidationError::new(
-                        "/bind",
-                        "sidecar_digest",
-                    )
-                    .into());
+                    return Err(
+                        waitprims_core::ValidationError::new("/bind", "sidecar_digest").into(),
+                    );
                 }
             }
         }
