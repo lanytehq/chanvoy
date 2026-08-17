@@ -1970,6 +1970,97 @@ mod staged_cursor_tests {
     }
 
     #[test]
+    fn attention_only_advance_survives_reload_via_shared_writer() {
+        let profile = format!("attn-only-reload-{}", std::process::id());
+        let mut live = chanvoy_core::AttentionState::default();
+        persist_then_publish_attention(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut live,
+            sample_advance(),
+        )
+        .expect("attention-only persist");
+        assert_eq!(
+            live.channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
+        let reloaded = chanvoy_core::load_attention_state(&profile).expect("restart");
+        assert_eq!(
+            reloaded
+                .channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
+        let path = chanvoy_core::attention_state_path(&profile);
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert!(meta.is_file());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn attention_only_persist_failure_does_not_publish_or_survive_restart() {
+        let profile = format!("attn-only-fail-{}", std::process::id());
+        let path = chanvoy_core::attention_state_path(&profile);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).expect("block persist path");
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut live,
+            sample_advance(),
+        );
+        assert!(err.is_err());
+        assert!(live.channels.is_empty());
+        std::fs::remove_dir(&path).expect("unblock");
+        let reloaded = chanvoy_core::load_attention_state(&profile).expect("restart");
+        assert!(
+            reloaded.channels.is_empty(),
+            "failed attention-only persist must not appear after restart"
+        );
+    }
+
+    #[test]
+    fn ordinary_writers_use_the_same_durable_attention_store() {
+        let profile = format!("attn-ordinary-{}", std::process::id());
+        let mut live = chanvoy_core::AttentionState::default();
+        persist_then_publish_attention_state(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.mentions = chanvoy_core::MentionCursorState {
+                    last_seen_post_id: Some("mention-1".into()),
+                    updated_at: Some(1),
+                };
+                next.channels
+                    .insert("org/seed".into(), sample_advance().cursor);
+                next
+            },
+        )
+        .expect("ordinary persist");
+        let reloaded = chanvoy_core::load_attention_state(&profile).expect("restart");
+        assert_eq!(
+            reloaded.mentions.last_seen_post_id.as_deref(),
+            Some("mention-1")
+        );
+        assert_eq!(
+            reloaded
+                .channels
+                .get("org/seed")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
+        let _ = std::fs::remove_file(chanvoy_core::attention_state_path(&profile));
+    }
+
+    #[test]
     fn staleness_persist_failure_does_not_publish_verdict() {
         let mut live = chanvoy_core::AttentionState::default();
         live.channels.insert(

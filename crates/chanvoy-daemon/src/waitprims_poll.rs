@@ -220,9 +220,7 @@ fn materialize_canonical(
     poll: &BTreeMap<String, String>,
 ) -> Result<(), CoreError> {
     persist(profile, poll)?;
-    let raw = serde_json::to_string_pretty(attention)
-        .map_err(|err| contract_internal("poll", format!("attention encode: {err}")))?;
-    persist_bytes(&chanvoy_core::attention_state_path(profile), raw.as_bytes())
+    chanvoy_core::store_attention_state(profile, attention).map(|_| ())
 }
 
 fn clear_combined_txn(profile: &str) -> Result<(), CoreError> {
@@ -266,37 +264,8 @@ fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreErro
 }
 
 fn persist_bytes(path: &std::path::Path, raw: &[u8]) -> Result<(), CoreError> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let dir = chanvoy_core::default_chanvoy_config_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|err| contract_internal("poll", format!("cursor dir: {err}")))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|err| contract_internal("poll", format!("cursor dir mode: {err}")))?;
-    let tmp = dir.join(format!(
-        "{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("cursor"),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&tmp);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)
-        .map_err(|err| contract_internal("poll", format!("cursor tmp create: {err}")))?;
-    file.write_all(raw)
-        .map_err(|err| contract_internal("poll", format!("cursor tmp write: {err}")))?;
-    file.sync_all()
-        .map_err(|err| contract_internal("poll", format!("cursor tmp sync: {err}")))?;
-    drop(file);
-    std::fs::rename(&tmp, path)
-        .map_err(|err| contract_internal("poll", format!("cursor persist: {err}")))?;
-    fsync_dir(&dir)?;
-    Ok(())
+    chanvoy_core::persist_tool_owned_bytes(path, raw)
+        .map_err(|err| contract_internal("poll", format!("cursor persist: {err}")))
 }
 
 fn fsync_dir(dir: &std::path::Path) -> Result<(), CoreError> {

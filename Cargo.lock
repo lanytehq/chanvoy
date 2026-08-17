@@ -294,7 +294,6 @@ dependencies = [
  "chanvoy-ipc",
  "chrono",
  "dirs",
- "libc",
  "regex",
  "reqwest",
  "serde",

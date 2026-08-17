@@ -52,7 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `read --after --advance` recovers a pending redo before building the
   next attention candidate so a later channel cannot roll back a
   recovered cursor. Ordinary attention writers persist a cloned
-  candidate before replacing in-memory state. `restore_ready` is `Result` and fail-closed.
+  candidate before replacing in-memory state. Acknowledged attention
+  state uses the same 0600 no-follow temp, file sync, rename, and
+  parent-directory sync as poll cursors. `restore_ready` is `Result` and fail-closed.
   A1 single-channel `wait_channel_v3` remains. Path-dep on
   waitprims `f12e707` — not for origin/main.
 
