@@ -89,6 +89,7 @@ struct AppState {
     /// target fails startup (never a silent bare-identity fallback).
     reduce_writer: Option<ReduceWriter>,
     wait_owners: Arc<wait_owner::WaitOwnerRegistry>,
+    poll_cursors: waitprims_poll::PollCursorStore,
 }
 
 /// PER-035: a pre-built client bound to the family profile a stream
@@ -396,6 +397,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         identity_drift,
         reduce_writer,
         wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
+        poll_cursors: waitprims_poll::PollCursorStore::load(&profile.name),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -786,10 +788,24 @@ async fn dispatch_request(
                     .read_channel_most_recent(&params.channel, limit, team)
                     .await?
             } else if let Some(after_post_id) = params.after_post_id {
-                state
-                    .client
-                    .read_channel_after(&params.channel, &after_post_id, team)
-                    .await?
+                let resolved = state.client.resolve_channel(&params.channel, team).await?;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let cycle = waitprims_poll::poll_channel_once(
+                    state,
+                    &state.poll_cursors,
+                    &params.channel,
+                    &resolved.channel_id,
+                    Some(&after_post_id),
+                    deadline,
+                )
+                .await?;
+                waitprims_poll::ack_poll_cycle(
+                    &state.poll_cursors,
+                    &cycle.outcome,
+                    &format!("poll:{}", resolved.channel_id),
+                    &state.my_user_id,
+                )?;
+                cycle.messages
             } else if params.since_last_mine {
                 state
                     .client

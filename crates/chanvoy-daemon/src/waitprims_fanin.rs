@@ -21,8 +21,8 @@ use waitprims_core::{
 };
 
 use crate::wait::{
-    channel_is_monitored, establish_baseline, provider_retry, wait_push_from_cursor,
-    wait_rest_from_cursor, WaitPredicate,
+    channel_is_monitored, drain_bus, establish_baseline, inbound_to_message, provider_retry,
+    wait_push_from_cursor, wait_rest_from_cursor, WaitPredicate,
 };
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::waitprims_hold::{
@@ -46,6 +46,7 @@ struct FanArm {
     prebound: Option<(Anchor, HashSet<String>)>,
     monitored: bool,
     predicate: WaitPredicate,
+    retained: Vec<chanvoy_core::Message>,
 }
 
 struct MultiRelease {
@@ -94,6 +95,9 @@ pub(crate) async fn wait_channels_first_match(
         params.pattern.as_deref(),
     )?;
     let deadline = Instant::now() + Duration::from_secs(params.timeout_secs);
+    let mut rx = state.event_bus.subscribe();
+    let mut bus = VecDeque::new();
+    drain_bus(&mut rx, &mut bus, "fan-in")?;
 
     let mut resolved_keys = Vec::new();
     let mut arms = Vec::new();
@@ -111,19 +115,32 @@ pub(crate) async fn wait_channels_first_match(
                 "duplicate wait arm {qualified} (same canonical channel as another arm)"
             )));
         }
-        let prebound = if let Some(anchor) = arm.after.as_deref() {
-            let (scan, baseline) = establish_baseline(
+        drain_bus(&mut rx, &mut bus, "fan-in")?;
+        let retained: Vec<chanvoy_core::Message> = bus
+            .iter()
+            .filter_map(|ev| match &ev.payload {
+                chanvoy_core::DaemonEventPayloadInner::Inbound(p)
+                    if p.channel_id == resolved.channel_id =>
+                {
+                    Some(inbound_to_message(p))
+                }
+                _ => None,
+            })
+            .collect();
+        let prebound = {
+            let (scan, mut baseline) = establish_baseline(
                 state,
                 &qualified,
                 &resolved.channel_id,
-                Some(anchor),
+                arm.after.as_deref(),
                 deadline,
             )
             .await
             .map_err(|err| map_arm_err(&selector, err))?;
+            for msg in &retained {
+                baseline.remove(&msg.id);
+            }
             Some(cursor_from_baseline(scan, baseline))
-        } else {
-            None
         };
         let predicate = WaitPredicate::compile(
             &state.my_user_id,
@@ -144,6 +161,7 @@ pub(crate) async fn wait_channels_first_match(
             prebound,
             monitored: channel_is_monitored(state, &arm.selector().channel),
             predicate,
+            retained,
         });
     }
 
@@ -223,7 +241,21 @@ fn map_arm_err(selector: &WaitChannelSelector, err: CoreError) -> CoreError {
         CoreError::WaitFilterInvalid(message) => {
             CoreError::WaitFilterInvalid(format!("wait arm {q}: {message}"))
         }
-        other => CoreError::WaitFilterInvalid(format!("wait arm {q}: {other}")),
+        CoreError::WaitProviderDegraded { message, .. } => CoreError::WaitProviderDegraded {
+            channel: q,
+            message,
+        },
+        CoreError::WaitTimeout(_) => CoreError::WaitTimeout(q),
+        CoreError::ChannelNotFoundInAnyTeam { .. } => CoreError::WaitFilterInvalid(format!(
+            "wait arm {q}: resolve failed (channel not found)"
+        )),
+        CoreError::NotAMemberOfTeam { .. } => CoreError::WaitFilterInvalid(format!(
+            "wait arm {q}: resolve failed (team not a member)"
+        )),
+        CoreError::AmbiguousChannel { .. } => {
+            CoreError::WaitFilterInvalid(format!("wait arm {q}: resolve failed (ambiguous)"))
+        }
+        other => other,
     }
 }
 
@@ -416,14 +448,27 @@ impl Observer for FanInObserver {
                 waitprims_core::ValidationError::new("/bind", "provider")
             })?,
         };
-        Ok(ChanvoyBind {
+        let bind = ChanvoyBind {
             registration_id: registration.registration_id.clone(),
             subject_id: registration.subject_id.clone(),
-            resolved_start,
+            resolved_start: resolved_start.clone(),
             rest_baseline,
             release: Arc::new(LeaseRelease::noop()),
             inner_cancel: self.inner_cancel.clone(),
-        })
+        };
+        for message in &arm.retained {
+            if let Ok(Some(event)) = event_from_foreign_message(
+                message,
+                &self.my_user_id,
+                &registration.registration_id,
+                &registration.subject_id,
+                &resolved_start,
+                &self.sidecar,
+            ) {
+                let _ = self.restore_ready(&bind, Observation::Event(Box::new(event)));
+            }
+        }
+        Ok(bind)
     }
 
     async fn next(&self, bind: &Self::Bind) -> waitprims_core::Result<Observation> {
@@ -439,7 +484,14 @@ impl Observer for FanInObserver {
             }
         };
         {
-            let mut seen = self.observed.lock().expect("observed");
+            let mut seen = match self.observed.lock() {
+                Ok(seen) => seen,
+                Err(_) => {
+                    return Ok(Observation::Failed {
+                        reason_code: IdToken::new("observed_lock"),
+                    });
+                }
+            };
             if !seen.insert(bind.registration_id().as_str().to_string()) {
                 return Ok(Observation::Idle);
             }
@@ -560,5 +612,23 @@ mod tests {
     fn a2_tie_rule_is_registration_set_order() {
         assert!(tie_rule_is_registration_order());
         assert!(TIE_RULE.contains("earliest arm"));
+    }
+
+    #[test]
+    fn fan_in_preserves_provider_and_deadman_classes() {
+        let sel = WaitChannelSelector::new("org-lanytehq", "ops");
+        let degraded = map_arm_err(
+            &sel,
+            CoreError::WaitProviderDegraded {
+                channel: "other".into(),
+                message: "deadline reached while provider observation was failing".into(),
+            },
+        );
+        assert!(
+            matches!(degraded, CoreError::WaitProviderDegraded { .. }),
+            "provider must not become WaitFilterInvalid: {degraded:?}"
+        );
+        let timeout = map_arm_err(&sel, CoreError::WaitTimeout("other".into()));
+        assert!(matches!(timeout, CoreError::WaitTimeout(_)));
     }
 }

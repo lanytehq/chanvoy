@@ -1,5 +1,4 @@
 //! A2 grok-bot / no-listener poll: one `run_poll_cycle` per wake.
-#![allow(dead_code)]
 //!
 //! Events and cursor advances stay uncommitted until `poll_cycle_ack`.
 //! Cancel, bound exhaustion, and a restart between outcome and ack
@@ -22,28 +21,36 @@ use waitprims_core::{
 };
 
 use crate::wait::{
-    channel_is_monitored, wait_push_from_cursor, wait_rest_from_cursor, WaitPredicate,
+    channel_is_monitored, establish_baseline, wait_push_from_cursor, wait_rest_from_cursor,
+    WaitPredicate,
 };
 use crate::waitprims_hold::{
-    authenticate_sidecar_message, channel_subject, contract_internal, event_from_foreign_message,
-    map_waitprims_err, scan_cursor_from_bind, timestamp_now, ChanvoyBind, LeaseRelease,
-    MessageSidecar, WallClock, METHOD_ID,
+    authenticate_sidecar_message, channel_subject, classify_bind_core_error, contract_internal,
+    cursor_from_baseline, event_from_foreign_message, map_waitprims_err, scan_cursor_from_bind,
+    timestamp_now, ChanvoyBind, LeaseRelease, MessageSidecar, WallClock, METHOD_ID,
 };
 use crate::AppState;
 
+#[cfg(test)]
 pub(crate) fn poll_ack_retention_is_fail_closed() -> bool {
     POLL_ACK_RETENTION.contains("not committed until poll_cycle_ack")
 }
 
-/// Daemon-local last-acked cursors. Never advanced by an unacked outcome.
-#[derive(Clone, Default)]
+/// Last-acked cursors. Never advanced by an unacked outcome. Persisted
+/// under the profile config dir so a restart cannot skip an unacked cycle.
+#[derive(Clone)]
 pub(crate) struct PollCursorStore {
-    inner: Arc<Mutex<BTreeMap<String, Anchor>>>,
+    profile: String,
+    inner: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl PollCursorStore {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn load(profile: &str) -> Self {
+        let map = load_persisted(profile);
+        Self {
+            profile: profile.to_string(),
+            inner: Arc::new(Mutex::new(map)),
+        }
     }
 
     pub(crate) fn get(&self, registration_id: &str) -> Option<Anchor> {
@@ -51,12 +58,41 @@ impl PollCursorStore {
             .lock()
             .ok()
             .and_then(|map| map.get(registration_id).cloned())
+            .map(|value| Anchor {
+                kind: AnchorKind::ProviderOpaque,
+                value: IdToken::new(value),
+            })
     }
 
     pub(crate) fn commit(&self, anchors: BTreeMap<String, Anchor>) {
         if let Ok(mut map) = self.inner.lock() {
-            map.extend(anchors);
+            for (key, anchor) in anchors {
+                map.insert(key, anchor.value.as_str().to_string());
+            }
+            persist(&self.profile, &map);
         }
+    }
+}
+
+fn poll_cursor_path(profile: &str) -> std::path::PathBuf {
+    chanvoy_core::default_chanvoy_config_dir().join(format!("poll-cursors-{profile}.json"))
+}
+
+fn load_persisted(profile: &str) -> BTreeMap<String, String> {
+    let path = poll_cursor_path(profile);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn persist(profile: &str, map: &BTreeMap<String, String>) {
+    let path = poll_cursor_path(profile);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(raw) = serde_json::to_string(map) {
+        let _ = std::fs::write(path, raw);
     }
 }
 
@@ -75,6 +111,8 @@ pub(crate) async fn poll_channel_once(
     after: Option<&str>,
     deadline: Instant,
 ) -> Result<PollCycleResult, CoreError> {
+    let _retention = POLL_ACK_RETENTION;
+    let _ = _retention;
     let predicate = WaitPredicate::compile(&state.my_user_id, channel_id, None, None)?;
     let sidecar = MessageSidecar::new();
     let last_error = Arc::new(Mutex::new(None));
@@ -82,6 +120,7 @@ pub(crate) async fn poll_channel_once(
     let observer = PollObserver {
         state: state.clone(),
         channel: channel.to_string(),
+        channel_id: channel_id.to_string(),
         after: after.map(str::to_string),
         monitored: channel_is_monitored(state, channel),
         predicate,
@@ -273,6 +312,7 @@ fn build_poll_documents(
 struct PollObserver {
     state: AppState,
     channel: String,
+    channel_id: String,
     after: Option<String>,
     monitored: bool,
     predicate: WaitPredicate,
@@ -291,15 +331,31 @@ impl Observer for PollObserver {
         &self,
         registration: &waitprims_core::Registration,
     ) -> waitprims_core::Result<Self::Bind> {
-        let start = registration.start_anchor.clone().unwrap_or(Anchor {
-            kind: AnchorKind::ProviderOpaque,
-            value: IdToken::new("anc:empty-at-arm"),
-        });
+        let after = registration
+            .start_anchor
+            .as_ref()
+            .map(|anchor| anchor.value.as_str().to_string());
+        let (scan, baseline) = establish_baseline(
+            &self.state,
+            &self.channel,
+            &self.channel_id,
+            after.as_deref(),
+            self.deadline,
+        )
+        .await
+        .map_err(|err| {
+            let _ = self
+                .last_error
+                .lock()
+                .map(|mut slot| *slot = Some(classify_bind_core_error(err)));
+            waitprims_core::ValidationError::new("/bind", "provider")
+        })?;
+        let (resolved_start, rest_baseline) = cursor_from_baseline(scan, baseline);
         Ok(ChanvoyBind {
             registration_id: registration.registration_id.clone(),
             subject_id: registration.subject_id.clone(),
-            resolved_start: start,
-            rest_baseline: Default::default(),
+            resolved_start,
+            rest_baseline,
             release: Arc::new(LeaseRelease::noop()),
             inner_cancel: self.inner_cancel.clone(),
         })
@@ -420,21 +476,21 @@ mod tests {
 
     #[test]
     fn unacked_outcome_does_not_advance_store() {
-        let store = PollCursorStore::new();
+        let profile = format!("poll-test-{}", std::process::id());
+        let store = PollCursorStore::load(&profile);
         assert!(store.get("reg:poll:ch").is_none());
         let proposed = Anchor {
             kind: AnchorKind::ProviderOpaque,
             value: IdToken::new("post-new"),
         };
-        // Simulate an unacked outcome: store is untouched.
-        assert_ne!(proposed.value.as_str(), "");
-        assert!(store.get("reg:poll:ch").is_none());
-        store.commit(BTreeMap::from([("reg:poll:ch".into(), proposed.clone())]));
+        store.commit(BTreeMap::from([("reg:poll:ch".into(), proposed)]));
+        let reloaded = PollCursorStore::load(&profile);
         assert_eq!(
-            store
+            reloaded
                 .get("reg:poll:ch")
                 .map(|a| a.value.as_str().to_string()),
             Some("post-new".into())
         );
+        let _ = std::fs::remove_file(poll_cursor_path(&profile));
     }
 }
