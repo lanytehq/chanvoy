@@ -2050,6 +2050,14 @@ fn local_attention_key_for(primary_team: &str, channel: &str, team: Option<&str>
     chanvoy_core::attention_key_for(resolved_team, trimmed)
 }
 
+async fn complete_pending_then_lock_attention(
+    state: &AppState,
+) -> Result<tokio::sync::MutexGuard<'_, chanvoy_core::AttentionState>, CoreError> {
+    let mut attention = state.attention_state.lock().await;
+    state.poll_cursors.apply_pending_txn(&mut attention)?;
+    Ok(attention)
+}
+
 async fn record_channel_cursor(
     state: &AppState,
     channel: &str,
@@ -2063,7 +2071,7 @@ async fn record_channel_cursor(
     // channels record under the right qualified key.
     let resolved = state.client.resolve_channel(channel, team).await?;
     let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
-    let mut attention = state.attention_state.lock().await;
+    let mut attention = complete_pending_then_lock_attention(state).await?;
     // Every cursor-write path is a staleness-clearing event per the
     // PER-008B D1 guardrail: the new cursor value is fresh, by definition
     // not stale, and has not yet been checked.
@@ -2092,7 +2100,7 @@ async fn record_notifications_cursor(
         return Ok(());
     };
 
-    let mut attention = state.attention_state.lock().await;
+    let mut attention = complete_pending_then_lock_attention(state).await?;
     attention.mentions = chanvoy_core::MentionCursorState {
         last_seen_post_id: Some(last.message.id.clone()),
         updated_at: Some(chanvoy_core::now_unix_millis()),
@@ -2115,7 +2123,7 @@ async fn record_channel_cursor_if_absent(
     // map is qualified-keyed.
     let resolved = state.client.resolve_channel(channel, None).await?;
     let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
-    let mut attention = state.attention_state.lock().await;
+    let mut attention = complete_pending_then_lock_attention(state).await?;
     if attention.channels.contains_key(&key) {
         return Ok(false);
     }
@@ -2171,7 +2179,18 @@ async fn record_staleness_verdict(
             return;
         }
     };
-    let mut attention = state.attention_state.lock().await;
+    let mut attention = match complete_pending_then_lock_attention(state).await {
+        Ok(attention) => attention,
+        Err(err) => {
+            tracing::warn!(
+                profile = %state.profile.name,
+                channel = %channel,
+                %err,
+                "pending cursor txn blocked staleness persist"
+            );
+            return;
+        }
+    };
     let Some(cursor) = attention.channels.get_mut(&key) else {
         return;
     };
