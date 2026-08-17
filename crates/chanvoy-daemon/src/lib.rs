@@ -604,6 +604,13 @@ async fn handle_client(
                         state.poll_cursors.commit(ack).map_err(DaemonError::from)?;
                     }
                 }
+                if let Some(advance) = dispatched.staged_attention {
+                    if response.error.is_none() {
+                        commit_staged_attention(&state, advance)
+                            .await
+                            .map_err(DaemonError::from)?;
+                    }
+                }
                 if let Some(consume) = dispatched.staged_fanin_consume {
                     if response.error.is_none() {
                         state
@@ -749,9 +756,15 @@ const LOCAL_ONLY_METHODS: &[&str] = &[
     "shutdown",
 ];
 
+struct StagedAttentionAdvance {
+    key: String,
+    cursor: chanvoy_core::ChannelCursorState,
+}
+
 struct DispatchOutcome {
     response: JsonRpcResponse,
     staged_poll_ack: Option<waitprims_poll::StagedPollAck>,
+    staged_attention: Option<StagedAttentionAdvance>,
     staged_fanin_consume: Option<waitprims_fanin::StagedFanInConsume>,
     fanin_hold: Option<std::sync::Arc<waitprims_fanin::FanInHold>>,
 }
@@ -777,12 +790,14 @@ async fn dispatch_request(
                 "identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.".to_string(),
             ),
             staged_poll_ack: None,
+            staged_attention: None,
             staged_fanin_consume: None,
             fanin_hold: None,
         };
     }
 
     let mut staged_poll_ack = None;
+    let mut staged_attention = None;
     let mut staged_fanin_consume = None;
     let mut fanin_hold = None;
     let response: Result<serde_json::Value, DaemonError> = match request.method.as_str() {
@@ -813,8 +828,9 @@ async fn dispatch_request(
         "read_channel" => match serde_json::from_value::<ReadChannelParams>(request.params.clone())
         {
             Ok(params) => match read_channel_rpc(state, params).await {
-                Ok((messages, ack)) => {
+                Ok((messages, ack, attention)) => {
                     staged_poll_ack = ack;
+                    staged_attention = attention;
                     Ok(to_value(messages))
                 }
                 Err(err) => Err(DaemonError::from(err)),
@@ -1423,6 +1439,7 @@ async fn dispatch_request(
     DispatchOutcome {
         response,
         staged_poll_ack,
+        staged_attention,
         staged_fanin_consume,
         fanin_hold,
     }
@@ -1481,7 +1498,14 @@ fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> 
 async fn read_channel_rpc(
     state: &AppState,
     params: ReadChannelParams,
-) -> Result<(Vec<chanvoy_core::Message>, Option<waitprims_poll::StagedPollAck>), CoreError> {
+) -> Result<
+    (
+        Vec<chanvoy_core::Message>,
+        Option<waitprims_poll::StagedPollAck>,
+        Option<StagedAttentionAdvance>,
+    ),
+    CoreError,
+> {
     let team = params.team.as_deref();
     // PER-023 Scope §2 + AC #2a: bootstrap mode hits MM directly
     // for bounded-most-recent-N posts (default N=50, --limit
@@ -1546,13 +1570,51 @@ async fn read_channel_rpc(
     }
     // PER-023 Scope §4 + AC #4: --advance advances the cursor
     // to the latest post **returned** (mode-independent rule).
-    // No-op when zero posts returned.
-    if params.advance {
+    // No-op when zero posts returned. Applied only after the RPC
+    // write succeeds so EOF cannot skip undelivered posts.
+    let attention = if params.advance {
         if let Some(latest) = messages.last() {
-            record_channel_cursor(state, &params.channel, &latest.id, team).await?;
+            Some(prepare_attention_advance(state, &params.channel, &latest.id, team).await?)
+        } else {
+            None
         }
-    }
-    Ok((messages, staged))
+    } else {
+        None
+    };
+    Ok((messages, staged, attention))
+}
+
+async fn prepare_attention_advance(
+    state: &AppState,
+    channel: &str,
+    post_id: &str,
+    team: Option<&str>,
+) -> Result<StagedAttentionAdvance, CoreError> {
+    let resolved = state.client.resolve_channel(channel, team).await?;
+    let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
+    Ok(StagedAttentionAdvance {
+        key,
+        cursor: chanvoy_core::ChannelCursorState {
+            last_seen_post_id: Some(post_id.to_string()),
+            updated_at: Some(chanvoy_core::now_unix_millis()),
+            last_known_stale: false,
+            last_checked_at: None,
+            channel_id: resolved.channel_id,
+            team_id: resolved.team_id,
+            team_name: resolved.team_name,
+            channel_name: resolved.channel_name,
+        },
+    })
+}
+
+async fn commit_staged_attention(
+    state: &AppState,
+    staged: StagedAttentionAdvance,
+) -> Result<(), CoreError> {
+    let mut attention = state.attention_state.lock().await;
+    attention.channels.insert(staged.key, staged.cursor);
+    store_attention_state(&state.profile.name, &attention)?;
+    Ok(())
 }
 
 async fn parse_and_call<P, F, Fut, T>(params: &serde_json::Value, func: F) -> Result<T, DaemonError>

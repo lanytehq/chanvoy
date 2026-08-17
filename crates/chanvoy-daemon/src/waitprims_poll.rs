@@ -135,6 +135,15 @@ fn persist(profile: &str, map: &BTreeMap<String, String>) -> Result<(), CoreErro
     drop(file);
     std::fs::rename(&tmp, &path)
         .map_err(|err| contract_internal("poll", format!("cursor persist: {err}")))?;
+    fsync_dir(&dir)?;
+    Ok(())
+}
+
+fn fsync_dir(dir: &std::path::Path) -> Result<(), CoreError> {
+    let file = std::fs::File::open(dir)
+        .map_err(|err| contract_internal("poll", format!("cursor dir open: {err}")))?;
+    file.sync_all()
+        .map_err(|err| contract_internal("poll", format!("cursor dir sync: {err}")))?;
     Ok(())
 }
 
@@ -708,6 +717,22 @@ mod tests {
         let meta = std::fs::metadata(&path).expect("stat");
         assert!(meta.is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persist_fsyncs_parent_dir_after_rename() {
+        let dir = chanvoy_core::default_chanvoy_config_dir();
+        fsync_dir(&dir).expect("parent dir must be fsyncable");
+        let profile = format!("poll-dirsync-{}", std::process::id());
+        let store = PollCursorStore::load(&profile).expect("empty");
+        store
+            .commit(StagedPollAck {
+                anchors: BTreeMap::from([("reg:poll:ch".into(), "post-a".into())]),
+            })
+            .expect("persist with dir sync");
+        let path = poll_cursor_path(&profile);
+        assert!(path.is_file());
         let _ = std::fs::remove_file(path);
     }
 
