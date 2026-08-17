@@ -43,7 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   large `read --after` is not truncated. Fan-in tie losers replay from
   daemon-owned retention; the member-cancel watcher aborts on drop.
   Fan-in acquires the key set before baseline observation. Poll cursors
-  use the tool-owned bounded reader and a 0600 non-following temp file. `restore_ready` is `Result` and fail-closed.
+  use the tool-owned bounded reader and a 0600 non-following temp file.
+  Selected fan-in matches stay in replay until the RPC write succeeds. `restore_ready` is `Result` and fail-closed.
   A1 single-channel `wait_channel_v3` remains. Path-dep on
   waitprims `f12e707` — not for origin/main.
 

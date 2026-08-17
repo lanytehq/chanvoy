@@ -1688,6 +1688,22 @@ mod wait_rpc_code_tests {
     }
 
     #[test]
+    fn wait_replaced_error_data_carries_both_ids() {
+        let err = DaemonError::Core(CoreError::WaitReplaced {
+            wait_id: "wait_old".into(),
+            replaced_by_wait_id: "wait_new".into(),
+        });
+        let (code, _, data) = error_payload(&err);
+        assert_eq!(code, RPC_WAIT_REPLACED);
+        let data = data.expect("replaced error data");
+        assert_eq!(data["class"], "wait_replaced");
+        assert_eq!(data["wait_id"], "wait_old");
+        assert_eq!(data["replaced_by_wait_id"], "wait_new");
+        assert_ne!(data["wait_id"], "");
+        assert_ne!(data["replaced_by_wait_id"], "");
+    }
+
+    #[test]
     fn wait_channels_v1_params_require_two_arms() {
         let v = serde_json::json!({
             "arms": [

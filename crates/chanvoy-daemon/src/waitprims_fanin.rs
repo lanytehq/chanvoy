@@ -269,17 +269,18 @@ pub(crate) async fn wait_channels_first_match(
         .await?;
     state.wait_owners.note_arm();
     let mut guards = Vec::new();
-    let mut session = None;
+    let mut sessions = Vec::new();
     let mut member_cancels = Vec::new();
     for lease in leases {
         let (sess, guard) = lease.into_guard();
         member_cancels.push(sess.cancel.clone());
-        if session.is_none() {
-            session = Some(sess);
-        }
+        sessions.push(sess);
         guards.push(guard);
     }
-    let session = session.expect("fan-in requires arms");
+    let session = sessions
+        .first()
+        .cloned()
+        .expect("fan-in requires arms");
     let keys = MultiRelease::new(guards);
 
     let mut built = Vec::new();
@@ -290,10 +291,7 @@ pub(crate) async fn wait_channels_first_match(
         tokio::select! {
             biased;
             _ = wait_any_cancel(&member_cancels) => {
-                return Err(CoreError::WaitReplaced {
-                    wait_id: String::new(),
-                    replaced_by_wait_id: String::new(),
-                });
+                return Err(replaced_from_sessions(&sessions));
             }
             result = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", baseline_fut) => {
                 let (scan, baseline) = result.map_err(|err| map_arm_err(&selector, err))?;
@@ -308,10 +306,7 @@ pub(crate) async fn wait_channels_first_match(
                     tokio::select! {
                         biased;
                         _ = wait_any_cancel(&member_cancels) => {
-                            return Err(CoreError::WaitReplaced {
-                                wait_id: String::new(),
-                                replaced_by_wait_id: String::new(),
-                            });
+                            return Err(replaced_from_sessions(&sessions));
                         }
                         page = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", page_fut) => {
                             Some(page.map_err(|err| map_arm_err(&selector, err))?.into_iter().map(|m| m.id).collect())
@@ -413,7 +408,15 @@ pub(crate) async fn wait_channels_first_match(
     keys.release();
     let outcome = outcome.map_err(|err| map_waitprims_err("fan-in", err))?;
     let outcome = admit_wait_result(&docs, outcome)?;
-    translate_fanin_outcome(outcome, &params, &sidecar, &last_error, &subjects)
+    translate_fanin_outcome(
+        outcome,
+        &params,
+        &sidecar,
+        &last_error,
+        &subjects,
+        &state.fanin_replay,
+        &sessions,
+    )
 }
 
 fn map_arm_err(selector: &WaitChannelSelector, err: CoreError) -> CoreError {
@@ -544,12 +547,31 @@ fn registration_digest_all(registrations: &[Registration]) -> Result<String, Cor
         .map_err(|err| contract_internal("fan-in", format!("registration digest: {err}")))
 }
 
+fn replaced_from_sessions(sessions: &[WaitSession]) -> CoreError {
+    let session = sessions
+        .iter()
+        .find(|session| session.cancel.is_cancelled())
+        .or_else(|| sessions.first());
+    match session {
+        Some(session) => CoreError::WaitReplaced {
+            wait_id: session.wait_id.clone(),
+            replaced_by_wait_id: session.replaced_by_id(),
+        },
+        None => CoreError::WaitReplaced {
+            wait_id: String::new(),
+            replaced_by_wait_id: String::new(),
+        },
+    }
+}
+
 fn translate_fanin_outcome(
     outcome: LiveWaitOutcome,
     params: &WaitChannelsParams,
     sidecar: &MessageSidecar,
     last_error: &Mutex<Option<CoreError>>,
     subjects: &[(String, WaitChannelSelector, String)],
+    replay: &FanInReplayStore,
+    sessions: &[WaitSession],
 ) -> Result<(WaitChannelsResult, Option<StagedFanInConsume>), CoreError> {
     let channels: Vec<WaitChannelSelector> = params.arms.iter().map(|a| a.selector()).collect();
     match outcome.outcome_kind {
@@ -570,6 +592,7 @@ fn translate_fanin_outcome(
                 .find(|(s, _, _)| s == subject)
                 .map(|(_, sel, channel_id)| (sel.clone(), channel_id.clone()))
                 .ok_or_else(|| contract_internal("fan-in", "matched subject has no arm"))?;
+            replay.stash(&channel_id, message.clone())?;
             let consume = StagedFanInConsume {
                 channel_id,
                 post_id: message.id.clone(),
@@ -582,10 +605,7 @@ fn translate_fanin_outcome(
         OutcomeKind::LogicalDeadman | OutcomeKind::NoChange => {
             Err(CoreError::WaitTimeout("fan-in".into()))
         }
-        OutcomeKind::Cancelled => Err(CoreError::WaitReplaced {
-            wait_id: String::new(),
-            replaced_by_wait_id: String::new(),
-        }),
+        OutcomeKind::Cancelled => Err(replaced_from_sessions(sessions)),
         _ => {
             if let Some(err) = last_error.lock().ok().and_then(|mut slot| slot.take()) {
                 return Err(err);
@@ -882,6 +902,37 @@ mod tests {
         assert_eq!(store.peek("ch-1").expect("peek").len(), 1);
         store.consume("ch-1", "p-loser").expect("consume");
         assert!(store.peek("ch-1").expect("empty").is_empty());
+    }
+
+    #[test]
+    fn fresh_winner_stays_replayable_until_write_ack() {
+        let store = FanInReplayStore::new();
+        let winner = replay_msg("p-win");
+        store.stash("ch-1", winner.clone()).expect("stash winner");
+        let peeked = store.peek("ch-1").expect("peek");
+        assert_eq!(peeked.len(), 1);
+        assert_eq!(peeked[0].id, "p-win");
+        // write/EOF failure never consumes
+        assert_eq!(store.peek("ch-1").expect("still there").len(), 1);
+        store.consume("ch-1", "p-win").expect("ack write");
+        assert!(store.peek("ch-1").expect("consumed").is_empty());
+    }
+
+    #[test]
+    fn replacement_error_carries_cancelled_arm_ids() {
+        let live = WaitSession::for_test("wait_live", None, false);
+        let cancelled = WaitSession::for_test("wait_old", Some("wait_new"), true);
+        let err = replaced_from_sessions(&[live, cancelled]);
+        match err {
+            CoreError::WaitReplaced {
+                wait_id,
+                replaced_by_wait_id,
+            } => {
+                assert_eq!(wait_id, "wait_old");
+                assert_eq!(replaced_by_wait_id, "wait_new");
+            }
+            other => panic!("expected WaitReplaced, got {other:?}"),
+        }
     }
 
     #[tokio::test]

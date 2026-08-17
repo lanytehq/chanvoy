@@ -541,6 +541,7 @@ impl WaitLease {
     }
 }
 
+#[derive(Clone)]
 pub struct WaitSession {
     pub wait_id: String,
     pub replaced_wait_id: Option<String>,
@@ -555,6 +556,20 @@ impl WaitSession {
             .expect("replaced_by")
             .clone()
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(wait_id: &str, replaced_by: Option<&str>, cancelled: bool) -> Self {
+        let cancel = CancellationToken::new();
+        if cancelled {
+            cancel.cancel();
+        }
+        Self {
+            wait_id: wait_id.to_string(),
+            replaced_wait_id: None,
+            cancel,
+            replaced_by: Arc::new(Mutex::new(replaced_by.map(str::to_string))),
+        }
     }
 }
 
