@@ -56,13 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state uses the same 0600 no-follow temp, file sync, rename, and
   parent-directory sync as poll cursors. `restore_ready` is `Result` and fail-closed.
   A1 single-channel `wait_channel_v3` remains. Waitprims is pinned
-  to git tag `v0.1.0`.
+  to git tag `v0.1.2`.
 
 - **`chanvoy wait` waitprims hold (local A1).** Single-channel
   `wait_channel_v3` is driven by `waitprims-async::run_first_match`
   over the existing daemon stream. MCP `wait` single and CLI
   `chanvoy wait <channel>` keep the same RPC bodies. Waitprims is
-  pinned to git tag `v0.1.0`.
+  pinned to git tag `v0.1.2`.
 
 - **`chanvoy mcp`.** MCP 2026-07-28 access face on the existing profile
   daemon (`stdio` by default; `--listen 127.0.0.1:<port>` for loopback
