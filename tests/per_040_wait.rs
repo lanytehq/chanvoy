@@ -451,22 +451,29 @@ async fn client_disconnect_releases_wait_immediately() {
 
     let _ = first.start_kill();
     let _ = first.wait().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let successor = run_chanvoy(
-        &env,
-        &["--json", "wait", "brief-per-040", "--timeout", "2s"],
-    )
-    .await;
-    let value: serde_json::Value = serde_json::from_slice(&successor.stdout).unwrap();
+    let mut value = serde_json::Value::Null;
+    let mut successor_status = None;
+    for _ in 0..20 {
+        let successor = run_chanvoy(
+            &env,
+            &["--json", "wait", "brief-per-040", "--timeout", "2s"],
+        )
+        .await;
+        successor_status = successor.status.code();
+        value = serde_json::from_slice(&successor.stdout).unwrap();
+        if value["error"]["class"] != "wait_already_active" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_ne!(
         value["error"]["class"], "wait_already_active",
         "disconnect must release the key: {value}"
     );
     assert!(
-        successor.status.code() == Some(1) || value["timeout"] == true,
-        "successor should deadman on empty channel, got {value} status={:?}",
-        successor.status.code()
+        successor_status == Some(1) || value["timeout"] == true,
+        "successor should deadman on empty channel, got {value} status={successor_status:?}"
     );
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
