@@ -121,6 +121,12 @@ pub struct WaitGuard {
     cleanup_notify: Arc<Notify>,
 }
 
+impl WaitGuard {
+    pub(crate) fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
+}
+
 impl Default for WaitOwnerRegistry {
     fn default() -> Self {
         Self::new()
@@ -370,6 +376,31 @@ impl WaitOwnerRegistry {
         }
     }
 
+    /// Acquire every key or release those already taken. Refusal happens
+    /// before the caller starts additional provider observation.
+    pub async fn acquire_all(
+        self: &Arc<Self>,
+        keys: &[(String, String, String)],
+        remaining: Duration,
+    ) -> Result<Vec<WaitLease>, CoreError> {
+        let mut held = Vec::with_capacity(keys.len());
+        for (channel_id, team, channel) in keys {
+            match self
+                .acquire(channel_id, team, channel, None, remaining)
+                .await
+            {
+                Ok(lease) => held.push(lease),
+                Err(err) => {
+                    for lease in held {
+                        drop(lease.into_guard());
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(held)
+    }
+
     fn install_locked(
         self: &Arc<Self>,
         inner: &mut Inner,
@@ -516,6 +547,7 @@ impl WaitLease {
     }
 }
 
+#[derive(Clone)]
 pub struct WaitSession {
     pub wait_id: String,
     pub replaced_wait_id: Option<String>,
@@ -530,6 +562,20 @@ impl WaitSession {
             .expect("replaced_by")
             .clone()
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(wait_id: &str, replaced_by: Option<&str>, cancelled: bool) -> Self {
+        let cancel = CancellationToken::new();
+        if cancelled {
+            cancel.cancel();
+        }
+        Self {
+            wait_id: wait_id.to_string(),
+            replaced_wait_id: None,
+            cancel,
+            replaced_by: Arc::new(Mutex::new(replaced_by.map(str::to_string))),
+        }
     }
 }
 

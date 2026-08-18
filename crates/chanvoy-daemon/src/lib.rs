@@ -8,6 +8,9 @@ use std::{env, fs, io};
 mod wait;
 mod wait_channels;
 mod wait_owner;
+mod waitprims_fanin;
+mod waitprims_hold;
+mod waitprims_poll;
 
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
@@ -86,6 +89,8 @@ struct AppState {
     /// target fails startup (never a silent bare-identity fallback).
     reduce_writer: Option<ReduceWriter>,
     wait_owners: Arc<wait_owner::WaitOwnerRegistry>,
+    poll_cursors: waitprims_poll::PollCursorStore,
+    fanin_replay: waitprims_fanin::FanInReplayStore,
 }
 
 /// PER-035: a pre-built client bound to the family profile a stream
@@ -380,6 +385,12 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         }
     }
 
+    let poll_cursors =
+        waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
+    poll_cursors
+        .apply_pending_txn(&mut attention)
+        .map_err(DaemonError::from)?;
+
     let state = Arc::new(AppState {
         profile: profile.clone(),
         client,
@@ -393,6 +404,8 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         identity_drift,
         reduce_writer,
         wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
+        poll_cursors,
+        fanin_replay: waitprims_fanin::FanInReplayStore::new(),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -562,10 +575,10 @@ async fn handle_client(
                 } else {
                     None
                 };
-                let response = if is_wait_rpc(&request.method) {
+                let dispatched = if is_wait_rpc(&request.method) {
                     let mut eof_buf = String::new();
                     tokio::select! {
-                        response = dispatch_request(request, &state, &shutdown_tx) => response,
+                        dispatched = dispatch_request(request, &state, &shutdown_tx) => dispatched,
                         peek = reader.read_line(&mut eof_buf) => {
                             let _ = peek?;
                             break;
@@ -574,6 +587,7 @@ async fn handle_client(
                 } else {
                     dispatch_request(request, &state, &shutdown_tx).await
                 };
+                let response = dispatched.response;
 
                 if let Some(sub_ack) = extract_subscription_id(&response.result) {
                     client_sub_ids.push(sub_ack);
@@ -590,6 +604,29 @@ async fn handle_client(
                     .write_all(serde_json::to_string(&response)?.as_bytes())
                     .await?;
                 writer.write_all(b"\n").await?;
+                if response.error.is_none()
+                    && (dispatched.staged_poll_ack.is_some()
+                        || dispatched.staged_attention.is_some())
+                {
+                    commit_staged_read_cursors(
+                        &state,
+                        dispatched.staged_poll_ack,
+                        dispatched.staged_attention,
+                    )
+                    .await
+                    .map_err(DaemonError::from)?;
+                }
+                if let Some(consume) = dispatched.staged_fanin_consume {
+                    if response.error.is_none() {
+                        state
+                            .fanin_replay
+                            .consume(&consume.channel_id, &consume.post_id)
+                            .map_err(DaemonError::from)?;
+                    }
+                }
+                if let Some(hold) = dispatched.fanin_hold {
+                    hold.release();
+                }
                 line.clear();
             }
             recv_result = async {
@@ -724,11 +761,24 @@ const LOCAL_ONLY_METHODS: &[&str] = &[
     "shutdown",
 ];
 
+struct StagedAttentionAdvance {
+    key: String,
+    cursor: chanvoy_core::ChannelCursorState,
+}
+
+struct DispatchOutcome {
+    response: JsonRpcResponse,
+    staged_poll_ack: Option<waitprims_poll::StagedPollAck>,
+    staged_attention: Option<StagedAttentionAdvance>,
+    staged_fanin_consume: Option<waitprims_fanin::StagedFanInConsume>,
+    fanin_hold: Option<std::sync::Arc<waitprims_fanin::FanInHold>>,
+}
+
 async fn dispatch_request(
     request: JsonRpcRequest,
     state: &AppState,
     shutdown_tx: &Arc<Mutex<Option<oneshot::Sender<()>>>>,
-) -> JsonRpcResponse {
+) -> DispatchOutcome {
     // PER-014 drift gate. If the post-bind probe (or any later
     // `daemon_status` probe) caught the bot's Mattermost identity
     // diverging from the configured `bot_username`, network-backed RPCs
@@ -738,13 +788,23 @@ async fn dispatch_request(
     // drift-floor framing (#per-014, 2026-04-27).
     let method = request.method.as_str();
     if state.identity_drift.load(Ordering::Relaxed) && !LOCAL_ONLY_METHODS.contains(&method) {
-        return rpc_error(
-            request.id,
-            -32_000,
-            "identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.".to_string(),
-        );
+        return DispatchOutcome {
+            response: rpc_error(
+                request.id,
+                -32_000,
+                "identity drift detected: configured bot_username does not match the Mattermost-returned username for this token; network-backed RPCs are refused. Inspect daemon_status.mattermost_identity_drift and re-run `chanvoy auto-setup` to re-validate identity.".to_string(),
+            ),
+            staged_poll_ack: None,
+            staged_attention: None,
+            staged_fanin_consume: None,
+            fanin_hold: None,
+        };
     }
 
+    let mut staged_poll_ack = None;
+    let mut staged_attention = None;
+    let mut staged_fanin_consume = None;
+    let mut fanin_hold = None;
     let response: Result<serde_json::Value, DaemonError> = match request.method.as_str() {
         "whoami" => state
             .client
@@ -770,66 +830,18 @@ async fn dispatch_request(
             .await
             .map(to_value)
             .map_err(DaemonError::from),
-        "read_channel" => parse_and_call(&request.params, |params: ReadChannelParams| async move {
-            let team = params.team.as_deref();
-            // PER-023 Scope §2 + AC #2a: bootstrap mode hits MM directly
-            // for bounded-most-recent-N posts (default N=50, --limit
-            // override). Mode-independent of --since/--after/etc.; CLI
-            // enforces mutual exclusion.
-            let mut messages = if params.since_bootstrap {
-                let limit = params.limit.unwrap_or(50);
-                state
-                    .client
-                    .read_channel_most_recent(&params.channel, limit, team)
-                    .await?
-            } else if let Some(after_post_id) = params.after_post_id {
-                state
-                    .client
-                    .read_channel_after(&params.channel, &after_post_id, team)
-                    .await?
-            } else if params.since_last_mine {
-                state
-                    .client
-                    .read_channel_since_last_mine(&params.channel, team)
-                    .await?
-            } else if let Some(secs) = params.since_secs {
-                state
-                    .client
-                    .read_channel_since_secs(&params.channel, secs, team)
-                    .await?
-            } else {
-                state
-                    .client
-                    .read_channel(&params.channel, params.since_minutes.unwrap_or(60), team)
-                    .await?
-            };
-            // PER-023 Scope §2 + AC #2a: general --limit truncates the
-            // existing read-mode result set (hard cap; no full-window
-            // pagination semantics added by PER-023). Bootstrap already
-            // applied the limit at the API layer, so this no-ops there.
-            if let Some(limit) = params.limit {
-                if !params.since_bootstrap {
-                    let limit = limit as usize;
-                    if messages.len() > limit {
-                        // Keep the most-recent N — sort is ascending by
-                        // create_at, so truncate from the front.
-                        let drop = messages.len() - limit;
-                        messages.drain(..drop);
-                    }
+        "read_channel" => match serde_json::from_value::<ReadChannelParams>(request.params.clone())
+        {
+            Ok(params) => match read_channel_rpc(state, params).await {
+                Ok((messages, ack, attention)) => {
+                    staged_poll_ack = ack;
+                    staged_attention = attention;
+                    Ok(to_value(messages))
                 }
-            }
-            // PER-023 Scope §4 + AC #4: --advance advances the cursor
-            // to the latest post **returned** (mode-independent rule).
-            // No-op when zero posts returned.
-            if params.advance {
-                if let Some(latest) = messages.last() {
-                    record_channel_cursor(state, &params.channel, &latest.id, team).await?;
-                }
-            }
-            Ok::<_, CoreError>(messages)
-        })
-        .await
-        .map(to_value),
+                Err(err) => Err(DaemonError::from(err)),
+            },
+            Err(err) => Err(DaemonError::from(err)),
+        },
         "pinned_channel" => {
             parse_and_call(&request.params, |params: PinnedChannelParams| async move {
                 state
@@ -1205,9 +1217,9 @@ async fn dispatch_request(
             .await
             .map(to_value)
         }
-        method if method == WAIT_CHANNEL_V3_METHOD => {
+        method if wait::uses_first_match_engine(method) => {
             match serde_json::from_value::<WaitChannelV3Params>(request.params.clone()) {
-                Ok(params) => wait::wait_with_params(
+                Ok(params) => wait::wait_with_params_v3(
                     state,
                     wait::WaitRequest {
                         channel: &params.channel,
@@ -1230,10 +1242,14 @@ async fn dispatch_request(
         }
         method if method == WAIT_CHANNELS_V1_METHOD => {
             match serde_json::from_value::<WaitChannelsParams>(request.params.clone()) {
-                Ok(params) => wait_channels::wait_channels_with_params(state, params)
-                    .await
-                    .map(to_value)
-                    .map_err(DaemonError::from),
+                Ok(params) => match wait_channels::wait_channels_with_params(state, params).await {
+                    Ok((result, consume, hold)) => {
+                        staged_fanin_consume = consume;
+                        fanin_hold = hold;
+                        Ok(to_value(result))
+                    }
+                    Err(err) => Err(DaemonError::from(err)),
+                },
                 Err(err) => Err(DaemonError::Core(CoreError::WaitFilterInvalid(format!(
                     "wait_channels_v1 input: {err}"
                 )))),
@@ -1418,12 +1434,19 @@ async fn dispatch_request(
         }),
     };
 
-    match response {
+    let response = match response {
         Ok(value) => rpc_result(request.id, value),
         Err(error) => {
             let (code, message, data) = error_payload(&error);
             rpc_error_with_data(request.id, code, message, data)
         }
+    };
+    DispatchOutcome {
+        response,
+        staged_poll_ack,
+        staged_attention,
+        staged_fanin_consume,
+        fanin_hold,
     }
 }
 
@@ -1475,6 +1498,178 @@ fn restate_against_requested_post(error: CoreError, requested_post_id: &str) -> 
             message: format!("could not read the thread for post {requested_post_id}"),
         },
     }
+}
+
+async fn read_channel_rpc(
+    state: &AppState,
+    params: ReadChannelParams,
+) -> Result<
+    (
+        Vec<chanvoy_core::Message>,
+        Option<waitprims_poll::StagedPollAck>,
+        Option<StagedAttentionAdvance>,
+    ),
+    CoreError,
+> {
+    let team = params.team.as_deref();
+    // PER-023 Scope §2 + AC #2a: bootstrap mode hits MM directly
+    // for bounded-most-recent-N posts (default N=50, --limit
+    // override). Mode-independent of --since/--after/etc.; CLI
+    // enforces mutual exclusion.
+    let mut staged = None;
+    let mut messages = if params.since_bootstrap {
+        let limit = params.limit.unwrap_or(50);
+        state
+            .client
+            .read_channel_most_recent(&params.channel, limit, team)
+            .await?
+    } else if let Some(after_post_id) = params.after_post_id {
+        let resolved = state.client.resolve_channel(&params.channel, team).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let cycle = waitprims_poll::poll_channel_once(
+            state,
+            &state.poll_cursors,
+            &params.channel,
+            &resolved.channel_id,
+            Some(&after_post_id),
+            team,
+            deadline,
+        )
+        .await?;
+        staged = Some(waitprims_poll::ack_poll_cycle(
+            &cycle.outcome,
+            &format!("poll:{}", resolved.channel_id),
+            &state.my_user_id,
+        )?);
+        cycle.messages
+    } else if params.since_last_mine {
+        state
+            .client
+            .read_channel_since_last_mine(&params.channel, team)
+            .await?
+    } else if let Some(secs) = params.since_secs {
+        state
+            .client
+            .read_channel_since_secs(&params.channel, secs, team)
+            .await?
+    } else {
+        state
+            .client
+            .read_channel(&params.channel, params.since_minutes.unwrap_or(60), team)
+            .await?
+    };
+    // PER-023 Scope §2 + AC #2a: general --limit truncates the
+    // existing read-mode result set (hard cap; no full-window
+    // pagination semantics added by PER-023). Bootstrap already
+    // applied the limit at the API layer, so this no-ops there.
+    if let Some(limit) = params.limit {
+        if !params.since_bootstrap {
+            let limit = limit as usize;
+            if messages.len() > limit {
+                // Keep the most-recent N — sort is ascending by
+                // create_at, so truncate from the front.
+                let drop = messages.len() - limit;
+                messages.drain(..drop);
+            }
+        }
+    }
+    // PER-023 Scope §4 + AC #4: --advance advances the cursor
+    // to the latest post **returned** (mode-independent rule).
+    // No-op when zero posts returned. Applied only after the RPC
+    // write succeeds so EOF cannot skip undelivered posts.
+    let attention = if params.advance {
+        if let Some(latest) = messages.last() {
+            Some(prepare_attention_advance(state, &params.channel, &latest.id, team).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok((messages, staged, attention))
+}
+
+async fn prepare_attention_advance(
+    state: &AppState,
+    channel: &str,
+    post_id: &str,
+    team: Option<&str>,
+) -> Result<StagedAttentionAdvance, CoreError> {
+    let resolved = state.client.resolve_channel(channel, team).await?;
+    let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
+    Ok(StagedAttentionAdvance {
+        key,
+        cursor: chanvoy_core::ChannelCursorState {
+            last_seen_post_id: Some(post_id.to_string()),
+            updated_at: Some(chanvoy_core::now_unix_millis()),
+            last_known_stale: false,
+            last_checked_at: None,
+            channel_id: resolved.channel_id,
+            team_id: resolved.team_id,
+            team_name: resolved.team_name,
+            channel_name: resolved.channel_name,
+        },
+    })
+}
+
+fn attention_candidate(
+    current: &chanvoy_core::AttentionState,
+    staged: StagedAttentionAdvance,
+) -> chanvoy_core::AttentionState {
+    let mut next = current.clone();
+    next.channels.insert(staged.key, staged.cursor);
+    next
+}
+
+fn persist_then_publish_attention_state(
+    persist: impl FnOnce(&chanvoy_core::AttentionState) -> Result<(), CoreError>,
+    live: &mut chanvoy_core::AttentionState,
+    build: impl FnOnce(&chanvoy_core::AttentionState) -> chanvoy_core::AttentionState,
+) -> Result<(), CoreError> {
+    let candidate = build(live);
+    persist(&candidate)?;
+    *live = candidate;
+    Ok(())
+}
+
+fn persist_then_publish_attention(
+    persist: impl FnOnce(&chanvoy_core::AttentionState) -> Result<(), CoreError>,
+    live: &mut chanvoy_core::AttentionState,
+    staged: StagedAttentionAdvance,
+) -> Result<(), CoreError> {
+    persist_then_publish_attention_state(persist, live, move |current| {
+        attention_candidate(current, staged)
+    })
+}
+
+async fn commit_staged_read_cursors(
+    state: &AppState,
+    poll: Option<waitprims_poll::StagedPollAck>,
+    attention: Option<StagedAttentionAdvance>,
+) -> Result<(), CoreError> {
+    let mut attn = state.attention_state.lock().await;
+    let Some(advance) = attention else {
+        if let Some(ack) = poll {
+            state.poll_cursors.commit(ack, &mut attn)?;
+        }
+        return Ok(());
+    };
+    let profile = state.profile.name.clone();
+    if poll.is_none() {
+        state.poll_cursors.apply_pending_txn(&mut attn)?;
+        persist_then_publish_attention(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut attn,
+            advance,
+        )?;
+        return Ok(());
+    }
+    state
+        .poll_cursors
+        .commit_combined(poll.expect("poll"), &mut attn, |current| {
+            attention_candidate(current, advance)
+        })?;
+    Ok(())
 }
 
 async fn parse_and_call<P, F, Fut, T>(params: &serde_json::Value, func: F) -> Result<T, DaemonError>
@@ -1618,6 +1813,22 @@ mod wait_rpc_code_tests {
     }
 
     #[test]
+    fn wait_replaced_error_data_carries_both_ids() {
+        let err = DaemonError::Core(CoreError::WaitReplaced {
+            wait_id: "wait_old".into(),
+            replaced_by_wait_id: "wait_new".into(),
+        });
+        let (code, _, data) = error_payload(&err);
+        assert_eq!(code, RPC_WAIT_REPLACED);
+        let data = data.expect("replaced error data");
+        assert_eq!(data["class"], "wait_replaced");
+        assert_eq!(data["wait_id"], "wait_old");
+        assert_eq!(data["replaced_by_wait_id"], "wait_new");
+        assert_ne!(data["wait_id"], "");
+        assert_ne!(data["replaced_by_wait_id"], "");
+    }
+
+    #[test]
     fn wait_channels_v1_params_require_two_arms() {
         let v = serde_json::json!({
             "arms": [
@@ -1643,6 +1854,244 @@ mod wait_rpc_code_tests {
         let p: WaitChannelV2Params = serde_json::from_value(v).expect("deserialize");
         assert_eq!(p.timeout_secs, 60);
         assert_eq!(p.contains.as_deref(), Some("ASSENT"));
+    }
+}
+
+#[cfg(test)]
+mod staged_cursor_tests {
+    use super::*;
+
+    fn sample_advance() -> StagedAttentionAdvance {
+        StagedAttentionAdvance {
+            key: "org/ops".into(),
+            cursor: chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-new".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn attention_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention(
+            |_| {
+                Err(CoreError::WaitProviderDegraded {
+                    channel: "poll".into(),
+                    message: "forced persist fail".into(),
+                })
+            },
+            &mut live,
+            sample_advance(),
+        );
+        assert!(err.is_err());
+        assert!(
+            live.channels.is_empty(),
+            "failed persist must leave in-memory attention unchanged"
+        );
+    }
+
+    #[test]
+    fn attention_persist_success_publishes_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        persist_then_publish_attention(|_| Ok(()), &mut live, sample_advance()).expect("ok");
+        assert_eq!(
+            live.channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
+    }
+
+    fn forced_persist_err() -> CoreError {
+        CoreError::WaitProviderDegraded {
+            channel: "attn".into(),
+            message: "forced persist fail".into(),
+        }
+    }
+
+    #[test]
+    fn ordinary_cursor_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.channels
+                    .insert("org/ops".into(), sample_advance().cursor);
+                next
+            },
+        );
+        assert!(err.is_err());
+        assert!(live.channels.is_empty());
+    }
+
+    #[test]
+    fn notification_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.mentions = chanvoy_core::MentionCursorState {
+                    last_seen_post_id: Some("mention-1".into()),
+                    updated_at: Some(1),
+                };
+                next
+            },
+        );
+        assert!(err.is_err());
+        assert!(live.mentions.last_seen_post_id.is_none());
+    }
+
+    #[test]
+    fn seed_persist_failure_does_not_advance_memory() {
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.channels
+                    .insert("org/seed".into(), sample_advance().cursor);
+                next
+            },
+        );
+        assert!(err.is_err());
+        assert!(live.channels.is_empty());
+    }
+
+    #[test]
+    fn attention_only_advance_survives_reload_via_shared_writer() {
+        let profile = format!("attn-only-reload-{}", std::process::id());
+        let mut live = chanvoy_core::AttentionState::default();
+        persist_then_publish_attention(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut live,
+            sample_advance(),
+        )
+        .expect("attention-only persist");
+        assert_eq!(
+            live.channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
+        let reloaded = chanvoy_core::load_attention_state(&profile).expect("restart");
+        assert_eq!(
+            reloaded
+                .channels
+                .get("org/ops")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
+        let path = chanvoy_core::attention_state_path(&profile);
+        let meta = std::fs::metadata(&path).expect("stat");
+        assert!(meta.is_file());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn attention_only_persist_failure_does_not_publish_or_survive_restart() {
+        let profile = format!("attn-only-fail-{}", std::process::id());
+        let path = chanvoy_core::attention_state_path(&profile);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).expect("block persist path");
+        let mut live = chanvoy_core::AttentionState::default();
+        let err = persist_then_publish_attention(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut live,
+            sample_advance(),
+        );
+        assert!(err.is_err());
+        assert!(live.channels.is_empty());
+        std::fs::remove_dir(&path).expect("unblock");
+        let reloaded = chanvoy_core::load_attention_state(&profile).expect("restart");
+        assert!(
+            reloaded.channels.is_empty(),
+            "failed attention-only persist must not appear after restart"
+        );
+    }
+
+    #[test]
+    fn ordinary_writers_use_the_same_durable_attention_store() {
+        let profile = format!("attn-ordinary-{}", std::process::id());
+        let mut live = chanvoy_core::AttentionState::default();
+        persist_then_publish_attention_state(
+            |candidate| store_attention_state(&profile, candidate).map(|_| ()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                next.mentions = chanvoy_core::MentionCursorState {
+                    last_seen_post_id: Some("mention-1".into()),
+                    updated_at: Some(1),
+                };
+                next.channels
+                    .insert("org/seed".into(), sample_advance().cursor);
+                next
+            },
+        )
+        .expect("ordinary persist");
+        let reloaded = chanvoy_core::load_attention_state(&profile).expect("restart");
+        assert_eq!(
+            reloaded.mentions.last_seen_post_id.as_deref(),
+            Some("mention-1")
+        );
+        assert_eq!(
+            reloaded
+                .channels
+                .get("org/seed")
+                .and_then(|c| c.last_seen_post_id.as_deref()),
+            Some("p-new")
+        );
+        let _ = std::fs::remove_file(chanvoy_core::attention_state_path(&profile));
+    }
+
+    #[test]
+    fn staleness_persist_failure_does_not_publish_verdict() {
+        let mut live = chanvoy_core::AttentionState::default();
+        live.channels.insert(
+            "org/ops".into(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("p-old".into()),
+                updated_at: Some(1),
+                last_known_stale: false,
+                last_checked_at: None,
+                channel_id: "ch".into(),
+                team_id: "t".into(),
+                team_name: "org".into(),
+                channel_name: "ops".into(),
+            },
+        );
+        let err = persist_then_publish_attention_state(
+            |_| Err(forced_persist_err()),
+            &mut live,
+            |current| {
+                let mut next = current.clone();
+                if let Some(cursor) = next.channels.get_mut("org/ops") {
+                    cursor.last_known_stale = true;
+                    cursor.last_checked_at = Some(9);
+                }
+                next
+            },
+        );
+        assert!(err.is_err());
+        let cursor = live.channels.get("org/ops").expect("kept");
+        assert!(!cursor.last_known_stale);
+        assert!(cursor.last_checked_at.is_none());
     }
 }
 
@@ -1797,6 +2246,14 @@ fn local_attention_key_for(primary_team: &str, channel: &str, team: Option<&str>
     chanvoy_core::attention_key_for(resolved_team, trimmed)
 }
 
+async fn complete_pending_then_lock_attention(
+    state: &AppState,
+) -> Result<tokio::sync::MutexGuard<'_, chanvoy_core::AttentionState>, CoreError> {
+    let mut attention = state.attention_state.lock().await;
+    state.poll_cursors.apply_pending_txn(&mut attention)?;
+    Ok(attention)
+}
+
 async fn record_channel_cursor(
     state: &AppState,
     channel: &str,
@@ -1810,25 +2267,29 @@ async fn record_channel_cursor(
     // channels record under the right qualified key.
     let resolved = state.client.resolve_channel(channel, team).await?;
     let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
-    let mut attention = state.attention_state.lock().await;
+    let mut attention = complete_pending_then_lock_attention(state).await?;
     // Every cursor-write path is a staleness-clearing event per the
     // PER-008B D1 guardrail: the new cursor value is fresh, by definition
     // not stale, and has not yet been checked.
-    attention.channels.insert(
-        key,
-        chanvoy_core::ChannelCursorState {
-            last_seen_post_id: Some(post_id.to_string()),
-            updated_at: Some(chanvoy_core::now_unix_millis()),
-            last_known_stale: false,
-            last_checked_at: None,
-            channel_id: resolved.channel_id,
-            team_id: resolved.team_id,
-            team_name: resolved.team_name,
-            channel_name: resolved.channel_name,
+    let cursor = chanvoy_core::ChannelCursorState {
+        last_seen_post_id: Some(post_id.to_string()),
+        updated_at: Some(chanvoy_core::now_unix_millis()),
+        last_known_stale: false,
+        last_checked_at: None,
+        channel_id: resolved.channel_id,
+        team_id: resolved.team_id,
+        team_name: resolved.team_name,
+        channel_name: resolved.channel_name,
+    };
+    persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        move |current| {
+            let mut next = current.clone();
+            next.channels.insert(key, cursor);
+            next
         },
-    );
-    store_attention_state(&state.profile.name, &attention)?;
-    Ok(())
+    )
 }
 
 async fn record_notifications_cursor(
@@ -1839,13 +2300,20 @@ async fn record_notifications_cursor(
         return Ok(());
     };
 
-    let mut attention = state.attention_state.lock().await;
-    attention.mentions = chanvoy_core::MentionCursorState {
+    let mut attention = complete_pending_then_lock_attention(state).await?;
+    let mentions = chanvoy_core::MentionCursorState {
         last_seen_post_id: Some(last.message.id.clone()),
         updated_at: Some(chanvoy_core::now_unix_millis()),
     };
-    store_attention_state(&state.profile.name, &attention)?;
-    Ok(())
+    persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        move |current| {
+            let mut next = current.clone();
+            next.mentions = mentions;
+            next
+        },
+    )
 }
 
 /// Record a channel cursor only if none already exists for that channel.
@@ -1862,25 +2330,30 @@ async fn record_channel_cursor_if_absent(
     // map is qualified-keyed.
     let resolved = state.client.resolve_channel(channel, None).await?;
     let key = chanvoy_core::attention_key_for(&resolved.team_name, &resolved.channel_name);
-    let mut attention = state.attention_state.lock().await;
+    let mut attention = complete_pending_then_lock_attention(state).await?;
     if attention.channels.contains_key(&key) {
         return Ok(false);
     }
     // A freshly-seeded cursor is by definition non-stale and unchecked.
-    attention.channels.insert(
-        key,
-        chanvoy_core::ChannelCursorState {
-            last_seen_post_id: Some(post_id.to_string()),
-            updated_at: Some(chanvoy_core::now_unix_millis()),
-            last_known_stale: false,
-            last_checked_at: None,
-            channel_id: resolved.channel_id,
-            team_id: resolved.team_id,
-            team_name: resolved.team_name,
-            channel_name: resolved.channel_name,
+    let cursor = chanvoy_core::ChannelCursorState {
+        last_seen_post_id: Some(post_id.to_string()),
+        updated_at: Some(chanvoy_core::now_unix_millis()),
+        last_known_stale: false,
+        last_checked_at: None,
+        channel_id: resolved.channel_id,
+        team_id: resolved.team_id,
+        team_name: resolved.team_name,
+        channel_name: resolved.channel_name,
+    };
+    persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        move |current| {
+            let mut next = current.clone();
+            next.channels.insert(key, cursor);
+            next
         },
-    );
-    store_attention_state(&state.profile.name, &attention)?;
+    )?;
     Ok(true)
 }
 
@@ -1918,13 +2391,34 @@ async fn record_staleness_verdict(
             return;
         }
     };
-    let mut attention = state.attention_state.lock().await;
-    let Some(cursor) = attention.channels.get_mut(&key) else {
-        return;
+    let mut attention = match complete_pending_then_lock_attention(state).await {
+        Ok(attention) => attention,
+        Err(err) => {
+            tracing::warn!(
+                profile = %state.profile.name,
+                channel = %channel,
+                %err,
+                "pending cursor txn blocked staleness persist"
+            );
+            return;
+        }
     };
-    cursor.last_known_stale = stale;
-    cursor.last_checked_at = Some(chanvoy_core::now_unix_millis());
-    if let Err(err) = store_attention_state(&state.profile.name, &attention) {
+    if !attention.channels.contains_key(&key) {
+        return;
+    }
+    let checked_at = chanvoy_core::now_unix_millis();
+    if let Err(err) = persist_then_publish_attention_state(
+        |candidate| store_attention_state(&state.profile.name, candidate).map(|_| ()),
+        &mut attention,
+        |current| {
+            let mut next = current.clone();
+            if let Some(cursor) = next.channels.get_mut(&key) {
+                cursor.last_known_stale = stale;
+                cursor.last_checked_at = Some(checked_at);
+            }
+            next
+        },
+    ) {
         tracing::warn!(
             profile = %state.profile.name,
             channel = %channel,

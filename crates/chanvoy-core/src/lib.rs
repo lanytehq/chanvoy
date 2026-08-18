@@ -52,7 +52,7 @@ pub use reqwest::StatusCode;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -2313,18 +2313,40 @@ pub fn load_attention_state(profile_name: &str) -> Result<AttentionState, CoreEr
     }
 }
 
+/// Crash-durable replace of a tool-owned file in the chanvoy config dir:
+/// 0600 `O_NOFOLLOW` temp, `sync_all`, rename, parent-directory fsync.
+pub fn persist_tool_owned_bytes(path: &Path, raw: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let dir = default_chanvoy_config_dir();
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let tmp = dir.join(format!(
+        "{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("state"),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&tmp);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    file.write_all(raw)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path)?;
+    let dir_file = fs::File::open(&dir)?;
+    dir_file.sync_all()?;
+    Ok(())
+}
+
 pub fn store_attention_state(
     profile_name: &str,
     state: &AttentionState,
 ) -> Result<PathBuf, CoreError> {
-    let dir = default_chanvoy_config_dir();
-    fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     let path = attention_state_path(profile_name);
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(state)?)?;
-    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp_path, &path)?;
+    persist_tool_owned_bytes(&path, serde_json::to_string_pretty(state)?.as_bytes())?;
     Ok(path)
 }
 
@@ -6199,8 +6221,55 @@ env_name = \"LANYTE_MM_TOKEN\"
 
         assert_eq!(loaded, state);
         assert!(path.ends_with("lanytehq/chanvoy/state-bravo-devlead.json"));
+        let meta = fs::metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
 
         unsafe { env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn store_attention_state_fails_over_directory_without_new_cursor() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { env::set_var("CHANVOY_CONFIG_DIR", dir.path()) };
+
+        let profile = format!("attn-fail-{}", std::process::id());
+        let prior = AttentionState {
+            channels: BTreeMap::from([(
+                "org/ops".to_string(),
+                ChannelCursorState {
+                    last_seen_post_id: Some("p-old".to_string()),
+                    updated_at: Some(1),
+                    ..ChannelCursorState::default()
+                },
+            )]),
+            ..AttentionState::default()
+        };
+        store_attention_state(&profile, &prior).unwrap();
+        let path = attention_state_path(&profile);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let next = AttentionState {
+            channels: BTreeMap::from([(
+                "org/ops".to_string(),
+                ChannelCursorState {
+                    last_seen_post_id: Some("p-new".to_string()),
+                    updated_at: Some(2),
+                    ..ChannelCursorState::default()
+                },
+            )]),
+            ..AttentionState::default()
+        };
+        assert!(store_attention_state(&profile, &next).is_err());
+        fs::remove_dir(&path).unwrap();
+        let loaded = load_attention_state(&profile).unwrap();
+        assert!(
+            loaded.channels.is_empty(),
+            "failed persist must not leave a new durable cursor"
+        );
+
+        unsafe { env::remove_var("CHANVOY_CONFIG_DIR") };
     }
 
     #[cfg(unix)]

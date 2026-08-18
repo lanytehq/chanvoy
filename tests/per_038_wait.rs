@@ -245,6 +245,55 @@ async fn wait_process_match_and_deadman_shapes() {
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
 
+#[tokio::test]
+#[ignore = "integration: PER-038 process outcome matrix"]
+async fn wait_process_monitored_match_uses_stream_path() {
+    let env = TestEnv::new("per-038-process-monitored").await;
+    env.write_profile_with_monitored("agent-bravo-devlead", "org-lanytehq", &["brief-per-038"]);
+    mount_wait_channel(
+        &env,
+        "brief-per-038",
+        "chan-id-per038-monitored",
+        Some("anchor-mon"),
+        &[(
+            "stream-post",
+            "reviewer-id",
+            "reviewer",
+            "ASSENT: monitored stream",
+            1_780_000_000_200,
+        )],
+    )
+    .await;
+    let daemon = spawn_daemon(&env).await;
+
+    let matched = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "brief-per-038",
+            "--timeout",
+            "5s",
+            "--contains",
+            "ASSENT",
+            "--after",
+            "anchor-mon",
+        ],
+    )
+    .await;
+    assert_eq!(
+        matched.status.code(),
+        Some(0),
+        "monitored match must exit 0"
+    );
+    let matched_json: serde_json::Value =
+        serde_json::from_slice(&matched.stdout).expect("match JSON payload");
+    assert_eq!(matched_json["channel"], "brief-per-038");
+    assert_eq!(matched_json["messages"][0]["id"], "stream-post");
+    assert!(String::from_utf8_lossy(&matched.stderr).is_empty());
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
 /// AC-W2: a hard input refusal is process-visible as exit 2, JSON with
 /// `timeout:false`, and no misleading timeout payload.
 #[tokio::test]

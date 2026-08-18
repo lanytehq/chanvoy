@@ -83,6 +83,21 @@ impl FanInRetain {
 pub async fn wait_channels_with_params(
     state: &AppState,
     params: WaitChannelsParams,
+) -> Result<
+    (
+        WaitChannelsResult,
+        Option<crate::waitprims_fanin::StagedFanInConsume>,
+        Option<std::sync::Arc<crate::waitprims_fanin::FanInHold>>,
+    ),
+    CoreError,
+> {
+    crate::waitprims_fanin::wait_channels_first_match(state, params).await
+}
+
+#[allow(dead_code)]
+async fn wait_channels_legacy_unused(
+    state: &AppState,
+    params: WaitChannelsParams,
 ) -> Result<WaitChannelsResult, CoreError> {
     validate_wait_channels_params(&params)?;
     WaitPredicate::compile(
@@ -565,7 +580,7 @@ fn redact_arm_error(message: &str) -> String {
     }
 }
 
-async fn with_bus_drain<T, Fut>(
+pub(crate) async fn with_bus_drain<T, Fut>(
     rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
     bus: &mut VecDeque<Arc<DaemonEvent>>,
     label: &str,

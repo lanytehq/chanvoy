@@ -33,6 +33,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`chanvoy wait` waitprims hold (local A2).** Fan-in
+  `wait_channels_v1` is one `run_first_match` registration set
+  (tie = registration order). Grok-bot / no-listener uses one
+  `run_poll_cycle` per wake; `read --after` still returns the
+  complete provider page (including self-authored posts); cursors
+  stay uncommitted until a request-owned `poll_cycle_ack` after a
+  successful RPC write. Poll bounds follow the fetched page so a
+  large `read --after` is not truncated. Fan-in tie losers replay from
+  daemon-owned retention; the member-cancel watcher aborts on drop.
+  Fan-in acquires the key set before baseline observation. Poll cursors
+  use the tool-owned bounded reader and a 0600 non-following temp file.
+  Selected fan-in matches stay in replay until the RPC write succeeds.
+  The winning fan-in arm stays owned until that write completes.
+  `read --advance` and poll cursors apply only after a successful RPC
+  write; a combined poll+attention commit uses one recoverable txn;
+  poll persist fsyncs the parent directory after rename. Combined
+  `read --after --advance` recovers a pending redo before building the
+  next attention candidate so a later channel cannot roll back a
+  recovered cursor. Ordinary attention writers persist a cloned
+  candidate before replacing in-memory state. Acknowledged attention
+  state uses the same 0600 no-follow temp, file sync, rename, and
+  parent-directory sync as poll cursors. `restore_ready` is `Result` and fail-closed.
+  A1 single-channel `wait_channel_v3` remains. Waitprims is pinned
+  to git tag `v0.1.2`.
+
+- **`chanvoy wait` waitprims hold (local A1).** Single-channel
+  `wait_channel_v3` is driven by `waitprims-async::run_first_match`
+  over the existing daemon stream. MCP `wait` single and CLI
+  `chanvoy wait <channel>` keep the same RPC bodies. Waitprims is
+  pinned to git tag `v0.1.2`.
+
 - **`chanvoy mcp`.** MCP 2026-07-28 access face on the existing profile
   daemon (`stdio` by default; `--listen 127.0.0.1:<port>` for loopback
   Streamable HTTP). Tools: `whoami`, `read_channel`, `show`, `thread`,

@@ -22,6 +22,16 @@ use tokio::time::{sleep, timeout, Instant};
 
 use crate::AppState;
 
+pub(crate) fn channel_is_monitored(state: &AppState, channel: &str) -> bool {
+    channel_name_is_monitored(&state.profile.monitored_channels, channel)
+}
+
+pub(crate) fn channel_name_is_monitored(monitored: &[String], channel: &str) -> bool {
+    monitored
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(channel))
+}
+
 /// Max UTF-8 source bytes for `--contains` and `--pattern` (product + secrev).
 pub const FILTER_SOURCE_MAX_BYTES: usize = 256;
 /// Compiled regex size limit (bytes) enforced at RegexBuilder.
@@ -284,9 +294,98 @@ pub async fn wait_with_params(
     }
 }
 
+/// Whether this RPC method uses the A1 waitprims first-match engine.
+/// Legacy `wait_channel` / `wait_channel_v2` stay on the established paths.
+pub(crate) fn uses_first_match_engine(method: &str) -> bool {
+    method == chanvoy_core::WAIT_CHANNEL_V3_METHOD
+}
+
+/// PER-040 v3 only: first-match hold. Legacy wait RPCs must not call this.
+pub async fn wait_with_params_v3(
+    state: &AppState,
+    req: WaitRequest<'_>,
+) -> Result<WaitResult, CoreError> {
+    let WaitRequest {
+        channel,
+        timeout_secs,
+        team,
+        contains,
+        pattern,
+        after,
+        replace_wait_id,
+        emit_wait_ids,
+    } = req;
+    validate_wait_timeout_secs(timeout_secs)?;
+    validate_wait_channel_v3_strings(channel, team, contains, pattern, after)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    WaitPredicate::compile("pending", "pending", contains, pattern)?;
+
+    let resolved = provider_retry(state, channel, deadline, || async {
+        state.client.resolve_channel(channel, team).await
+    })
+    .await?;
+
+    // Bind explicit `--after` before any potentially replacing acquire.
+    // Invalid/foreign/missing anchors must fail closed as input/provider
+    // without displacing a live waiter. The resolved cursor is carried
+    // into the runner; the runner must not fetch it again.
+    let prebound_after = if let Some(anchor) = after {
+        let (scan, baseline) =
+            establish_baseline(state, channel, &resolved.channel_id, Some(anchor), deadline)
+                .await?;
+        Some(crate::waitprims_hold::cursor_from_baseline(scan, baseline))
+    } else {
+        None
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lease = state
+        .wait_owners
+        .acquire(
+            &resolved.channel_id,
+            &resolved.team_name,
+            &resolved.channel_name,
+            replace_wait_id,
+            remaining,
+        )
+        .await?;
+    state.wait_owners.note_arm();
+    let (session, guard) = lease.into_guard();
+
+    let predicate =
+        WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
+    let monitored = channel_is_monitored(state, channel);
+
+    let result = crate::waitprims_hold::run_single_channel_first_match(
+        state,
+        crate::waitprims_hold::FirstMatchWait {
+            channel,
+            channel_id: &resolved.channel_id,
+            after,
+            prebound_after,
+            monitored,
+            predicate,
+            deadline,
+            session: &session,
+            guard,
+        },
+    )
+    .await;
+
+    match result {
+        Ok(mut wr) if emit_wait_ids => {
+            wr.wait_id = Some(session.wait_id);
+            wr.replaced_wait_id = session.replaced_wait_id;
+            Ok(wr)
+        }
+        other => other,
+    }
+}
+
 /// Monitored path: **subscribe first**, then resolve/compile/anchor/backfill
 /// while draining the receiver (devrev D1 / AC-W3).
-async fn wait_push_path(
+pub(crate) async fn wait_push_path(
     state: &AppState,
     channel: &str,
     team: Option<&str>,
@@ -322,10 +421,6 @@ async fn wait_push_path(
     let predicate = WaitPredicate::compile(&state.my_user_id, &channel_id, contains, pattern)?;
     let pred_channel = predicate.channel_id().to_string();
 
-    // Explicit --after: bus may only fire posts confirmed in the provider
-    // `after` relation (devrev D2). None = bare wait (post-sub bus eligible).
-    let mut after_eligible: Option<HashSet<String>> = after.map(|_| HashSet::new());
-
     let (scan_after, _rest_baseline) = {
         let baseline = establish_baseline(state, channel, &pred_channel, after, deadline);
         tokio::pin!(baseline);
@@ -338,6 +433,63 @@ async fn wait_push_path(
             }
         }
     };
+
+    wait_push_after_baseline(
+        state,
+        channel,
+        &predicate,
+        after,
+        scan_after,
+        deadline,
+        &mut rx,
+        &mut bus_buffer,
+    )
+    .await
+}
+
+/// Monitored v3 observation from an already-bound cursor. Subscribes to
+/// the daemon event bus (existing WS loop — not a second Mattermost
+/// client) and does not re-fetch the bind baseline.
+pub(crate) async fn wait_push_from_cursor(
+    state: &AppState,
+    channel: &str,
+    predicate: &WaitPredicate,
+    after: Option<&str>,
+    scan_after: Option<String>,
+    deadline: Instant,
+) -> Result<WaitResult, CoreError> {
+    let mut rx = state.event_bus.subscribe();
+    let mut bus_buffer: VecDeque<Arc<DaemonEvent>> = VecDeque::new();
+    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+    wait_push_after_baseline(
+        state,
+        channel,
+        predicate,
+        after,
+        scan_after,
+        deadline,
+        &mut rx,
+        &mut bus_buffer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_push_after_baseline(
+    state: &AppState,
+    channel: &str,
+    predicate: &WaitPredicate,
+    after: Option<&str>,
+    scan_after: Option<String>,
+    deadline: Instant,
+    rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
+    bus_buffer: &mut VecDeque<Arc<DaemonEvent>>,
+) -> Result<WaitResult, CoreError> {
+    let pred_channel = predicate.channel_id().to_string();
+
+    // Explicit --after: bus may only fire posts confirmed in the provider
+    // `after` relation (devrev D2). None = bare wait (post-sub bus eligible).
+    let mut after_eligible: Option<HashSet<String>> = after.map(|_| HashSet::new());
 
     let mut processed: HashSet<String> = HashSet::new();
     let mut backfill_msgs: Vec<Message> = Vec::new();
@@ -355,18 +507,18 @@ async fn wait_push_path(
                     break;
                 }
                 _ = sleep(Duration::from_millis(5)) => {
-                    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                    drain_bus(rx, bus_buffer, channel)?;
                 }
             }
         }
     }
     note_after_eligible(&mut after_eligible, &backfill_msgs);
 
-    drain_bus(&mut rx, &mut bus_buffer, channel)?;
+    drain_bus(rx, bus_buffer, channel)?;
     if let Some(hit) = first_match_bus_then_rest(
         &backfill_msgs,
-        &bus_buffer,
-        &predicate,
+        bus_buffer,
+        predicate,
         &processed,
         after_eligible.as_ref(),
     ) {
@@ -378,19 +530,15 @@ async fn wait_push_path(
     // F1: under explicit --after, retain body-matching bus candidates that
     // are not yet REST-confirmed; do not mark them processed.
     reconcile_bus_after_eval(
-        &mut bus_buffer,
-        &predicate,
+        bus_buffer,
+        predicate,
         &mut processed,
         after_eligible.as_ref(),
     );
     // F2: initial posts_after(anchor) is exhaustive — drop proven non-members.
     // (Only when an explicit after anchor was used; bare wait has no set.)
     if after.is_some() {
-        drop_pending_non_members_after_success(
-            &mut bus_buffer,
-            &predicate,
-            after_eligible.as_ref(),
-        );
+        drop_pending_non_members_after_success(bus_buffer, predicate, after_eligible.as_ref());
     }
 
     // D5: advance exclusive cursor past initial backfill so live REST
@@ -433,16 +581,16 @@ async fn wait_push_path(
                         bus_buffer.push_back(event);
                         if let Some(hit) = first_match_bus_then_rest(
                             &[],
-                            &bus_buffer,
-                            &predicate,
+                            bus_buffer,
+                            predicate,
                             &processed,
                             after_eligible.as_ref(),
                         ) {
                             return Ok(one_message_result(channel, hit));
                         }
                         reconcile_bus_after_eval(
-                            &mut bus_buffer,
-                            &predicate,
+                            bus_buffer,
+                            predicate,
                             &mut processed,
                             after_eligible.as_ref(),
                         );
@@ -450,13 +598,13 @@ async fn wait_push_path(
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Drain anything left, then REST recover while still
                         // draining the bus (devrev R3 #2).
-                        let _ = drain_bus(&mut rx, &mut bus_buffer, channel);
+                        let _ = drain_bus(rx, bus_buffer, channel);
                         let cursor_snap = scan_cursor.clone();
                         let page = {
                             let recover = lag_recover_page(
                                 state,
                                 channel,
-                                &predicate,
+                                predicate,
                                 cursor_snap.as_deref(),
                                 deadline,
                             );
@@ -465,19 +613,19 @@ async fn wait_push_path(
                                 tokio::select! {
                                     res = &mut recover => break res,
                                     _ = sleep(Duration::from_millis(5)) => {
-                                        drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                                        drain_bus(rx, bus_buffer, channel)?;
                                         if let Some(hit) = first_match_bus_then_rest(
                                             &[],
-                                            &bus_buffer,
-                                            &predicate,
+                                            bus_buffer,
+                                            predicate,
                                             &processed,
                                             after_eligible.as_ref(),
                                         ) {
                                             return Ok(one_message_result(channel, hit));
                                         }
                                         reconcile_bus_after_eval(
-                                            &mut bus_buffer,
-                                            &predicate,
+                                            bus_buffer,
+                                            predicate,
                                             &mut processed,
                                             after_eligible.as_ref(),
                                         );
@@ -490,26 +638,26 @@ async fn wait_push_path(
                                 note_after_eligible(&mut after_eligible, &page);
                                 saw_successful_rest = true;
                                 clean_observe = true;
-                                drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                                drain_bus(rx, bus_buffer, channel)?;
                                 if let Some(hit) = first_match_bus_then_rest(
                                     &page,
-                                    &bus_buffer,
-                                    &predicate,
+                                    bus_buffer,
+                                    predicate,
                                     &processed,
                                     after_eligible.as_ref(),
                                 ) {
                                     return Ok(one_message_result(channel, hit));
                                 }
                                 reconcile_bus_after_eval(
-                                    &mut bus_buffer,
-                                    &predicate,
+                                    bus_buffer,
+                                    predicate,
                                     &mut processed,
                                     after_eligible.as_ref(),
                                 );
                                 // F2: successful exhaustive posts_after — drop non-members.
                                 drop_pending_non_members_after_success(
-                                    &mut bus_buffer,
-                                    &predicate,
+                                    bus_buffer,
+                                    predicate,
                                     after_eligible.as_ref(),
                                 );
                                 if let Some(last) = page.last() {
@@ -562,7 +710,7 @@ async fn wait_push_path(
                             })
                             .await
                         } else {
-                            empty_at_arm_observation(state, channel, &predicate, deadline)
+                            empty_at_arm_observation(state, channel, predicate, deadline)
                                 .await
                         }
                     };
@@ -571,19 +719,19 @@ async fn wait_push_path(
                         tokio::select! {
                             res = &mut fetch_fut => break res,
                             _ = sleep(Duration::from_millis(5)) => {
-                                drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                                drain_bus(rx, bus_buffer, channel)?;
                                 if let Some(hit) = first_match_bus_then_rest(
                                     &[],
-                                    &bus_buffer,
-                                    &predicate,
+                                    bus_buffer,
+                                    predicate,
                                     &processed,
                                     after_eligible.as_ref(),
                                 ) {
                                     return Ok(one_message_result(channel, hit));
                                 }
                                 reconcile_bus_after_eval(
-                                    &mut bus_buffer,
-                                    &predicate,
+                                    bus_buffer,
+                                    predicate,
                                     &mut processed,
                                     after_eligible.as_ref(),
                                 );
@@ -597,26 +745,26 @@ async fn wait_push_path(
                         saw_successful_rest = true;
                         clean_observe = true;
                         // Live REST must drain bus before firing (devrev).
-                        drain_bus(&mut rx, &mut bus_buffer, channel)?;
+                        drain_bus(rx, bus_buffer, channel)?;
                         if let Some(hit) = first_match_bus_then_rest(
                             &page,
-                            &bus_buffer,
-                            &predicate,
+                            bus_buffer,
+                            predicate,
                             &processed,
                             after_eligible.as_ref(),
                         ) {
                             return Ok(one_message_result(channel, hit));
                         }
                         reconcile_bus_after_eval(
-                            &mut bus_buffer,
-                            &predicate,
+                            bus_buffer,
+                            predicate,
                             &mut processed,
                             after_eligible.as_ref(),
                         );
                         // F2: successful exhaustive posts_after — drop non-members.
                         drop_pending_non_members_after_success(
-                            &mut bus_buffer,
-                            &predicate,
+                            bus_buffer,
+                            predicate,
                             after_eligible.as_ref(),
                         );
                         if let Some(last) = page.last() {
@@ -646,7 +794,7 @@ async fn wait_push_path(
     }
 }
 
-async fn wait_rest_path(
+pub(crate) async fn wait_rest_path(
     state: &AppState,
     channel: &str,
     predicate: &WaitPredicate,
@@ -654,8 +802,29 @@ async fn wait_rest_path(
     deadline: Instant,
 ) -> Result<WaitResult, CoreError> {
     state.wait_owners.note_provider_io();
-    let (mut scan_cursor, rest_baseline) =
+    let (scan_cursor, rest_baseline) =
         establish_baseline(state, channel, predicate.channel_id(), after, deadline).await?;
+    wait_rest_from_cursor(
+        state,
+        channel,
+        predicate,
+        scan_cursor,
+        rest_baseline,
+        deadline,
+    )
+    .await
+}
+
+/// REST observe from an already-resolved exclusive cursor. Does not
+/// re-establish a baseline (A1 bind cursor must be consumed as-is).
+pub(crate) async fn wait_rest_from_cursor(
+    state: &AppState,
+    channel: &str,
+    predicate: &WaitPredicate,
+    mut scan_cursor: Option<String>,
+    rest_baseline: HashSet<String>,
+    deadline: Instant,
+) -> Result<WaitResult, CoreError> {
     let mut processed: HashSet<String> = HashSet::new();
 
     if let Some(ref anchor) = scan_cursor {
@@ -969,7 +1138,7 @@ pub(crate) fn drain_bus(
     }
 }
 
-fn one_message_result(channel: &str, message: Message) -> WaitResult {
+pub(crate) fn one_message_result(channel: &str, message: Message) -> WaitResult {
     WaitResult {
         channel: channel.to_string(),
         messages: vec![message],
@@ -1270,6 +1439,25 @@ mod tests {
     }
 
     #[test]
+    fn first_match_engine_is_v3_only() {
+        assert!(uses_first_match_engine(
+            chanvoy_core::WAIT_CHANNEL_V3_METHOD
+        ));
+        assert!(!uses_first_match_engine("wait_channel"));
+        assert!(!uses_first_match_engine("wait_channel_v2"));
+        assert!(!uses_first_match_engine("wait_channels_v1"));
+    }
+
+    #[test]
+    fn monitored_channel_selects_event_bus_observation() {
+        let listed = vec!["ops".into(), "tooling".into()];
+        assert!(channel_name_is_monitored(&listed, "ops"));
+        assert!(channel_name_is_monitored(&listed, "OPS"));
+        assert!(!channel_name_is_monitored(&listed, "brief-per-042"));
+        assert!(!channel_name_is_monitored(&[], "ops"));
+    }
+
+    #[test]
     fn zero_timeout_is_filter_invalid_not_deadman() {
         let err = validate_wait_timeout_secs(0).unwrap_err();
         assert!(
@@ -1303,6 +1491,16 @@ mod tests {
             hit.id, "p1",
             "must prefer bus arrival over REST timestamp order"
         );
+    }
+
+    #[test]
+    fn monitored_stream_match_does_not_require_rest_page() {
+        let p = pred(Some("ASSENT"), None);
+        let mut bus = VecDeque::new();
+        bus.push_back(inbound_event("bus-1", "panel ASSENT", 10));
+        let hit = first_match_bus_then_rest(&[], &bus, &p, &HashSet::new(), None)
+            .expect("bus inbound must deliver without a REST page");
+        assert_eq!(hit.id, "bus-1");
     }
 
     #[test]
