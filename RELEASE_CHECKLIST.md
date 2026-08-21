@@ -83,6 +83,7 @@ Checks (each fails fast with a clear hint):
 - No conflicting `vX.Y.Z` tag locally OR on origin
 - No published GitHub release for this version
 - `gh`, `minisign`, `gpg` available on PATH
+- `decernor` **0.1.4+** available (`DECERNOR=` override allowed; strict `X.Y.Z` only)
 - `CHANVOY_MINISIGN_KEY` set and points at an existing file
 - `CHANVOY_PGP_KEY_ID` set and present in the GPG keyring
   (GPG signature over `checksums.txt` is mandatory for v0.2.2 trust

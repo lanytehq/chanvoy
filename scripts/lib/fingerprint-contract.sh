@@ -29,26 +29,23 @@ chanvoy_decernor_bin() {
     return 1
 }
 
-# True if $1 is a dotted version >= $2 (numeric components only).
+# True if $1 and $2 are strict X.Y.Z and $1 >= $2.
 chanvoy_version_ge() {
     python3 - "$1" "$2" <<'PY'
-import sys
+import re, sys
 
 def parts(s):
-    out = []
-    for p in s.strip().lstrip("vV").split("."):
-        digits = "".join(c for c in p if c.isdigit())
-        out.append(int(digits) if digits else 0)
-    return out
+    s = s.strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+", s):
+        sys.exit(1)
+    return [int(p) for p in s.split(".")]
 
 have, need = parts(sys.argv[1]), parts(sys.argv[2])
-n = max(len(have), len(need))
-have += [0] * (n - len(have))
-need += [0] * (n - len(need))
 sys.exit(0 if have >= need else 1)
 PY
 }
 
+# Strict stable X.Y.Z only. Rejects 0.1.4-rc1 (must not become 0.1.41).
 chanvoy_decernor_version() {
     local bin="$1"
     local raw
@@ -56,10 +53,10 @@ chanvoy_decernor_version() {
     python3 - "$raw" <<'PY'
 import re, sys
 raw = sys.argv[1]
-m = re.search(r"(\d+\.\d+\.\d+)", raw)
-if not m:
+matches = re.findall(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.\-A-Za-z])", raw)
+if len(matches) != 1:
     sys.exit(1)
-print(m.group(1))
+print(matches[0])
 PY
 }
 
@@ -76,6 +73,81 @@ chanvoy_require_decernor() {
         return 1
     fi
     printf '%s\n' "$bin"
+}
+
+chanvoy_preflight_decernor() {
+    local bin ver
+    bin="$(chanvoy_require_decernor)" || return 1
+    ver="$(chanvoy_decernor_version "$bin")" || return 1
+    echo "[ok] decernor ${ver} (>= ${CHANVOY_MIN_DECERNOR}) at ${bin}"
+}
+
+# stdout: minisign<TAB>gpg
+# Rejects duplicates, unknown algos, extra fields. Values may still be TBD-*.
+chanvoy_read_expected_contract() {
+    python3 - "$1" <<'PY'
+import pathlib, re, sys
+
+path = pathlib.Path(sys.argv[1])
+minisign = None
+gpg = None
+for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split()
+    if len(parts) != 2:
+        print(
+            f"error: expected contract line {lineno} must be '<algo> <fingerprint>' with no extra fields",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    algo, value = parts
+    if algo == "minisign":
+        if minisign is not None:
+            print("error: duplicate minisign line in expected-fingerprints", file=sys.stderr)
+            sys.exit(1)
+        minisign = value
+    elif algo == "gpg":
+        if gpg is not None:
+            print("error: duplicate gpg line in expected-fingerprints", file=sys.stderr)
+            sys.exit(1)
+        gpg = value
+    else:
+        print(
+            f"error: unknown algorithm {algo!r} on expected contract line {lineno}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+if minisign is None:
+    print("error: no 'minisign' line in expected-fingerprints", file=sys.stderr)
+    sys.exit(1)
+if gpg is None:
+    print("error: no 'gpg' line in expected-fingerprints", file=sys.stderr)
+    sys.exit(1)
+
+def classify(kind, value):
+    if value.startswith("TBD-"):
+        return "tbd"
+    if kind == "minisign" and re.fullmatch(r"[0-9a-f]{64}", value):
+        return "ok"
+    if kind == "gpg" and re.fullmatch(r"[0-9A-F]{40}", value):
+        return "ok"
+    print(
+        f"error: {kind} fingerprint is not a well-formed contract token",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+mini_kind = classify("minisign", minisign)
+gpg_kind = classify("gpg", gpg)
+if mini_kind == "tbd" or gpg_kind == "tbd":
+    print("TBD", minisign, gpg)
+    sys.exit(2)
+
+print(f"{minisign}\t{gpg}")
+PY
 }
 
 # stdout: uppercase 40-hex GPG primary fingerprint

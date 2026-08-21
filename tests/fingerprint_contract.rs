@@ -22,6 +22,10 @@ fn verify_script() -> PathBuf {
     repo_root().join("scripts/verify-public-keys.sh")
 }
 
+fn check_decernor_script() -> PathBuf {
+    repo_root().join("scripts/check-decernor.sh")
+}
+
 fn fixture(name: &str) -> PathBuf {
     repo_root()
         .join("tests/fixtures/fingerprint-contract")
@@ -318,6 +322,120 @@ fn old_decernor_version_is_refused() {
     assert!(!out.status.success());
     assert!(stderr_of(&out).contains("too old"));
     assert_eq!(fs::read_to_string(&dest).unwrap(), TBD_CONTRACT);
+}
+
+#[test]
+fn verify_rejects_duplicate_minisign_line() {
+    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let dir = TempDir::new().unwrap();
+    seed_publics(dir.path());
+    let v = run_verify(
+        &stub.bin,
+        dir.path(),
+        &fixture("expected-duplicate-minisign.txt"),
+    );
+    assert!(!v.status.success());
+    assert!(stderr_of(&v).contains("duplicate minisign"));
+}
+
+#[test]
+fn verify_rejects_extra_field() {
+    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let dir = TempDir::new().unwrap();
+    seed_publics(dir.path());
+    let v = run_verify(&stub.bin, dir.path(), &fixture("expected-extra-field.txt"));
+    assert!(!v.status.success());
+    assert!(stderr_of(&v).contains("no extra fields"));
+}
+
+#[test]
+fn verify_rejects_unknown_algo() {
+    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let dir = TempDir::new().unwrap();
+    seed_publics(dir.path());
+    let v = run_verify(&stub.bin, dir.path(), &fixture("expected-unknown-algo.txt"));
+    assert!(!v.status.success());
+    assert!(stderr_of(&v).contains("unknown algorithm"));
+}
+
+#[test]
+fn verify_rejects_malformed_hex() {
+    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let dir = TempDir::new().unwrap();
+    seed_publics(dir.path());
+    let v = run_verify(
+        &stub.bin,
+        dir.path(),
+        &fixture("expected-malformed-hex.txt"),
+    );
+    assert!(!v.status.success());
+    assert!(stderr_of(&v).contains("not a well-formed contract token"));
+}
+
+#[test]
+fn prerelease_decernor_version_is_refused() {
+    let stub = StubDecernor::new("0.1.4-rc1", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let dir = TempDir::new().unwrap();
+    seed_publics(dir.path());
+    let dest = dir.path().join("expected-fingerprints.txt");
+    fs::write(&dest, TBD_CONTRACT).unwrap();
+    let out = run_insert(
+        &stub.bin,
+        &dir.path().join("chanvoy.pub"),
+        &dir.path().join("chanvoy.gpg.asc"),
+        &dest,
+    );
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("could not parse version") || err.contains("too old"),
+        "unexpected stderr: {err}"
+    );
+    assert_eq!(fs::read_to_string(&dest).unwrap(), TBD_CONTRACT);
+}
+
+#[test]
+fn malformed_decernor_version_is_refused() {
+    let stub = StubDecernor::new("not-a-version", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let dir = TempDir::new().unwrap();
+    seed_publics(dir.path());
+    let dest = dir.path().join("expected-fingerprints.txt");
+    fs::write(&dest, TBD_CONTRACT).unwrap();
+    let out = run_insert(
+        &stub.bin,
+        &dir.path().join("chanvoy.pub"),
+        &dir.path().join("chanvoy.gpg.asc"),
+        &dest,
+    );
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("could not parse version"));
+}
+
+#[test]
+fn check_decernor_preflight_accepts_stable_014() {
+    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let out = Command::new("bash")
+        .arg(check_decernor_script())
+        .env("DECERNOR", &stub.bin)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "preflight failed: {}",
+        stderr_of(&out)
+    );
+    assert!(stdout_of(&out).contains("decernor 0.1.4"));
+}
+
+#[test]
+fn check_decernor_preflight_rejects_prerelease() {
+    let stub = StubDecernor::new("0.1.4-rc1", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let out = Command::new("bash")
+        .arg(check_decernor_script())
+        .env("DECERNOR", &stub.bin)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }
 
 #[test]

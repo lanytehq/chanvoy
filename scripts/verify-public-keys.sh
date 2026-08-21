@@ -65,34 +65,20 @@ done
 chanvoy_refuse_private "${release_dir}/chanvoy.pub"
 chanvoy_refuse_private "${release_dir}/chanvoy.gpg.asc"
 
-expected_minisign=""
-expected_gpg=""
-while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-        '#'*|'') continue ;;
-    esac
-    algo="$(printf '%s\n' "$line" | awk '{print $1}')"
-    value="$(printf '%s\n' "$line" | awk '{print $2}')"
-    case "$algo" in
-        minisign) expected_minisign="$value" ;;
-        gpg)      expected_gpg="$value" ;;
-    esac
-done < "$fingerprints_file"
-
-if [ -z "$expected_minisign" ]; then
-    echo "error: no 'minisign' line in ${fingerprints_file}" >&2
-    exit 1
-fi
-if [ -z "$expected_gpg" ]; then
-    echo "error: no 'gpg' line in ${fingerprints_file}" >&2
-    exit 1
-fi
-if [ "${expected_minisign#TBD-}" != "$expected_minisign" ] || [ "${expected_gpg#TBD-}" != "$expected_gpg" ]; then
+parsed=""
+parse_status=0
+parsed="$(chanvoy_read_expected_contract "$fingerprints_file")" || parse_status=$?
+if [ "$parse_status" -eq 2 ]; then
     echo "error: fingerprint contract still contains a TBD placeholder in ${fingerprints_file}" >&2
     echo "       run scripts/insert-expected-fingerprints.sh against exported public files" >&2
     echo "       (decernor 0.1.4+). Do not hand-type hex." >&2
     exit 1
 fi
+if [ "$parse_status" -ne 0 ]; then
+    exit 1
+fi
+expected_minisign="${parsed%%$'\t'*}"
+expected_gpg="${parsed#*$'\t'}"
 
 bin="$(chanvoy_require_decernor)"
 

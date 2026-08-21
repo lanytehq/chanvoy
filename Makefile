@@ -354,6 +354,7 @@ release-preflight: release-prep ## Pre-tag readiness gate — clean tree, versio
 		fi; \
 	done
 	@echo "[ok] release tooling (gh + minisign + gpg) on PATH"
+	@bash scripts/check-decernor.sh
 	@if [ -z "$${CHANVOY_MINISIGN_KEY:-}" ]; then \
 		echo "[!!] CHANVOY_MINISIGN_KEY not set"; \
 		echo "     export CHANVOY_MINISIGN_KEY=/path/to/minisign-secret-key"; \
