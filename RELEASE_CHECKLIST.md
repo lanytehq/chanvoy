@@ -224,8 +224,8 @@ only via a documented key-rotation announcement on `#ops-updates`.
 
 | Algorithm | Fingerprint |
 |---|---|
-| minisign | `TBD — pinned at impl time from dispatch's keypair provisioning` |
-| GPG | `TBD — pinned at impl time from dispatch's keypair provisioning` |
+| minisign (`minisign-public-blob-sha256-v1`) | `TBD — insert with decernor 0.1.4+ from the exported .pub` |
+| GPG (OpenPGP primary, `--gpg-role primary`) | `TBD — insert with decernor 0.1.4+ from the exported .asc` |
 
 The same values are checked into `keys/expected-fingerprints.txt` so
 `make release-verify-keys` asserts an exported `chanvoy.pub` /
@@ -250,10 +250,19 @@ export CHANVOY_PGP_KEY_ID=ABC123...
 ```
 
 ### `release-verify-keys` fails on "TBD placeholder"
-The expected fingerprints in `keys/expected-fingerprints.txt` are
-still the pre-provisioning placeholders. Fill in the real values
-after dispatch's keypair provisioning completes (Dave's step A on
-`#release-chanvoy-v022`).
+`keys/expected-fingerprints.txt` still has placeholders. Fill both
+lines together with the inserter (decernor **0.1.4+**, explicit
+public files). Do not hand-type hex. A missing minisign `.pub` or
+GPG export leaves the dest unchanged.
+
+```bash
+make insert-expected-fingerprints MINISIGN_PUB=... GPG_ASC=...
+```
+
+### `insert-expected-fingerprints` / `verify-public-keys` fail on "decernor … too old"
+The host binary is older than 0.1.4. Install 0.1.4 or later and set
+`DECERNOR=` if PATH still points at an older copy. Do not verify
+against a pre-0.1.4 contract.
 
 ### `release-checksums` fails on "no chanvoy-v*-* binaries found"
 You ran the target before `make release-download` populated the

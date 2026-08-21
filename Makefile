@@ -25,7 +25,7 @@ VERSION_FILE := VERSION
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
 .PHONY: sbom security-scan license-check release-prep release-smoke workflow-lint
 .PHONY: release-preflight release-clean release-download release-checksums release-sign
-.PHONY: release-export-keys release-verify-signatures release-verify-keys release-verify
+.PHONY: release-export-keys release-verify-signatures release-verify-keys release-verify insert-expected-fingerprints
 .PHONY: release-notes release-upload release-undraft release-upload-all help
 
 all: check
@@ -407,6 +407,17 @@ release-verify-signatures: ## Verify minisign + GPG signatures on signed artifac
 
 release-verify-keys: ## Verify public-key fingerprints match keys/expected-fingerprints.txt
 	@bash scripts/verify-public-keys.sh $(RELEASE_DIR)
+
+# Explicit public files only. Requires decernor 0.1.4+. Both lines or neither.
+# Usage: make insert-expected-fingerprints MINISIGN_PUB=... GPG_ASC=...
+insert-expected-fingerprints: ## Write keys/expected-fingerprints.txt from decernor records
+ifndef MINISIGN_PUB
+	$(error MINISIGN_PUB is required)
+endif
+ifndef GPG_ASC
+	$(error GPG_ASC is required)
+endif
+	@bash scripts/insert-expected-fingerprints.sh --minisign "$(MINISIGN_PUB)" --gpg "$(GPG_ASC)"
 
 release-verify: release-verify-signatures release-verify-keys ## Composite — signatures + key fingerprints
 	@echo "[ok] release-verify passed (signatures + key fingerprints)"
