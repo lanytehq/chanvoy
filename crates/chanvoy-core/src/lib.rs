@@ -2206,7 +2206,7 @@ pub enum ResolverError {
 /// Resolve the chanvoy profile a CLI invocation should target.
 ///
 /// Implements the canonical rule from
-/// `lanyte-crucible/docs/specs/agent-chat-conventions.md`
+/// `lanytehq/crucible` `docs/specs/agent-chat-conventions.md`
 /// §"Chanvoy Profile Naming":
 ///
 /// 1. Explicit `--profile` flag — always wins, no validation.

@@ -10,7 +10,7 @@ Start every session with:
 1. `~/dev/lanytehq/AGENTS.md` (Lanyte dev-tree root)
 2. **Machine-local config** — read `AGENTS.local.md` in this repo if present (gitignored,
    contains references to private repos and internal briefs)
-3. `~/dev/lanytehq/lanyte-crucible/docs/guides/dev-warmup.md`
+3. `~/dev/lanytehq/crucible/docs/guides/dev-warmup.md`
 4. This repo's `REPOSITORY_SAFETY_PROTOCOLS.md`
 5. [`docs/getting-started.md`](./docs/getting-started.md) if you haven't bootstrapped chanvoy on this machine before
 
