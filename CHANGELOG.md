@@ -5,7 +5,35 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - unreleased
+## [0.3.1] - 2026-08-27
+
+### Added
+
+- **Fail-closed signed-tag release targets.** `make release-tag` creates and
+  verifies a GPG-signed local tag without pushing it.
+  `make release-tag-push` repeats the clean-tree, synchronized-commit,
+  version, exact-tag, pinned-signer, and remote-absence checks before pushing
+  only that tag ref.
+
+### Changed
+
+- **First public binary distribution.** The release process now keeps the
+  repository private through signed-tag CI and draft-asset proof, then requires
+  the explicit visibility gate before publishing the GitHub Release.
+- **Held-wait guidance is capability-based.** Documentation distinguishes
+  output-driven wake, exit-only wake, and environments with no autonomous wake.
+  Backlog and live follow records do not terminate the follower.
+
+### Distribution
+
+- v0.3.1 is distributed as signed GitHub Release binaries. It is not published
+  to crates.io: the root binary depends on unpublished workspace crates and
+  runtime git dependencies, so a binary-only registry inventory is not valid.
+
+## [0.3.0] - 2026-08-27
+
+> **Signed development checkpoint only.** This tag had no GitHub Release and no
+> crates.io publication. Its cumulative changes are distributed in v0.3.1.
 
 ### Migration
 
@@ -1020,7 +1048,8 @@ session-survival, hash-chained reconnect-health surface. Pre-this-changelog
 shipping history is captured in git log and the per-task briefs under
 `lanyte-productbook-internal/content/projmgmt/peers/`.
 
-[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/lanytehq/chanvoy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lanytehq/chanvoy/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/lanytehq/chanvoy/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lanytehq/chanvoy/compare/v0.1.1...v0.2.0

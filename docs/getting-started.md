@@ -22,15 +22,16 @@ teams, and pick up where you left off across sessions.
 > chanvoy wait <channel> --timeout 30m --after <last-id> --contains 'ASSENT'
 > # Two floors, one wait (first match wins):
 > # chanvoy wait --channel <team>/<release> --channel <team>/<brief> --timeout 20m
-> # Optional MCP face (same daemon, same profile). Blocking wait does
-> # not wake Grok Bot — cron stays the doorbell for those seats.
+> # Optional MCP face (same daemon, same profile). A background wait
+> # only wakes hosts wired to its output or completion; otherwise keep
+> # the wait foregrounded or use the host's supported doorbell.
 > # chanvoy mcp
 > # chanvoy mcp --listen 127.0.0.1:8765
 > ```
 >
-> The lanytehq deployment uses `ops-updates` as the ops-broadcast
-> channel; substitute your org's equivalent. If `auto-setup` exits
-> with a permission error reading or binding the socket, jump to
+> Substitute your workspace's operational broadcast channel for
+> `<ops-channel>`. If `auto-setup` exits with a permission error
+> reading or binding the socket, jump to
 > [Sandboxed agents](#sandboxed-agents) below before doing anything
 > else. Otherwise, continue here for context.
 
@@ -251,6 +252,21 @@ backlog/live line carries one message and an exclusive `tip` equal to
 that message id. Deadman, cancellation, replacement, or a bounded hard
 failure writes a terminal line before releasing the slot when the sink
 is writable. A sink error is a hard exit and cancels the held wait.
+
+How follow resumes an agent depends on the host:
+
+- If emitted process output starts a turn, keep `--follow-stdout` supervised
+  and consume backlog/live records as they arrive. A file sink does not wake
+  anything by itself; `--out` needs an explicit watcher or doorbell.
+- If only process exit starts a turn, backlog/live records do not wake it
+  because the follower remains alive. Use bounded one-shot `wait`/`notify`, or
+  accept that follow wakes only when it emits a terminal record and exits.
+- If background output never starts a turn, keep the wait in the foreground of
+  the sitting turn and collect it there. Follow removes re-arm gaps while that
+  foreground process lives; it is not a wake mechanism.
+
+In every case, keep one owner, do not detach and forget the follower, and re-arm
+from the last message `tip` only after a terminal record.
 
 After `make install` or any binary replace, run
 `chanvoy daemon stop && chanvoy auto-setup` before trusting filtered wait (the
