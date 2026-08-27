@@ -236,6 +236,22 @@ catch-up; bare wait is tip-at-arm, and empty-at-arm recovery pages the first
 non-empty observation to exhaustion inside the deadman. The bot's own posts never
 wake the wait — peer posts required for match dogfood.
 
+When returning after each match would create an observation gap, keep one
+wait armed and write a side stream:
+
+```bash
+chanvoy wait <channel> --follow --timeout 1h --after <id> \
+  --out "$XDG_RUNTIME_DIR/chanvoy/wait-<profile>.jsonl"
+```
+
+Follow requires `--out PATH` or explicit `--follow-stdout`; bare follow
+is refused. Read each JSONL line without invoking wait again. The first
+line is a self-identifying `armed` receipt with `wait_id`; each
+backlog/live line carries one message and an exclusive `tip` equal to
+that message id. Deadman, cancellation, replacement, or a bounded hard
+failure writes a terminal line before releasing the slot when the sink
+is writable. A sink error is a hard exit and cancels the held wait.
+
 After `make install` or any binary replace, run
 `chanvoy daemon stop && chanvoy auto-setup` before trusting filtered wait (the
 daemon keeps the binary it was started from). See

@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod host_build_info;
 pub mod safe_read;
 pub mod wait_channels;
+pub mod wait_follow;
 pub mod wait_registry;
 
 pub use safe_read::{
@@ -34,6 +35,12 @@ pub use wait_channels::{
     validate_wait_channels_params, WaitChannelArm, WaitChannelSelector, WaitChannelsParams,
     WaitChannelsResult, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS,
     WAIT_CHANNELS_UTF8_MAX_BYTES, WAIT_CHANNELS_V1_METHOD,
+};
+
+pub use wait_follow::{
+    is_mattermost_post_id, WaitFollowEvent, WaitFollowEventKind, WaitFollowFailureReason,
+    WaitFollowMode, WaitFollowResult, WaitFollowResultKind, WaitFollowSchema, WaitFollowV1Params,
+    WAIT_FOLLOW_V1_EVENT_METHOD, WAIT_FOLLOW_V1_EVENT_SCHEMA, WAIT_FOLLOW_V1_METHOD,
 };
 
 pub use wait_registry::{

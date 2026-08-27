@@ -223,6 +223,33 @@ returned post id. A CLI that knows fan-in talking to an older daemon
 fails hard; cycle the daemon (`chanvoy daemon stop` then
 `chanvoy auto-setup`) after install.
 
+For an attention stream that must remain armed after each match, use
+held follow:
+
+```bash
+chanvoy wait <channel> --follow --timeout 1h --after <last-id> \
+  --out "$XDG_RUNTIME_DIR/chanvoy/wait-<profile>.jsonl"
+```
+
+`--follow` is single-channel in v1 and requires exactly one explicit
+sink: `--out PATH` or `--follow-stdout`. The file sink is opened before
+daemon admission, appended with mode 0600, and refuses a symlink,
+non-regular file, foreign owner, or any mode other than 0600. Every
+line is self-identifying with `schema: "wait_follow_v1.event"`. The
+first line is `armed`; each backlog/live line carries exactly one
+message and an exclusive `tip` equal to that message id. Deadman,
+cancellation, replacement, and bounded hard failures write their
+terminal line before lease release when the sink remains writable. A
+later sink write failure exits 2 and closes the daemon stream
+immediately.
+
+Follow shares the ordinary one-waiter registry key. A competing needle
+wait is refused unless it performs an exact `--replace-wait`; replacing
+the follow intentionally ends attention. Restart a new follow from its
+last message `tip`. `Ctrl-C` writes a `canceled` line, closes the held
+daemon call, releases the slot, and exits 130. Do not simulate follow by
+repeatedly invoking one-shot wait.
+
 | Outcome | Exit | Notes |
 | --- | ---: | --- |
 | Match | 0 | One message in `{channel, messages:[…]}` |
@@ -233,8 +260,7 @@ Filters are case-sensitive by default; use `--pattern '(?i)…'` when case shoul
 matter. Self posts never wake the wait. Empty filters are refused. Bare wait
 without `--after` is tip-at-arm; empty-at-arm recovery pages the first non-empty
 observation to exhaustion inside the deadman, then arms an exclusive cursor.
-One seat owns the blocking deadman per channel/panel until tool support for
-single-waiter lands.
+One seat owns the blocking deadman or held follow per channel/panel.
 
 Filtered flags (`--contains` / `--pattern` / `--after`) require a daemon that
 knows `wait_channel_v2`. If the CLI refuses with “does not support filtered

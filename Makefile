@@ -42,6 +42,7 @@ test-integration:
 	cargo test --package chanvoy --test restart_harness -- --ignored --nocapture
 	cargo test --package chanvoy --test per_038_wait -- --ignored --nocapture
 	cargo test --package chanvoy --test per_040_wait -- --ignored --nocapture
+	cargo test --package chanvoy --test per_043_wait_follow -- --ignored --nocapture
 	cargo test --package chanvoy --test post_show_and_thread -- --ignored --nocapture
 
 fmt:

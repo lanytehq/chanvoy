@@ -496,6 +496,7 @@ fn build_poll_documents(
         bounds: bounds.clone(),
         start_anchor,
         baseline_policy,
+        priority: None,
     };
     let digest = crate::waitprims_hold::registration_digest_hex(&registration)?;
     let set = RegistrationSet {
@@ -620,14 +621,15 @@ impl Observer for PollObserver {
             kind: AnchorKind::ProviderOpaque,
             value: IdToken::new("anc:empty-at-arm"),
         });
-        let bind = ChanvoyBind {
-            registration_id: registration.registration_id.clone(),
-            subject_id: registration.subject_id.clone(),
+        let bind = ChanvoyBind::new(
+            registration.registration_id.clone(),
+            registration.subject_id.clone(),
             resolved_start,
-            rest_baseline: Default::default(),
-            release: Arc::new(LeaseRelease::noop()),
-            inner_cancel: self.inner_cancel.clone(),
-        };
+            Default::default(),
+            Arc::new(LeaseRelease::noop()),
+            self.inner_cancel.clone(),
+            None,
+        );
         self.enqueue_page(&bind)?;
         Ok(bind)
     }

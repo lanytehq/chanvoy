@@ -204,6 +204,16 @@ pub struct WaitRequest<'a> {
     pub emit_wait_ids: bool,
 }
 
+/// One held-follow record plus a one-shot acknowledgement from the UDS
+/// writer. The waitprims callback does not return until the line has
+/// crossed this boundary.
+pub struct FollowStreamRecord {
+    pub event: chanvoy_core::WaitFollowEvent,
+    pub written: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+pub type FollowStreamSender = tokio::sync::mpsc::Sender<FollowStreamRecord>;
+
 /// Absolute deadline from RPC entry; covers resolve, anchor, backfill, retries, block.
 pub async fn wait_with_params(
     state: &AppState,
@@ -386,6 +396,79 @@ pub async fn wait_with_params_v3(
     }
 }
 
+/// Held single-channel wait through waitprims `run_follow`.
+pub async fn wait_with_params_follow(
+    state: &AppState,
+    req: WaitRequest<'_>,
+    stream: FollowStreamSender,
+) -> Result<chanvoy_core::WaitFollowResult, CoreError> {
+    let WaitRequest {
+        channel,
+        timeout_secs,
+        team,
+        contains,
+        pattern,
+        after,
+        replace_wait_id,
+        ..
+    } = req;
+    validate_wait_timeout_secs(timeout_secs)?;
+    validate_wait_channel_v3_strings(channel, team, contains, pattern, after)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    WaitPredicate::compile("pending", "pending", contains, pattern)?;
+    let monitored = channel_is_monitored(state, channel);
+    if monitored {
+        refuse_current_ws_failure(state, channel).await?;
+    }
+    let resolved = provider_retry(state, channel, deadline, || async {
+        state.client.resolve_channel(channel, team).await
+    })
+    .await?;
+
+    let prebound_after = if let Some(anchor) = after {
+        let (scan, baseline) =
+            establish_baseline(state, channel, &resolved.channel_id, Some(anchor), deadline)
+                .await?;
+        Some(crate::waitprims_hold::cursor_from_baseline(scan, baseline))
+    } else {
+        None
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lease = state
+        .wait_owners
+        .acquire(
+            &resolved.channel_id,
+            &resolved.team_name,
+            &resolved.channel_name,
+            replace_wait_id,
+            remaining,
+        )
+        .await?;
+    state.wait_owners.note_arm();
+    let (session, guard) = lease.into_guard();
+    let predicate =
+        WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
+
+    crate::waitprims_hold::run_single_channel_follow(
+        state,
+        crate::waitprims_hold::FirstMatchWait {
+            channel,
+            channel_id: &resolved.channel_id,
+            after,
+            prebound_after,
+            monitored,
+            predicate,
+            deadline,
+            session: &session,
+            guard,
+        },
+        stream,
+    )
+    .await
+}
+
 /// Monitored path: **subscribe first**, then resolve/compile/anchor/backfill
 /// while draining the receiver (devrev D1 / AC-W3).
 pub(crate) async fn wait_push_path(
@@ -478,7 +561,7 @@ pub(crate) async fn wait_push_from_cursor(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn wait_push_after_baseline(
+pub(crate) async fn wait_push_after_baseline(
     state: &AppState,
     channel: &str,
     predicate: &WaitPredicate,

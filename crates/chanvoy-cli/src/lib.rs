@@ -1,7 +1,10 @@
-use std::io::{ErrorKind, IsTerminal, Read};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
@@ -17,7 +20,8 @@ use chanvoy_core::{
     PinResult, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult,
     SeedCursorsResult, SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult,
     UnreadNotifications, WaitChannelArm, WaitChannelSelector, WaitChannelV3Params,
-    WaitChannelsParams, WaitChannelsResult, WaitResult, WsConnectionState, RPC_WAIT_ALREADY_ACTIVE,
+    WaitChannelsParams, WaitChannelsResult, WaitFollowEvent, WaitFollowEventKind, WaitFollowMode,
+    WaitFollowV1Params, WaitResult, WsConnectionState, RPC_WAIT_ALREADY_ACTIVE,
     RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED,
     WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS,
 };
@@ -479,7 +483,7 @@ struct WaitArgs {
     #[arg(
         long,
         default_value = "10",
-        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider/ownership failures exit 2 (never timeout:true).\n\nThis profile daemon allows one active wait per canonical channel. A second wait without --replace-wait <id> is a hard conflict. --replace-wait is compare-and-replace only (no --force). This is not a host-wide or cross-seat lock.\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after, --team, and --replace-wait are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider/ownership failures exit 2 (never timeout:true).\n\nThis profile daemon allows one active wait per canonical channel. A second wait without --replace-wait <id> is a hard conflict. --replace-wait is compare-and-replace only (no --force). This is not a host-wide or cross-seat lock.\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nHeld follow: --follow is single-channel and requires exactly one of --out PATH or --follow-stdout. It emits self-identifying JSONL while retaining the same waitprims bind: armed first, one message per backlog/live record, then an optional terminal record. Deadman exits 1; replacement or failed exits 2; Ctrl-C writes canceled and exits 130. Sink failure is a hard exit and releases the waiter.\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after, --team, and --replace-wait are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
     )]
     timeout: String,
     /// Literal body substring (case-sensitive). Self-posts never match.
@@ -501,6 +505,20 @@ struct WaitArgs {
         long_help = "Compare-and-replace the active wait on this profile daemon for the same canonical channel. Supply the opaque wait id from a wait_already_active conflict. There is no --force. This is not a host-wide or cross-seat lock."
     )]
     replace_wait: Option<String>,
+    /// Keep one single-channel subscription armed and emit JSONL bursts.
+    #[arg(long)]
+    follow: bool,
+    /// Append held-wait JSONL to a secure caller-named file.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "follow",
+        conflicts_with = "follow_stdout"
+    )]
+    out: Option<PathBuf>,
+    /// Emit held-wait JSONL directly to stdout.
+    #[arg(long, requires = "follow", conflicts_with = "out")]
+    follow_stdout: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1650,6 +1668,9 @@ async fn handle_mcp(profile: &str, args: McpArgs) -> Result<(), CliError> {
 /// ownership claims require the v3 daemon. Fan-in (`--channel` ×2–8)
 /// uses `wait_channels_v1` and never falls back.
 async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    if args.follow {
+        return handle_wait_follow(profile, json, args).await;
+    }
     if !args.channels.is_empty() || args.channel.is_none() {
         return handle_wait_fan_in(profile, json, args).await;
     }
@@ -1758,6 +1779,257 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             };
             print_value(json, &one)
         }
+        Err(err) => classify_wait_error(json, &channel, timeout_secs, err),
+    }
+}
+
+enum FollowSink {
+    File(std::fs::File),
+    Stdout(std::io::Stdout),
+}
+
+enum FollowWaitOutcome {
+    Completed(Result<chanvoy_core::WaitFollowResult, DaemonError>),
+    Interrupted(Result<(), std::io::Error>),
+}
+
+impl FollowSink {
+    fn emit(&mut self, event: &WaitFollowEvent) -> Result<(), std::io::Error> {
+        match self {
+            Self::File(file) => {
+                serde_json::to_writer(&mut *file, event).map_err(std::io::Error::other)?;
+                file.write_all(b"\n")?;
+                file.flush()
+            }
+            Self::Stdout(stdout) => {
+                serde_json::to_writer(&mut *stdout, event).map_err(std::io::Error::other)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()
+            }
+        }
+    }
+}
+
+fn open_follow_sink(args: &WaitArgs) -> Result<FollowSink, CliError> {
+    match (&args.out, args.follow_stdout) {
+        (Some(path), false) => {
+            #[cfg(unix)]
+            {
+                if let Ok(meta) = std::fs::symlink_metadata(path) {
+                    if meta.file_type().is_symlink() {
+                        return Err(CliError::Bootstrap(format!(
+                            "wait --follow refuses symlinked --out {}",
+                            path.display()
+                        )));
+                    }
+                    if !meta.file_type().is_file() {
+                        return Err(CliError::Bootstrap(format!(
+                            "wait --follow --out is not a regular file: {}",
+                            path.display()
+                        )));
+                    }
+                }
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+                    .map_err(|err| {
+                        CliError::Bootstrap(format!(
+                            "cannot open wait --follow --out {}: {err}",
+                            path.display()
+                        ))
+                    })?;
+                let meta = file.metadata()?;
+                if !meta.file_type().is_file() {
+                    return Err(CliError::Bootstrap(format!(
+                        "wait --follow --out is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                if meta.uid() != unsafe { libc::geteuid() } {
+                    return Err(CliError::Bootstrap(format!(
+                        "wait --follow --out is not owned by the current user: {}",
+                        path.display()
+                    )));
+                }
+                if meta.permissions().mode() & 0o777 != 0o600 {
+                    return Err(CliError::Bootstrap(format!(
+                        "wait --follow --out permissions must be 0600: {}",
+                        path.display()
+                    )));
+                }
+                Ok(FollowSink::File(file))
+            }
+            #[cfg(not(unix))]
+            {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(CliError::Bootstrap(format!(
+                        "wait --follow --out is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                Ok(FollowSink::File(file))
+            }
+        }
+        (None, true) => Ok(FollowSink::Stdout(std::io::stdout())),
+        _ => Err(CliError::Bootstrap(
+            "wait --follow requires exactly one of --out PATH or --follow-stdout".into(),
+        )),
+    }
+}
+
+async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    let Some(channel) = args.channel.clone() else {
+        return exit_wait_hard(
+            json,
+            "",
+            "input",
+            false,
+            "wait --follow requires one positional channel",
+        );
+    };
+    if !args.channels.is_empty() || !args.after_channels.is_empty() {
+        return exit_wait_hard(
+            json,
+            &channel,
+            "input",
+            false,
+            "wait --follow v1 is single-channel; repeated --channel and --after-channel are refused",
+        );
+    }
+    let timeout_secs = match parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes) {
+        Ok(secs) if secs > 0 => secs,
+        Ok(_) => {
+            return exit_wait_hard(
+                json,
+                &channel,
+                "input",
+                false,
+                "wait --follow --timeout must be greater than zero",
+            )
+        }
+        Err(err) => {
+            return exit_wait_hard(
+                json,
+                &channel,
+                "input",
+                false,
+                &format!("invalid --timeout: {err}"),
+            )
+        }
+    };
+    if args.contains.as_deref() == Some("") || args.pattern.as_deref() == Some("") {
+        return exit_wait_hard(
+            json,
+            &channel,
+            "input",
+            false,
+            "empty follow filters are refused",
+        );
+    }
+
+    // Sink establishment precedes daemon admission: an unwritable or
+    // unsafe path can never leave an unseen held wait behind.
+    let sink = match open_follow_sink(&args) {
+        Ok(sink) => Arc::new(Mutex::new(sink)),
+        Err(err) => {
+            return exit_wait_hard(json, &channel, "sink", false, &err.to_string());
+        }
+    };
+    if !json {
+        eprintln!("following new messages in #{channel} (timeout: {timeout_secs}s)...");
+    }
+    let seen_wait_id = Arc::new(Mutex::new(None::<String>));
+    let outcome = {
+        let callback_wait_id = Arc::clone(&seen_wait_id);
+        let callback_sink = Arc::clone(&sink);
+        let client = daemon_client(profile);
+        let follow = client.wait_follow_v1(
+            WaitFollowV1Params {
+                channel: channel.clone(),
+                timeout_secs,
+                team: args.team.clone(),
+                contains: args.contains.clone(),
+                pattern: args.pattern.clone(),
+                after: args.after.clone(),
+                replace_wait_id: args.replace_wait.clone(),
+            },
+            |event| {
+                if let Ok(mut slot) = callback_wait_id.lock() {
+                    *slot = Some(event.wait_id.clone());
+                }
+                callback_sink
+                    .lock()
+                    .map_err(|_| {
+                        DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                    })?
+                    .emit(&event)
+                    .map_err(DaemonError::from)
+            },
+        );
+        tokio::pin!(follow);
+        tokio::select! {
+            result = &mut follow => FollowWaitOutcome::Completed(result),
+            signal = tokio::signal::ctrl_c() => {
+                let emitted = signal
+                    .map_err(std::io::Error::other)
+                    .and_then(|()| {
+                        let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                        let Some(wait_id) = wait_id else {
+                            return Ok(());
+                        };
+                        let canceled =
+                            WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Canceled);
+                        sink.lock()
+                            .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                            .emit(&canceled)
+                    });
+                // `follow` (and therefore its UDS) is still alive while the
+                // canceled record is written and flushed above. It drops only
+                // when this block exits.
+                FollowWaitOutcome::Interrupted(emitted)
+            }
+        }
+    };
+
+    let result = match outcome {
+        FollowWaitOutcome::Completed(result) => result,
+        FollowWaitOutcome::Interrupted(Ok(())) => process::exit(130),
+        FollowWaitOutcome::Interrupted(Err(err)) => {
+            return exit_wait_hard(json, &channel, "sink", false, &err.to_string());
+        }
+    };
+
+    match result {
+        Ok(result) if result.mode() == WaitFollowMode::Deadman => process::exit(1),
+        Ok(result) if result.mode() == WaitFollowMode::Replaced => process::exit(EXIT_ENV_INPUT),
+        Ok(_) => exit_wait_hard(
+            json,
+            &channel,
+            "provider",
+            false,
+            "held wait returned a non-terminal result",
+        ),
+        Err(DaemonError::Io(err)) => {
+            exit_wait_hard(json, &channel, "sink", false, &err.to_string())
+        }
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) => exit_wait_hard(
+            json,
+            &channel,
+            "capability",
+            false,
+            "the running daemon does not support wait --follow; cycle it with \
+             `chanvoy daemon stop` then `chanvoy auto-setup`",
+        ),
         Err(err) => classify_wait_error(json, &channel, timeout_secs, err),
     }
 }
@@ -5230,6 +5502,9 @@ mod tests {
             after: None,
             team: None,
             replace_wait: None,
+            follow: false,
+            out: None,
+            follow_stdout: false,
         };
         assert!(build_fan_in_params(&mix, 10).is_err());
 
@@ -5243,6 +5518,9 @@ mod tests {
             after: None,
             team: None,
             replace_wait: None,
+            follow: false,
+            out: None,
+            follow_stdout: false,
         };
         assert!(build_fan_in_params(&bare, 10).is_err());
 
@@ -5256,6 +5534,9 @@ mod tests {
             after: None,
             team: None,
             replace_wait: None,
+            follow: false,
+            out: None,
+            follow_stdout: false,
         };
         assert!(build_fan_in_params(&one, 10).is_err());
 
@@ -5273,6 +5554,9 @@ mod tests {
             after: None,
             team: None,
             replace_wait: None,
+            follow: false,
+            out: None,
+            follow_stdout: false,
         };
         assert!(build_fan_in_params(&too_many, 10).is_err());
 
@@ -5286,6 +5570,9 @@ mod tests {
             after: Some("post".into()),
             team: None,
             replace_wait: None,
+            follow: false,
+            out: None,
+            follow_stdout: false,
         };
         assert!(build_fan_in_params(&after_single, 10).is_err());
 
@@ -5299,6 +5586,9 @@ mod tests {
             after: None,
             team: None,
             replace_wait: None,
+            follow: false,
+            out: None,
+            follow_stdout: false,
         };
         assert!(build_fan_in_params(&unmatched, 10).is_err());
 
@@ -5312,6 +5602,9 @@ mod tests {
             after: None,
             team: None,
             replace_wait: None,
+            follow: false,
+            out: None,
+            follow_stdout: false,
         };
         let params = build_fan_in_params(&ok, 30).expect("valid fan-in");
         assert_eq!(params.arms.len(), 2);

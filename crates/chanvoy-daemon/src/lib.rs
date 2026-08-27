@@ -26,9 +26,10 @@ use chanvoy_core::{
     SearchResult, ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter,
     UnpinParams, UnpinResult, UnreactParams, UnreadNotifications, UnsubscribeParams,
     WaitChannelParams, WaitChannelV2Params, WaitChannelV3Params, WaitChannelsParams,
-    WaitChannelsResult, WaitResult, WsState, RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED,
-    RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_V1_METHOD,
-    WAIT_CHANNEL_V3_METHOD,
+    WaitChannelsResult, WaitFollowV1Params, WaitResult, WsState, RPC_WAIT_ALREADY_ACTIVE,
+    RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED,
+    WAIT_CHANNELS_V1_METHOD, WAIT_CHANNEL_V3_METHOD, WAIT_FOLLOW_V1_EVENT_METHOD,
+    WAIT_FOLLOW_V1_METHOD,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -570,6 +571,112 @@ async fn handle_client(
                     break;
                 }
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
+                if request.method == WAIT_FOLLOW_V1_METHOD {
+                    if state.identity_drift.load(Ordering::Relaxed) {
+                        let response = rpc_error(
+                            request.id,
+                            -32_000,
+                            "identity drift detected: held waits are refused until `chanvoy auto-setup` re-validates identity.",
+                        );
+                        writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        line.clear();
+                        continue;
+                    }
+                    let params = match serde_json::from_value::<WaitFollowV1Params>(
+                        request.params.clone(),
+                    ) {
+                        Ok(params) => params,
+                        Err(err) => {
+                            let response = rpc_error(
+                                request.id,
+                                -32_007,
+                                format!("wait_follow_v1 input: {err}"),
+                            );
+                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                            writer.write_all(b"\n").await?;
+                            line.clear();
+                            continue;
+                        }
+                    };
+                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
+                    let follow = wait::wait_with_params_follow(
+                        &state,
+                        wait::WaitRequest {
+                            channel: &params.channel,
+                            timeout_secs: params.timeout_secs,
+                            team: params.team.as_deref(),
+                            contains: params.contains.as_deref(),
+                            pattern: params.pattern.as_deref(),
+                            after: params.after.as_deref(),
+                            replace_wait_id: params.replace_wait_id.as_deref(),
+                            emit_wait_ids: true,
+                        },
+                        stream_tx,
+                    );
+                    tokio::pin!(follow);
+                    let mut eof_buf = String::new();
+                    loop {
+                        tokio::select! {
+                            biased;
+                            Some(record) = stream_rx.recv() => {
+                                let notification = JsonRpcNotification {
+                                    jsonrpc: "2.0".to_string(),
+                                    method: WAIT_FOLLOW_V1_EVENT_METHOD.to_string(),
+                                    params: to_value(record.event),
+                                };
+                                let write_result = async {
+                                    writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
+                                    writer.write_all(b"\n").await?;
+                                    writer.flush().await
+                                }.await;
+                                let ack = write_result
+                                    .as_ref()
+                                    .map(|_| ())
+                                    .map_err(ToString::to_string);
+                                let _ = record.written.send(ack);
+                                write_result?;
+                            }
+                            result = &mut follow => {
+                                while let Ok(record) = stream_rx.try_recv() {
+                                    let notification = JsonRpcNotification {
+                                        jsonrpc: "2.0".to_string(),
+                                        method: WAIT_FOLLOW_V1_EVENT_METHOD.to_string(),
+                                        params: to_value(record.event),
+                                    };
+                                    let write_result = async {
+                                        writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
+                                        writer.write_all(b"\n").await?;
+                                        writer.flush().await
+                                    }.await;
+                                    let ack = write_result
+                                        .as_ref()
+                                        .map(|_| ())
+                                        .map_err(ToString::to_string);
+                                    let _ = record.written.send(ack);
+                                    write_result?;
+                                }
+                                let response = match result {
+                                    Ok(result) => rpc_result(request.id, to_value(result)),
+                                    Err(error) => {
+                                        let error = DaemonError::from(error);
+                                        let (code, message, data) = error_payload(&error);
+                                        rpc_error_with_data(request.id, code, message, data)
+                                    }
+                                };
+                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                break;
+                            }
+                            peek = reader.read_line(&mut eof_buf) => {
+                                let _ = peek?;
+                                break;
+                            }
+                        }
+                    }
+                    line.clear();
+                    continue;
+                }
                 let unsub_id = if request.method == "unsubscribe" {
                     request.params.get("subscription_id").and_then(|v| v.as_str()).map(|s| s.to_string())
                 } else {
@@ -1679,6 +1786,7 @@ fn is_wait_rpc(method: &str) -> bool {
         method,
         "wait_channel" | "wait_channel_v2" | "wait_channels_v1"
     ) || method == WAIT_CHANNEL_V3_METHOD
+        || method == WAIT_FOLLOW_V1_METHOD
 }
 
 fn error_payload(error: &DaemonError) -> (i64, String, Option<serde_json::Value>) {
@@ -3078,6 +3186,88 @@ impl DaemonClient {
     ) -> Result<WaitResult, DaemonError> {
         self.call(WAIT_CHANNEL_V3_METHOD, serde_json::to_value(params)?)
             .await
+    }
+
+    /// Held wait stream. Every event is delivered to `on_event` before
+    /// the terminal result is returned. Returning an error from the sink
+    /// drops the socket immediately, which cancels the daemon runner and
+    /// releases its ownership guard.
+    pub async fn wait_follow_v1<F>(
+        &self,
+        params: WaitFollowV1Params,
+        mut on_event: F,
+    ) -> Result<chanvoy_core::WaitFollowResult, DaemonError>
+    where
+        F: FnMut(chanvoy_core::WaitFollowEvent) -> Result<(), DaemonError>,
+    {
+        if !self.socket_path.exists() {
+            return Err(DaemonError::NotRunning(
+                self.socket_path.display().to_string(),
+            ));
+        }
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let request =
+            chanvoy_core::rpc_request(WAIT_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
+        stream
+            .write_all(serde_json::to_string(&request)?.as_bytes())
+            .await?;
+        stream.write_all(b"\n").await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait stream closed before terminal response".into(),
+                    data: None,
+                });
+            }
+            let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            line.clear();
+            if value.get("method").and_then(serde_json::Value::as_str)
+                == Some(WAIT_FOLLOW_V1_EVENT_METHOD)
+            {
+                let event: chanvoy_core::WaitFollowEvent = serde_json::from_value(
+                    value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )?;
+                event.validate().map_err(|message| DaemonError::Rpc {
+                    code: -32_000,
+                    message: format!("invalid held wait stream record: {message}"),
+                    data: None,
+                })?;
+                on_event(event)?;
+                continue;
+            }
+            let response: JsonRpcResponse = serde_json::from_value(value)?;
+            if response.id != request.id {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait response id mismatch".into(),
+                    data: None,
+                });
+            }
+            if let Some(error) = response.error {
+                return Err(DaemonError::Rpc {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                });
+            }
+            let result = response.result.unwrap_or(serde_json::Value::Null);
+            let result: chanvoy_core::WaitFollowResult = serde_json::from_value(result)?;
+            result.validate().map_err(|message| DaemonError::Rpc {
+                code: -32_000,
+                message: format!("invalid held wait terminal result: {message}"),
+                data: None,
+            })?;
+            return Ok(result);
+        }
     }
 
     pub async fn create_channel(
