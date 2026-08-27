@@ -58,6 +58,15 @@ impl PollCursorStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(profile: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            inner: Arc::new(Mutex::new(BTreeMap::new())),
+            persist_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
     pub(crate) fn get(&self, registration_id: &str) -> Option<Anchor> {
         self.inner
             .lock()

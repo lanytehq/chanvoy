@@ -8,13 +8,18 @@
 
 mod common;
 
-use common::{read_attention_state_bytes, run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
+use common::{
+    read_attention_state_bytes, run_chanvoy, spawn_daemon, stop_daemon_cleanly,
+    wait_for_ws_failure, TestEnv,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
-/// Happy path: Date header present → clock healthy; identity pass; channel resolve.
+/// REST can be healthy while the mock server's unsupported websocket is not.
+/// Doctor must retain the healthy clock/identity/channel evidence without
+/// greenwashing the current websocket failure.
 #[tokio::test]
-async fn doctor_reports_healthy_clock_and_channel() {
+async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
     let env = TestEnv::new("doctor-healthy").await;
     env.write_default_profile("agent-test", "org-lanytehq");
     mount_whoami_with_date(&env, "bot-id", "agent-test", 0).await;
@@ -22,12 +27,14 @@ async fn doctor_reports_healthy_clock_and_channel() {
     env.mock_channel_lookup("ops-updates", "chan-ops").await;
 
     let daemon = spawn_daemon(&env).await;
+    wait_for_ws_failure(&env).await;
     let before = read_attention_state_bytes(&env);
 
     let output = run_chanvoy(&env, &["--json", "doctor", "ops-updates"]).await;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
+    assert_eq!(
+        output.status.code(),
+        Some(1),
         "stdout={stdout} stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -39,7 +46,11 @@ async fn doctor_reports_healthy_clock_and_channel() {
     );
 
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
-    assert_eq!(v["exit_code"], 0, "report={stdout}");
+    assert_eq!(v["exit_code"], 1, "report={stdout}");
+    assert_eq!(v["daemon"]["check"], "warn");
+    assert_eq!(v["daemon"]["health"], "degraded");
+    assert!(v["daemon"]["ws_last_error"].as_str().is_some());
+    assert!(v["daemon"]["ws_reconnect_count"].as_u64().is_some());
     assert_eq!(v["identity"]["ok"], true);
     assert_eq!(v["identity"]["username"], "agent-test");
     assert_eq!(v["clock"]["verdict"], "healthy");
@@ -51,6 +62,23 @@ async fn doctor_reports_healthy_clock_and_channel() {
     assert!(!dumped.contains("request_id"));
     assert!(!dumped.contains("detailed_error"));
     assert!(!dumped.contains("app_error"));
+
+    let human = run_chanvoy(&env, &["doctor", "ops-updates"]).await;
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert_eq!(human.status.code(), Some(1), "{human_stdout}");
+    assert!(
+        human_stdout.contains("ws_connection_state:"),
+        "{human_stdout}"
+    );
+    assert!(human_stdout.contains("ws_last_error:"), "{human_stdout}");
+    assert!(
+        human_stdout.contains("ws_reconnect_count:"),
+        "{human_stdout}"
+    );
+    assert!(
+        !human_stdout.contains(env.server_url().as_str()),
+        "{human_stdout}"
+    );
 
     let _ = stop_daemon_cleanly(&env, daemon).await;
 }

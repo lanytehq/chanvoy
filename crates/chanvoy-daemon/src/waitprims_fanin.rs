@@ -22,7 +22,7 @@ use waitprims_core::{
 
 use crate::wait::{
     channel_is_monitored, drain_bus, establish_baseline, inbound_to_message, provider_retry,
-    wait_push_from_cursor, wait_rest_from_cursor, WaitPredicate,
+    refuse_current_ws_failure, wait_push_from_cursor, wait_rest_from_cursor, WaitPredicate,
 };
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::waitprims_hold::{
@@ -247,6 +247,10 @@ pub(crate) async fn wait_channels_first_match(
         params.contains.as_deref(),
         params.pattern.as_deref(),
     )?;
+    let push_selectors = push_dependent_selectors(&state.profile.monitored_channels, &params);
+    if !push_selectors.is_empty() {
+        refuse_current_ws_failure(state, &push_selectors.join(", ")).await?;
+    }
     let deadline = Instant::now() + Duration::from_secs(params.timeout_secs);
     let mut rx = state.event_bus.subscribe();
     let mut bus = VecDeque::new();
@@ -434,6 +438,18 @@ pub(crate) async fn wait_channels_first_match(
         keys.release();
     }
     Ok((result, consume, Some(keys)))
+}
+
+fn push_dependent_selectors(monitored: &[String], params: &WaitChannelsParams) -> Vec<String> {
+    params
+        .arms
+        .iter()
+        .map(|arm| arm.selector())
+        .filter(|selector| {
+            crate::wait::channel_name_is_monitored(monitored, selector.channel.as_str())
+        })
+        .map(|selector| selector.qualified())
+        .collect()
 }
 
 fn map_arm_err(selector: &WaitChannelSelector, err: CoreError) -> CoreError {
@@ -887,6 +903,35 @@ mod tests {
         );
         let timeout = map_arm_err(&sel, CoreError::WaitTimeout("other".into()));
         assert!(matches!(timeout, CoreError::WaitTimeout(_)));
+    }
+
+    #[test]
+    fn ws_gate_names_only_push_dependent_fan_in_arms() {
+        let params = WaitChannelsParams {
+            arms: vec![
+                chanvoy_core::WaitChannelArm {
+                    team: "org".into(),
+                    channel: "push".into(),
+                    after: None,
+                },
+                chanvoy_core::WaitChannelArm {
+                    team: "org".into(),
+                    channel: "rest".into(),
+                    after: None,
+                },
+            ],
+            timeout_secs: 600,
+            contains: None,
+            pattern: None,
+        };
+        assert_eq!(
+            push_dependent_selectors(&["push".into()], &params),
+            vec!["org/push"]
+        );
+        assert!(
+            push_dependent_selectors(&[], &params).is_empty(),
+            "all-REST fan-in must not be poisoned by websocket history"
+        );
     }
 
     #[test]
