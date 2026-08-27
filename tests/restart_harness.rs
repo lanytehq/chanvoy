@@ -37,11 +37,16 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use chanvoy_core::Profile;
+use chanvoy_core::{rpc_result, JsonRpcRequest, Profile};
 use common::{
-    kill_daemon, read_attention_state, run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv,
+    kill_daemon, read_attention_state, run_chanvoy, spawn_daemon, stop_daemon_cleanly,
+    wait_for_ws_failure, TestEnv,
 };
 use tokio::process::Command;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixListener,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -361,6 +366,143 @@ async fn teardown_auto_setup_daemon(env: &TestEnv) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+}
+
+async fn clean_fake_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
+    let socket_path = env.socket_path();
+    let listener = UnixListener::bind(&socket_path).expect("bind clean fake daemon");
+    let profile = env.profile_name.clone();
+    let socket_json = socket_path.clone();
+    tokio::spawn(async move {
+        for expected in ["daemon_status", "seed_cursors"] {
+            let (stream, _) = listener.accept().await.expect("accept fake daemon client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read fake daemon request");
+            let request: JsonRpcRequest =
+                serde_json::from_str(line.trim_end()).expect("decode fake daemon request");
+            assert_eq!(request.method, expected);
+            let value = if expected == "daemon_status" {
+                serde_json::json!({
+                    "profile_name": profile,
+                    "socket_path": socket_json,
+                    "mattermost_username": "agent-bravo-devlead",
+                    "mattermost_ok": true,
+                    "ws_connection_state": "healthy",
+                    "ws_last_error": null,
+                    "ws_reconnect_count": 0,
+                    "health": "healthy",
+                    "mattermost_identity_drift": false,
+                    "binary": chanvoy_core::resolve_host_build_info(),
+                })
+            } else {
+                serde_json::json!({"outcomes": []})
+            };
+            let response = rpc_result(request.id, value);
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&response).expect("encode response")
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write fake daemon response");
+        }
+        let _ = std::fs::remove_file(socket_path);
+    })
+}
+
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_reuses_clean_generation_matched_daemon_without_pid_change() {
+    let env = TestEnv::new("auto-setup-ws-clean").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-clean", "agent-bravo-devlead", "team-id-clean")
+        .await;
+    env.mock_empty_memberships("team-id-clean").await;
+    std::fs::create_dir_all(env.chanvoy_runtime_dir()).expect("runtime dir");
+    let pid_path = env
+        .chanvoy_runtime_dir()
+        .join(format!("{}.pid", env.profile_name));
+    std::fs::write(&pid_path, "424242").expect("sentinel pid");
+    let server = clean_fake_daemon(&env).await;
+
+    let output = auto_setup_command(&env, "lanytehq", "bravo-devlead")
+        .output()
+        .await
+        .expect("auto-setup");
+    assert!(
+        output.status.success(),
+        "clean daemon must reuse; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("auto-setup JSON");
+    assert_eq!(report["daemon_state"], "already_running");
+    assert_eq!(
+        std::fs::read_to_string(&pid_path).expect("sentinel pid retained"),
+        "424242",
+        "reuse must not cycle the daemon"
+    );
+    server.await.expect("fake daemon completed");
+}
+
+/// A generation-matched, identity-ownable daemon with a current websocket
+/// failure must never be reported as reused/successful. The HTTP-only test
+/// provider cannot establish a healthy replacement websocket, so this pins
+/// the permitted refusal branch after auto-setup cycles the failed daemon.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_refuses_success_when_ownable_ws_repair_cannot_recover() {
+    let env = TestEnv::new("auto-setup-ws-degraded").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-ws", "agent-bravo-devlead", "team-id-ws")
+        .await;
+    env.mock_empty_memberships("team-id-ws").await;
+
+    let mut daemon = spawn_daemon(&env).await;
+    wait_for_ws_failure(&env).await;
+    let old_pid = read_daemon_pid(&env).expect("failed daemon pid");
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        auto_setup_command(&env, "lanytehq", "bravo-devlead").output(),
+    )
+    .await
+    .expect("auto-setup repair remains bounded")
+    .expect("auto-setup subprocess");
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "failed WS repair must not report reuse/success; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("auto-setup error JSON");
+    assert_eq!(report["error_code"], "daemon_start");
+    assert!(report["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("did not restore healthy websocket")));
+    tokio::time::timeout(Duration::from_secs(2), daemon.wait())
+        .await
+        .expect("the known-degraded daemon exits within the cleanup bound")
+        .expect("wait for known-degraded daemon");
+    assert!(
+        sysprims_proc::get_process(old_pid).is_err(),
+        "the known-degraded daemon must have been stopped and reaped"
+    );
+    assert!(
+        !env.socket_path().exists(),
+        "an unsuccessful replacement must be cleaned up"
+    );
 }
 
 /// Read the persisted profile TOML for this env's profile.

@@ -12,7 +12,10 @@ use std::path::PathBuf;
 mod common;
 
 use chanvoy_core::{rpc_error, rpc_request, JsonRpcRequest, JsonRpcResponse};
-use common::{run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
+use common::{
+    read_attention_state_bytes, run_chanvoy, spawn_daemon, stop_daemon_cleanly,
+    wait_for_ws_failure, TestEnv,
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -247,7 +250,7 @@ async fn wait_process_match_and_deadman_shapes() {
 
 #[tokio::test]
 #[ignore = "integration: PER-038 process outcome matrix"]
-async fn wait_process_monitored_match_uses_stream_path() {
+async fn wait_process_monitored_arm_fails_fast_when_ws_is_already_failed() {
     let env = TestEnv::new("per-038-process-monitored").await;
     env.write_profile_with_monitored("agent-bravo-devlead", "org-lanytehq", &["brief-per-038"]);
     mount_wait_channel(
@@ -265,15 +268,18 @@ async fn wait_process_monitored_match_uses_stream_path() {
     )
     .await;
     let daemon = spawn_daemon(&env).await;
+    wait_for_ws_failure(&env).await;
 
-    let matched = run_chanvoy(
+    let attention_before = read_attention_state_bytes(&env);
+    let started = std::time::Instant::now();
+    let failed = run_chanvoy(
         &env,
         &[
             "--json",
             "wait",
             "brief-per-038",
             "--timeout",
-            "5s",
+            "10m",
             "--contains",
             "ASSENT",
             "--after",
@@ -282,15 +288,25 @@ async fn wait_process_monitored_match_uses_stream_path() {
     )
     .await;
     assert_eq!(
-        matched.status.code(),
-        Some(0),
-        "monitored match must exit 0"
+        failed.status.code(),
+        Some(2),
+        "known-failed monitored observation must be hard/retryable"
     );
-    let matched_json: serde_json::Value =
-        serde_json::from_slice(&matched.stdout).expect("match JSON payload");
-    assert_eq!(matched_json["channel"], "brief-per-038");
-    assert_eq!(matched_json["messages"][0]["id"], "stream-post");
-    assert!(String::from_utf8_lossy(&matched.stderr).is_empty());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "known failure must not consume the ten-minute deadman"
+    );
+    let failed_json: serde_json::Value =
+        serde_json::from_slice(&failed.stdout).expect("provider failure JSON payload");
+    assert_eq!(failed_json["timeout"], false);
+    assert_eq!(failed_json["error_class"], "provider");
+    assert_eq!(failed_json["retryable"], true);
+    assert_eq!(
+        read_attention_state_bytes(&env),
+        attention_before,
+        "fail-fast admission must not mutate attention state"
+    );
+    assert!(String::from_utf8_lossy(&failed.stderr).is_empty());
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
 

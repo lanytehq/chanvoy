@@ -5,8 +5,8 @@ use std::process::Stdio;
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    check_search_operator_conflicts, clock_check_from_observation, doctor_exit_code,
-    format_basic as format_host_basic, format_extended as format_host_extended,
+    check_search_operator_conflicts, clock_check_from_observation, current_ws_observation_degraded,
+    doctor_exit_code, format_basic as format_host_basic, format_extended as format_host_extended,
     host_generation_match, list_profiles, load_active_profile, load_profile, load_token,
     parse_after_channel_flag, parse_qualified_wait_selector, parse_time_window,
     pid_path_for_profile, provider_status_class, resolve_host_build_info, socket_path_for_profile,
@@ -2827,6 +2827,44 @@ async fn validate_persisted_profile_identity(profile: &Profile) -> Result<Identi
     Ok(identity)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonReuseDecision {
+    Reuse,
+    RestartOwnable,
+    RefuseForeign,
+}
+
+/// Decide whether this invocation may reuse or replace a reachable daemon.
+///
+/// This stays pure so the generation-matched field case can be pinned without
+/// process orchestration: a current websocket observation failure defeats
+/// reuse even when REST identity and binary generation are otherwise healthy.
+/// Replacement remains identity-owned; a foreign daemon is never stopped.
+fn daemon_reuse_decision(status: &DaemonStatus, cli_username: &str) -> DaemonReuseDecision {
+    let drifted = status.mattermost_identity_drift.unwrap_or(false);
+    let ws_degraded = daemon_ws_degraded(status);
+    if status.mattermost_ok && !drifted && !ws_degraded {
+        return DaemonReuseDecision::Reuse;
+    }
+    if status.mattermost_username == cli_username {
+        DaemonReuseDecision::RestartOwnable
+    } else {
+        DaemonReuseDecision::RefuseForeign
+    }
+}
+
+fn daemon_ws_degraded(status: &DaemonStatus) -> bool {
+    current_ws_observation_degraded(
+        status.ws_connection_state,
+        status.ws_last_error.as_deref(),
+        status.ws_reconnect_count,
+        status.health,
+        status.ws_suspected_gap,
+        status.ws_catchup_in_flight,
+        status.ws_observation_admission_closed,
+    )
+}
+
 async fn ensure_daemon_running(
     profile: &Profile,
     identity: &Identity,
@@ -2847,15 +2885,25 @@ async fn ensure_daemon_running(
     //       elsewhere does NOT make that distinction by design.
     let profile_name = profile.name.as_str();
     let ping_outcome = tokio::time::timeout(PING_TIMEOUT, ping_full(profile_name)).await;
+    let mut require_ws_recovery_proof = false;
     if let Ok(Ok(status)) = &ping_outcome {
-        // Daemon is bound AND its network probe completed. Reuse it
-        // only if it's actually healthy (token reachable, no identity
-        // drift). Anything else falls through to the stop+respawn path
-        // so the new daemon picks up the parent's freshly-validated
-        // identity and a current token from the env-name lookup.
-        let drifted = status.mattermost_identity_drift.unwrap_or(false);
-        if status.mattermost_ok && !drifted {
-            return Ok(DaemonState::AlreadyRunning);
+        match daemon_reuse_decision(status, &identity.username) {
+            DaemonReuseDecision::Reuse => return Ok(DaemonState::AlreadyRunning),
+            DaemonReuseDecision::RestartOwnable => {
+                // Fall through to bounded stop + fresh start. In particular,
+                // a live ws_last_error must not be greenwashed by a successful
+                // REST whoami probe or a nominally Healthy derived state.
+                require_ws_recovery_proof = daemon_ws_degraded(status);
+            }
+            DaemonReuseDecision::RefuseForeign => {
+                return Err(CliError::Bootstrap(format!(
+                    "daemon for profile {profile_name} is unhealthy but is not restart-ownable \
+                     by this environment (cli identity {}, daemon identity {}); target the \
+                     owning profile, then run `chanvoy daemon stop --profile {profile_name}` \
+                     followed by `chanvoy auto-setup`",
+                    identity.username, status.mattermost_username
+                )));
+            }
         }
     }
     // ping_full failing/timing out OR returning unhealthy/drifted does
@@ -2870,7 +2918,54 @@ async fn ensure_daemon_running(
     stop_daemon_if_present(profile_name).await?;
 
     spawn_durable_daemon(profile, identity, profile_name).await?;
+    if require_ws_recovery_proof {
+        if let Err(err) = await_replacement_ws_ready(profile_name, &identity.username).await {
+            // A replacement that cannot restore observation is not a
+            // successful repair. Tear it down so the next auto-setup does not
+            // inherit another known-degraded daemon from this attempt.
+            let cleanup = stop_daemon_if_present(profile_name).await;
+            return Err(ws_repair_failure_with_cleanup(err, cleanup));
+        }
+    }
     Ok(DaemonState::Started)
+}
+
+fn ws_repair_failure_with_cleanup(
+    recovery_error: CliError,
+    cleanup: Result<(), CliError>,
+) -> CliError {
+    match cleanup {
+        Ok(()) => recovery_error,
+        Err(cleanup_error) => CliError::Bootstrap(format!(
+            "websocket recovery failed: {recovery_error}; replacement cleanup also failed: \
+             {cleanup_error}; replacement termination is unconfirmed and its runtime state \
+             was preserved for diagnosis"
+        )),
+    }
+}
+
+async fn await_replacement_ws_ready(
+    profile_name: &str,
+    cli_username: &str,
+) -> Result<(), CliError> {
+    let deadline = std::time::Instant::now() + SPAWN_READY_DEADLINE;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Ok(status)) =
+            tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping_full(profile_name)).await
+        {
+            if daemon_reuse_decision(&status, cli_username) == DaemonReuseDecision::Reuse
+                && status.ws_connection_state == Some(WsConnectionState::Healthy)
+            {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err(CliError::Bootstrap(format!(
+        "replacement daemon for profile {profile_name} did not restore healthy websocket \
+         observation within {} seconds",
+        SPAWN_READY_DEADLINE.as_secs()
+    )))
 }
 
 /// CHAN-TASK-001: the **single** durable background-start primitive.
@@ -3877,14 +3972,9 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     let (daemon_check, daemon_block, daemon_binary) = match status(profile_name).await {
         Ok(st) => {
             let drifted = st.mattermost_identity_drift.unwrap_or(false);
-            let check = if drifted {
-                hard_failure = true;
-                CheckVerdict::Fail
-            } else if st.mattermost_ok {
-                CheckVerdict::Pass
-            } else {
-                CheckVerdict::Warn
-            };
+            let ws_degraded = daemon_ws_degraded(&st);
+            let (check, daemon_hard_failure) = doctor_daemon_assessment(&st);
+            hard_failure |= daemon_hard_failure;
             checks.push(check);
             let binary = st.binary.clone();
             (
@@ -3894,10 +3984,24 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     mattermost_ok: st.mattermost_ok,
                     identity_drift: drifted,
                     mattermost_username: Some(st.mattermost_username.clone()),
-                    health: st.health.map(|h| health_label(h).to_string()),
+                    health: if ws_degraded {
+                        Some("degraded".into())
+                    } else {
+                        st.health.map(|h| health_label(h).to_string())
+                    },
+                    ws_connection_state: st.ws_connection_state,
+                    ws_last_error: st.ws_last_error.as_deref().map(doctor_ws_error_summary),
+                    ws_reconnect_count: st.ws_reconnect_count,
+                    ws_catchup_in_flight: st.ws_catchup_in_flight,
+                    ws_observation_admission_closed: st.ws_observation_admission_closed,
                     reason: if drifted {
                         Some(
                             "daemon reports identity drift; network RPCs through the daemon are refused"
+                                .into(),
+                        )
+                    } else if ws_degraded {
+                        Some(
+                            "daemon reports a current websocket observation failure; run auto-setup to cycle the ownable daemon"
                                 .into(),
                         )
                     } else if !st.mattermost_ok {
@@ -3921,6 +4025,11 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     identity_drift: false,
                     mattermost_username: None,
                     health: None,
+                    ws_connection_state: None,
+                    ws_last_error: None,
+                    ws_reconnect_count: None,
+                    ws_catchup_in_flight: None,
+                    ws_observation_admission_closed: None,
                     reason: Some(format!("daemon unreachable: {e}")),
                 },
                 None,
@@ -4178,6 +4287,16 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     Ok(())
 }
 
+fn doctor_daemon_assessment(status: &DaemonStatus) -> (CheckVerdict, bool) {
+    if status.mattermost_identity_drift.unwrap_or(false) {
+        (CheckVerdict::Fail, true)
+    } else if daemon_ws_degraded(status) || !status.mattermost_ok {
+        (CheckVerdict::Warn, false)
+    } else {
+        (CheckVerdict::Pass, false)
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 struct DoctorReport {
     profile: String,
@@ -4207,6 +4326,16 @@ struct DoctorDaemonBlock {
     mattermost_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_connection_state: Option<WsConnectionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_reconnect_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_catchup_in_flight: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_observation_admission_closed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -4282,6 +4411,28 @@ fn doctor_provider_error_summary(err: &chanvoy_core::CoreError) -> (Option<Strin
     }
 }
 
+/// Stable, credential-free websocket failure summary for doctor output.
+///
+/// Transport errors can contain provider URLs or response fragments. Doctor
+/// needs to surface the failure class, not echo those raw internals.
+fn doctor_ws_error_summary(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "websocket observation timed out".into()
+    } else if lower.contains("auth")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+    {
+        "websocket authentication failed".into()
+    } else if lower.contains("connection refused") {
+        "websocket connection was refused".into()
+    } else if lower.contains("dns") || lower.contains("name resolution") {
+        "websocket name resolution failed".into()
+    } else {
+        "websocket observation failed".into()
+    }
+}
+
 fn doctor_channel_error_summary(
     err: &chanvoy_core::CoreError,
 ) -> (Option<String>, String, CheckVerdict) {
@@ -4346,6 +4497,21 @@ fn render_doctor_human(report: &DoctorReport) -> String {
     ));
     if let Some(u) = &d.mattermost_username {
         lines.push(format!("  username: {u}"));
+    }
+    if let Some(state) = d.ws_connection_state {
+        lines.push(format!("  ws_connection_state: {}", ws_state_label(state)));
+    }
+    if let Some(count) = d.ws_reconnect_count {
+        lines.push(format!("  ws_reconnect_count: {count}"));
+    }
+    if let Some(in_flight) = d.ws_catchup_in_flight {
+        lines.push(format!("  ws_catchup_in_flight: {in_flight}"));
+    }
+    if let Some(closed) = d.ws_observation_admission_closed {
+        lines.push(format!("  ws_observation_admission_closed: {closed}"));
+    }
+    if let Some(err) = &d.ws_last_error {
+        lines.push(format!("  ws_last_error: {err}"));
     }
     if let Some(r) = &d.reason {
         lines.push(format!("  reason: {r}"));
@@ -4943,6 +5109,12 @@ impl HumanReadable for DaemonStatus {
         }
         if self.ws_suspected_gap == Some(true) {
             out.push_str("\nsuspected_gap: yes");
+        }
+        if self.ws_catchup_in_flight == Some(true) {
+            out.push_str("\nws_catchup_in_flight: yes");
+        }
+        if let Some(closed) = self.ws_observation_admission_closed {
+            out.push_str(&format!("\nws_observation_admission_closed: {closed}"));
         }
         if let Some(err) = &self.mattermost_last_error {
             out.push_str(&format!("\nmattermost_last_error: {}", err));
@@ -6270,8 +6442,207 @@ mod tests {
         }
     }
 
+    fn daemon_status_with_ws(
+        connection: WsConnectionState,
+        last_error: Option<&str>,
+    ) -> DaemonStatus {
+        DaemonStatus {
+            profile_name: "seat-lanytehq".into(),
+            socket_path: PathBuf::from("/tmp/seat.sock"),
+            mattermost_username: "agent-seat".into(),
+            mattermost_ok: true,
+            ws_connection_state: Some(connection),
+            ws_last_event_at: None,
+            ws_last_error: last_error.map(str::to_string),
+            ws_reconnect_count: Some(if last_error.is_some() { 3 } else { 0 }),
+            ipc_connected: None,
+            ipc_peer_id: None,
+            ipc_reconnect_count: None,
+            health: Some(DaemonHealthState::Healthy),
+            ws_last_disconnect_at: None,
+            ws_last_recovered_at: None,
+            ws_suspected_gap: Some(false),
+            ws_catchup_in_flight: Some(false),
+            ws_observation_admission_closed: None,
+            mattermost_last_error: None,
+            mattermost_identity_drift: Some(false),
+            binary: Some(pin(COMMIT_A, Some(false))),
+        }
+    }
+
     const COMMIT_A: &str = "aaaaaaa1111111aaaaaaa1111111aaaaaaa11111";
     const COMMIT_B: &str = "bbbbbbb2222222bbbbbbb2222222bbbbbbb22222";
+
+    #[test]
+    fn generation_matched_live_ws_error_cycles_an_ownable_daemon() {
+        let status = daemon_status_with_ws(
+            WsConnectionState::Healthy,
+            Some("io error: operation timed out"),
+        );
+        assert_eq!(
+            host_generation_match(&pin(COMMIT_A, Some(false)), status.binary.as_ref()),
+            Some(true),
+            "fixture pins the motivating generation-match case"
+        );
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-seat"),
+            DaemonReuseDecision::RestartOwnable
+        );
+    }
+
+    #[test]
+    fn clean_ws_reuses_the_same_daemon() {
+        let status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-seat"),
+            DaemonReuseDecision::Reuse
+        );
+    }
+
+    #[test]
+    fn authenticated_recovery_does_not_reuse_until_catchup_completes() {
+        let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        status.ws_reconnect_count = Some(3);
+        status.health = Some(DaemonHealthState::Recovering);
+        status.ws_catchup_in_flight = Some(true);
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-seat"),
+            DaemonReuseDecision::RestartOwnable
+        );
+        assert_eq!(
+            doctor_daemon_assessment(&status),
+            (CheckVerdict::Warn, false)
+        );
+
+        status.health = Some(DaemonHealthState::Healthy);
+        status.ws_catchup_in_flight = Some(false);
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-seat"),
+            DaemonReuseDecision::Reuse,
+            "completed recovery must not preserve a sticky failure"
+        );
+    }
+
+    #[test]
+    fn clean_close_reconnect_does_not_reuse_or_pass_doctor_before_authentication() {
+        let mut status = daemon_status_with_ws(WsConnectionState::Connecting, None);
+        status.ws_reconnect_count = Some(1);
+        status.health = Some(DaemonHealthState::Connecting);
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-seat"),
+            DaemonReuseDecision::RestartOwnable
+        );
+        assert_eq!(
+            doctor_daemon_assessment(&status),
+            (CheckVerdict::Warn, false)
+        );
+    }
+
+    #[test]
+    fn authoritative_gate_prevents_mixed_completion_fields_from_greenwashing() {
+        let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        status.ws_reconnect_count = Some(3);
+        status.health = Some(DaemonHealthState::Healthy);
+        status.ws_suspected_gap = Some(false);
+        status.ws_catchup_in_flight = Some(false);
+        status.ws_observation_admission_closed = Some(true);
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-seat"),
+            DaemonReuseDecision::RestartOwnable
+        );
+        assert_eq!(
+            doctor_daemon_assessment(&status),
+            (CheckVerdict::Warn, false)
+        );
+
+        status.ws_observation_admission_closed = Some(false);
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-seat"),
+            DaemonReuseDecision::Reuse
+        );
+        assert_eq!(
+            doctor_daemon_assessment(&status),
+            (CheckVerdict::Pass, false)
+        );
+    }
+
+    #[test]
+    fn degraded_foreign_daemon_is_refused_not_stopped() {
+        let status = daemon_status_with_ws(WsConnectionState::Degraded, Some("connection refused"));
+        assert_eq!(
+            daemon_reuse_decision(&status, "agent-other"),
+            DaemonReuseDecision::RefuseForeign
+        );
+    }
+
+    #[test]
+    fn doctor_ws_summary_is_redacted_and_actionable() {
+        let summary = doctor_ws_error_summary(
+            "io error contacting https://private.example/token/secret: operation timed out",
+        );
+        assert_eq!(summary, "websocket observation timed out");
+        assert!(!summary.contains("private.example"));
+        assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn doctor_scores_live_ws_error_nonhealthy_and_nonzero() {
+        let status = daemon_status_with_ws(
+            WsConnectionState::Healthy,
+            Some("io error: operation timed out"),
+        );
+        let (check, hard) = doctor_daemon_assessment(&status);
+        assert_eq!(check, CheckVerdict::Warn);
+        assert!(!hard);
+        assert_eq!(doctor_exit_code(&[check], hard), 1);
+
+        let block = DoctorDaemonBlock {
+            reachable: true,
+            mattermost_ok: true,
+            identity_drift: false,
+            mattermost_username: Some("agent-seat".into()),
+            health: Some("degraded".into()),
+            ws_connection_state: status.ws_connection_state,
+            ws_last_error: status.ws_last_error.as_deref().map(doctor_ws_error_summary),
+            ws_reconnect_count: status.ws_reconnect_count,
+            ws_catchup_in_flight: status.ws_catchup_in_flight,
+            ws_observation_admission_closed: status.ws_observation_admission_closed,
+            reason: Some("current websocket observation failure".into()),
+        };
+        let json = serde_json::to_string(&block).expect("doctor daemon JSON");
+        assert!(json.contains("\"health\":\"degraded\""), "{json}");
+        assert!(json.contains("\"ws_last_error\":"), "{json}");
+        assert!(json.contains("\"ws_reconnect_count\":3"), "{json}");
+        assert!(!json.contains("operation timed out"), "{json}");
+    }
+
+    #[test]
+    fn failed_ws_repair_reports_cleanup_failure_without_claiming_termination() {
+        let err = ws_repair_failure_with_cleanup(
+            CliError::Bootstrap("replacement did not recover".into()),
+            Err(CliError::Bootstrap(
+                "shutdown RPC and pid fallback failed".into(),
+            )),
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("replacement did not recover"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("shutdown RPC and pid fallback failed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("termination is unconfirmed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("runtime state was preserved"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("replacement was removed"), "{rendered}");
+    }
 
     /// An owned daemon on the same pin scores, and scores `match`.
     #[test]

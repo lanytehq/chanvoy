@@ -475,6 +475,31 @@ pub async fn run_chanvoy(env: &TestEnv, args: &[&str]) -> std::process::Output {
         .expect("spawn chanvoy cli")
 }
 
+/// Wait until the hermetic HTTP-only provider has produced a current
+/// websocket failure in the daemon. This closes the startup race for tests
+/// that intentionally exercise degraded-observation behavior.
+pub async fn wait_for_ws_failure(env: &TestEnv) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let output = run_chanvoy(env, &["--json", "daemon", "status"]).await;
+        if output.status.success() {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if value["ws_last_error"].as_str().is_some() {
+                    return;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon did not report a websocket failure within the test deadline; \
+             stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// PER-036: run a `chanvoy` CLI subcommand with `stdin_input` piped to
 /// its stdin (for the `-` stdin-message convention). Writes the bytes,
 /// closes stdin, then collects output.

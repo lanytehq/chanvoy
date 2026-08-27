@@ -1337,26 +1337,7 @@ async fn dispatch_request(
             let ws_snapshot = {
                 let ws_guard = state.ws_state_holder.lock().await;
                 match ws_guard.as_ref() {
-                    Some(ws) => {
-                        let conn = *ws.connection_state.lock().await;
-                        let last = ws.last_event_at.load(Ordering::Relaxed);
-                        let err = ws.last_error.lock().await.clone();
-                        let rc = ws.reconnect_count.load(Ordering::Relaxed);
-                        let ldx = ws.last_disconnect_at.load(Ordering::Relaxed);
-                        let lrx = ws.last_recovered_at.load(Ordering::Relaxed);
-                        let gap = ws.suspected_gap.load(Ordering::Relaxed);
-                        let ru = ws.recovering_until.load(Ordering::Relaxed);
-                        chanvoy_core::WsStatusSnapshot {
-                            connection_state: Some(conn),
-                            last_event_at: if last > 0 { Some(last) } else { None },
-                            last_error: err,
-                            reconnect_count: Some(rc),
-                            last_disconnect_at: if ldx > 0 { Some(ldx) } else { None },
-                            last_recovered_at: if lrx > 0 { Some(lrx) } else { None },
-                            suspected_gap: Some(gap),
-                            recovering_until: ru,
-                        }
-                    }
+                    Some(ws) => ws.status_snapshot().await,
                     None => chanvoy_core::WsStatusSnapshot {
                         connection_state: None,
                         last_event_at: None,
@@ -1365,6 +1346,8 @@ async fn dispatch_request(
                         last_disconnect_at: None,
                         last_recovered_at: None,
                         suspected_gap: None,
+                        catchup_in_flight: None,
+                        admission_closed: None,
                         recovering_until: 0,
                     },
                 }

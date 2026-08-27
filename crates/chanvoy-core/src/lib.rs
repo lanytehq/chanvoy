@@ -352,6 +352,47 @@ pub const RECOVERY_GRACE_MS: i64 = 10_000;
 /// healthy path. PER-010, entarch.
 pub const STATUS_PROBE_TIMEOUT_MS: u64 = 2_000;
 
+/// Whether a websocket snapshot represents a current observation failure.
+///
+/// `last_error` is a live latch: [`WsState::set_state`] clears it when a
+/// connection becomes healthy again. A present error therefore means the
+/// current reconnect cycle has not recovered. After a recorded reconnect,
+/// disconnected/degraded transport, recovery grace, a suspected gap, and
+/// in-flight catch-up all keep observation closed. The first cold-start
+/// connection/catch-up is exempt until it actually records an error.
+pub fn current_ws_observation_degraded(
+    connection_state: Option<WsConnectionState>,
+    last_error: Option<&str>,
+    reconnect_count: Option<u64>,
+    health: Option<DaemonHealthState>,
+    suspected_gap: Option<bool>,
+    catchup_in_flight: Option<bool>,
+    admission_closed: Option<bool>,
+) -> bool {
+    // New daemons publish one authoritative admission gate. The remaining
+    // fields are diagnostics and a compatibility fallback for older daemons.
+    if let Some(closed) = admission_closed {
+        return closed;
+    }
+    if last_error.is_some() {
+        return true;
+    }
+    if matches!(
+        connection_state,
+        Some(WsConnectionState::Disconnected | WsConnectionState::Degraded)
+    ) {
+        return true;
+    }
+    // Cold start is admissible while the first connection/catch-up is being
+    // established. Recovery gates apply only after a recorded reconnect.
+    let recovering = reconnect_count.unwrap_or(0) > 0;
+    recovering
+        && (matches!(connection_state, Some(WsConnectionState::Connecting))
+            || matches!(health, Some(DaemonHealthState::Recovering))
+            || suspected_gap.unwrap_or(false)
+            || catchup_in_flight.unwrap_or(false))
+}
+
 /// Time-bound a Mattermost identity probe. On success returns the
 /// username; on remote error or local timeout returns a printable
 /// error string, ready to feed `build_daemon_status` as
@@ -373,7 +414,8 @@ pub async fn probe_whoami(client: &MattermostClient, timeout_ms: u64) -> Result<
 }
 
 /// Snapshot of websocket state for building a `DaemonStatus` without
-/// holding any locks. All fields reflect a single atomic read moment.
+/// retaining live locks. Diagnostic fields may straddle a transition; the
+/// release/acquire-published `admission_closed` field is authoritative.
 pub struct WsStatusSnapshot {
     pub connection_state: Option<WsConnectionState>,
     pub last_event_at: Option<i64>,
@@ -382,6 +424,8 @@ pub struct WsStatusSnapshot {
     pub last_disconnect_at: Option<i64>,
     pub last_recovered_at: Option<i64>,
     pub suspected_gap: Option<bool>,
+    pub catchup_in_flight: Option<bool>,
+    pub admission_closed: Option<bool>,
     pub recovering_until: i64,
 }
 
@@ -450,6 +494,8 @@ pub fn build_daemon_status(
         ws_last_disconnect_at: ws.last_disconnect_at,
         ws_last_recovered_at: ws.last_recovered_at,
         ws_suspected_gap: ws.suspected_gap,
+        ws_catchup_in_flight: ws.catchup_in_flight,
+        ws_observation_admission_closed: ws.admission_closed,
         mattermost_last_error,
         mattermost_identity_drift,
         // PER-038A: pin of *this* process (the daemon), not the calling CLI.
@@ -1704,6 +1750,10 @@ pub struct DaemonStatus {
     pub ws_last_recovered_at: Option<i64>,
     #[serde(default)]
     pub ws_suspected_gap: Option<bool>,
+    #[serde(default)]
+    pub ws_catchup_in_flight: Option<bool>,
+    #[serde(default)]
+    pub ws_observation_admission_closed: Option<bool>,
     #[serde(default)]
     pub mattermost_last_error: Option<String>,
     /// PER-014: post-bind drift signal — `true` when a successful
@@ -5054,6 +5104,9 @@ pub struct WsState {
     pub recovering_until: Arc<AtomicI64>,
     pub last_recovered_at: Arc<AtomicI64>,
     pub catchup_in_flight: Arc<AtomicBool>,
+    /// Single admission authority for push-dependent work. It closes before
+    /// reconnect publication and opens only after recovery fully completes.
+    pub observation_admission_closed: Arc<AtomicBool>,
 }
 
 impl Default for WsState {
@@ -5075,15 +5128,113 @@ impl WsState {
             recovering_until: Arc::new(AtomicI64::new(0)),
             last_recovered_at: Arc::new(AtomicI64::new(0)),
             catchup_in_flight: Arc::new(AtomicBool::new(false)),
+            observation_admission_closed: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub async fn set_state(&self, state: WsConnectionState) {
+        self.set_state_inner(state, None).await;
+    }
+
+    async fn set_state_inner(
+        &self,
+        state: WsConnectionState,
+        ready_before_publication_lock: Option<&tokio::sync::Notify>,
+    ) {
+        let reconnecting = self.reconnect_count.load(Ordering::Acquire) > 0;
         if matches!(state, WsConnectionState::Disconnected) {
             self.last_disconnect_at
                 .store(now_unix_millis(), Ordering::Relaxed);
         }
-        *self.connection_state.lock().await = state;
+        if let Some(ready) = ready_before_publication_lock {
+            ready.notify_one();
+        }
+        // Take the locks in the same order as daemon_status. A status reader
+        // therefore sees either the prior failed snapshot or the recovered
+        // healthy snapshot, never Healthy paired with a stale historical
+        // error. Keeping `last_error` as a live latch makes it safe for
+        // auto-setup, doctor, and wait admission to share one classifier.
+        let mut connection = self.connection_state.lock().await;
+        let mut last_error = self.last_error.lock().await;
+        if matches!(
+            state,
+            WsConnectionState::Disconnected | WsConnectionState::Degraded
+        ) || matches!(state, WsConnectionState::Connecting) && reconnecting
+        {
+            // Serialize gate closure with state publication. A stale recovery
+            // opener holding this same lock must finish first; this newer
+            // transition then becomes the final authority publisher.
+            self.observation_admission_closed
+                .store(true, Ordering::Release);
+        }
+        *connection = state;
+        if matches!(state, WsConnectionState::Healthy) {
+            *last_error = None;
+        }
+        if !reconnecting
+            && matches!(
+                state,
+                WsConnectionState::Connecting | WsConnectionState::Healthy
+            )
+        {
+            // Cold-start admission opens only after its admissible transport
+            // state is visible. Reconnect never opens here.
+            self.observation_admission_closed
+                .store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    async fn set_state_signaled(
+        &self,
+        state: WsConnectionState,
+        ready_before_publication_lock: &tokio::sync::Notify,
+    ) {
+        self.set_state_inner(state, Some(ready_before_publication_lock))
+            .await;
+    }
+
+    /// Publish the conservative markers for an authenticated session before
+    /// `Healthy` becomes observable. This deliberately stays separate from
+    /// `set_state`: the boundary between these calls is safe (closed), which
+    /// also gives tests a deterministic interleaving point.
+    pub fn prepare_authenticated_session(&self) {
+        self.catchup_in_flight.store(true, Ordering::Relaxed);
+        self.suspected_gap.store(false, Ordering::Relaxed);
+    }
+
+    /// Capture websocket diagnostics plus the authoritative admission gate.
+    ///
+    /// Diagnostic fields may straddle a transition. Admission does not infer
+    /// from those fields when `admission_closed` is present: an Acquire load of
+    /// the single gate is the coherent decision authority.
+    pub async fn status_snapshot(&self) -> WsStatusSnapshot {
+        let connection_state = *self.connection_state.lock().await;
+        let last_error = self.last_error.lock().await.clone();
+        let last = self.last_event_at.load(Ordering::Relaxed);
+        let reconnect_count = self.reconnect_count.load(Ordering::Relaxed);
+        let last_disconnect = self.last_disconnect_at.load(Ordering::Relaxed);
+        let last_recovered = self.last_recovered_at.load(Ordering::Relaxed);
+        WsStatusSnapshot {
+            connection_state: Some(connection_state),
+            last_event_at: if last > 0 { Some(last) } else { None },
+            last_error,
+            reconnect_count: Some(reconnect_count),
+            last_disconnect_at: if last_disconnect > 0 {
+                Some(last_disconnect)
+            } else {
+                None
+            },
+            last_recovered_at: if last_recovered > 0 {
+                Some(last_recovered)
+            } else {
+                None
+            },
+            suspected_gap: Some(self.suspected_gap.load(Ordering::Relaxed)),
+            catchup_in_flight: Some(self.catchup_in_flight.load(Ordering::Relaxed)),
+            admission_closed: Some(self.observation_admission_closed.load(Ordering::Acquire)),
+            recovering_until: self.recovering_until.load(Ordering::Relaxed),
+        }
     }
 
     pub fn record_disconnect_seq(&self, seq: u64) {
@@ -5091,7 +5242,13 @@ impl WsState {
     }
 
     pub async fn set_error(&self, msg: impl Into<String>) {
-        *self.last_error.lock().await = Some(msg.into());
+        // Share the connection lock with state transitions and recovery-open
+        // publication so a stale opener cannot overwrite this newer failure.
+        let _connection = self.connection_state.lock().await;
+        let mut last_error = self.last_error.lock().await;
+        self.observation_admission_closed
+            .store(true, Ordering::Release);
+        *last_error = Some(msg.into());
     }
 
     pub fn touch_event(&self) {
@@ -5101,6 +5258,60 @@ impl WsState {
 
     pub fn bump_reconnect(&self) {
         self.reconnect_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn commit_recovery_open_inner(
+        &self,
+        target: i64,
+        reconnect_generation: u64,
+        acquired_publication_lock: Option<&tokio::sync::Notify>,
+        release_publication_lock: Option<&tokio::sync::Notify>,
+    ) {
+        let connection = self.connection_state.lock().await;
+        if let Some(acquired) = acquired_publication_lock {
+            acquired.notify_one();
+        }
+        if let Some(release) = release_publication_lock {
+            release.notified().await;
+        }
+        let last_error = self.last_error.lock().await;
+        if self.recovering_until.load(Ordering::Relaxed) != target
+            || self.reconnect_count.load(Ordering::Acquire) != reconnect_generation
+            || self.catchup_in_flight.load(Ordering::Relaxed)
+            || !matches!(*connection, WsConnectionState::Healthy)
+            || last_error.is_some()
+        {
+            return;
+        }
+        self.last_recovered_at
+            .store(now_unix_millis(), Ordering::Relaxed);
+        self.suspected_gap.store(false, Ordering::Relaxed);
+        // Publish open last while retaining the same publication lock used by
+        // newer disconnect/error closures.
+        self.observation_admission_closed
+            .store(false, Ordering::Release);
+    }
+
+    async fn commit_recovery_open(&self, target: i64, reconnect_generation: u64) {
+        self.commit_recovery_open_inner(target, reconnect_generation, None, None)
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn commit_recovery_open_signaled(
+        &self,
+        target: i64,
+        reconnect_generation: u64,
+        acquired_publication_lock: &tokio::sync::Notify,
+        release_publication_lock: &tokio::sync::Notify,
+    ) {
+        self.commit_recovery_open_inner(
+            target,
+            reconnect_generation,
+            Some(acquired_publication_lock),
+            Some(release_publication_lock),
+        )
+        .await;
     }
 
     /// Stamp `recovering_until = now + RECOVERY_GRACE_MS` and spawn an
@@ -5125,6 +5336,7 @@ impl WsState {
             return;
         }
         let target = now_unix_millis() + RECOVERY_GRACE_MS;
+        let reconnect_generation = self.reconnect_count.load(Ordering::Acquire);
         self.recovering_until.store(target, Ordering::Relaxed);
         let ws = Arc::clone(self);
         tokio::spawn(async move {
@@ -5147,17 +5359,7 @@ impl WsState {
                 }
                 sleep(Duration::from_millis(200)).await;
             }
-            // Re-check target after the wait in case a new reconnect
-            // restamped it while we were waiting on catchup.
-            if ws.recovering_until.load(Ordering::Relaxed) != target {
-                return;
-            }
-            let conn = *ws.connection_state.lock().await;
-            if matches!(conn, WsConnectionState::Healthy) {
-                ws.last_recovered_at
-                    .store(now_unix_millis(), Ordering::Relaxed);
-                ws.suspected_gap.store(false, Ordering::Relaxed);
-            }
+            ws.commit_recovery_open(target, reconnect_generation).await;
         });
     }
 }
@@ -5372,11 +5574,15 @@ impl MattermostWs {
                             if !authenticated {
                                 if is_auth_success(&text) {
                                     authenticated = true;
+                                    // Close recovery admission before Healthy
+                                    // clears the live error latch. Readers at
+                                    // this exact boundary remain conservative.
+                                    self.ws_state.prepare_authenticated_session();
+                                    self.ws_state.arm_recovery_window();
                                     self.ws_state
                                         .set_state(WsConnectionState::Healthy)
                                         .await;
                                     info!("websocket authenticated and healthy");
-                                    self.ws_state.arm_recovery_window();
                                     self.event_bus.emit(DaemonEvent {
                                         seq: 0,
                                         kind: DaemonEventKind::ConnectionStateChanged,
@@ -5569,21 +5775,10 @@ impl MattermostWs {
     }
 
     async fn reconnect_catchup(&self) {
-        // Mark this cycle's catchup as in-flight so the grace-window
-        // task (armed before we entered this function) will wait for
-        // us to finish before clearing suspected_gap. Otherwise a slow
-        // catchup — many monitored channels, slow REST — can leave the
-        // grace task firing early, clearing a gap that hadn't been
-        // flagged yet, then catchup sets the gap post-hoc with no
-        // further clear. PER-010, secrev follow-up.
-        self.ws_state
-            .catchup_in_flight
-            .store(true, Ordering::Relaxed);
-        // Each reconnect cycle starts with a clean slate. If this cycle's
-        // outage exceeded the 5-min window and emits a Gap below, we'll
-        // re-flag suspected_gap; the arm_recovery_window task clears it
-        // at grace-window completion (after we finish).
-        self.ws_state.suspected_gap.store(false, Ordering::Relaxed);
+        // `prepare_authenticated_session` marks catch-up in flight and resets
+        // the cycle's gap before Healthy is published. If this outage exceeded
+        // the five-minute window, re-flag it below; the recovery-window task
+        // clears it only after catch-up finishes.
         let five_min_ago = now_unix_millis() - (5 * 60 * 1000);
         let disconnect_at = self.ws_state.last_disconnect_at.load(Ordering::Relaxed);
         let outage_exceeded_window = disconnect_at > 0 && disconnect_at < five_min_ago;
@@ -7077,6 +7272,186 @@ monitored_channels = ["per-003", "per-004"]
             let (conn, gap, ru) = snapshot(&ws);
             let health = derive_daemon_health(now_unix_millis(), Some(conn), gap, ru);
             assert_eq!(health, Some(DaemonHealthState::Healthy));
+            assert!(!current_ws_observation_degraded(
+                Some(conn),
+                None,
+                Some(0),
+                Some(DaemonHealthState::Healthy),
+                Some(false),
+                Some(false),
+                None,
+            ));
+        }
+
+        #[tokio::test]
+        async fn websocket_error_is_live_until_a_healthy_recovery() {
+            let ws = WsState::new();
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.set_error("io timeout").await;
+
+            let failed_state = *ws.connection_state.lock().await;
+            let failed_error = ws.last_error.lock().await.clone();
+            assert!(current_ws_observation_degraded(
+                Some(failed_state),
+                failed_error.as_deref(),
+                Some(0),
+                Some(DaemonHealthState::Healthy),
+                Some(false),
+                Some(false),
+                None,
+            ));
+
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.set_state(WsConnectionState::Connecting).await;
+            assert!(
+                current_ws_observation_degraded(
+                    Some(*ws.connection_state.lock().await),
+                    ws.last_error.lock().await.as_deref(),
+                    Some(1),
+                    Some(DaemonHealthState::Connecting),
+                    Some(false),
+                    Some(false),
+                    None,
+                ),
+                "a reconnect attempt must retain the live failure"
+            );
+
+            ws.set_state(WsConnectionState::Healthy).await;
+            let recovered_state = *ws.connection_state.lock().await;
+            let recovered_error = ws.last_error.lock().await.clone();
+            assert_eq!(recovered_error, None, "recovery clears historical error");
+            assert!(!current_ws_observation_degraded(
+                Some(recovered_state),
+                recovered_error.as_deref(),
+                Some(1),
+                Some(DaemonHealthState::Healthy),
+                Some(false),
+                Some(false),
+                None,
+            ));
+        }
+
+        #[tokio::test]
+        async fn newer_disconnect_closes_after_a_stale_recovery_opener() {
+            let ws = Arc::new(WsState::new());
+            ws.set_state(WsConnectionState::Disconnected).await;
+            ws.bump_reconnect();
+            ws.set_state(WsConnectionState::Connecting).await;
+            ws.prepare_authenticated_session();
+            ws.set_state(WsConnectionState::Healthy).await;
+            ws.catchup_in_flight.store(false, Ordering::Relaxed);
+            let target = now_unix_millis() - 1;
+            ws.recovering_until.store(target, Ordering::Relaxed);
+            let generation = ws.reconnect_count.load(Ordering::Acquire);
+            assert!(ws.observation_admission_closed.load(Ordering::Acquire));
+
+            // Pause the production recovery-open helper while it owns the
+            // publication lock, then queue a newer disconnect behind it.
+            let opener_acquired = Arc::new(tokio::sync::Notify::new());
+            let opener_release = Arc::new(tokio::sync::Notify::new());
+            let old = Arc::clone(&ws);
+            let acquired = Arc::clone(&opener_acquired);
+            let release = Arc::clone(&opener_release);
+            let opener = tokio::spawn(async move {
+                old.commit_recovery_open_signaled(
+                    target,
+                    generation,
+                    acquired.as_ref(),
+                    release.as_ref(),
+                )
+                .await;
+            });
+            opener_acquired.notified().await;
+
+            let disconnect_ready = Arc::new(tokio::sync::Notify::new());
+            let newer = Arc::clone(&ws);
+            let ready = Arc::clone(&disconnect_ready);
+            let disconnect = tokio::spawn(async move {
+                newer
+                    .set_state_signaled(WsConnectionState::Disconnected, ready.as_ref())
+                    .await;
+            });
+            disconnect_ready.notified().await;
+
+            assert!(
+                ws.observation_admission_closed.load(Ordering::Acquire),
+                "the newer disconnect cannot publish before acquiring the shared lock"
+            );
+            opener_release.notify_one();
+            opener.await.expect("old recovery opener completes");
+            disconnect.await.expect("newer disconnect completes");
+
+            let snapshot = ws.status_snapshot().await;
+            assert_eq!(
+                snapshot.connection_state,
+                Some(WsConnectionState::Disconnected)
+            );
+            assert_eq!(
+                snapshot.admission_closed,
+                Some(true),
+                "the newer disconnect must be the final authority publisher"
+            );
+        }
+
+        #[test]
+        fn authenticated_recovery_remains_degraded_until_catchup_and_grace_complete() {
+            assert!(current_ws_observation_degraded(
+                Some(WsConnectionState::Connecting),
+                None,
+                Some(1),
+                Some(DaemonHealthState::Connecting),
+                Some(false),
+                Some(false),
+                None,
+            ));
+            assert!(!current_ws_observation_degraded(
+                Some(WsConnectionState::Connecting),
+                None,
+                Some(0),
+                Some(DaemonHealthState::Connecting),
+                Some(false),
+                Some(false),
+                None,
+            ));
+            assert!(current_ws_observation_degraded(
+                Some(WsConnectionState::Healthy),
+                None,
+                Some(3),
+                Some(DaemonHealthState::Recovering),
+                Some(false),
+                Some(true),
+                None,
+            ));
+            assert!(current_ws_observation_degraded(
+                Some(WsConnectionState::Healthy),
+                None,
+                Some(3),
+                Some(DaemonHealthState::Healthy),
+                Some(false),
+                Some(true),
+                None,
+            ));
+            assert!(!current_ws_observation_degraded(
+                Some(WsConnectionState::Healthy),
+                None,
+                Some(3),
+                Some(DaemonHealthState::Healthy),
+                Some(false),
+                Some(false),
+                None,
+            ));
+            assert!(
+                !current_ws_observation_degraded(
+                    Some(WsConnectionState::Healthy),
+                    None,
+                    Some(0),
+                    Some(DaemonHealthState::Healthy),
+                    Some(false),
+                    Some(true),
+                    None,
+                ),
+                "cold-start catchup is not a reconnect failure"
+            );
         }
 
         #[tokio::test]
@@ -7166,6 +7541,8 @@ monitored_channels = ["per-003", "per-004"]
                 last_disconnect_at,
                 last_recovered_at: None,
                 suspected_gap,
+                catchup_in_flight: Some(false),
+                admission_closed: None,
                 recovering_until,
             }
         }

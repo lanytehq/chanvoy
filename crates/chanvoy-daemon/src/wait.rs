@@ -320,6 +320,10 @@ pub async fn wait_with_params_v3(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     WaitPredicate::compile("pending", "pending", contains, pattern)?;
+    let monitored = channel_is_monitored(state, channel);
+    if monitored {
+        refuse_current_ws_failure(state, channel).await?;
+    }
 
     let resolved = provider_retry(state, channel, deadline, || async {
         state.client.resolve_channel(channel, team).await
@@ -355,7 +359,6 @@ pub async fn wait_with_params_v3(
 
     let predicate =
         WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
-    let monitored = channel_is_monitored(state, channel);
 
     let result = crate::waitprims_hold::run_single_channel_first_match(
         state,
@@ -1178,6 +1181,88 @@ pub(crate) async fn ws_connection_healthy(state: &AppState) -> bool {
     matches!(state, WsConnectionState::Healthy)
 }
 
+/// Refuse a push-dependent wait before provider work or ownership admission
+/// when the daemon already knows its websocket observation path is failed.
+///
+/// The raw transport error is intentionally not copied into the RPC error:
+/// it may contain a provider URL or response fragment. `daemon status` and
+/// `doctor` carry the redacted diagnostic evidence.
+pub(crate) async fn refuse_current_ws_failure(
+    state: &AppState,
+    channel: &str,
+) -> Result<(), CoreError> {
+    let ws = {
+        let guard = state.ws_state_holder.lock().await;
+        guard.clone()
+    };
+    let Some(ws) = ws else {
+        return Ok(());
+    };
+    let snapshot = ws.status_snapshot().await;
+    let connection = snapshot
+        .connection_state
+        .unwrap_or(WsConnectionState::Disconnected);
+    let health = chanvoy_core::derive_daemon_health(
+        chanvoy_core::now_unix_millis(),
+        Some(connection),
+        snapshot.suspected_gap.unwrap_or(false),
+        snapshot.recovering_until,
+    );
+    refuse_ws_snapshot(
+        WsAdmissionSnapshot {
+            connection,
+            last_error: snapshot.last_error.as_deref(),
+            reconnect_count: snapshot.reconnect_count.unwrap_or(0),
+            health,
+            suspected_gap: snapshot.suspected_gap.unwrap_or(false),
+            catchup_in_flight: snapshot.catchup_in_flight.unwrap_or(false),
+            admission_closed: snapshot.admission_closed,
+        },
+        channel,
+    )
+}
+
+struct WsAdmissionSnapshot<'a> {
+    connection: WsConnectionState,
+    last_error: Option<&'a str>,
+    reconnect_count: u64,
+    health: Option<chanvoy_core::DaemonHealthState>,
+    suspected_gap: bool,
+    catchup_in_flight: bool,
+    admission_closed: Option<bool>,
+}
+
+fn refuse_ws_snapshot(snapshot: WsAdmissionSnapshot<'_>, channel: &str) -> Result<(), CoreError> {
+    if !chanvoy_core::current_ws_observation_degraded(
+        Some(snapshot.connection),
+        snapshot.last_error,
+        Some(snapshot.reconnect_count),
+        snapshot.health,
+        Some(snapshot.suspected_gap),
+        Some(snapshot.catchup_in_flight),
+        snapshot.admission_closed,
+    ) {
+        return Ok(());
+    }
+    Err(CoreError::WaitProviderDegraded {
+        channel: channel.to_string(),
+        message: format!(
+            "websocket observation is currently unavailable (state={}); \
+             run `chanvoy auto-setup` to repair the ownable daemon",
+            ws_state_name(snapshot.connection)
+        ),
+    })
+}
+
+fn ws_state_name(state: WsConnectionState) -> &'static str {
+    match state {
+        WsConnectionState::Disconnected => "disconnected",
+        WsConnectionState::Connecting => "connecting",
+        WsConnectionState::Healthy => "healthy",
+        WsConnectionState::Degraded => "degraded",
+    }
+}
+
 /// Clean deadman only when observation actually worked (secrev/entarch B,
 /// devrev D3). Connection-state bus traffic is not evidence; a currently
 /// healthy WS with zero successful observes is still provider/hard, not
@@ -1276,7 +1361,113 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chanvoy_core::{DaemonEventKind, InboundEventPayload, Provider};
+    use chanvoy_core::{
+        AttentionState, CapabilityClass, CredentialMode, DaemonEventKind, EventBus,
+        InboundEventPayload, MattermostClient, Profile, Provider, WaitChannelArm,
+        WaitChannelsParams, WsState,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+
+    async fn state_with_failed_ws(monitored: &[&str]) -> AppState {
+        let profile = Profile {
+            name: "test".into(),
+            role: "test".into(),
+            scope: "test".into(),
+            provider: Provider::Mattermost,
+            bot_username: "agent-test".into(),
+            team_name: "org".into(),
+            server_url: "http://127.0.0.1:9".into(),
+            env_name: "TEST_TOKEN".into(),
+            env_file: None,
+            credential_mode: CredentialMode::EnvName,
+            capability_class: CapabilityClass::Standard,
+            monitored_channels: monitored.iter().map(|s| (*s).to_string()).collect(),
+            ipc: None,
+            reduce: None,
+        };
+        let client = MattermostClient::new(&profile, "test-token".into()).expect("client");
+        let ws = Arc::new(WsState::new());
+        ws.set_state(WsConnectionState::Healthy).await;
+        ws.set_error("private transport detail").await;
+        AppState {
+            profile,
+            client,
+            socket_path: "/tmp/chanvoy-test.sock".into(),
+            my_user_id: "bot-id".into(),
+            event_bus: Arc::new(EventBus::new(16)),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            ws_state_holder: Arc::new(tokio::sync::Mutex::new(Some(ws))),
+            ipc_state: None,
+            attention_state: Arc::new(tokio::sync::Mutex::new(AttentionState::default())),
+            identity_drift: Arc::new(AtomicBool::new(false)),
+            reduce_writer: None,
+            wait_owners: Arc::new(crate::wait_owner::WaitOwnerRegistry::new()),
+            poll_cursors: crate::waitprims_poll::PollCursorStore::for_test("test"),
+            fanin_replay: crate::waitprims_fanin::FanInReplayStore::new(),
+        }
+    }
+
+    async fn state_with_recovery_in_flight(monitored: &[&str]) -> AppState {
+        let state = state_with_failed_ws(monitored).await;
+        let ws = state
+            .ws_state_holder
+            .lock()
+            .await
+            .clone()
+            .expect("ws state");
+        ws.set_state(WsConnectionState::Disconnected).await;
+        ws.bump_reconnect();
+        ws.set_state(WsConnectionState::Connecting).await;
+        // Model a cleanly-ended websocket session: there is no error latch to
+        // carry the gate. The pre-Healthy recovery markers alone must close
+        // admission at the publication boundary.
+        *ws.last_error.lock().await = None;
+        ws.prepare_authenticated_session();
+        ws.arm_recovery_window();
+        state
+    }
+
+    async fn state_at_clean_reconnect_before_auth(monitored: &[&str]) -> AppState {
+        let state = state_with_failed_ws(monitored).await;
+        let ws = state
+            .ws_state_holder
+            .lock()
+            .await
+            .clone()
+            .expect("ws state");
+        ws.set_state(WsConnectionState::Disconnected).await;
+        ws.bump_reconnect();
+        ws.set_state(WsConnectionState::Connecting).await;
+        *ws.last_error.lock().await = None;
+        state
+    }
+
+    async fn state_at_recovery_completion_boundary(monitored: &[&str]) -> AppState {
+        let state = state_at_clean_reconnect_before_auth(monitored).await;
+        let ws = state
+            .ws_state_holder
+            .lock()
+            .await
+            .clone()
+            .expect("ws state");
+        ws.prepare_authenticated_session();
+        ws.set_state(WsConnectionState::Healthy).await;
+        ws.recovering_until.store(
+            chanvoy_core::now_unix_millis() - 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        ws.suspected_gap
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        ws.catchup_in_flight
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // The completion task has not yet committed the authoritative gate
+        // open. All legacy diagnostics now look healthy by construction.
+        assert!(ws
+            .observation_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire));
+        state
+    }
 
     fn pred(contains: Option<&str>, pattern: Option<&str>) -> WaitPredicate {
         WaitPredicate::compile("bot", "ch-1", contains, pattern).expect("compile")
@@ -1694,5 +1885,376 @@ mod tests {
             DaemonEventPayloadInner::Inbound(p) => assert_eq!(p.post_id, "post"),
             _ => panic!("expected inbound"),
         }
+    }
+
+    #[test]
+    fn push_wait_refuses_a_live_ws_error_without_echoing_it() {
+        let err = refuse_ws_snapshot(
+            WsAdmissionSnapshot {
+                connection: WsConnectionState::Healthy,
+                last_error: Some("https://private.example/token/secret timed out"),
+                reconnect_count: 3,
+                health: Some(chanvoy_core::DaemonHealthState::Healthy),
+                suspected_gap: false,
+                catchup_in_flight: false,
+                admission_closed: None,
+            },
+            "org/panel",
+        )
+        .expect_err("live websocket error must refuse");
+        match err {
+            CoreError::WaitProviderDegraded { channel, message } => {
+                assert_eq!(channel, "org/panel");
+                assert!(message.contains("auto-setup"));
+                assert!(!message.contains("private.example"));
+                assert!(!message.contains("secret"));
+            }
+            other => panic!("expected provider-degraded refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovered_ws_snapshot_does_not_refuse_wait() {
+        assert!(refuse_ws_snapshot(
+            WsAdmissionSnapshot {
+                connection: WsConnectionState::Healthy,
+                last_error: None,
+                reconnect_count: 3,
+                health: Some(chanvoy_core::DaemonHealthState::Healthy),
+                suspected_gap: false,
+                catchup_in_flight: false,
+                admission_closed: None,
+            },
+            "org/panel"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn disconnected_ws_refuses_even_without_an_error_body() {
+        assert!(matches!(
+            refuse_ws_snapshot(
+                WsAdmissionSnapshot {
+                    connection: WsConnectionState::Disconnected,
+                    last_error: None,
+                    reconnect_count: 1,
+                    health: Some(chanvoy_core::DaemonHealthState::Disconnected),
+                    suspected_gap: false,
+                    catchup_in_flight: false,
+                    admission_closed: None,
+                },
+                "org/panel"
+            ),
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+    }
+
+    #[test]
+    fn authenticated_recovery_and_catchup_still_refuse_wait() {
+        assert!(matches!(
+            refuse_ws_snapshot(
+                WsAdmissionSnapshot {
+                    connection: WsConnectionState::Healthy,
+                    last_error: None,
+                    reconnect_count: 3,
+                    health: Some(chanvoy_core::DaemonHealthState::Recovering),
+                    suspected_gap: false,
+                    catchup_in_flight: true,
+                    admission_closed: None,
+                },
+                "org/panel"
+            ),
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+    }
+
+    #[test]
+    fn cold_start_catchup_is_admissible() {
+        assert!(refuse_ws_snapshot(
+            WsAdmissionSnapshot {
+                connection: WsConnectionState::Healthy,
+                last_error: None,
+                reconnect_count: 0,
+                health: Some(chanvoy_core::DaemonHealthState::Healthy),
+                suspected_gap: false,
+                catchup_in_flight: true,
+                admission_closed: None,
+            },
+            "org/panel"
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn single_push_wait_fails_before_ownership_provider_or_attention() {
+        let state = state_with_failed_ws(&["panel"]).await;
+        let attention_before = state.attention_state.lock().await.clone();
+        let started = std::time::Instant::now();
+        let err = wait_with_params_v3(
+            &state,
+            WaitRequest {
+                channel: "panel",
+                timeout_secs: 600,
+                team: Some("org"),
+                contains: None,
+                pattern: None,
+                after: None,
+                replace_wait_id: None,
+                emit_wait_ids: true,
+            },
+        )
+        .await
+        .expect_err("failed push observation must refuse");
+        assert!(matches!(err, CoreError::WaitProviderDegraded { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(state.wait_owners.armed_count(), 0);
+        assert_eq!(state.wait_owners.provider_io_count(), 0);
+        assert_eq!(*state.attention_state.lock().await, attention_before);
+    }
+
+    #[tokio::test]
+    async fn fan_in_push_wait_fails_before_ownership_provider_or_attention() {
+        let state = state_with_failed_ws(&["push"]).await;
+        let attention_before = state.attention_state.lock().await.clone();
+        let params = WaitChannelsParams {
+            arms: vec![
+                WaitChannelArm {
+                    team: "org".into(),
+                    channel: "push".into(),
+                    after: None,
+                },
+                WaitChannelArm {
+                    team: "org".into(),
+                    channel: "rest".into(),
+                    after: None,
+                },
+            ],
+            timeout_secs: 600,
+            contains: None,
+            pattern: None,
+        };
+        let started = std::time::Instant::now();
+        let err = match crate::waitprims_fanin::wait_channels_first_match(&state, params).await {
+            Ok(_) => panic!("mixed fan-in must refuse when its push arm is failed"),
+            Err(err) => err,
+        };
+        match err {
+            CoreError::WaitProviderDegraded { channel, .. } => {
+                assert_eq!(channel, "org/push");
+            }
+            other => panic!("expected provider-degraded refusal, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(state.wait_owners.armed_count(), 0);
+        assert_eq!(state.wait_owners.provider_io_count(), 0);
+        assert_eq!(*state.attention_state.lock().await, attention_before);
+    }
+
+    #[tokio::test]
+    async fn pre_healthy_recovery_boundary_refuses_before_leases_or_attention() {
+        let state = state_with_recovery_in_flight(&["push"]).await;
+        let attention_before = state.attention_state.lock().await.clone();
+        let ws = state
+            .ws_state_holder
+            .lock()
+            .await
+            .clone()
+            .expect("ws state");
+        let boundary = ws.status_snapshot().await;
+        assert_eq!(
+            boundary.connection_state,
+            Some(WsConnectionState::Connecting)
+        );
+        assert_eq!(boundary.last_error, None);
+        assert_eq!(boundary.catchup_in_flight, Some(true));
+
+        let single = wait_with_params_v3(
+            &state,
+            WaitRequest {
+                channel: "push",
+                timeout_secs: 600,
+                team: Some("org"),
+                contains: None,
+                pattern: None,
+                after: None,
+                replace_wait_id: None,
+                emit_wait_ids: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            single,
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+
+        let fan_in = crate::waitprims_fanin::wait_channels_first_match(
+            &state,
+            WaitChannelsParams {
+                arms: vec![
+                    WaitChannelArm {
+                        team: "org".into(),
+                        channel: "push".into(),
+                        after: None,
+                    },
+                    WaitChannelArm {
+                        team: "org".into(),
+                        channel: "rest".into(),
+                        after: None,
+                    },
+                ],
+                timeout_secs: 600,
+                contains: None,
+                pattern: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            fan_in,
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+        assert_eq!(state.wait_owners.armed_count(), 0);
+        assert_eq!(state.wait_owners.provider_io_count(), 0);
+        assert_eq!(*state.attention_state.lock().await, attention_before);
+    }
+
+    #[tokio::test]
+    async fn pre_auth_clean_reconnect_refuses_single_and_fan_in_before_admission() {
+        let state = state_at_clean_reconnect_before_auth(&["push"]).await;
+        let attention_before = state.attention_state.lock().await.clone();
+        let ws = state
+            .ws_state_holder
+            .lock()
+            .await
+            .clone()
+            .expect("ws state");
+        let boundary = ws.status_snapshot().await;
+        assert_eq!(
+            boundary.connection_state,
+            Some(WsConnectionState::Connecting)
+        );
+        assert_eq!(boundary.last_error, None);
+        assert_eq!(boundary.reconnect_count, Some(1));
+        assert_eq!(boundary.catchup_in_flight, Some(false));
+
+        let single = wait_with_params_v3(
+            &state,
+            WaitRequest {
+                channel: "push",
+                timeout_secs: 600,
+                team: Some("org"),
+                contains: None,
+                pattern: None,
+                after: None,
+                replace_wait_id: None,
+                emit_wait_ids: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            single,
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+
+        let fan_in = crate::waitprims_fanin::wait_channels_first_match(
+            &state,
+            WaitChannelsParams {
+                arms: vec![
+                    WaitChannelArm {
+                        team: "org".into(),
+                        channel: "push".into(),
+                        after: None,
+                    },
+                    WaitChannelArm {
+                        team: "org".into(),
+                        channel: "rest".into(),
+                        after: None,
+                    },
+                ],
+                timeout_secs: 600,
+                contains: None,
+                pattern: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            fan_in,
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+        assert_eq!(state.wait_owners.armed_count(), 0);
+        assert_eq!(state.wait_owners.provider_io_count(), 0);
+        assert_eq!(*state.attention_state.lock().await, attention_before);
+    }
+
+    #[tokio::test]
+    async fn mixed_after_grace_completion_fields_remain_closed_before_admission_commit() {
+        let state = state_at_recovery_completion_boundary(&["push"]).await;
+        let attention_before = state.attention_state.lock().await.clone();
+        let ws = state
+            .ws_state_holder
+            .lock()
+            .await
+            .clone()
+            .expect("ws state");
+        let snapshot = ws.status_snapshot().await;
+        assert_eq!(snapshot.connection_state, Some(WsConnectionState::Healthy));
+        assert_eq!(snapshot.last_error, None);
+        assert_eq!(snapshot.suspected_gap, Some(false));
+        assert_eq!(snapshot.catchup_in_flight, Some(false));
+        assert_eq!(snapshot.admission_closed, Some(true));
+
+        let single = wait_with_params_v3(
+            &state,
+            WaitRequest {
+                channel: "push",
+                timeout_secs: 600,
+                team: Some("org"),
+                contains: None,
+                pattern: None,
+                after: None,
+                replace_wait_id: None,
+                emit_wait_ids: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            single,
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+
+        let fan_in = crate::waitprims_fanin::wait_channels_first_match(
+            &state,
+            WaitChannelsParams {
+                arms: vec![
+                    WaitChannelArm {
+                        team: "org".into(),
+                        channel: "push".into(),
+                        after: None,
+                    },
+                    WaitChannelArm {
+                        team: "org".into(),
+                        channel: "rest".into(),
+                        after: None,
+                    },
+                ],
+                timeout_secs: 600,
+                contains: None,
+                pattern: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            fan_in,
+            Err(CoreError::WaitProviderDegraded { .. })
+        ));
+        assert_eq!(state.wait_owners.armed_count(), 0);
+        assert_eq!(state.wait_owners.provider_io_count(), 0);
+        assert_eq!(*state.attention_state.lock().await, attention_before);
+
+        ws.observation_admission_closed
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(
+            refuse_current_ws_failure(&state, "push").await.is_ok(),
+            "the single authoritative completion commit opens admission"
+        );
     }
 }
