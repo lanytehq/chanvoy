@@ -94,7 +94,17 @@ if [[ -z "${SMOKE_TEAM}" ]]; then
   exit 2
 fi
 
-SMOKE_CHANNEL="chanvoy-smoke-v${VERSION}"
+if ! validate_smoke_team "${SMOKE_TEAM}" "${LANYTE_MM_TEAM:-}"; then
+  echo "[release-smoke] error: smoke team must equal the identity profile's LANYTE_MM_TEAM." >&2
+  echo "  channel archive has no cross-team override, so cleanup must target the primary team." >&2
+  exit 2
+fi
+
+SMOKE_RUN_SUFFIX="$(date -u +%Y%m%d%H%M%S)-$$"
+if ! SMOKE_CHANNEL="$(derive_smoke_channel "${VERSION}" "${SMOKE_RUN_SUFFIX}")"; then
+  echo "[release-smoke] error: VERSION cannot produce a valid disposable channel slug." >&2
+  exit 2
+fi
 SMOKE_BOT_USERNAME="${LANYTE_MM_BOT_USERNAME:-}"
 SMOKE_LOG="release-smoke.log"
 
@@ -135,7 +145,7 @@ cleanup() {
   set +e
   if [[ "${SMOKE_CHANNEL_CREATED:-0}" == "1" ]]; then
     echo "[release-smoke] cleanup: archiving ${SMOKE_CHANNEL}" >> "${SMOKE_LOG}"
-    chanvoy channel archive "${SMOKE_CHANNEL}" --team "${SMOKE_TEAM}" >> "${SMOKE_LOG}" 2>&1 || \
+    chanvoy channel archive "${SMOKE_CHANNEL}" >> "${SMOKE_LOG}" 2>&1 || \
       echo "[release-smoke] cleanup: archive failed (channel may persist; archive manually)" >> "${SMOKE_LOG}"
   fi
   scrub_log
@@ -171,9 +181,9 @@ run "whoami"   whoami
 run "channels" channels
 
 # ---- create disposable channel --------------------------------------
-run "channel create" channel create "${SMOKE_CHANNEL}" "chanvoy smoke v${VERSION}" \
-    --team "${SMOKE_TEAM}" \
-    --purpose "PER-032 Tier-B URL-shape smoke for chanvoy v${VERSION}. Disposable; archived at script exit."
+run "channel create" channel create --team "${SMOKE_TEAM}" \
+    "${SMOKE_CHANNEL}" "chanvoy smoke v${VERSION}" \
+    "PER-032 Tier-B URL-shape smoke for chanvoy v${VERSION}. Disposable; archived at script exit."
 SMOKE_CHANNEL_CREATED=1
 
 # ---- bootstrap read (channel is empty) ------------------------------
@@ -241,7 +251,7 @@ if chanvoy wait "${SMOKE_CHANNEL}" --team "${SMOKE_TEAM}" --timeout 2s >> "${SMO
 fi
 
 # ---- archive --------------------------------------------------------
-run "channel archive" channel archive "${SMOKE_CHANNEL}" --team "${SMOKE_TEAM}"
+run "channel archive" channel archive "${SMOKE_CHANNEL}"
 SMOKE_CHANNEL_CREATED=0  # archive succeeded; suppress duplicate cleanup
 
 echo "[release-smoke] all verbs in Tier-B safe-subset passed" >> "${SMOKE_LOG}"
