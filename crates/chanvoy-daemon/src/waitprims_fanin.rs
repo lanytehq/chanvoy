@@ -523,6 +523,7 @@ fn build_fanin_documents(
             },
             start_anchor,
             baseline_policy,
+            priority: None,
         });
     }
     let digest = registration_digest_all(&registrations)?;
@@ -692,14 +693,15 @@ impl Observer for FanInObserver {
                 waitprims_core::ValidationError::new("/bind", "provider")
             })?,
         };
-        let bind = ChanvoyBind {
-            registration_id: registration.registration_id.clone(),
-            subject_id: registration.subject_id.clone(),
-            resolved_start: resolved_start.clone(),
+        let bind = ChanvoyBind::new(
+            registration.registration_id.clone(),
+            registration.subject_id.clone(),
+            resolved_start.clone(),
             rest_baseline,
-            release: Arc::new(LeaseRelease::noop()),
-            inner_cancel: self.inner_cancel.clone(),
-        };
+            Arc::new(LeaseRelease::noop()),
+            self.inner_cancel.clone(),
+            None,
+        );
         for message in &arm.retained {
             if !arm.predicate.matches_message(message) {
                 continue;

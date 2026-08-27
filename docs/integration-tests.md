@@ -252,6 +252,28 @@ settle.
   control: `daemon serve` must *not* become a session leader and must
   stay in the invoking process's session
 
+## Held wait stream gate
+
+`tests/per_043_wait_follow.rs` exercises the process-held
+`wait --follow` surface through a real daemon and isolated Mattermost
+mock:
+
+- one `armed` line, two ordered same-timestamp backlog records on one
+  wait id, and a
+  deadman terminal without re-invoking wait;
+- exact replacement writes lineage in both old and new streams before
+  releasing the shared single-waiter key;
+- client EOF and `SIGINT` release the held owner, with `SIGINT` writing
+  `canceled` and exiting 130;
+- a broken stdout sink exits 2 and releases the held owner, while a
+  provider hard failure writes a bounded `failed` terminal first;
+- old-daemon capability skew refuses without fallback;
+- a skewed daemon record with mismatched `tip`/message lineage is
+  rejected before any sink output;
+- caller-named symlink sinks, non-0600 existing files, and a missing
+  explicit sink fail before daemon admission; and
+- every emitted record passes the in-process contract validator.
+
 ## Adding a test
 
 1. Start in `#[tokio::test] #[ignore = "integration: run via make test-integration"]`.

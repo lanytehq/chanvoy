@@ -1,5 +1,6 @@
 //! A1: drive single-channel `wait_channel_v3` through
-//! `waitprims_async::run_first_match`.
+//! `waitprims_async::run_first_match`, and held `wait_follow_v1`
+//! through `waitprims_async::run_follow`.
 //!
 //! The adapter lives only in this crate. `chanvoy-core` public types and
 //! `chanvoy-mcp` take no waitprims dependency. Legacy `wait_channel` /
@@ -9,16 +10,21 @@
 //! channels, REST from a bind-resolved cursor otherwise. No second
 //! Mattermost client or per-wait WebSocket.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chanvoy_core::{CoreError, Message, WaitResult};
+use chanvoy_core::{
+    CoreError, Message, WaitFollowEvent, WaitFollowEventKind, WaitFollowFailureReason,
+    WaitFollowMode, WaitFollowResult, WaitFollowResultKind, WaitResult,
+};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use waitprims_async::{run_first_match, BindHandle, Cancel, Clock, Observation, Observer};
+use waitprims_async::{
+    run_first_match, run_follow, BindHandle, Cancel, Clock, FollowEnd, Observation, Observer,
+};
 use waitprims_core::{
     validate_raw_documents, ActorRef, AgentWaitMessage, Anchor, AnchorKind, AuthnMode,
     BaselinePolicy, Canonicalization, CapabilityToken, ContentDigest, DigestAlgorithm, IdToken,
@@ -27,8 +33,8 @@ use waitprims_core::{
 };
 
 use crate::wait::{
-    establish_baseline, one_message_result, wait_push_from_cursor, wait_rest_from_cursor,
-    WaitPredicate,
+    empty_at_arm_observation, establish_baseline, one_message_result, provider_retry,
+    wait_push_from_cursor, wait_rest_from_cursor, WaitPredicate,
 };
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::AppState;
@@ -122,6 +128,9 @@ pub(crate) async fn run_single_channel_first_match(
         last_error: Arc::clone(&last_error),
         release: Arc::clone(&release),
         inner_cancel: inner_cancel.clone(),
+        follow: false,
+        follow_rx: Mutex::new(None),
+        bind_ready: Mutex::new(None),
         observed: AtomicBool::new(false),
         restored: Mutex::new(HashMap::new()),
     };
@@ -147,6 +156,372 @@ pub(crate) async fn run_single_channel_first_match(
     inner_cancel.cancel();
     release.release();
     translate_outcome(outcome, wait.channel, &sidecar, wait.session, &last_error)
+}
+
+/// Held single-channel wait. The waitprims runner owns one bind for the
+/// session; emitted bursts are projected to the daemon stream without
+/// re-binding or opening another provider connection.
+pub(crate) async fn run_single_channel_follow(
+    state: &AppState,
+    wait: FirstMatchWait<'_>,
+    stream: crate::wait::FollowStreamSender,
+) -> Result<WaitFollowResult, CoreError> {
+    let release = Arc::new(LeaseRelease::new(wait.guard));
+    let sidecar = MessageSidecar::new();
+    let last_error = Arc::new(Mutex::new(None));
+    let inner_cancel = CancellationToken::new();
+    // Subscribe before the remaining bind work so monitored delivery
+    // cannot fall into a baseline-to-subscribe seam.
+    let follow_rx = wait.monitored.then(|| state.event_bus.subscribe());
+    let (resolved_start, rest_baseline) = match wait.prebound_after {
+        Some(bound) => bound,
+        None => resolve_bind_cursor(
+            state,
+            wait.session,
+            wait.channel,
+            wait.predicate.channel_id(),
+            wait.after,
+            wait.deadline,
+        )
+        .await
+        .map_err(classify_bind_core_error)?,
+    };
+
+    let tip_state = Arc::new(Mutex::new(None));
+    let (bind_ready_tx, bind_ready_rx) = tokio::sync::oneshot::channel();
+
+    let observer = ChanvoyWaitObserver {
+        state: state.clone(),
+        channel: wait.channel.to_string(),
+        after: wait.after.map(str::to_string),
+        monitored: wait.monitored,
+        predicate: wait.predicate,
+        deadline: wait.deadline,
+        my_user_id: state.my_user_id.clone(),
+        registration_id: IdToken::new(format!("reg:{}", wait.session.wait_id)),
+        subject_id: channel_subject(wait.channel_id),
+        resolved_start,
+        rest_baseline,
+        sidecar: sidecar.clone(),
+        last_error: Arc::clone(&last_error),
+        release: Arc::clone(&release),
+        inner_cancel: inner_cancel.clone(),
+        follow: true,
+        follow_rx: Mutex::new(follow_rx),
+        bind_ready: Mutex::new(Some(bind_ready_tx)),
+        observed: AtomicBool::new(false),
+        restored: Mutex::new(HashMap::new()),
+    };
+
+    let clock = WallClock::new();
+    let (set, request) = build_live_documents(
+        wait.session,
+        &state.my_user_id,
+        wait.channel_id,
+        wait.after,
+        clock.project_deadline(wait.deadline),
+    )?;
+    let docs = admit_set_and_request(wait.channel, set, request)?;
+    let wp_cancel = Cancel::new();
+    let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
+
+    let sink_stream = stream.clone();
+    let sink_sidecar = sidecar.clone();
+    let sink_error = Arc::clone(&last_error);
+    let sink_tip = Arc::clone(&tip_state);
+    let sink_channel = wait.channel.to_string();
+    let sink_wait_id = wait.session.wait_id.clone();
+    let follow = run_follow(
+        &observer,
+        &clock,
+        &wp_cancel,
+        &docs.set,
+        &docs.request,
+        move |burst| {
+            let stream = sink_stream.clone();
+            let sidecar = sink_sidecar.clone();
+            let last_error = Arc::clone(&sink_error);
+            let tip_state = Arc::clone(&sink_tip);
+            let channel = sink_channel.clone();
+            let wait_id = sink_wait_id.clone();
+            async move {
+                let event_count = burst.events.len();
+                for (index, event) in burst.events.into_iter().enumerate() {
+                    let key = event.payload.payload_ref.as_str();
+                    let Some(entry) = sidecar.take_entry(key) else {
+                        let err = CoreError::WaitProviderDegraded {
+                            channel: channel.clone(),
+                            message: "held wait event missing sidecar message".into(),
+                        };
+                        if let Ok(mut slot) = last_error.lock() {
+                            *slot = Some(err);
+                        }
+                        return Err(waitprims_core::ValidationError::new(
+                            "/follow_sink",
+                            "sidecar_missing",
+                        )
+                        .into());
+                    };
+                    if let Err(err) = authenticate_sidecar_message(
+                        &channel,
+                        &entry.message,
+                        &event.payload.content_digest,
+                    ) {
+                        if let Ok(mut slot) = last_error.lock() {
+                            *slot = Some(err);
+                        }
+                        return Err(waitprims_core::ValidationError::new(
+                            "/follow_sink",
+                            "sidecar_digest",
+                        )
+                        .into());
+                    }
+                    let proposed_tip = event.proposed_next_anchor.value.as_str();
+                    if proposed_tip != entry.message.id {
+                        if let Ok(mut slot) = last_error.lock() {
+                            *slot = Some(CoreError::WaitProviderDegraded {
+                                channel: channel.clone(),
+                                message: "held wait tip does not equal its sole message id".into(),
+                            });
+                        }
+                        return Err(waitprims_core::ValidationError::new(
+                            "/follow_sink",
+                            "tip_message_mismatch",
+                        )
+                        .into());
+                    }
+                    let mode = match entry.phase {
+                        FollowObservationPhase::Backlog => WaitFollowMode::Backlog,
+                        FollowObservationPhase::Live => WaitFollowMode::Live,
+                    };
+                    let record = WaitFollowEvent::message(
+                        wait_id.clone(),
+                        mode,
+                        entry.message,
+                        mode == WaitFollowMode::Backlog && index + 1 < event_count,
+                    )
+                    .map_err(|_| {
+                        waitprims_core::ValidationError::new(
+                            "/follow_sink",
+                            "invalid_event_document",
+                        )
+                    })?;
+                    emit_follow_event(&stream, record).await.map_err(|err| {
+                        if let Ok(mut slot) = last_error.lock() {
+                            *slot = Some(err);
+                        }
+                        waitprims_async::Error::from(waitprims_core::ValidationError::new(
+                            "/follow_sink",
+                            "stream_write_failed",
+                        ))
+                    })?;
+                    if let Ok(mut current) = tip_state.lock() {
+                        *current = Some(proposed_tip.to_string());
+                    }
+                }
+                Ok(())
+            }
+        },
+    );
+    tokio::pin!(follow);
+
+    let early_end = tokio::select! {
+        bound = bind_ready_rx => {
+            bound.map_err(|_| CoreError::WaitProviderDegraded {
+                channel: wait.channel.to_string(),
+                message: "held wait ended before observer bind".into(),
+            })?;
+            None
+        }
+        end = &mut follow => Some(end),
+    };
+    if let Some(end) = early_end {
+        inner_cancel.cancel();
+        release.release();
+        return Err(match end {
+            Ok(_) => CoreError::WaitProviderDegraded {
+                channel: wait.channel.to_string(),
+                message: "held wait ended before armed receipt".into(),
+            },
+            Err(err) => map_waitprims_err(wait.channel, err),
+        });
+    }
+
+    emit_follow_event(
+        &stream,
+        WaitFollowEvent::armed(
+            wait.session.wait_id.clone(),
+            wait.session.replaced_wait_id.clone(),
+        ),
+    )
+    .await?;
+
+    let end = follow.await;
+    let end = match end {
+        Ok(end) => end,
+        Err(err) => {
+            let reason = last_error
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(follow_failure_reason))
+                .unwrap_or(WaitFollowFailureReason::ProviderFailed);
+            emit_follow_event(
+                &stream,
+                WaitFollowEvent::terminal(
+                    wait.session.wait_id.clone(),
+                    WaitFollowEventKind::Failed {
+                        reason_code: reason,
+                    },
+                ),
+            )
+            .await?;
+            inner_cancel.cancel();
+            release.release();
+            if let Some(saved) = last_error.lock().ok().and_then(|mut slot| slot.take()) {
+                return Err(saved);
+            }
+            return Err(map_waitprims_err(wait.channel, err));
+        }
+    };
+
+    let tip = tip_state.lock().ok().and_then(|current| current.clone());
+    let (terminal_kind, result_kind) = match end {
+        FollowEnd::Deadline => (
+            WaitFollowEventKind::Deadman,
+            WaitFollowResultKind::Deadman { tip },
+        ),
+        FollowEnd::Cancel => {
+            let replaced_by_wait_id = wait.session.replaced_by_id();
+            if replaced_by_wait_id.is_empty() {
+                emit_follow_event(
+                    &stream,
+                    WaitFollowEvent::terminal(
+                        wait.session.wait_id.clone(),
+                        WaitFollowEventKind::Canceled,
+                    ),
+                )
+                .await?;
+                inner_cancel.cancel();
+                release.release();
+                return Err(CoreError::WaitProviderDegraded {
+                    channel: wait.channel.to_string(),
+                    message: "held wait canceled".into(),
+                });
+            } else {
+                (
+                    WaitFollowEventKind::Replaced {
+                        replaced_by_wait_id: replaced_by_wait_id.clone(),
+                    },
+                    WaitFollowResultKind::Replaced {
+                        replaced_by_wait_id,
+                        tip,
+                    },
+                )
+            }
+        }
+        FollowEnd::TerminalArm { reason_code, .. } => {
+            let reason = follow_failure_reason_code(reason_code.as_str());
+            emit_follow_event(
+                &stream,
+                WaitFollowEvent::terminal(
+                    wait.session.wait_id.clone(),
+                    WaitFollowEventKind::Failed {
+                        reason_code: reason,
+                    },
+                ),
+            )
+            .await?;
+            inner_cancel.cancel();
+            release.release();
+            if let Some(saved) = last_error.lock().ok().and_then(|mut slot| slot.take()) {
+                return Err(saved);
+            }
+            return Err(named_failure(wait.channel, reason_code.as_str()));
+        }
+    };
+
+    let result = WaitFollowResult {
+        wait_id: wait.session.wait_id.clone(),
+        kind: result_kind,
+    };
+    result
+        .validate()
+        .map_err(|message| CoreError::WaitProviderDegraded {
+            channel: wait.channel.to_string(),
+            message: message.into(),
+        })?;
+    // The terminal line must cross the UDS write boundary before the
+    // ownership guard is released or the terminal response is returned.
+    emit_follow_event(
+        &stream,
+        WaitFollowEvent::terminal(wait.session.wait_id.clone(), terminal_kind),
+    )
+    .await?;
+    inner_cancel.cancel();
+    release.release();
+    Ok(result)
+}
+
+async fn emit_follow_event(
+    stream: &crate::wait::FollowStreamSender,
+    event: WaitFollowEvent,
+) -> Result<(), CoreError> {
+    event
+        .validate()
+        .map_err(|message| CoreError::WaitProviderDegraded {
+            channel: "follow".into(),
+            message: message.into(),
+        })?;
+    let (written, receipt) = tokio::sync::oneshot::channel();
+    stream
+        .send(crate::wait::FollowStreamRecord { event, written })
+        .await
+        .map_err(|_| CoreError::WaitProviderDegraded {
+            channel: "follow".into(),
+            message: "held wait stream closed".into(),
+        })?;
+    receipt
+        .await
+        .map_err(|_| CoreError::WaitProviderDegraded {
+            channel: "follow".into(),
+            message: "held wait stream closed before write acknowledgement".into(),
+        })?
+        .map_err(|message| CoreError::WaitProviderDegraded {
+            channel: "follow".into(),
+            message,
+        })
+}
+
+fn follow_failure_reason(error: &CoreError) -> WaitFollowFailureReason {
+    match error {
+        CoreError::WaitFilterInvalid(message)
+            if message.contains("cursor") || message.contains("--after") =>
+        {
+            WaitFollowFailureReason::CursorUncertain
+        }
+        CoreError::WaitReplaced { .. } => WaitFollowFailureReason::OwnershipLost,
+        CoreError::WaitProviderDegraded { message, .. }
+            if message.contains("overflow") || message.contains("lagged") =>
+        {
+            WaitFollowFailureReason::ProviderOverflow
+        }
+        CoreError::WaitProviderDegraded { message, .. } if message.contains("outage") => {
+            WaitFollowFailureReason::ProviderOutage
+        }
+        CoreError::WaitProviderDegraded { .. } => WaitFollowFailureReason::ProviderDegraded,
+        _ => WaitFollowFailureReason::ProviderFailed,
+    }
+}
+
+fn follow_failure_reason_code(reason: &str) -> WaitFollowFailureReason {
+    match reason {
+        REASON_OVERFLOW => WaitFollowFailureReason::ProviderOverflow,
+        REASON_CURSOR => WaitFollowFailureReason::CursorUncertain,
+        REASON_DEGRADED => WaitFollowFailureReason::ProviderDegraded,
+        REASON_REPLACED => WaitFollowFailureReason::OwnershipLost,
+        "provider_outage" => WaitFollowFailureReason::ProviderOutage,
+        _ => WaitFollowFailureReason::ProviderFailed,
+    }
 }
 
 /// Production clock: one RFC3339 origin plus monotonic Instant elapsed.
@@ -248,7 +623,19 @@ impl Drop for LeaseRelease {
 /// A match reconstructs `WaitResult` from this map; it does not refetch.
 #[derive(Clone, Default)]
 pub(crate) struct MessageSidecar {
-    inner: Arc<Mutex<HashMap<String, Message>>>,
+    inner: Arc<Mutex<HashMap<String, MessageSidecarEntry>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowObservationPhase {
+    Backlog,
+    Live,
+}
+
+#[derive(Clone)]
+struct MessageSidecarEntry {
+    message: Message,
+    phase: FollowObservationPhase,
 }
 
 impl MessageSidecar {
@@ -256,13 +643,20 @@ impl MessageSidecar {
         Self::default()
     }
 
-    pub(crate) fn store(&self, payload_ref: &str, message: Message) {
+    fn store_with_phase(&self, payload_ref: &str, message: Message, phase: FollowObservationPhase) {
         if let Ok(mut map) = self.inner.lock() {
-            map.insert(payload_ref.to_string(), message);
+            map.insert(
+                payload_ref.to_string(),
+                MessageSidecarEntry { message, phase },
+            );
         }
     }
 
     pub(crate) fn take(&self, payload_ref: &str) -> Option<Message> {
+        self.take_entry(payload_ref).map(|entry| entry.message)
+    }
+
+    fn take_entry(&self, payload_ref: &str) -> Option<MessageSidecarEntry> {
         self.inner
             .lock()
             .ok()
@@ -273,7 +667,7 @@ impl MessageSidecar {
         self.inner
             .lock()
             .ok()
-            .and_then(|map| map.get(payload_ref).cloned())
+            .and_then(|map| map.get(payload_ref).map(|entry| entry.message.clone()))
     }
 }
 
@@ -316,8 +710,26 @@ pub(crate) fn event_from_message(
     start: &Anchor,
     sidecar: &MessageSidecar,
 ) -> Result<WaitEvent, CoreError> {
+    event_from_message_with_phase(
+        message,
+        registration_id,
+        subject_id,
+        start,
+        sidecar,
+        FollowObservationPhase::Live,
+    )
+}
+
+fn event_from_message_with_phase(
+    message: &Message,
+    registration_id: &IdToken,
+    subject_id: &IdToken,
+    start: &Anchor,
+    sidecar: &MessageSidecar,
+    phase: FollowObservationPhase,
+) -> Result<WaitEvent, CoreError> {
     let payload_ref = payload_ref_for(message);
-    sidecar.store(&payload_ref, message.clone());
+    sidecar.store_with_phase(&payload_ref, message.clone(), phase);
     let observed = timestamp_now();
     let digest = content_digest_for(message)?;
     Ok(WaitEvent {
@@ -356,10 +768,32 @@ pub(crate) fn event_from_foreign_message(
     start: &Anchor,
     sidecar: &MessageSidecar,
 ) -> Result<Option<WaitEvent>, CoreError> {
+    event_from_foreign_message_with_phase(
+        message,
+        my_user_id,
+        registration_id,
+        subject_id,
+        start,
+        sidecar,
+        FollowObservationPhase::Live,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn event_from_foreign_message_with_phase(
+    message: &Message,
+    my_user_id: &str,
+    registration_id: &IdToken,
+    subject_id: &IdToken,
+    start: &Anchor,
+    sidecar: &MessageSidecar,
+    phase: FollowObservationPhase,
+) -> Result<Option<WaitEvent>, CoreError> {
     if message.user_id == my_user_id {
         return Ok(None);
     }
-    event_from_message(message, registration_id, subject_id, start, sidecar).map(Some)
+    event_from_message_with_phase(message, registration_id, subject_id, start, sidecar, phase)
+        .map(Some)
 }
 
 pub(crate) fn authenticate_sidecar_message(
@@ -509,6 +943,7 @@ pub(crate) fn build_live_documents(
         },
         start_anchor,
         baseline_policy,
+        priority: None,
     };
 
     let digest = registration_digest_hex(&registration)?;
@@ -670,6 +1105,9 @@ struct ChanvoyWaitObserver {
     last_error: Arc<Mutex<Option<CoreError>>>,
     release: Arc<LeaseRelease>,
     inner_cancel: CancellationToken,
+    follow: bool,
+    follow_rx: Mutex<Option<tokio::sync::broadcast::Receiver<Arc<chanvoy_core::DaemonEvent>>>>,
+    bind_ready: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     observed: AtomicBool,
     restored: Mutex<HashMap<String, std::collections::VecDeque<Observation>>>,
 }
@@ -678,15 +1116,63 @@ pub(crate) struct ChanvoyBind {
     pub(crate) registration_id: IdToken,
     pub(crate) subject_id: IdToken,
     pub(crate) resolved_start: Anchor,
+    current_cursor: Mutex<Anchor>,
     pub(crate) rest_baseline: HashSet<String>,
+    backlog_ids: HashSet<String>,
+    follow_push: tokio::sync::Mutex<Option<FollowPushState>>,
+    release_on_drop: bool,
     pub(crate) release: Arc<LeaseRelease>,
     pub(crate) inner_cancel: CancellationToken,
+}
+
+struct FollowPushState {
+    rx: tokio::sync::broadcast::Receiver<Arc<chanvoy_core::DaemonEvent>>,
+    buffer: VecDeque<Arc<chanvoy_core::DaemonEvent>>,
+}
+
+pub(crate) struct FollowBindState {
+    backlog_ids: HashSet<String>,
+    rx: Option<tokio::sync::broadcast::Receiver<Arc<chanvoy_core::DaemonEvent>>>,
+}
+
+impl ChanvoyBind {
+    pub(crate) fn new(
+        registration_id: IdToken,
+        subject_id: IdToken,
+        resolved_start: Anchor,
+        rest_baseline: HashSet<String>,
+        release: Arc<LeaseRelease>,
+        inner_cancel: CancellationToken,
+        follow: Option<FollowBindState>,
+    ) -> Self {
+        let release_on_drop = follow.is_none();
+        let (backlog_ids, follow_rx) = follow
+            .map(|state| (state.backlog_ids, state.rx))
+            .unwrap_or_default();
+        Self {
+            registration_id,
+            subject_id,
+            current_cursor: Mutex::new(resolved_start.clone()),
+            resolved_start,
+            rest_baseline,
+            backlog_ids,
+            follow_push: tokio::sync::Mutex::new(follow_rx.map(|rx| FollowPushState {
+                rx,
+                buffer: VecDeque::new(),
+            })),
+            release_on_drop,
+            release,
+            inner_cancel,
+        }
+    }
 }
 
 impl Drop for ChanvoyBind {
     fn drop(&mut self) {
         self.inner_cancel.cancel();
-        self.release.release();
+        if self.release_on_drop {
+            self.release.release();
+        }
     }
 }
 
@@ -720,19 +1206,21 @@ impl ChanvoyWaitObserver {
         &self,
         start: &Anchor,
         result: Result<WaitResult, CoreError>,
+        phase: FollowObservationPhase,
     ) -> Observation {
         match result {
             Ok(wr) => {
                 let Some(message) = wr.messages.into_iter().next() else {
                     return Observation::Idle;
                 };
-                match event_from_foreign_message(
+                match event_from_foreign_message_with_phase(
                     &message,
                     &self.my_user_id,
                     &self.registration_id,
                     &self.subject_id,
                     start,
                     &self.sidecar,
+                    phase,
                 ) {
                     Ok(Some(event)) => Observation::Event(Box::new(event)),
                     Ok(None) => Observation::Idle,
@@ -787,42 +1275,126 @@ impl Observer for ChanvoyWaitObserver {
     type Bind = ChanvoyBind;
 
     async fn bind(&self, registration: &Registration) -> waitprims_core::Result<Self::Bind> {
-        Ok(ChanvoyBind {
-            registration_id: registration.registration_id.clone(),
-            subject_id: registration.subject_id.clone(),
-            resolved_start: self.resolved_start.clone(),
-            rest_baseline: self.rest_baseline.clone(),
-            release: Arc::clone(&self.release),
-            inner_cancel: self.inner_cancel.clone(),
-        })
+        let follow_rx = self
+            .follow_rx
+            .lock()
+            .map_err(|_| waitprims_core::ValidationError::new("/bind", "receiver_lock_poisoned"))?
+            .take();
+        let backlog_ids = if self.follow {
+            let scan = scan_cursor_from_bind(&self.resolved_start);
+            let page = match scan {
+                Some(anchor) => {
+                    let channel_id = self.predicate.channel_id().to_string();
+                    provider_retry(&self.state, &self.channel, self.deadline, || {
+                        let channel_id = channel_id.clone();
+                        let anchor = anchor.clone();
+                        async move {
+                            self.state
+                                .client
+                                .posts_after_by_channel_id(&channel_id, &anchor)
+                                .await
+                        }
+                    })
+                    .await
+                }
+                None => {
+                    empty_at_arm_observation(
+                        &self.state,
+                        &self.channel,
+                        &self.predicate,
+                        self.deadline,
+                    )
+                    .await
+                }
+            };
+            match page {
+                Ok(messages) => messages.into_iter().map(|message| message.id).collect(),
+                Err(error) => {
+                    self.remember(error);
+                    return Err(waitprims_core::ValidationError::new(
+                        "/bind",
+                        "backlog_snapshot_failed",
+                    )
+                    .into());
+                }
+            }
+        } else {
+            HashSet::new()
+        };
+        let bind = ChanvoyBind::new(
+            registration.registration_id.clone(),
+            registration.subject_id.clone(),
+            self.resolved_start.clone(),
+            self.rest_baseline.clone(),
+            Arc::clone(&self.release),
+            self.inner_cancel.clone(),
+            self.follow.then_some(FollowBindState {
+                backlog_ids,
+                rx: follow_rx,
+            }),
+        );
+        if let Some(ready) = self.bind_ready.lock().ok().and_then(|mut slot| slot.take()) {
+            let _ = ready.send(());
+        }
+        Ok(bind)
     }
 
     async fn next(&self, bind: &Self::Bind) -> waitprims_core::Result<Observation> {
         if let Some(obs) = self.take_restored(bind) {
             return Ok(obs);
         }
-        if self.observed.swap(true, Ordering::SeqCst) {
+        if !self.follow && self.observed.swap(true, Ordering::SeqCst) {
             return Ok(Observation::Idle);
         }
+
+        let start = if self.follow {
+            bind.current_cursor
+                .lock()
+                .map_err(|_| waitprims_core::ValidationError::new("/bind", "cursor_lock_poisoned"))?
+                .clone()
+        } else {
+            bind.resolved_start().clone()
+        };
 
         let engine = async {
             self.state.wait_owners.note_provider_io();
             if self.monitored {
-                wait_push_from_cursor(
-                    &self.state,
-                    &self.channel,
-                    &self.predicate,
-                    self.after.as_deref(),
-                    scan_cursor_from_bind(bind.resolved_start()),
-                    self.deadline,
-                )
-                .await
+                if self.follow {
+                    let mut push = bind.follow_push.lock().await;
+                    let push = push
+                        .as_mut()
+                        .ok_or_else(|| CoreError::WaitProviderDegraded {
+                            channel: self.channel.clone(),
+                            message: "held wait event subscription missing".into(),
+                        })?;
+                    crate::wait::wait_push_after_baseline(
+                        &self.state,
+                        &self.channel,
+                        &self.predicate,
+                        self.after.as_deref(),
+                        scan_cursor_from_bind(&start),
+                        self.deadline,
+                        &mut push.rx,
+                        &mut push.buffer,
+                    )
+                    .await
+                } else {
+                    wait_push_from_cursor(
+                        &self.state,
+                        &self.channel,
+                        &self.predicate,
+                        self.after.as_deref(),
+                        scan_cursor_from_bind(&start),
+                        self.deadline,
+                    )
+                    .await
+                }
             } else {
                 wait_rest_from_cursor(
                     &self.state,
                     &self.channel,
                     &self.predicate,
-                    scan_cursor_from_bind(bind.resolved_start()),
+                    scan_cursor_from_bind(&start),
                     bind.rest_baseline.clone(),
                     self.deadline,
                 )
@@ -841,12 +1413,38 @@ impl Observer for ChanvoyWaitObserver {
             res = engine => res,
         };
 
-        Ok(self.observation_from_wait(bind.resolved_start(), result))
+        if self.follow {
+            if let Ok(wait_result) = &result {
+                if let Some(message) = wait_result.messages.first() {
+                    if let Ok(mut cursor) = bind.current_cursor.lock() {
+                        *cursor = Anchor {
+                            kind: AnchorKind::ProviderOpaque,
+                            value: IdToken::new(message.id.clone()),
+                        };
+                    }
+                }
+            }
+        }
+        let phase = result
+            .as_ref()
+            .ok()
+            .and_then(|wait_result| wait_result.messages.first())
+            .map(|message| {
+                if bind.backlog_ids.contains(&message.id) {
+                    FollowObservationPhase::Backlog
+                } else {
+                    FollowObservationPhase::Live
+                }
+            })
+            .unwrap_or(FollowObservationPhase::Live);
+        Ok(self.observation_from_wait(&start, result, phase))
     }
 
     async fn cancel(&self, _bind: &Self::Bind) -> waitprims_core::Result<()> {
         self.inner_cancel.cancel();
-        self.release.release();
+        if !self.follow {
+            self.release.release();
+        }
         Ok(())
     }
 
@@ -1526,6 +2124,101 @@ mod tests {
         assert!(
             matches!(err, CoreError::WaitProviderDegraded { .. }),
             "cross-document lease/admission must fail closed as internal, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_callback_waits_for_actual_writer_ack() {
+        let (stream, mut records) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            emit_follow_event(
+                &stream,
+                WaitFollowEvent::armed("wait_0123456789abcdef0123456789abcdef", None),
+            )
+            .await
+        });
+        let record = records.recv().await.expect("record");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !task.is_finished(),
+            "runner callback advanced before the UDS writer acknowledged"
+        );
+        record.written.send(Ok(())).expect("writer ack");
+        task.await.expect("task").expect("emit");
+    }
+
+    #[tokio::test]
+    async fn follow_bind_teardown_holds_owner_until_terminal_write_ack() {
+        let registry = Arc::new(WaitOwnerRegistry::new());
+        let lease = registry
+            .acquire(
+                "channel-1",
+                "org-lanytehq",
+                "release-floor",
+                None,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("lease");
+        let wait_id = lease.wait_id.clone();
+        let (_session, guard) = lease.into_guard();
+        let release = Arc::new(LeaseRelease::new(guard));
+        let bind = ChanvoyBind::new(
+            IdToken::new(format!("reg:{wait_id}")),
+            channel_subject("channel-1"),
+            Anchor {
+                kind: AnchorKind::ProviderOpaque,
+                value: IdToken::new(EMPTY_AT_ARM_CURSOR),
+            },
+            HashSet::new(),
+            Arc::clone(&release),
+            CancellationToken::new(),
+            Some(FollowBindState {
+                backlog_ids: HashSet::new(),
+                rx: None,
+            }),
+        );
+        drop(bind);
+        assert!(
+            registry.snapshot("channel-1").is_some(),
+            "normal waitprims bind teardown released the held owner"
+        );
+
+        let (stream, mut records) = tokio::sync::mpsc::channel(1);
+        let emit_wait_id = wait_id.clone();
+        let task = tokio::spawn(async move {
+            emit_follow_event(
+                &stream,
+                WaitFollowEvent::terminal(emit_wait_id, WaitFollowEventKind::Deadman),
+            )
+            .await
+        });
+        let record = records.recv().await.expect("terminal record");
+        let conflict = registry
+            .acquire(
+                "channel-1",
+                "org-lanytehq",
+                "release-floor",
+                None,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(conflict, Err(CoreError::WaitAlreadyActive { .. })));
+        record.written.send(Ok(())).expect("terminal write ack");
+        task.await.expect("task").expect("emit");
+        release.release();
+        assert!(
+            registry
+                .acquire(
+                    "channel-1",
+                    "org-lanytehq",
+                    "release-floor",
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await
+                .is_ok(),
+            "owner remained held after terminal write ack and explicit release"
         );
     }
 }

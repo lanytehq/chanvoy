@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Process-held `chanvoy wait --follow`.** Single-channel follow invokes
+  waitprims `run_follow` once and keeps the same bind armed across ordered
+  backlog and live records. The self-identifying JSONL stream starts with an
+  `armed` receipt and ends with a bounded terminal record. Exactly one explicit
+  sink is required: a secure 0600 `--out` file or `--follow-stdout`. Sink
+  failure, client EOF, replacement, and `Ctrl-C` release the held owner;
+  `Ctrl-C` writes `canceled` and exits 130. Fan-in follow is refused in v1.
+  Waitprims is pinned to git tag `v0.2.1`.
+
 - **`chanvoy wait` waitprims hold (local A2).** Fan-in
   `wait_channels_v1` is one `run_first_match` registration set
   (tie = registration order). Grok-bot / no-listener uses one
@@ -56,13 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state uses the same 0600 no-follow temp, file sync, rename, and
   parent-directory sync as poll cursors. `restore_ready` is `Result` and fail-closed.
   A1 single-channel `wait_channel_v3` remains. Waitprims is pinned
-  to git tag `v0.1.2`.
+  to git tag `v0.2.1`.
 
 - **`chanvoy wait` waitprims hold (local A1).** Single-channel
   `wait_channel_v3` is driven by `waitprims-async::run_first_match`
   over the existing daemon stream. MCP `wait` single and CLI
   `chanvoy wait <channel>` keep the same RPC bodies. Waitprims is
-  pinned to git tag `v0.1.2`.
+  pinned to git tag `v0.2.1`.
 
 - **`chanvoy mcp`.** MCP 2026-07-28 access face on the existing profile
   daemon (`stdio` by default; `--listen 127.0.0.1:<port>` for loopback

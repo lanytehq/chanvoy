@@ -13,6 +13,11 @@
 - **Threads come back** — thread reads filtered on that same absent field and discarded every post, reporting success with nothing in it. A root plus N replies now returns N+1 messages. A genuinely empty thread response is an error, not a plausible-looking empty result.
 - **Channel-bound thread reads over the agent IPC surface** — the thread was previously fetched on the post id alone and stamped with whatever channel the caller claimed. The anchor is now checked first (a mismatch issues no thread request at all), every post in the response is checked, and a truncated read reports `has_more` instead of being indistinguishable from a complete one.
 - **Durable `daemon start`** — it now detaches into its own session with the parent-side identity handoff, so the daemon outlives the command that started it; a start reported as failed no longer leaves a daemon running.
+- **Process-held wait streams** — `chanvoy wait <channel> --follow` keeps one
+  single-channel wait armed and writes self-identifying JSONL to an explicit
+  secure file or stdout sink. It preserves ordered backlog/live messages,
+  replacement lineage, clean deadline, failure, and cancellation terminals;
+  `Ctrl-C` writes `canceled` and exits 130. Cycle an older daemon before use.
 - **Operator-legible errors** — errors print their message instead of an internal debug shape, and a daemon older than the verb you just used names the verb and the two commands that fix it (`chanvoy daemon stop`, then `chanvoy auto-setup`).
 - **Compatibility**: source-breaking for Rust code building against `chanvoy-core` — `CoreError` is now `#[non_exhaustive]` and gained two variants, and `MattermostClient::read_thread` is deprecated and always refuses (use `read_thread_in_channel`). No on-disk or state migration; exit codes unchanged; a binary distribution needs no source rebuild. Cycle the daemon before using the new verbs, and review strict parsers of human output or stderr — default `read` rows and error text both changed. Messages gain an additive `root_id` in JSON.
 
