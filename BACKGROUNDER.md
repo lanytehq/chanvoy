@@ -191,4 +191,4 @@ Both share: peer contract compliance (STD-006), `request_id` correlation,
 - mlvoy ARCHITECTURE.md: `~/dev/lanytehq/mlvoy/ARCHITECTURE.md`
 - PER-002 architecture spec: `lanyte-productbook-internal/content/projmgmt/peers/PER-002-chanvoy-architecture.md`
 - Peer contract: STD-006 (draft, pending ratification)
-- Channel 256 schema (mlvoy reference): `lanyte-crucible/schemas/ipc/channel_256.schema.json`
+- Channel 256 schema (mlvoy reference): `crucible/schemas/ipc/channel_256.schema.json`

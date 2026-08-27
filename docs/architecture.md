@@ -53,7 +53,7 @@ The optional fourth layer — a Lanyte-core peer over IPC channel 260 —
 is the contract chanvoy will eventually speak to integrate with the
 broader Lanyte runtime. Today's chanvoy ships only the local-mode
 subset (CLI + daemon); the channel 260 surface is documented in
-[STD-006 peer contract](https://github.com/lanytehq/lanyte-crucible/tree/main/schemas/ipc)
+[STD-006 peer contract](https://github.com/lanytehq/crucible/tree/main/schemas/ipc)
 but not wired into the daemon yet.
 
 ### Why a daemon at all?
@@ -247,8 +247,8 @@ Two carve-outs:
   to avoid acting on another operator's daemon on a shared machine.
 
 The full resolver contract lives in
-[`agent-chat-conventions.md`](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/specs/agent-chat-conventions.md)
-in lanyte-crucible. Operators rarely need to read it.
+[`agent-chat-conventions.md`](https://github.com/lanytehq/crucible/blob/main/docs/specs/agent-chat-conventions.md)
+in Lanyte Crucible. Operators rarely need to read it.
 
 ### Stale-marker recovery
 
@@ -422,7 +422,7 @@ profile names encode the org via the `<role>-<scope>` convention.
 
 Chanvoy is one of the Lanyte platform's communication peers. The peer
 contract — common patterns every peer implements — is specified in
-STD-006 (lanyte-crucible). Common patterns:
+STD-006 (Lanyte Crucible). Common patterns:
 
 - Control lifecycle (hello / hello_ack / ping / pong / disconnect)
 - Request/response correlation via `request_id` (UUID v4)
@@ -438,7 +438,7 @@ over UDS, daemon ↔ Mattermost over REST/WS, no Lanyte-core peer
 session. The channel 260 surface (chanvoy ↔ Lanyte-core orchestrator
 over IPC) is the next layer — when wired, it lets the orchestrator
 route delegation envelopes through chanvoy as one of several peers.
-That work is deferred; the schemas exist in lanyte-crucible.
+That work is deferred; the schemas exist in Lanyte Crucible.
 
 What this means for changes today: the local-mode CLI and daemon
 shapes are stable contracts that the future peer surface will preserve.
@@ -495,7 +495,7 @@ A short list of cross-cutting touchpoints contributors hit most often:
 | Storage layout (new file, renamed file, permission mask) | `docs/architecture.md §Storage layout` + REPOSITORY_SAFETY_PROTOCOLS.md | Storage contract is referenced by audit docs |
 | Daemon RPC method (new, renamed, response shape) | `crates/chanvoy-daemon/src/lib.rs::LOCAL_ONLY_METHODS` if appropriate, plus integration tests under `tests/` | Drift gate must classify every RPC; tests exercise dispatch |
 | Bootstrap flow (auto-setup or daemon spawn) | `docs/getting-started.md §Bootstrap` and integration tests under `tests/restart_harness.rs`, `tests/per_023_*.rs`, etc. | Getting-started is the agent's first read; tests exercise the spawn path |
-| Profile resolution rules | `docs/operator-guide.md §Profile Resolution` + this doc's resolver section + the canonical spec link in `agent-chat-conventions.md` (lanyte-crucible) | Operators read operator-guide; the canonical contract is in crucible |
+| Profile resolution rules | `docs/operator-guide.md §Profile Resolution` + this doc's resolver section + the canonical spec link in `agent-chat-conventions.md` (Lanyte Crucible) | Operators read operator-guide; the canonical contract is in crucible |
 | Attention-state schema or cursor-advance rules | `docs/architecture.md §Attention state` + `docs/operator-guide.md §Resume And Attention` + the migration logic in `chanvoy-core::migrate_attention_state` | Schema changes are forward-only; migration needs to handle the prior shape |
 | Sandbox-handling design | `docs/getting-started.md §Sandboxed agents` + `docs/troubleshooting.md` sandbox entries | Sandboxed agents are a first-class audience; the path-tree there is load-bearing |
 
@@ -512,4 +512,4 @@ search `docs/` for the symbol you changed.
 - [`migration-runbook.md`](./migration-runbook.md) — for operators replacing `lanyte-chat` with chanvoy
 - [`integration-tests.md`](./integration-tests.md) — for contributors adding tests
 - [`BACKGROUNDER.md`](../BACKGROUNDER.md) — the "why chanvoy exists" narrative
-- [`agent-chat-conventions.md` in lanyte-crucible](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/specs/agent-chat-conventions.md) — canonical profile-naming + resolver spec
+- [`agent-chat-conventions.md` in Lanyte Crucible](https://github.com/lanytehq/crucible/blob/main/docs/specs/agent-chat-conventions.md) — canonical profile-naming + resolver spec

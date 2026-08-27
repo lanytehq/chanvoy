@@ -63,7 +63,7 @@ The two overrides are independent; either can be set without the other. Profile 
 ## Agent-Critical File Reads (ADR-0016)
 
 chanvoy reads several local files whose contents carry agent-critical
-context. Per [ADR-0016](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/decisions/adr-0016-agent-critical-file-input-symlink-policy.md)
+context. Per [ADR-0016](https://github.com/lanytehq/crucible/blob/main/docs/decisions/adr-0016-agent-critical-file-input-symlink-policy.md)
 these reads fail closed against shared-filesystem redirects:
 
 - **Caller-named inputs** (`--message-file`): a **symlinked** final
@@ -129,7 +129,7 @@ Chanvoy profile names and Mattermost team names follow a portable convention tha
 
 When you source an identity script with these names, `chanvoy auto-setup` synthesizes the canonical profile name (`<role>-<scope>`) and derives the team name (`org-<scope>`) automatically. Subsequent commands resolve to the canonical profile via your sourced env (no `--profile` flag needed).
 
-The full convention, including rationale and the migration story for legacy bare-name profiles, lives in [`lanyte-crucible/docs/specs/agent-chat-conventions.md`](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
+The full convention, including rationale and the migration story for legacy bare-name profiles, lives in [`docs/specs/agent-chat-conventions.md` in Lanyte Crucible](https://github.com/lanytehq/crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
 
 ## Using Chanvoy in Another Org
 
@@ -1025,7 +1025,7 @@ Two carve-outs:
 - **Profile-collection management verbs** (`profile list`, `profile create`, `profile create-from-env`) and the **`auto-setup` bootstrap verb** bypass this resolver entirely. They operate on the profile collection or env-derived synthesis, not on a single existing target — and forcing resolution would brick fresh bootstrap on an empty config.
 - **Side-effecting daemon-lifecycle verbs** (`daemon stop` and `daemon start`) refuse on rules 4 and 5. They require an explicit target — `--profile`, `CHANVOY_PROFILE`, or env-derived `<role>-<scope>` — to avoid acting on another operator's daemon on a shared machine. `daemon start` is in this set because it validates a live credential and then spawns a long-lived process under that identity: resolving its target from the active marker or "whichever daemon happens to be running" could start a daemon under an identity the operator did not name.
 
-The full resolver contract, including policy semantics and per-rule rationale, lives in [`lanyte-crucible/docs/specs/agent-chat-conventions.md`](https://github.com/lanytehq/lanyte-crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
+The full resolver contract, including policy semantics and per-rule rationale, lives in [`docs/specs/agent-chat-conventions.md` in Lanyte Crucible](https://github.com/lanytehq/crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
 
 ### Stale `active_profile` recovery
 
