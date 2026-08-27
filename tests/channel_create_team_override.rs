@@ -6,9 +6,9 @@
 //! primary `team_id()`).
 //!
 //! Test asserts:
-//! - `chanvoy channel create some-name "Display" --team org-3leaps`
+//! - `chanvoy channel create --team org-3leaps some-name "Display" "Purpose"`
 //!   posts to `POST /api/v4/channels` with `team_id: <alt-team-id>`,
-//!   NOT the primary team's id
+//!   NOT the primary team's id, and preserves the positional purpose
 //! - The team override does NOT change behavior when omitted (legacy
 //!   default still lands on the primary team)
 //!
@@ -49,9 +49,10 @@ async fn mount_alternate_team(
         .await;
 }
 
-/// `chanvoy channel create <name> <display> --team <alt-team>` posts
+/// `chanvoy channel create --team <alt-team> <name> <display> <purpose>` posts
 /// to MM `/channels` with `team_id` set to the alt team's id, not the
-/// primary team's. Verified by reading back the wiremock POST body.
+/// primary team's, and passes the positional purpose through. This is
+/// the exact argument shape used by the live release-smoke harness.
 #[tokio::test]
 #[ignore = "integration: run via make test-integration"]
 async fn channel_create_with_team_override_uses_alt_team_id() {
@@ -79,10 +80,11 @@ async fn channel_create_with_team_override_uses_alt_team_id() {
         &[
             "channel",
             "create",
-            "ops-discussions",
-            "Ops Discussions",
             "--team",
             "org-3leaps",
+            "ops-discussions",
+            "Ops Discussions",
+            "Release smoke purpose",
         ],
     )
     .await;
@@ -111,6 +113,11 @@ async fn channel_create_with_team_override_uses_alt_team_id() {
         body["team_id"].as_str(),
         Some("team-id-456"),
         "channel create --team must NOT use primary-team id"
+    );
+    assert_eq!(
+        body["purpose"].as_str(),
+        Some("Release smoke purpose"),
+        "channel create must preserve its optional positional purpose"
     );
 
     let _ = stop_daemon_cleanly(&env, daemon).await;

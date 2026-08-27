@@ -54,3 +54,31 @@ scrub_stream() {
       ${SMOKE_TEAM:+ -e "s|${SMOKE_TEAM}|<smoke-team>|g"} \
       ${SMOKE_BOT_USERNAME:+ -e "s|${SMOKE_BOT_USERNAME}|<smoke-bot>|g"}
 }
+# Derive the disposable Mattermost channel slug from VERSION. Mattermost
+# channel names accept lowercase ASCII letters, digits, hyphens, and
+# underscores, with a 64-byte maximum. Dots from semantic versions are
+# normalized to hyphens; any other unsupported character fails closed.
+derive_smoke_channel() {
+  local version="${1:-}"
+  local run_suffix="${2:-}"
+  local version_slug
+  local channel
+
+  version_slug="${version//./-}"
+  channel="chanvoy-smoke-v${version_slug}-${run_suffix}"
+
+  if [[ -z "${run_suffix}" || ! "${channel}" =~ ^[a-z0-9_-]+$ ]] || (( ${#channel} > 64 )); then
+    return 1
+  fi
+
+  printf '%s\n' "${channel}"
+}
+
+# The archive CLI currently operates on the profile's primary team and has
+# no cross-team override. Refuse a smoke team that cleanup cannot archive.
+validate_smoke_team() {
+  local selected_team="${1:-}"
+  local identity_team="${2:-}"
+
+  [[ -n "${selected_team}" && -n "${identity_team}" && "${selected_team}" == "${identity_team}" ]]
+}
