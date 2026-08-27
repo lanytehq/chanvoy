@@ -250,6 +250,22 @@ last message `tip`. `Ctrl-C` writes a `canceled` line, closes the held
 daemon call, releases the slot, and exits 130. Do not simulate follow by
 repeatedly invoking one-shot wait.
 
+Choose the wait posture by what the host can use to start a turn:
+
+1. **Emitted output or a sink watcher wakes the turn.** A supervised
+   `--follow-stdout` process can surface backlog/live records without exiting.
+   `--out` needs an explicit watcher or doorbell; writing the 0600 file alone
+   does not wake an agent.
+2. **Only process exit wakes the turn.** Backlog/live records do not terminate
+   a held follow. Prefer bounded one-shot `wait`/`notify`, or accept that follow
+   wakes only at its terminal record.
+3. **No background output wakes the turn.** Keep the wait in the foreground of
+   the sitting turn and collect the same process. `--follow` preserves
+   observation while it lives; it cannot start a turn.
+
+All three postures keep a single owner. Do not detach and forget a follower or
+fan out multiple owners. Re-arm from the last drained `tip` only after terminal.
+
 | Outcome | Exit | Notes |
 | --- | ---: | --- |
 | Match | 0 | One message in `{channel, messages:[…]}` |

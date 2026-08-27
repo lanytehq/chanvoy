@@ -20,11 +20,11 @@ below corresponds to one step):
 
 ```
 make release-prep      → release-smoke → release-preflight
-git tag → git push     → GHA produces draft
+release-tag → release-tag-push → GHA produces draft
+(first public release only) verify draft → visibility PRIVATE → PUBLIC
 make release-download  → release-sign → release-verify
 make release-upload    → release-undraft
-#release-chanvoy-vXYZ announcement → #ops-updates announcement
-(first public release only) public-flip: repo visibility PRIVATE → PUBLIC
+release announcement   → operational announcement
 ```
 
 ---
@@ -37,7 +37,7 @@ make release-upload    → release-undraft
 - [ ] `VERSION` matches `Cargo.toml` workspace + crate versions
       (`make version-check`)
 - [ ] Release notes exist at `docs/releases/vX.Y.Z.md`
-      (see §10 AC #3a — must inline fingerprints + verification
+      (see §11 — must inline fingerprints + verification
       commands OR hard-pointer to this file)
 - [ ] `keys/expected-fingerprints.txt` contains both stable public-key
       fingerprints with no `TBD` values
@@ -123,6 +123,9 @@ no conflicting tag/release, tooling on PATH, signing keys present.
 ```bash
 export CHANVOY_MINISIGN_KEY=/path/to/minisign-secret-key
 export CHANVOY_PGP_KEY_ID=ABC123...
+export CHANVOY_GPG_HOMEDIR=/path/to/isolated/gnupg
+export CHANVOY_RELEASE_TAG="v$(cat VERSION)"
+export RELEASE_TAG="$CHANVOY_RELEASE_TAG"
 make release-preflight
 ```
 
@@ -136,22 +139,42 @@ Checks (each fails fast with a clear hint):
 - `decernor` **0.1.4+** available (`DECERNOR=` override allowed; strict `X.Y.Z` only)
 - `CHANVOY_MINISIGN_KEY` set and points at an existing file
 - `CHANVOY_PGP_KEY_ID` set and present in the GPG keyring
+- `CHANVOY_GPG_HOMEDIR` set to the isolated release keyring
   (GPG signature over `checksums.txt` is mandatory for v0.2.2 trust
   posture — devrev PR #33 review)
+- `CHANVOY_RELEASE_TAG` and `RELEASE_TAG`, when set, are identical and
+  exactly match `v$(cat VERSION)`
+- Clean `main` is synchronized to `origin/main`; the desired local and
+  remote tag refs are absent
 - `docs/releases/vX.Y.Z.md` exists
 
 **This step does NOT inspect a draft release** — none exists yet.
-Post-GHA draft checks live in §7 `release-download` + `release-verify`.
+Post-GHA draft checks live in §8 `release-download` + `release-verify`.
 
-## 5. Tag push
+## 5. Create and push the signed tag
 
 Only proceed if §2 / §3 / §4 are all green.
 
 ```bash
-VERSION=$(cat VERSION)
-git tag -a "v${VERSION}" -m "v${VERSION}"
-git push origin "v${VERSION}"
+export CHANVOY_RELEASE_TAG="v$(cat VERSION)"
+export RELEASE_TAG="$CHANVOY_RELEASE_TAG"
+export GNUPGHOME="$CHANVOY_GPG_HOMEDIR"
+
+# Creates and verifies the signed annotated tag locally. Does not push.
+make release-tag
+
+# Repeats the exact-tag, pinned-signer, clean-main, synced-commit, and
+# origin-absence guards, then pushes only this tag ref.
+make release-tag-push
 ```
+
+Both targets fail before signing or pushing if the tag overrides disagree or
+do not equal `v$(cat VERSION)`. `release-tag` requires an untagged clean `main`
+at the exact live `origin` `main` commit. `release-tag-push` requires the
+annotated tag to peel to that commit, the selected isolated-keyring primary to
+equal the GPG value in `keys/expected-fingerprints.txt`, and the tag signature
+to validate against that contracted fingerprint.
+Neither target force-updates a tag.
 
 ## 6. GHA workflow (PER-031)
 
@@ -174,33 +197,59 @@ gh run watch --repo lanytehq/chanvoy
 
 When the workflow completes, the draft URL is in the job summary.
 
-## 7. Local signing flow
+## 7. First-public visibility gate
+
+This section applies only while the repository is private. Keep the repository
+private through the signed tag-only push and the exact-tag workflow/draft proof
+in §6. Confirm the draft contains all three binaries plus `checksums.txt`, then
+perform the explicit principal visibility change:
+
+```bash
+gh repo view lanytehq/chanvoy --json visibility -q .visibility
+gh repo edit lanytehq/chanvoy --visibility public
+gh repo view lanytehq/chanvoy --json visibility -q .visibility
+```
+
+If the first command already reports `PUBLIC`, the edit is a no-op and must not
+be repeated. Stop if tag CI or draft verification is not green. The repository
+must be public before any crates.io publication or GitHub Release publication.
+
+v0.3.1 is GitHub-binary-only: do not run `cargo publish`. The root binary is
+not a valid standalone registry inventory because it depends on unpublished
+workspace crates and runtime git dependencies.
+
+## 8. Local signing flow
 
 All steps run locally. Idempotent: any step can be re-run safely.
 
 ```bash
-# 7.1 — Download the draft release into a local working directory
+# 8.1 — Download the draft release into a local working directory
 make release-download                # writes release/vX.Y.Z/
 
-# 7.2 — Regenerate checksums.txt locally (must byte-match what
+# 8.2 — Regenerate checksums.txt locally (must byte-match what
 #        the GHA workflow produced)
 make release-checksums
 
-# 7.3 — Export public signing keys into the release dir
+# 8.3 — Export public signing keys into the release dir
 make release-export-keys
 
-# 7.4 — Sign: minisign per binary + GPG over checksums.txt
+# 8.4 — Sign: minisign per binary + GPG over checksums.txt
 make release-sign
 
-# 7.5 — Verify signatures AND that exported public-key files
+# 8.5 — Verify signatures AND that exported public-key files
 #        match keys/expected-fingerprints.txt
 make release-verify
 
-# 7.6 — Attach signed artifacts + public keys to the draft
+# 8.6 — Attach signed artifacts + public keys to the draft
 #        release (atomic — does NOT flip draft state)
 make release-upload
 
-# 7.7 — Flip the GitHub release from draft → published
+# 8.7 — Execute the downloaded host binary and require VERSION, the tagged
+#        commit, and Dirty: false; release-undraft depends on this gate.
+make release-verify-identity
+
+# 8.8 — Re-run the executable identity gate, then flip the GitHub release
+#        from draft → published
 #        (atomic — does NOT touch assets)
 make release-undraft
 
@@ -211,43 +260,18 @@ make release-undraft
 If any step fails, fix the underlying issue and re-run. Don't skip
 ahead with a half-signed release.
 
-## 8. `#release-chanvoy-vXYZ` announcement
+## 9. Release announcement
 
-Post the release-published notice to `#release-chanvoy-vXYZ` (rotating
-per-release channel). Include:
+Post the release-published notice through the project release channel. Include:
 - Release URL
 - SHA-256 checksums (top of `release/vX.Y.Z/checksums.txt`)
 - The verification commands from §11 below
 - Download URLs for each binary
 
-## 9. `#ops-updates` announcement
+## 10. Operational announcement
 
-Post the operational notification to `#ops-updates`. Pin per the
-chanvoy version-notes pin convention (unpin the prior version's note
-first; see `reference_chanvoy_version_pin_convention.md`).
-
-## 10. Public-flip terminal action (first public release only)
-
-**Applies when the repo is still PRIVATE**, whichever release that turns
-out to be. Check current visibility rather than matching a version
-number — this step was previously pinned to a specific version, and a
-release that superseded that version would have skipped a required
-terminal action:
-
-```bash
-gh repo view lanytehq/chanvoy --json visibility -q .visibility
-```
-
-If it already reports `PUBLIC`, this section is a no-op; skip to the
-end of the cycle. If it reports `PRIVATE`, then after §8 + §9 are out,
-flip the repo visibility from PRIVATE → PUBLIC. This is the LAST action
-of the cycle.
-
-```bash
-gh repo edit lanytehq/chanvoy --visibility public
-```
-
-Once the repo is public this step is omitted on every later release.
+Post the operational notification through the project's maintainer channel,
+following its current version-note pin convention.
 
 ---
 
@@ -271,7 +295,7 @@ sha256sum -c checksums.txt --ignore-missing
 ### Stable key fingerprints
 
 External adopters should pin against these fingerprints. They change
-only via a documented key-rotation announcement on `#ops-updates`.
+only through a documented public key-rotation announcement.
 
 | Algorithm | Fingerprint |
 |---|---|

@@ -2,7 +2,27 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
-## v0.3.0 (unreleased)
+## v0.3.1 - 2026-08-27
+
+**First public distribution** — v0.3.1 carries the cumulative operator and
+integrity improvements proven at the signed v0.3.0 development checkpoint. It
+makes cited posts and their threads directly reachable, restores honest author
+and thread attribution, and adds process-held `wait --follow` observation
+without weakening the single-owner wait contract.
+
+This cut ships signed GitHub Release binaries only; it is not published on
+crates.io. Restart the profile daemon after installing the new binary so the
+CLI and daemon agree on wait, follow, show, and thread capabilities.
+
+See `docs/releases/v0.3.1.md` for full notes, upgrade guidance, follow wake
+capabilities, and the verification pointer.
+
+## v0.3.0 - 2026-08-27
+
+**Signed development checkpoint, not distributed** — the immutable v0.3.0 tag
+was retained after the release procedure was exercised, but no GitHub Release
+or crates.io package was published. Its cumulative changes are distributed in
+v0.3.1.
 
 **Post rehydration, thread orientation, and author honesty — with a deliberate source-compatibility boundary** — a cited post is now reachable. Several verbs already took a post id, but none of them would show you the post; the one read verb that accepted an id was the resume flag, which excludes the post it names. Two verbs close that, and two long-standing integrity bugs in reading are fixed alongside them.
 
@@ -36,15 +56,5 @@ See `docs/releases/v0.3.0.md` for full notes.
 - **Build**: `make release-prep` umbrella (goneat-driven license + vulnerability + SBOM generation). `rustls-webpki` 0.103.11 → 0.103.13 clears three RUSTSEC advisories.
 
 See `docs/releases/v0.2.1.md` for full notes.
-
-## v0.2.0 (May 2026)
-
-**Local-mode polish bundle** — sandbox-aware daemon startup, cross-team channel resolution, and a forensic harness for daemon-startup failures. The first chanvoy release with the Mattermost-adoption-ready surface.
-
-- **PER-014** — `chanvoy auto-setup` works end-to-end under sandbox restrictions (Codex agents, macOS sandboxd, Docker without `--network`). Identity validation moved into the parent CLI; daemon child receives validated identity via per-profile bootstrap-state file.
-- **PER-019** — Channel-name resolution finds channels across every team the bot is a member of. Closes the silent-404 cross-team posting gap. Cursors are independent per `<team>/<channel>` pair. Pre-PER-019 records migrate automatically; ambiguous historical names quarantine.
-- **PER-015 Phase 1** — `scripts/per015-diag.sh` forensic harness for daemon-startup failures. PER-015 itself scope-collapsed to done.
-
-See `docs/releases/v0.2.0.md` for full notes.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_
