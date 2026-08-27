@@ -10,10 +10,6 @@
 #   gpg       <40 uppercase hex, OpenPGP primary, --gpg-role primary>
 #
 # Lines starting with '#' are comments.
-#
-# TBD-* placeholders remain until both exported public files exist and
-# the inserter writes both lines together. verify-public-keys.sh
-# fail-closes on TBD.
 
-minisign  TBD-MINISIGN-FINGERPRINT-PENDING-DISPATCH-PROVISIONING
-gpg       TBD-GPG-FINGERPRINT-PENDING-DISPATCH-PROVISIONING
+minisign  36a80acfa44f5cf9ac402d3ce8e51fcc083e5a1dca22180d6a0ea85b7e5340ad
+gpg       83FCC69CB060EDB8374EDE0547AAC7D6EB946A84

@@ -140,8 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`scripts/verify-public-keys.sh` recomputes decernor records**
   instead of `gpg --show-keys` / minisign blob prefix. The
   checked-in contract comments describe 64-hex minisign blob SHA-256
-  and 40-hex GPG primary. Production lines stay TBD until both
-  exported publics exist.
+  and 40-hex GPG primary. The checked-in production values are
+  generated together from the exported public files and verified by
+  independent recomputation.
 
 - **The `CoreError` type gained additional variants, which will stop some code
   from compiling.** This affects Rust code that depends on the `chanvoy-core`
