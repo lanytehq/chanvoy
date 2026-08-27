@@ -39,7 +39,57 @@ make release-upload    → release-undraft
 - [ ] Release notes exist at `docs/releases/vX.Y.Z.md`
       (see §10 AC #3a — must inline fingerprints + verification
       commands OR hard-pointer to this file)
+- [ ] `keys/expected-fingerprints.txt` contains both stable public-key
+      fingerprints with no `TBD` values
 - [ ] All planned briefs for this release are at "done" status
+
+### Initialize or rotate the fingerprint contract
+
+Run this only when establishing or rotating the release-signing keyset.
+Start from the repository root. The host release environment must provide
+`CHANVOY_MINISIGN_PUB`, `CHANVOY_PGP_KEY_ID`, and, when the public GPG
+key is in a dedicated keyring, `CHANVOY_GPG_HOMEDIR`. Host-specific
+profile paths stay outside this repository.
+
+```bash
+(
+  set -euo pipefail
+  cd /path/to/chanvoy
+  : "${CHANVOY_MINISIGN_PUB:?set CHANVOY_MINISIGN_PUB}"
+  : "${CHANVOY_PGP_KEY_ID:?set CHANVOY_PGP_KEY_ID}"
+  if [ -n "$(git status --porcelain=v1)" ]; then
+    echo "error: fingerprint update requires a clean working tree" >&2
+    git status --short >&2
+    exit 1
+  fi
+  public_key_dir="$(mktemp -d)"
+
+  make release-export-keys RELEASE_DIR="$public_key_dir"
+  make insert-expected-fingerprints \
+    MINISIGN_PUB="$public_key_dir/chanvoy.pub" \
+    GPG_ASC="$public_key_dir/chanvoy.gpg.asc"
+  make release-verify-keys RELEASE_DIR="$public_key_dir"
+
+  fingerprint_git_status="$(git status --porcelain=v1)"
+  case "$fingerprint_git_status" in
+    "") echo "[--] fingerprint contract is already current" ;;
+    " M keys/expected-fingerprints.txt") ;;
+    *)
+      echo "error: expected only keys/expected-fingerprints.txt to change" >&2
+      git status --short >&2
+      exit 1
+      ;;
+  esac
+  git diff --check
+  git diff -- keys/expected-fingerprints.txt
+)
+```
+
+The export contains public material only. The inserter writes both
+fingerprints atomically from `decernor` records; the verification target
+independently recomputes and compares both values. Stop if the export is
+incomplete, any command fails, an unexpected file changes, or a `TBD`
+value remains.
 
 ## 2. `make release-prep` (commit-cycle gate)
 
@@ -225,8 +275,8 @@ only via a documented key-rotation announcement on `#ops-updates`.
 
 | Algorithm | Fingerprint |
 |---|---|
-| minisign (`minisign-public-blob-sha256-v1`) | `TBD — insert with decernor 0.1.4+ from the exported .pub` |
-| GPG (OpenPGP primary, `--gpg-role primary`) | `TBD — insert with decernor 0.1.4+ from the exported .asc` |
+| minisign (`minisign-public-blob-sha256-v1`) | `36a80acfa44f5cf9ac402d3ce8e51fcc083e5a1dca22180d6a0ea85b7e5340ad` |
+| GPG (OpenPGP primary, `--gpg-role primary`) | `83FCC69CB060EDB8374EDE0547AAC7D6EB946A84` |
 
 The same values are checked into `keys/expected-fingerprints.txt` so
 `make release-verify-keys` asserts an exported `chanvoy.pub` /
