@@ -18,16 +18,28 @@ operation flow lives in [`/RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md).
 
 ## Updating fingerprints
 
-After dispatch's keypair provisioning completes, replace the `TBD-*`
-placeholders in `expected-fingerprints.txt` with the real fingerprints.
-This is a single-file change and the only blocker between the current
-checked-in scaffolding and a fully-runnable release cycle.
+Fill `expected-fingerprints.txt` only with `decernor` **0.1.4+**
+records — never by hand.
+
+```bash
+make insert-expected-fingerprints \
+  MINISIGN_PUB=/path/to/chanvoy.pub \
+  GPG_ASC=/path/to/chanvoy.gpg.asc
+```
+
+The inserter scans **explicit public files** (`--class public`).
+GPG uses `--gpg-role primary` (exactly one primary record).
+Minisign uses `minisign-public-blob-sha256-v1` (64 lowercase hex).
+Both lines are written together; any failure leaves the dest unchanged.
+
+`scripts/verify-public-keys.sh` recomputes the same records and
+compares them to the checked-in file. TBD placeholders fail closed.
 
 Format:
 
 ```
-minisign  <10-byte hex key id from the minisign public key>
-gpg       <40-hex-char OpenPGP fingerprint>
+minisign  <64 lowercase hex, minisign-public-blob-sha256-v1>
+gpg       <40 uppercase hex, OpenPGP primary>
 ```
 
 Lines starting with `#` are comments.

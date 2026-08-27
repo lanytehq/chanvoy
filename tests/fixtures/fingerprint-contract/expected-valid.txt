@@ -1,0 +1,3 @@
+# valid filled contract for verify tests
+minisign  91f40ebe76f5af9f554c8e32ff52a46937363cc8c303bf826fa30e52f037a340
+gpg       5D8E7478C4EA08D97D39139CCEEA5771AED0966B

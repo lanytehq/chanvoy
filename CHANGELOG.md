@@ -127,8 +127,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   environment (`generation_scored`); foreign/`active_profile` probes never
   emit a bare Generation match. `daemon status` includes additive `binary`
   (daemon process pin) and human `binary_commit`.
+- **Release fingerprint contract (decernor 0.1.4).**
+  `scripts/insert-expected-fingerprints.sh` writes
+  `keys/expected-fingerprints.txt` from explicit public files.
+  GPG is the unique `--gpg-role primary` record. Minisign is
+  `minisign-public-blob-sha256-v1` (64 lowercase hex), not the
+  20-hex key-id prefix. Both lines or neither. Requires
+  `decernor` 0.1.4 or later.
 
 ### Changed
+
+- **`scripts/verify-public-keys.sh` recomputes decernor records**
+  instead of `gpg --show-keys` / minisign blob prefix. The
+  checked-in contract comments describe 64-hex minisign blob SHA-256
+  and 40-hex GPG primary. Production lines stay TBD until both
+  exported publics exist.
 
 - **The `CoreError` type gained additional variants, which will stop some code
   from compiling.** This affects Rust code that depends on the `chanvoy-core`

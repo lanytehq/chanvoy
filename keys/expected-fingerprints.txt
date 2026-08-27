@@ -1,21 +1,19 @@
 # Expected chanvoy release-signing public-key fingerprints.
 #
-# This file is the load-bearing trust contract per devrev pin #4
-# (2026-05-09): release-verification asserts against stable
-# checked-in fingerprints, not "some key file exists." The
-# RELEASE_CHECKLIST.md surface advertises these same values to
-# external adopters so they can verify a download independently.
+# Load-bearing trust contract: release-verification asserts against
+# these values, not "some key file exists." Fill only via
+# scripts/insert-expected-fingerprints.sh (decernor 0.1.4+ records).
+# Do not hand-type hex.
 #
 # Format: one `<algo> <fingerprint>` line per key.
-#   minisign  <10-byte hex key id from the minisign public key>
-#   gpg       <40-hex-char OpenPGP fingerprint>
+#   minisign  <64 lowercase hex, minisign-public-blob-sha256-v1>
+#   gpg       <40 uppercase hex, OpenPGP primary, --gpg-role primary>
 #
 # Lines starting with '#' are comments.
 #
-# TBD-* placeholders are temporary. They will be filled in once
-# dispatch's keypair provisioning completes (Dave's step A on
-# #release-chanvoy-v022). A run of scripts/verify-public-keys.sh
-# against a TBD value fails fast with a clear next-step hint.
+# TBD-* placeholders remain until both exported public files exist and
+# the inserter writes both lines together. verify-public-keys.sh
+# fail-closes on TBD.
 
 minisign  TBD-MINISIGN-FINGERPRINT-PENDING-DISPATCH-PROVISIONING
 gpg       TBD-GPG-FINGERPRINT-PENDING-DISPATCH-PROVISIONING
