@@ -48,6 +48,8 @@ impl ReleaseRepo {
             .current_dir(&self.work)
             .env("CHANVOY_RELEASE_TAG", "v0.3.1")
             .env("RELEASE_TAG", "v0.3.1")
+            .env_remove("CHANVOY_PGP_KEY_ID")
+            .env_remove("CHANVOY_GPG_HOMEDIR")
             .output()
             .expect("execute release tag guard")
     }
