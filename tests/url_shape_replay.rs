@@ -753,6 +753,37 @@ async fn replay_create_direct_channel() {
     assert_request_to(&server, "POST", "/channels/direct", "create_direct_channel").await;
 }
 
+/// `wait --dm` uses `open_direct_channel` (same two URLs as
+/// `direct_message`, without a `whoami` or `POST /posts`).
+#[tokio::test]
+async fn replay_open_direct_channel() {
+    let server = MockServer::start().await;
+    mount_fixture(
+        &server,
+        "GET",
+        &format!("/users/username/{USERNAME}"),
+        "user_by_username",
+    )
+    .await;
+    mount_fixture(&server, "POST", "/channels/direct", "create_direct_channel").await;
+    let client = build_client(&server.uri());
+
+    let opened = client
+        .open_direct_channel(USERNAME, "other-bot-id-stable")
+        .await
+        .expect("open_direct_channel succeeds");
+    assert!(!opened.id.is_empty());
+
+    assert_request_to(
+        &server,
+        "GET",
+        &format!("/users/username/{USERNAME}"),
+        "user_by_username",
+    )
+    .await;
+    assert_request_to(&server, "POST", "/channels/direct", "create_direct_channel").await;
+}
+
 /// `search_channel` hits `POST /teams/{team_id}/posts/search` (covers
 /// `search_posts`).
 ///

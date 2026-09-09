@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod host_build_info;
 pub mod safe_read;
 pub mod wait_channels;
+pub mod wait_dm;
 pub mod wait_follow;
 pub mod wait_registry;
 
@@ -37,6 +38,11 @@ pub use wait_channels::{
     WAIT_CHANNELS_UTF8_MAX_BYTES, WAIT_CHANNELS_V1_METHOD,
 };
 
+pub use wait_dm::{
+    canonical_dm_name, classify_wait_dm_username, is_dm_channel_name, is_rfc_uuid,
+    map_inaccessible_peer, not_a_waitable_peer, DirectChannel, WaitDmFollowResult, WaitDmV1Params,
+    WaitDmV1Result, NOT_A_WAITABLE_PEER, WAIT_DM_FOLLOW_V1_METHOD, WAIT_DM_HELP, WAIT_DM_V1_METHOD,
+};
 pub use wait_follow::{
     is_mattermost_post_id, WaitFollowEvent, WaitFollowEventKind, WaitFollowFailureReason,
     WaitFollowMode, WaitFollowResult, WaitFollowResultKind, WaitFollowSchema, WaitFollowV1Params,
@@ -3499,6 +3505,48 @@ impl MattermostClient {
             .request("POST", "/channels/direct", Some(vec![my_id, user_id]))
             .await?;
         self.post_message_by_id(&channel_id.id, message).await
+    }
+
+    /// Open (create-if-missing) the DM with `username`. Uses the
+    /// daemon-bound `my_user_id` so wait admission does not add a
+    /// `whoami` RPC. Lookup and create-time 400/403/404 are the same
+    /// `not a waitable peer` class; retryable provider failures stay
+    /// retryable. Canonical DM name is computed from the two user ids
+    /// and never taken from the provider body.
+    pub async fn open_direct_channel(
+        &self,
+        username: &str,
+        my_user_id: &str,
+    ) -> Result<DirectChannel, CoreError> {
+        let peer_id = match self.user_id(username).await {
+            Ok(id) => id,
+            Err(err) => return Err(map_inaccessible_peer(err)),
+        };
+        if peer_id == my_user_id {
+            return Err(not_a_waitable_peer());
+        }
+        #[derive(Deserialize)]
+        struct RawDirect {
+            id: String,
+            #[serde(default)]
+            name: String,
+        }
+        let raw: RawDirect = match self
+            .request(
+                "POST",
+                "/channels/direct",
+                Some(vec![my_user_id.to_string(), peer_id.clone()]),
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(err) => return Err(map_inaccessible_peer(err)),
+        };
+        let _ = raw.name;
+        Ok(DirectChannel {
+            id: raw.id,
+            name: canonical_dm_name(my_user_id, &peer_id),
+        })
     }
 
     pub async fn read_dm(
