@@ -224,7 +224,9 @@ fails hard; cycle the daemon (`chanvoy daemon stop` then
 `chanvoy auto-setup`) after install.
 
 For an attention stream that must remain armed after each match, use
-held follow:
+held follow. See [`docs/guides/wait-follow.md`](./guides/wait-follow.md)
+for the harness table (output-line monitor vs one-shot hosts), JSONL-only
+stdout, and re-arm from the last live `tip`.
 
 ```bash
 chanvoy wait <channel> --follow --timeout 1h --after <last-id> \

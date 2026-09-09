@@ -487,7 +487,7 @@ struct WaitArgs {
     #[arg(
         long,
         default_value = "10",
-        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider/ownership failures exit 2 (never timeout:true).\n\nThis profile daemon allows one active wait per canonical channel. A second wait without --replace-wait <id> is a hard conflict. --replace-wait is compare-and-replace only (no --force). This is not a host-wide or cross-seat lock.\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nHeld follow: --follow is single-channel and requires exactly one of --out PATH or --follow-stdout. It emits self-identifying JSONL while retaining the same waitprims bind: armed first, one message per backlog/live record, then an optional terminal record. Deadman exits 1; replacement or failed exits 2; Ctrl-C writes canceled and exits 130. Sink failure is a hard exit and releases the waiter.\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after, --team, and --replace-wait are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider/ownership failures exit 2 (never timeout:true).\n\nThis profile daemon allows one active wait per canonical channel. A second wait without --replace-wait <id> is a hard conflict. --replace-wait is compare-and-replace only (no --force). This is not a host-wide or cross-seat lock.\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nHeld follow is a stream, not a harness doorbell. --follow is single-channel and requires exactly one sink: --out PATH or --follow-stdout. --follow-stdout is JSONL-only (no human preamble on stdout). On a shared host pass --profile. After a terminal record, resume from the last live tip. It emits self-identifying JSONL while retaining the same waitprims bind: armed first, one message per backlog/live record, then an optional terminal record. Deadman exits 1; replacement or failed exits 2; Ctrl-C writes canceled and exits 130. Sink failure is a hard exit and releases the waiter.\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after, --team, and --replace-wait are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
     )]
     timeout: String,
     /// Literal body substring (case-sensitive). Self-posts never match.
@@ -509,8 +509,11 @@ struct WaitArgs {
         long_help = "Compare-and-replace the active wait on this profile daemon for the same canonical channel. Supply the opaque wait id from a wait_already_active conflict. There is no --force. This is not a host-wide or cross-seat lock."
     )]
     replace_wait: Option<String>,
-    /// Keep one single-channel subscription armed and emit JSONL bursts.
-    #[arg(long)]
+    /// Keep one single-channel wait armed as a held stream (not a harness doorbell).
+    #[arg(
+        long,
+        long_help = "Held follow is a stream, not a harness doorbell. It keeps one single-channel wait armed and emits self-identifying JSONL records: armed first, then one message per backlog/live record, then an optional terminal record. Requires exactly one sink. After a terminal record, resume from the last live tip. On a shared host pass --profile so seats do not replace each other."
+    )]
     follow: bool,
     /// Append held-wait JSONL to a secure caller-named file.
     #[arg(
@@ -520,8 +523,13 @@ struct WaitArgs {
         conflicts_with = "follow_stdout"
     )]
     out: Option<PathBuf>,
-    /// Emit held-wait JSONL directly to stdout.
-    #[arg(long, requires = "follow", conflicts_with = "out")]
+    /// Emit held-wait JSONL only on stdout (human breadcrumb stays on stderr).
+    #[arg(
+        long,
+        requires = "follow",
+        conflicts_with = "out",
+        long_help = "Emit held-wait JSONL only on stdout. No human preamble on stdout. The static following-new-messages breadcrumb stays on stderr and never includes a post body. Requires --follow. Conflicts with --out (exactly one sink)."
+    )]
     follow_stdout: bool,
 }
 
@@ -5765,6 +5773,39 @@ mod tests {
         assert!(
             help.contains(WAIT_DM_HELP),
             "wait help must document --dm: {help}"
+        );
+    }
+
+    #[test]
+    fn wait_help_names_follow_stream_contract() {
+        let mut cli = Cli::command();
+        let wait = cli
+            .find_subcommand_mut("wait")
+            .expect("wait subcommand is present");
+        let help = wait.render_long_help().to_string();
+        assert!(
+            help.contains("stream") && help.contains("doorbell"),
+            "wait help must say follow is a stream, not a doorbell: {help}"
+        );
+        assert!(
+            help.contains("JSONL-only"),
+            "wait help must say --follow-stdout is JSONL-only: {help}"
+        );
+        assert!(
+            help.contains("exactly one sink"),
+            "wait help must require exactly one sink: {help}"
+        );
+        assert!(
+            help.contains("--profile"),
+            "wait help must document --profile on a shared host: {help}"
+        );
+        assert!(
+            help.contains("last live tip"),
+            "wait help must say to resume from the last live tip: {help}"
+        );
+        assert!(
+            !help.contains("JSONL bursts"),
+            "wait help must not call one-message records bursts: {help}"
         );
     }
 

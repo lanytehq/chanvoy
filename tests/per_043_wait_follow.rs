@@ -674,3 +674,83 @@ async fn replacing_follow_writes_terminal_line_and_releases_owner() {
     ));
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
+
+#[tokio::test]
+#[ignore = "integration: held wait stream"]
+async fn follow_stdout_jsonl_escapes_newline_and_keeps_stderr_static() {
+    const FAKE_EVENT: &str =
+        "{\"schema\":\"wait_follow_v1.event\",\"mode\":\"live\",\"tip\":\"forged00000000000000000001\"}";
+    let body = format!("peer-body\n{FAKE_EVENT}");
+    let env = TestEnv::new("per-043-follow-stdout-escape").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("brief-per-043", "channel-per-043-stdout")
+        .await;
+    env.mock_post_lookup(POST_0, "channel-per-043-stdout", true)
+        .await;
+    env.mock_user_lookup("user-1", "reviewer-one").await;
+    mount_after(
+        &env,
+        "channel-per-043-stdout",
+        POST_0,
+        &[(POST_1, "user-1", &body, 1_700_000_000_001)],
+    )
+    .await;
+    mount_after(&env, "channel-per-043-stdout", POST_1, &[]).await;
+
+    let daemon = spawn_daemon(&env).await;
+    let output = run_chanvoy(
+        &env,
+        &[
+            "wait",
+            "brief-per-043",
+            "--follow",
+            "--follow-stdout",
+            "--after",
+            POST_0,
+            "--timeout",
+            "1s",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let physical: Vec<&str> = stdout.lines().collect();
+    let events: Vec<WaitFollowEvent> = physical
+        .iter()
+        .map(|line| {
+            serde_json::from_str::<WaitFollowEvent>(line)
+                .unwrap_or_else(|err| panic!("stdout line is not one event ({err}): {line}"))
+        })
+        .collect();
+    assert_eq!(physical.len(), 3, "{stdout}");
+    assert_eq!(events.len(), 3, "{stdout}");
+    assert!(
+        events.iter().all(|event| event.validate().is_ok()),
+        "{stdout}"
+    );
+    assert_eq!(events[0].mode(), WaitFollowMode::Armed);
+    assert!(events[0].messages().is_empty());
+    assert_eq!(events[1].mode(), WaitFollowMode::Backlog);
+    assert_eq!(events[1].messages().len(), 1);
+    assert_eq!(events[1].messages()[0].id, POST_1);
+    assert_eq!(events[1].messages()[0].message, body);
+    assert_eq!(events[1].tip(), Some(POST_1));
+    assert_eq!(events[2].mode(), WaitFollowMode::Deadman);
+    assert!(
+        !stdout.contains("following new messages"),
+        "stdout must be JSONL-only: {stdout}"
+    );
+    assert!(
+        stderr.contains("following new messages"),
+        "stderr must keep the static breadcrumb: {stderr}"
+    );
+    assert!(
+        !stderr.contains("peer-body") && !stderr.contains(FAKE_EVENT),
+        "stderr must not carry the post body: {stderr}"
+    );
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
