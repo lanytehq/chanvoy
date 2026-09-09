@@ -226,7 +226,8 @@ fails hard; cycle the daemon (`chanvoy daemon stop` then
 For an attention stream that must remain armed after each match, use
 held follow. See [`docs/guides/wait-follow.md`](./guides/wait-follow.md)
 for the harness table (output-line monitor vs one-shot hosts), JSONL-only
-stdout, and re-arm from the last live `tip`.
+stdout, and how to resume after a terminal record or confirmed process
+exit.
 
 ```bash
 chanvoy wait <channel> --follow --timeout 1h --after <last-id> \
@@ -242,8 +243,8 @@ first line is `armed`; each backlog/live line carries exactly one
 message and an exclusive `tip` equal to that message id. Deadman,
 cancellation, replacement, and bounded hard failures write their
 terminal line before lease release when the sink remains writable. A
-later sink write failure exits 2 and closes the daemon stream
-immediately.
+later sink write failure exits 2, closes the daemon stream immediately,
+and does **not** write a terminal record.
 
 Follow shares the ordinary one-waiter registry key. A competing needle
 wait is refused unless it performs an exact `--replace-wait`; replacing
@@ -266,7 +267,10 @@ Choose the wait posture by what the host can use to start a turn:
    observation while it lives; it cannot start a turn.
 
 All three postures keep a single owner. Do not detach and forget a follower or
-fan out multiple owners. Re-arm from the last drained `tip` only after terminal.
+fan out multiple owners. Start a new wait only after a terminal record *or
+confirmed old-process exit*. Resume from the last drained `tip` (or the
+original `--after`; drain first if neither exists). After a sink failure,
+repair the sink before re-arming.
 
 | Outcome | Exit | Notes |
 | --- | ---: | --- |

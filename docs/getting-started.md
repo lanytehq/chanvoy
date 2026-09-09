@@ -252,8 +252,9 @@ not work); each backlog/live line carries one message and an exclusive
 `tip` equal to that message id. Deadman, cancellation, replacement, or a
 bounded hard failure writes a terminal line before releasing the slot
 when the sink is writable. A sink error is a hard exit and cancels the
-held wait. `--follow-stdout` is JSONL-only; the human breadcrumb stays on
-stderr. See [`docs/guides/wait-follow.md`](./guides/wait-follow.md).
+held wait **without** a terminal record. `--follow-stdout` is JSONL-only;
+the human breadcrumb stays on stderr. See
+[`docs/guides/wait-follow.md`](./guides/wait-follow.md).
 
 How follow resumes an agent depends on the host:
 
@@ -267,8 +268,11 @@ How follow resumes an agent depends on the host:
   the sitting turn and collect it there. Follow removes re-arm gaps while that
   foreground process lives; it is not a wake mechanism.
 
-In every case, keep one owner, do not detach and forget the follower, and re-arm
-from the last message `tip` only after a terminal record.
+In every case, keep one owner, do not detach and forget the follower, and
+start a new wait only after a terminal record *or confirmed old-process
+exit*. Resume from the last message `tip` (or the original `--after`; if
+neither exists, drain first). After a sink failure, repair the sink
+before re-arming.
 
 After `make install` or any binary replace, run
 `chanvoy daemon stop && chanvoy auto-setup` before trusting filtered wait (the

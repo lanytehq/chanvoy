@@ -41,17 +41,31 @@ Message bodies are JSON-escaped, so a newline in a post cannot start a
 second record. Live coalesce (batching several posts into one record) is
 not available.
 
-## After terminal
+## After the follower ends
 
-Re-arm only after a terminal record. Resume from the last **live** or
-`backlog` `tip`. If the stream emitted no message records, the previous
-`--after` is still valid. Self-posts never match.
+A **new** wait is admitted only after a stream **terminal record** *or*
+**confirmed old-process exit**. Those are not the same: a writable sink
+gets a terminal JSONL line before lease release; a sink failure exits 2
+and releases the owner **without** a terminal record.
 
-| Terminal | Exit |
-| -------- | ---: |
+Resume from the last validated **live** or `backlog` `tip`. If the stream
+emitted no message records, the previous explicit `--after` is still
+valid. If neither exists, drain and re-establish a baseline before
+re-arming. Self-posts never match.
+
+| Stream terminal | Exit |
+| --------------- | ---: |
 | `deadman` | 1 |
 | `canceled` (`Ctrl-C`) | 130 |
-| `replaced` / `failed` / sink error | 2 |
+| `replaced` / `failed` | 2 |
+
+| Process outcome (may have no terminal line) | Exit |
+| ------------------------------------------- | ---: |
+| Sink write/flush failure | 2 |
+
+After a sink failure: repair the sink, then resume from the last
+validated tip (or the original `--after` / a fresh drain) only after the
+old follower has exited.
 
 ## Which host posture
 
