@@ -8,22 +8,23 @@ use std::sync::{Arc, Mutex};
 use std::{env, ffi::OsStr};
 
 use chanvoy_core::{
-    check_search_operator_conflicts, clock_check_from_observation, current_ws_observation_degraded,
-    doctor_exit_code, format_basic as format_host_basic, format_extended as format_host_extended,
-    host_generation_match, list_profiles, load_active_profile, load_profile, load_token,
-    parse_after_channel_flag, parse_qualified_wait_selector, parse_time_window,
-    pid_path_for_profile, provider_status_class, resolve_host_build_info, socket_path_for_profile,
-    store_active_profile, store_profile, validate_wait_channels_params, AckResult,
-    AttentionListResult, AttentionShowResult, AttentionSource, CapabilityClass, Channel,
-    ChanvoyScopes, CheckResult, CheckVerdict, ClockCheck, CredentialMode, DaemonHealthState,
-    DaemonStatus, DmConversation, Identity, LegacyChannel, MattermostClient, Message, Notification,
-    PinResult, PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult,
-    SeedCursorsResult, SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult,
-    UnreadNotifications, WaitChannelArm, WaitChannelSelector, WaitChannelV3Params,
-    WaitChannelsParams, WaitChannelsResult, WaitFollowEvent, WaitFollowEventKind, WaitFollowMode,
-    WaitFollowV1Params, WaitResult, WsConnectionState, RPC_WAIT_ALREADY_ACTIVE,
-    RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED,
-    WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS,
+    check_search_operator_conflicts, classify_wait_dm_username, clock_check_from_observation,
+    current_ws_observation_degraded, doctor_exit_code, format_basic as format_host_basic,
+    format_extended as format_host_extended, host_generation_match, list_profiles,
+    load_active_profile, load_profile, load_token, parse_after_channel_flag,
+    parse_qualified_wait_selector, parse_time_window, pid_path_for_profile, provider_status_class,
+    resolve_host_build_info, socket_path_for_profile, store_active_profile, store_profile,
+    validate_wait_channels_params, AckResult, AttentionListResult, AttentionShowResult,
+    AttentionSource, CapabilityClass, Channel, ChanvoyScopes, CheckResult, CheckVerdict,
+    ClockCheck, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation, Identity,
+    LegacyChannel, MattermostClient, Message, Notification, PinResult, PostReceipt, Profile,
+    ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult, SeededChannelOutcome,
+    TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitChannelArm, WaitChannelSelector,
+    WaitChannelV3Params, WaitChannelsParams, WaitChannelsResult, WaitDmV1Params, WaitDmV1Result,
+    WaitFollowEvent, WaitFollowEventKind, WaitFollowMode, WaitFollowV1Params, WaitResult,
+    WsConnectionState, NOT_A_WAITABLE_PEER, RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED,
+    RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_MAX_ARMS,
+    WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -467,11 +468,14 @@ struct CheckArgs {
 #[derive(Debug, Args)]
 struct WaitArgs {
     /// Single-channel wait. Mutually exclusive with repeated `--channel`.
-    #[arg(required_unless_present = "channels")]
+    #[arg(required_unless_present_any = ["channels", "dm"])]
     channel: Option<String>,
     /// Fan-in arm. Repeat 2–8 times with explicit `team/channel` selectors.
     #[arg(long = "channel", value_name = "TEAM/CHANNEL", action = clap::ArgAction::Append)]
     channels: Vec<String>,
+    /// wait for a DM from this user; do not pass a channel id.
+    #[arg(long, value_name = "USERNAME", help = WAIT_DM_HELP)]
+    dm: Option<String>,
     /// Per-arm exclusive baseline: `team/channel=post-id`. Repeatable. Fan-in only.
     #[arg(
         long = "after-channel",
@@ -1668,6 +1672,9 @@ async fn handle_mcp(profile: &str, args: McpArgs) -> Result<(), CliError> {
 /// ownership claims require the v3 daemon. Fan-in (`--channel` ×2–8)
 /// uses `wait_channels_v1` and never falls back.
 async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    if args.dm.is_some() {
+        return handle_wait_dm(profile, json, args).await;
+    }
     if args.follow {
         return handle_wait_follow(profile, json, args).await;
     }
@@ -1780,6 +1787,261 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             print_value(json, &one)
         }
         Err(err) => classify_wait_error(json, &channel, timeout_secs, err),
+    }
+}
+
+fn refuse_dm_selector_mix(args: &WaitArgs) -> Option<&'static str> {
+    if args.channel.is_some() {
+        return Some("wait --dm refuses a positional channel; do not pass a channel id");
+    }
+    if !args.channels.is_empty() {
+        return Some("wait --dm refuses repeated --channel fan-in");
+    }
+    if !args.after_channels.is_empty() {
+        return Some("wait --dm refuses --after-channel");
+    }
+    if args.team.is_some() {
+        return Some("wait --dm refuses --team; DMs are not team channels");
+    }
+    None
+}
+
+async fn handle_wait_dm(profile: &str, json: bool, args: WaitArgs) -> Result<(), CliError> {
+    let username = args.dm.clone().expect("wait --dm");
+    if let Some(message) = refuse_dm_selector_mix(&args) {
+        return exit_wait_hard(json, &username, "input", false, message);
+    }
+    if classify_wait_dm_username(&username).is_err() {
+        return exit_wait_hard(json, &username, "input", false, NOT_A_WAITABLE_PEER);
+    }
+    match load_profile(profile) {
+        Ok(cfg) if cfg.bot_username == username => {
+            return exit_wait_hard(json, &username, "input", false, NOT_A_WAITABLE_PEER);
+        }
+        _ => {}
+    }
+    if args.follow {
+        return handle_wait_dm_follow(profile, json, args, username).await;
+    }
+    let timeout_secs = match parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes) {
+        Ok(secs) if secs > 0 => secs,
+        Ok(_) => {
+            return exit_wait_hard(
+                json,
+                &username,
+                "input",
+                false,
+                "wait --timeout must be greater than zero",
+            );
+        }
+        Err(err) => {
+            return exit_wait_hard(
+                json,
+                &username,
+                "input",
+                false,
+                &format!("invalid --timeout: {err}"),
+            );
+        }
+    };
+    if args.contains.as_deref() == Some("") || args.pattern.as_deref() == Some("") {
+        return exit_wait_hard(
+            json,
+            &username,
+            "input",
+            false,
+            "empty wait filters are refused",
+        );
+    }
+    if !json {
+        eprintln!("waiting for a DM from @{username} (timeout: {timeout_secs}s)...");
+    }
+    let client = daemon_client(profile);
+    let result = match client
+        .wait_dm_v1(WaitDmV1Params {
+            username: username.clone(),
+            timeout_secs,
+            contains: args.contains.clone(),
+            pattern: args.pattern.clone(),
+            after: args.after.clone(),
+            replace_wait_id: args.replace_wait.clone(),
+        })
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) => {
+            return exit_wait_hard(
+                json,
+                &username,
+                "capability",
+                false,
+                "the running daemon does not support wait --dm (wait_dm_v1); \
+                 cycle it with `chanvoy daemon stop` then `chanvoy auto-setup`",
+            );
+        }
+        Err(other) => Err(other),
+    };
+    match result {
+        Ok(result) => {
+            if result.messages.is_empty() {
+                return exit_wait_hard(
+                    json,
+                    &username,
+                    "input",
+                    false,
+                    "wait --dm returned success with no message payload",
+                );
+            }
+            if !json {
+                eprintln!("--- new DM from @{} ---", result.peer_username);
+            }
+            print_value(json, &result)
+        }
+        Err(err) => classify_wait_error(json, &username, timeout_secs, err),
+    }
+}
+
+async fn handle_wait_dm_follow(
+    profile: &str,
+    json: bool,
+    args: WaitArgs,
+    username: String,
+) -> Result<(), CliError> {
+    let timeout_secs = match parse_time_window(&args.timeout, TimeWindowDefaultUnit::Minutes) {
+        Ok(secs) if secs > 0 => secs,
+        Ok(_) => {
+            return exit_wait_hard(
+                json,
+                &username,
+                "input",
+                false,
+                "wait --follow --timeout must be greater than zero",
+            )
+        }
+        Err(err) => {
+            return exit_wait_hard(
+                json,
+                &username,
+                "input",
+                false,
+                &format!("invalid --timeout: {err}"),
+            )
+        }
+    };
+    if args.contains.as_deref() == Some("") || args.pattern.as_deref() == Some("") {
+        return exit_wait_hard(
+            json,
+            &username,
+            "input",
+            false,
+            "empty follow filters are refused",
+        );
+    }
+    let sink = match open_follow_sink(&args) {
+        Ok(sink) => Arc::new(Mutex::new(sink)),
+        Err(err) => {
+            return exit_wait_hard(json, &username, "sink", false, &err.to_string());
+        }
+    };
+    if !json {
+        eprintln!("following DMs from @{username} (timeout: {timeout_secs}s)...");
+    }
+    let seen_wait_id = Arc::new(Mutex::new(None::<String>));
+    let outcome = {
+        let callback_wait_id = Arc::clone(&seen_wait_id);
+        let callback_sink = Arc::clone(&sink);
+        let client = daemon_client(profile);
+        let follow = client.wait_dm_follow_v1(
+            WaitDmV1Params {
+                username: username.clone(),
+                timeout_secs,
+                contains: args.contains.clone(),
+                pattern: args.pattern.clone(),
+                after: args.after.clone(),
+                replace_wait_id: args.replace_wait.clone(),
+            },
+            |event| {
+                if let Ok(mut slot) = callback_wait_id.lock() {
+                    *slot = Some(event.wait_id.clone());
+                }
+                callback_sink
+                    .lock()
+                    .map_err(|_| {
+                        DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                    })?
+                    .emit(&event)
+                    .map_err(DaemonError::from)
+            },
+        );
+        tokio::pin!(follow);
+        tokio::select! {
+            result = &mut follow => result,
+            signal = tokio::signal::ctrl_c() => {
+                let emitted = signal
+                    .map_err(std::io::Error::other)
+                    .and_then(|()| {
+                        let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                        let Some(wait_id) = wait_id else {
+                            return Ok(());
+                        };
+                        let canceled =
+                            WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Canceled);
+                        sink.lock()
+                            .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                            .emit(&canceled)
+                    });
+                match emitted {
+                    Ok(()) => process::exit(130),
+                    Err(err) => {
+                        return exit_wait_hard(json, &username, "sink", false, &err.to_string());
+                    }
+                }
+            }
+        }
+    };
+
+    match outcome {
+        Ok(result)
+            if matches!(
+                result.kind,
+                chanvoy_core::WaitFollowResultKind::Deadman { .. }
+            ) =>
+        {
+            process::exit(1)
+        }
+        Ok(result)
+            if matches!(
+                result.kind,
+                chanvoy_core::WaitFollowResultKind::Replaced { .. }
+            ) =>
+        {
+            process::exit(EXIT_ENV_INPUT)
+        }
+        Ok(_) => exit_wait_hard(
+            json,
+            &username,
+            "provider",
+            false,
+            "held dm wait returned a non-terminal result",
+        ),
+        Err(DaemonError::Io(err)) => {
+            exit_wait_hard(json, &username, "sink", false, &err.to_string())
+        }
+        Err(DaemonError::Rpc {
+            code: RPC_UNKNOWN_METHOD,
+            ..
+        }) => exit_wait_hard(
+            json,
+            &username,
+            "capability",
+            false,
+            "the running daemon does not support wait --dm --follow; cycle it with \
+             `chanvoy daemon stop` then `chanvoy auto-setup`",
+        ),
+        Err(err) => classify_wait_error(json, &username, timeout_secs, err),
     }
 }
 
@@ -5226,6 +5488,19 @@ impl HumanReadable for WaitResult {
     }
 }
 
+impl HumanReadable for WaitDmV1Result {
+    fn to_human_string(&self) -> String {
+        let header = format!("dm @{} ({})", self.peer_username, self.dm_name);
+        let body = self
+            .messages
+            .iter()
+            .map(format_message)
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{header}\n{body}")
+    }
+}
+
 impl HumanReadable for WaitChannelsResult {
     fn to_human_string(&self) -> String {
         let header = format!("matched {}", self.matched_channel.qualified());
@@ -5487,6 +5762,10 @@ mod tests {
             help.contains("--after-channel"),
             "wait help must document --after-channel: {help}"
         );
+        assert!(
+            help.contains(WAIT_DM_HELP),
+            "wait help must document --dm: {help}"
+        );
     }
 
     #[test]
@@ -5505,6 +5784,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            dm: None,
         };
         assert!(build_fan_in_params(&mix, 10).is_err());
 
@@ -5521,6 +5801,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            dm: None,
         };
         assert!(build_fan_in_params(&bare, 10).is_err());
 
@@ -5537,6 +5818,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            dm: None,
         };
         assert!(build_fan_in_params(&one, 10).is_err());
 
@@ -5557,6 +5839,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            dm: None,
         };
         assert!(build_fan_in_params(&too_many, 10).is_err());
 
@@ -5573,6 +5856,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            dm: None,
         };
         assert!(build_fan_in_params(&after_single, 10).is_err());
 
@@ -5589,6 +5873,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            dm: None,
         };
         assert!(build_fan_in_params(&unmatched, 10).is_err());
 
@@ -5605,6 +5890,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            dm: None,
         };
         let params = build_fan_in_params(&ok, 30).expect("valid fan-in");
         assert_eq!(params.arms.len(), 2);

@@ -702,20 +702,24 @@ impl Drop for AutoSetupDaemonGuard {
     }
 }
 
-/// SIGKILL the daemon via `sysprims_signal::force_kill` and reap via
-/// `child.wait()` with timeout. Platform-agnostic exit signal (Linux
-/// zombie semantics make `sysprims_proc::get_process` unreliable as a
-/// pre-wait liveness probe).
-pub async fn kill_daemon(mut child: Child) {
+/// SIGKILL a spawned child via `sysprims_signal::force_kill` and reap
+/// with a bounded `child.wait()`. Do not use `Child::start_kill` (macOS
+/// delivery gaps). Platform-agnostic exit signal (Linux zombie
+/// semantics make `sysprims_proc::get_process` unreliable as a pre-wait
+/// liveness probe).
+pub async fn force_kill_child(mut child: Child, what: &str) {
     let pid = child.id().expect("child pid present before kill");
     if let Err(err) = sysprims_signal::force_kill(pid) {
-        panic!("kill_daemon: sysprims force_kill({pid}) failed: {err}");
+        panic!("{what}: sysprims force_kill({pid}) failed: {err}");
     }
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(_status)) => {}
-        Ok(Err(err)) => panic!("kill_daemon: wait errored for pid {pid}: {err}"),
-        Err(_) => panic!(
-            "kill_daemon: pid {pid} not reaped within 5s of force_kill → signal-delivery or reactor failure"
-        ),
+        Ok(Err(err)) => panic!("{what}: wait errored for pid {pid}: {err}"),
+        Err(_) => panic!("{what}: pid {pid} not reaped within 5s of force_kill"),
     }
+}
+
+/// SIGKILL a spawned daemon child using [`force_kill_child`].
+pub async fn kill_daemon(child: Child) {
+    force_kill_child(child, "kill_daemon").await;
 }

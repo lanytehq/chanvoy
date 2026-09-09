@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chanvoy_core::{
-    validate_wait_channel_v3_strings, CoreError, DaemonEvent, DaemonEventPayloadInner,
-    InboundEventPayload, Message, WaitResult, WsConnectionState,
+    classify_wait_dm_username, not_a_waitable_peer, validate_wait_channel_v3_strings, CoreError,
+    DaemonEvent, DaemonEventPayloadInner, InboundEventPayload, Message, WaitDmFollowResult,
+    WaitDmV1Result, WaitResult, WsConnectionState,
 };
 use regex::RegexBuilder;
 use reqwest::StatusCode;
@@ -467,6 +468,167 @@ pub async fn wait_with_params_follow(
         stream,
     )
     .await
+}
+
+/// Absolute wait deadline from RPC entry. Refuses unrepresentable
+/// `Instant + Duration` instead of panicking on `Add`.
+pub(crate) fn deadline_from_rpc_entry(
+    started: Instant,
+    timeout_secs: u64,
+) -> Result<Instant, CoreError> {
+    started
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| {
+            CoreError::WaitFilterInvalid("wait timeout is not representable as a deadline".into())
+        })
+}
+
+pub struct WaitDmRequest<'a> {
+    pub username: &'a str,
+    pub timeout_secs: u64,
+    pub contains: Option<&'a str>,
+    pub pattern: Option<&'a str>,
+    pub after: Option<&'a str>,
+    pub replace_wait_id: Option<&'a str>,
+    /// Absolute deadline captured at daemon RPC entry.
+    pub deadline: Instant,
+}
+
+async fn admit_direct_channel(
+    state: &AppState,
+    req: &WaitDmRequest<'_>,
+) -> Result<(String, String), CoreError> {
+    validate_wait_timeout_secs(req.timeout_secs)?;
+    classify_wait_dm_username(req.username)?;
+    if req.username == state.profile.bot_username {
+        return Err(not_a_waitable_peer());
+    }
+    validate_wait_channel_v3_strings(req.username, None, req.contains, req.pattern, req.after)?;
+    WaitPredicate::compile("pending", "pending", req.contains, req.pattern)?;
+    let opened = provider_retry(state, req.username, req.deadline, || async {
+        state
+            .client
+            .open_direct_channel(req.username, &state.my_user_id)
+            .await
+    })
+    .await?;
+    Ok((opened.id, opened.name))
+}
+
+/// One-shot wait selected by exact username.
+pub async fn wait_with_params_dm(
+    state: &AppState,
+    req: WaitDmRequest<'_>,
+) -> Result<WaitDmV1Result, CoreError> {
+    let deadline = req.deadline;
+    let (channel_id, dm_name) = admit_direct_channel(state, &req).await?;
+    let monitored = channel_is_monitored(state, &dm_name);
+    if monitored {
+        refuse_current_ws_failure(state, &dm_name).await?;
+    }
+    let prebound_after = if let Some(anchor) = req.after {
+        let (scan, baseline) =
+            establish_baseline(state, &dm_name, &channel_id, Some(anchor), deadline).await?;
+        Some(crate::waitprims_hold::cursor_from_baseline(scan, baseline))
+    } else {
+        None
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lease = state
+        .wait_owners
+        .acquire(
+            &channel_id,
+            "direct",
+            &dm_name,
+            req.replace_wait_id,
+            remaining,
+        )
+        .await?;
+    state.wait_owners.note_arm();
+    let (session, guard) = lease.into_guard();
+    let predicate =
+        WaitPredicate::compile(&state.my_user_id, &channel_id, req.contains, req.pattern)?;
+    let result = crate::waitprims_hold::run_single_channel_first_match(
+        state,
+        crate::waitprims_hold::FirstMatchWait {
+            channel: &dm_name,
+            channel_id: &channel_id,
+            after: req.after,
+            prebound_after,
+            monitored,
+            predicate,
+            deadline,
+            session: &session,
+            guard,
+        },
+    )
+    .await?;
+    Ok(WaitDmV1Result {
+        peer_username: req.username.to_string(),
+        dm_name: dm_name.clone(),
+        channel: result.channel,
+        messages: result.messages,
+        wait_id: Some(session.wait_id),
+        replaced_wait_id: session.replaced_wait_id,
+    })
+}
+
+/// Held follow selected by exact username. Stream records stay
+/// `wait_follow_v1.event`; the terminal result names peer + dm_name.
+pub async fn wait_with_params_dm_follow(
+    state: &AppState,
+    req: WaitDmRequest<'_>,
+    stream: FollowStreamSender,
+) -> Result<WaitDmFollowResult, CoreError> {
+    let deadline = req.deadline;
+    let (channel_id, dm_name) = admit_direct_channel(state, &req).await?;
+    let monitored = channel_is_monitored(state, &dm_name);
+    if monitored {
+        refuse_current_ws_failure(state, &dm_name).await?;
+    }
+    let prebound_after = if let Some(anchor) = req.after {
+        let (scan, baseline) =
+            establish_baseline(state, &dm_name, &channel_id, Some(anchor), deadline).await?;
+        Some(crate::waitprims_hold::cursor_from_baseline(scan, baseline))
+    } else {
+        None
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let lease = state
+        .wait_owners
+        .acquire(
+            &channel_id,
+            "direct",
+            &dm_name,
+            req.replace_wait_id,
+            remaining,
+        )
+        .await?;
+    state.wait_owners.note_arm();
+    let (session, guard) = lease.into_guard();
+    let predicate =
+        WaitPredicate::compile(&state.my_user_id, &channel_id, req.contains, req.pattern)?;
+    let result = crate::waitprims_hold::run_single_channel_follow(
+        state,
+        crate::waitprims_hold::FirstMatchWait {
+            channel: &dm_name,
+            channel_id: &channel_id,
+            after: req.after,
+            prebound_after,
+            monitored,
+            predicate,
+            deadline,
+            session: &session,
+            guard,
+        },
+        stream,
+    )
+    .await?;
+    Ok(WaitDmFollowResult::from_follow(
+        req.username.to_string(),
+        dm_name,
+        result,
+    ))
 }
 
 /// Monitored path: **subscribe first**, then resolve/compile/anchor/backfill
@@ -1451,6 +1613,12 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn unrepresentable_dm_timeout_is_input_not_panic() {
+        let err = deadline_from_rpc_entry(Instant::now(), u64::MAX).unwrap_err();
+        assert!(matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("deadline")));
+    }
 
     async fn state_with_failed_ws(monitored: &[&str]) -> AppState {
         let profile = Profile {
