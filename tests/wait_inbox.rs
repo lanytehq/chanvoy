@@ -2,13 +2,16 @@
 
 #![allow(dead_code)]
 
+use std::process::Stdio;
 use std::time::Duration;
 
 mod common;
 
 use chanvoy_core::{
     canonical_dm_name, rpc_error, rpc_request, InboxCursorV1, JsonRpcRequest, JsonRpcResponse,
-    POST_ID_NOT_INBOX_CURSOR, WAIT_INBOX_FOLLOW_V1_METHOD, WAIT_INBOX_HELP, WAIT_INBOX_V1_METHOD,
+    Message, WaitFollowMode, WaitInboxFollowEvent, POST_ID_NOT_INBOX_CURSOR,
+    WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_METHOD, WAIT_INBOX_HELP,
+    WAIT_INBOX_V1_METHOD,
 };
 use common::{run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
 use serde_json::json;
@@ -273,4 +276,209 @@ fn help_names_inbox_without_channel_id() {
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains(WAIT_INBOX_HELP), "{help}");
     assert!(!help.contains("1024"), "caps must not be help SLAs: {help}");
+}
+
+fn sample_cursor(post_id: &str, ts: i64) -> String {
+    InboxCursorV1::empty("wait-inbox-follow-cli", BOT_ID)
+        .advance(ts, post_id)
+        .unwrap()
+        .encode()
+        .unwrap()
+}
+
+fn sample_live(wait_id: &str, post_id: &str, cursor: &str) -> WaitInboxFollowEvent {
+    WaitInboxFollowEvent::message(
+        wait_id,
+        WaitFollowMode::Live,
+        PEER_A.to_string(),
+        dm_a(),
+        cursor.to_string(),
+        Message {
+            id: post_id.into(),
+            user_id: PEER_A_ID.into(),
+            username: PEER_A.into(),
+            message: "hello".into(),
+            create_at: 1_780_000_000_100,
+            root_id: post_id.into(),
+        },
+        false,
+    )
+    .expect("live inbox record")
+}
+
+async fn fake_inbox_follow_daemon(
+    env: &TestEnv,
+    events: Vec<WaitInboxFollowEvent>,
+    pause_before_last: Option<Duration>,
+    hang: bool,
+) -> JoinHandle<()> {
+    let listener = UnixListener::bind(env.socket_path()).expect("bind follow daemon");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("request");
+        let request: JsonRpcRequest = serde_json::from_str(line.trim_end()).expect("decode");
+        assert_eq!(request.method, WAIT_INBOX_FOLLOW_V1_METHOD);
+        let last = events.len().saturating_sub(1);
+        for (index, event) in events.into_iter().enumerate() {
+            if index == last {
+                if let Some(delay) = pause_before_last {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": WAIT_INBOX_FOLLOW_V1_EVENT_METHOD,
+                "params": event,
+            });
+            writer
+                .write_all(
+                    format!("{}\n", serde_json::to_string(&notification).unwrap()).as_bytes(),
+                )
+                .await
+                .expect("event");
+            writer.flush().await.expect("flush");
+        }
+        if hang {
+            let mut buf = String::new();
+            let _ = reader.read_line(&mut buf).await;
+        }
+    })
+}
+
+async fn wait_for_inbox_mode(path: &std::path::Path, mode: WaitFollowMode) -> WaitInboxFollowEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            for line in raw.lines() {
+                if let Ok(event) = serde_json::from_str::<WaitInboxFollowEvent>(line) {
+                    if event.validate().is_ok() && event.mode() == mode {
+                        return event;
+                    }
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "missing {mode:?} inbox follow record"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "integration: wait --inbox follow SIGINT preserves sink-acked cursor"]
+async fn sigint_after_one_inbox_line_keeps_acked_cursor() {
+    let env = TestEnv::new("wait-inbox-sigint").await;
+    env.write_default_profile(BOT_USER, "org-lanytehq");
+    let cursor = sample_cursor(POST_A, 1_780_000_000_100);
+    let wait_id = "wait_inbox_sigint_0000000000000001";
+    let _server = fake_inbox_follow_daemon(
+        &env,
+        vec![
+            WaitInboxFollowEvent::armed(wait_id, None),
+            sample_live(wait_id, POST_A, &cursor),
+        ],
+        None,
+        true,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let out = env.runtime_dir().join("inbox-sigint.jsonl");
+    let follow = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args([
+            "wait",
+            "--inbox",
+            "--follow",
+            "--out",
+            out.to_str().unwrap(),
+            "--timeout",
+            "30s",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn inbox follow");
+    let pid = follow.id().expect("pid") as libc::pid_t;
+    let live = wait_for_inbox_mode(&out, WaitFollowMode::Live).await;
+    assert_eq!(live.inbox_cursor(), Some(cursor.as_str()));
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+    let output = tokio::time::timeout(Duration::from_secs(5), follow.wait_with_output())
+        .await
+        .expect("SIGINT exit")
+        .expect("follow output");
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    let raw = std::fs::read_to_string(&out).unwrap();
+    let events: Vec<WaitInboxFollowEvent> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(events.iter().all(|event| event.validate().is_ok()), "{raw}");
+    let last = events.last().unwrap();
+    assert_eq!(last.mode(), WaitFollowMode::Canceled);
+    assert_eq!(last.inbox_cursor(), Some(cursor.as_str()));
+}
+
+#[tokio::test]
+#[ignore = "integration: wait --inbox follow sink failure after one line"]
+async fn broken_stdout_after_one_inbox_line_exits_two() {
+    let env = TestEnv::new("wait-inbox-sink").await;
+    env.write_default_profile(BOT_USER, "org-lanytehq");
+    let first = sample_cursor(POST_A, 1_780_000_000_100);
+    let second = sample_cursor(POST_B, 1_780_000_000_200);
+    let wait_id = "wait_inbox_sink_00000000000000001";
+    let _server = fake_inbox_follow_daemon(
+        &env,
+        vec![
+            WaitInboxFollowEvent::armed(wait_id, None),
+            sample_live(wait_id, POST_A, &first),
+            sample_live(wait_id, POST_B, &second),
+        ],
+        Some(Duration::from_millis(250)),
+        true,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut follow = env
+        .chanvoy_command()
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .args([
+            "wait",
+            "--inbox",
+            "--follow",
+            "--follow-stdout",
+            "--timeout",
+            "30s",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn inbox follow");
+    let stdout = follow.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut armed = String::new();
+    reader.read_line(&mut armed).await.unwrap();
+    let event: WaitInboxFollowEvent = serde_json::from_str(armed.trim_end()).unwrap();
+    assert_eq!(event.mode(), WaitFollowMode::Armed);
+    let mut live = String::new();
+    reader.read_line(&mut live).await.unwrap();
+    let event: WaitInboxFollowEvent = serde_json::from_str(live.trim_end()).unwrap();
+    assert_eq!(event.mode(), WaitFollowMode::Live);
+    assert_eq!(event.inbox_cursor(), Some(first.as_str()));
+    drop(reader);
+    let output = tokio::time::timeout(Duration::from_secs(6), follow.wait_with_output())
+        .await
+        .expect("sink failure exit")
+        .expect("follow output");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("sink"),
+        "{output:?}"
+    );
 }

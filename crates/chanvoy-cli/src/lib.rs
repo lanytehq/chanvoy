@@ -1984,6 +1984,13 @@ async fn handle_wait_inbox_follow(
                 if let Ok(mut slot) = callback_wait_id.lock() {
                     *slot = Some(event.wait_id.clone());
                 }
+                callback_sink
+                    .lock()
+                    .map_err(|_| {
+                        DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                    })?
+                    .emit_json(&event)
+                    .map_err(DaemonError::from)?;
                 if matches!(event.mode(), WaitFollowMode::Backlog | WaitFollowMode::Live) {
                     if let Some(cursor) = event.inbox_cursor() {
                         if let Ok(mut slot) = callback_cursor.lock() {
@@ -1991,13 +1998,7 @@ async fn handle_wait_inbox_follow(
                         }
                     }
                 }
-                callback_sink
-                    .lock()
-                    .map_err(|_| {
-                        DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
-                    })?
-                    .emit_json(&event)
-                    .map_err(DaemonError::from)
+                Ok(())
             },
         );
         tokio::pin!(follow);

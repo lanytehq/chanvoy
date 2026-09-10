@@ -3890,6 +3890,11 @@ impl MattermostClient {
                 "inbox new-DM lookup is not a direct channel",
             ));
         }
+        if raw.id != channel_id {
+            return Err(cursor_uncertain(
+                "inbox channel lookup id does not match the requested channel",
+            ));
+        }
         Ok(DirectCatalogEntry {
             id: raw.id,
             name: raw.name,
