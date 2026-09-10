@@ -32,3 +32,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 waitprims-async = { workspace = true }
 waitprims-core = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"

@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use chanvoy_core::{
     can_install_replacement, decide_acquire, new_wait_id, now_unix_millis, should_release,
-    CoreError, WaitAcquireDecision, WaitAcquireIntent, WaitSlotView, REPLACE_CLEANUP_BUDGET_SECS,
+    CoreError, WaitAcquireDecision, WaitAcquireIntent, WaitSlotView, DM_CLASS_CHANNEL,
+    DM_CLASS_OWNERSHIP_KEY, DM_CLASS_TEAM, REPLACE_CLEANUP_BUDGET_SECS,
 };
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -74,9 +75,17 @@ struct Inner {
     next_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOwnerKind {
+    Channel,
+    Direct,
+    Inbox,
+}
+
 #[derive(Debug)]
 struct LiveSlot {
     view: WaitSlotView,
+    kind: WaitOwnerKind,
     cancel: CancellationToken,
     cleanup_acked: Arc<AtomicBool>,
     cleanup_notify: Arc<Notify>,
@@ -213,6 +222,84 @@ impl WaitOwnerRegistry {
         self.release(channel_id, generation);
     }
 
+    pub async fn acquire_direct(
+        self: &Arc<Self>,
+        channel_id: &str,
+        team: &str,
+        channel: &str,
+        replace_wait_id: Option<&str>,
+        remaining: Duration,
+    ) -> Result<WaitLease, CoreError> {
+        if let Some(err) = self.inbox_blocks_direct() {
+            return Err(err);
+        }
+        self.acquire_kind(
+            channel_id,
+            team,
+            channel,
+            replace_wait_id,
+            remaining,
+            WaitOwnerKind::Direct,
+        )
+        .await
+    }
+
+    pub async fn acquire_inbox(
+        self: &Arc<Self>,
+        replace_wait_id: Option<&str>,
+        remaining: Duration,
+    ) -> Result<WaitLease, CoreError> {
+        if let Some(err) = self.direct_blocks_inbox(replace_wait_id) {
+            return Err(err);
+        }
+        self.acquire_kind(
+            DM_CLASS_OWNERSHIP_KEY,
+            DM_CLASS_TEAM,
+            DM_CLASS_CHANNEL,
+            replace_wait_id,
+            remaining,
+            WaitOwnerKind::Inbox,
+        )
+        .await
+    }
+
+    fn inbox_blocks_direct(&self) -> Option<CoreError> {
+        let inner = self.inner.lock().expect("wait registry");
+        inner
+            .slots
+            .values()
+            .find(|slot| slot.kind == WaitOwnerKind::Inbox)
+            .map(|slot| CoreError::WaitAlreadyActive {
+                team: DM_CLASS_TEAM.to_string(),
+                channel: DM_CLASS_CHANNEL.to_string(),
+                existing_wait_id: slot.view.wait_id.clone(),
+                started_at_ms: slot.view.started_at_ms,
+            })
+    }
+
+    fn direct_blocks_inbox(&self, replace_wait_id: Option<&str>) -> Option<CoreError> {
+        let inner = self.inner.lock().expect("wait registry");
+        if let Some(slot) = inner
+            .slots
+            .values()
+            .find(|slot| slot.kind == WaitOwnerKind::Direct)
+        {
+            if replace_wait_id.is_some() {
+                return Some(CoreError::WaitConflictChanged {
+                    team: DM_CLASS_TEAM.to_string(),
+                    channel: DM_CLASS_CHANNEL.to_string(),
+                });
+            }
+            return Some(CoreError::WaitAlreadyActive {
+                team: DM_CLASS_TEAM.to_string(),
+                channel: DM_CLASS_CHANNEL.to_string(),
+                existing_wait_id: slot.view.wait_id.clone(),
+                started_at_ms: slot.view.started_at_ms,
+            });
+        }
+        None
+    }
+
     pub async fn acquire(
         self: &Arc<Self>,
         channel_id: &str,
@@ -220,6 +307,26 @@ impl WaitOwnerRegistry {
         channel: &str,
         replace_wait_id: Option<&str>,
         remaining: Duration,
+    ) -> Result<WaitLease, CoreError> {
+        self.acquire_kind(
+            channel_id,
+            team,
+            channel,
+            replace_wait_id,
+            remaining,
+            WaitOwnerKind::Channel,
+        )
+        .await
+    }
+
+    async fn acquire_kind(
+        self: &Arc<Self>,
+        channel_id: &str,
+        team: &str,
+        channel: &str,
+        replace_wait_id: Option<&str>,
+        remaining: Duration,
+        kind: WaitOwnerKind,
     ) -> Result<WaitLease, CoreError> {
         let intent = match replace_wait_id {
             Some(id) => WaitAcquireIntent::Replace {
@@ -243,6 +350,41 @@ impl WaitOwnerRegistry {
 
         let prepared = {
             let mut inner = self.inner.lock().expect("wait registry");
+            if kind == WaitOwnerKind::Direct {
+                if let Some(slot) = inner
+                    .slots
+                    .values()
+                    .find(|slot| slot.kind == WaitOwnerKind::Inbox)
+                {
+                    return Err(CoreError::WaitAlreadyActive {
+                        team: DM_CLASS_TEAM.to_string(),
+                        channel: DM_CLASS_CHANNEL.to_string(),
+                        existing_wait_id: slot.view.wait_id.clone(),
+                        started_at_ms: slot.view.started_at_ms,
+                    });
+                }
+            }
+            if kind == WaitOwnerKind::Inbox {
+                if let Some(slot) = inner
+                    .slots
+                    .values()
+                    .find(|slot| slot.kind == WaitOwnerKind::Direct)
+                {
+                    return Err(if replace_wait_id.is_some() {
+                        CoreError::WaitConflictChanged {
+                            team: DM_CLASS_TEAM.to_string(),
+                            channel: DM_CLASS_CHANNEL.to_string(),
+                        }
+                    } else {
+                        CoreError::WaitAlreadyActive {
+                            team: DM_CLASS_TEAM.to_string(),
+                            channel: DM_CLASS_CHANNEL.to_string(),
+                            existing_wait_id: slot.view.wait_id.clone(),
+                            started_at_ms: slot.view.started_at_ms,
+                        }
+                    });
+                }
+            }
             let current = inner.slots.get(channel_id).map(|s| s.view.clone());
             let decision = decide_acquire(
                 current.as_ref(),
@@ -265,6 +407,7 @@ impl WaitOwnerRegistry {
                         generation,
                         started_at_ms,
                         None,
+                        kind,
                     ))
                 }
                 WaitAcquireDecision::RefuseActive {
@@ -369,6 +512,7 @@ impl WaitOwnerRegistry {
                     new_generation,
                     started_at_ms,
                     Some(old_wait_id),
+                    kind,
                 );
                 txn.completed = true;
                 Ok(lease)
@@ -401,6 +545,7 @@ impl WaitOwnerRegistry {
         Ok(held)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn install_locked(
         self: &Arc<Self>,
         inner: &mut Inner,
@@ -409,6 +554,7 @@ impl WaitOwnerRegistry {
         generation: u64,
         started_at_ms: i64,
         replaced_wait_id: Option<String>,
+        kind: WaitOwnerKind,
     ) -> WaitLease {
         let cleanup_acked = Arc::new(AtomicBool::new(false));
         let cleanup_notify = Arc::new(Notify::new());
@@ -423,6 +569,7 @@ impl WaitOwnerRegistry {
                     started_at_ms,
                     replacing: false,
                 },
+                kind,
                 cancel: cancel.clone(),
                 cleanup_acked: Arc::clone(&cleanup_acked),
                 cleanup_notify: Arc::clone(&cleanup_notify),

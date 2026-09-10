@@ -5,6 +5,7 @@ pub mod safe_read;
 pub mod wait_channels;
 pub mod wait_dm;
 pub mod wait_follow;
+pub mod wait_inbox;
 pub mod wait_registry;
 
 pub use safe_read::{
@@ -47,6 +48,17 @@ pub use wait_follow::{
     is_mattermost_post_id, WaitFollowEvent, WaitFollowEventKind, WaitFollowFailureReason,
     WaitFollowMode, WaitFollowResult, WaitFollowResultKind, WaitFollowSchema, WaitFollowV1Params,
     WAIT_FOLLOW_V1_EVENT_METHOD, WAIT_FOLLOW_V1_EVENT_SCHEMA, WAIT_FOLLOW_V1_METHOD,
+};
+
+pub use wait_inbox::{
+    cursor_uncertain, inbox_capacity, peer_user_id_from_dm_name, refuse_inbox_after,
+    DirectCatalogEntry, InboxCursorV1, WaitInboxFailureReason, WaitInboxFollowEvent,
+    WaitInboxFollowEventKind, WaitInboxFollowResult, WaitInboxFollowResultKind,
+    WaitInboxFollowSchema, WaitInboxV1Params, WaitInboxV1Result, DM_CLASS_CHANNEL,
+    DM_CLASS_OWNERSHIP_KEY, DM_CLASS_TEAM, INBOX_CURSOR_MAX_BYTES, INBOX_CURSOR_PREFIX,
+    INBOX_MAX_BACKFILL, INBOX_MAX_DMS, INBOX_MAX_WATERMARK_IDS, INBOX_PAGE_SIZE,
+    POST_ID_NOT_INBOX_CURSOR, WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_EVENT_SCHEMA,
+    WAIT_INBOX_FOLLOW_V1_METHOD, WAIT_INBOX_HELP, WAIT_INBOX_V1_METHOD,
 };
 
 pub use wait_registry::{
@@ -563,6 +575,9 @@ pub struct InboundEventPayload {
     /// existed; normalized to a non-empty value on the way in.
     #[serde(default)]
     pub root_id: String,
+    /// Provider channel type (`D`, `O`, `P`, `G`). Empty when unknown.
+    #[serde(default)]
+    pub channel_type: String,
     pub sender_id: String,
     pub sender_username: String,
     pub message: String,
@@ -3657,6 +3672,65 @@ impl MattermostClient {
         Ok(channels)
     }
 
+    /// Complete authenticated type-`D` catalog for inbox wait. Paginates
+    /// to an empty page. Group DMs are excluded. Exceeding
+    /// [`INBOX_MAX_DMS`] fails closed rather than truncating. An
+    /// exactly-full last page is not completion — the next page is
+    /// fetched.
+    pub async fn list_direct_channels(&self) -> Result<Vec<DirectCatalogEntry>, CoreError> {
+        let my_id = self.whoami().await?.id;
+        #[derive(Deserialize)]
+        struct RawChannel {
+            id: String,
+            name: String,
+            #[serde(rename = "type")]
+            channel_type: String,
+            #[serde(default)]
+            last_post_at: i64,
+        }
+
+        let mut catalog = Vec::new();
+        let mut page = 0usize;
+        loop {
+            let raw: Vec<RawChannel> = self
+                .request(
+                    "GET",
+                    &format!("/users/{my_id}/channels?page={page}&per_page={INBOX_PAGE_SIZE}"),
+                    None::<Value>,
+                )
+                .await?;
+            let page_len = raw.len();
+            for channel in raw {
+                if channel.channel_type != "D" {
+                    continue;
+                }
+                catalog.push(DirectCatalogEntry {
+                    id: channel.id,
+                    name: channel.name,
+                    last_post_at: channel.last_post_at,
+                });
+                if catalog.len() > INBOX_MAX_DMS {
+                    return Err(inbox_capacity(format!(
+                        "inbox catalog exceeds {INBOX_MAX_DMS} direct channels"
+                    )));
+                }
+            }
+            if page_len < INBOX_PAGE_SIZE {
+                break;
+            }
+            page += 1;
+        }
+        Ok(catalog)
+    }
+
+    /// Fail-closed username lookup for inbox results. Missing names are
+    /// not substituted with a user id.
+    pub async fn required_username(&self, user_id: &str) -> Result<String, CoreError> {
+        self.fetch_username(user_id)
+            .await
+            .ok_or_else(|| cursor_uncertain("inbox peer username lookup failed"))
+    }
+
     /// Create a public channel. The channel lands on the profile's
     /// primary team unless `team` is `Some(<slug>)`, in which case
     /// the team slug is resolved through the bot's
@@ -3791,6 +3865,114 @@ impl MattermostClient {
             .await;
         Self::sort_chronologically(&mut posts);
         Ok(posts)
+    }
+
+    /// Authenticated type-`D` lookup for an unknown channel id.
+    /// Group/team channels fail closed.
+    pub async fn get_direct_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<DirectCatalogEntry, CoreError> {
+        #[derive(Deserialize)]
+        struct RawChannel {
+            id: String,
+            name: String,
+            #[serde(rename = "type")]
+            channel_type: String,
+            #[serde(default)]
+            last_post_at: i64,
+        }
+        let raw: RawChannel = self
+            .request("GET", &format!("/channels/{channel_id}"), None::<Value>)
+            .await?;
+        if raw.channel_type != "D" {
+            return Err(cursor_uncertain(
+                "inbox new-DM lookup is not a direct channel",
+            ));
+        }
+        Ok(DirectCatalogEntry {
+            id: raw.id,
+            name: raw.name,
+            last_post_at: raw.last_post_at,
+        })
+    }
+
+    /// Paginated inbox history counted against a global remaining raw-post
+    /// budget *before* hydration/filter. A full last page requires an
+    /// extra empty page as completeness proof. Exceeding `remaining`
+    /// fails `capacity`.
+    pub async fn inbox_history_since(
+        &self,
+        channel_id: &str,
+        since_millis: i64,
+        remaining: usize,
+    ) -> Result<(Vec<Message>, usize), CoreError> {
+        if remaining == 0 {
+            let extra: PostsEnvelope = self
+                .request(
+                    "GET",
+                    &format!(
+                        "/channels/{channel_id}/posts?since={since_millis}&page=0&per_page={INBOX_PAGE_SIZE}"
+                    ),
+                    None::<Value>,
+                )
+                .await?;
+            if extra.posts.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            return Err(inbox_capacity(format!(
+                "inbox backfill exceeds {INBOX_MAX_BACKFILL} retained candidates"
+            )));
+        }
+        let mut page = 0usize;
+        let mut messages = Vec::new();
+        let mut consumed = 0usize;
+        loop {
+            let response: PostsEnvelope = self
+                .request(
+                    "GET",
+                    &format!(
+                        "/channels/{channel_id}/posts?since={since_millis}&page={page}&per_page={INBOX_PAGE_SIZE}"
+                    ),
+                    None::<Value>,
+                )
+                .await?;
+            let raw = response.posts.into_values().collect::<Vec<_>>();
+            let page_len = raw.len();
+            if consumed.saturating_add(page_len) > remaining {
+                return Err(inbox_capacity(format!(
+                    "inbox backfill exceeds {INBOX_MAX_BACKFILL} retained candidates"
+                )));
+            }
+            consumed += page_len;
+            let mut page_messages = self.hydrate_posts(raw).await;
+            Self::sort_chronologically(&mut page_messages);
+            messages.extend(page_messages);
+            if page_len < INBOX_PAGE_SIZE {
+                break;
+            }
+            if consumed == remaining {
+                let extra: PostsEnvelope = self
+                    .request(
+                        "GET",
+                        &format!(
+                            "/channels/{channel_id}/posts?since={since_millis}&page={}&per_page={INBOX_PAGE_SIZE}",
+                            page + 1
+                        ),
+                        None::<Value>,
+                    )
+                    .await?;
+                if !extra.posts.is_empty() {
+                    return Err(inbox_capacity(format!(
+                        "inbox backfill exceeds {INBOX_MAX_BACKFILL} retained candidates"
+                    )));
+                }
+                break;
+            }
+            page += 1;
+        }
+        Self::sort_chronologically(&mut messages);
+        Ok((messages, consumed))
     }
 
     /// PER-023 primitive 3: read with second-resolution time window.
@@ -5430,6 +5612,10 @@ pub struct MattermostWs {
     bot_username: String,
     my_user_id: String,
     seen_posts: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Count of armed inbox waits. Direct-channel posts are admitted to
+    /// the event bus while this is non-zero even when the DM is not in
+    /// `monitored_channels`.
+    inbox_armed: Arc<AtomicU64>,
 }
 
 impl MattermostWs {
@@ -5459,7 +5645,12 @@ impl MattermostWs {
             bot_username: profile.bot_username.clone(),
             my_user_id,
             seen_posts: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            inbox_armed: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn set_inbox_gate(&mut self, gate: Arc<AtomicU64>) {
+        self.inbox_armed = gate;
     }
 
     pub fn ws_state(&self) -> Arc<WsState> {
@@ -5785,8 +5976,14 @@ impl MattermostWs {
             .monitored_channels
             .iter()
             .any(|m| m.eq_ignore_ascii_case(&channel_name));
+        let channel_type = data
+            .get("channel_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let inbox_admits_direct =
+            self.inbox_armed.load(Ordering::SeqCst) > 0 && channel_type == "D";
 
-        if is_monitored {
+        if is_monitored || inbox_admits_direct {
             let event = DaemonEvent {
                 seq: 0,
                 kind: DaemonEventKind::InboundMessage,
@@ -5795,6 +5992,7 @@ impl MattermostWs {
                     provider: Provider::Mattermost,
                     channel_id,
                     channel_name,
+                    channel_type: channel_type.to_string(),
                     post_id,
                     root_id,
                     sender_id,
@@ -5815,6 +6013,7 @@ impl MattermostWs {
                     provider: Provider::Mattermost,
                     channel_id,
                     channel_name,
+                    channel_type: channel_type.to_string(),
                     post_id,
                     root_id,
                     sender_id,
@@ -5867,6 +6066,7 @@ impl MattermostWs {
                         provider: Provider::Mattermost,
                         channel_id: channel_id.clone(),
                         channel_name: channel_name.clone(),
+                        channel_type: String::new(),
                         post_id: msg.id,
                         // Already normalized by the read path.
                         root_id: msg.root_id,
@@ -6631,6 +6831,7 @@ monitored_channels = ["per-003", "per-004"]
                 provider: Provider::Mattermost,
                 channel_id: "ch123".to_string(),
                 channel_name: "per-004".to_string(),
+                channel_type: String::new(),
                 post_id: "post456".to_string(),
                 root_id: "post456".to_string(),
                 sender_id: "user789".to_string(),
@@ -6735,6 +6936,7 @@ monitored_channels = ["per-003", "per-004"]
                 provider: Provider::Mattermost,
                 channel_id: "ch1".to_string(),
                 channel_name: "per-004".to_string(),
+                channel_type: String::new(),
                 post_id: "p1".to_string(),
                 root_id: "p1".to_string(),
                 sender_id: "u1".to_string(),
@@ -6761,6 +6963,7 @@ monitored_channels = ["per-003", "per-004"]
                 provider: Provider::Mattermost,
                 channel_id: "ch2".to_string(),
                 channel_name: "bravo-team".to_string(),
+                channel_type: String::new(),
                 post_id: "p2".to_string(),
                 root_id: "root-p0".to_string(),
                 sender_id: "u2".to_string(),

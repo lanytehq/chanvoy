@@ -308,6 +308,7 @@ dependencies = [
  "uuid",
  "waitprims-async",
  "waitprims-core",
+ "wiremock",
 ]
 
 [[package]]
