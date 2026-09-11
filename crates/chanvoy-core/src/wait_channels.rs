@@ -77,6 +77,9 @@ pub struct WaitChannelsParams {
     pub contains: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
 }
 
 /// Successful first-match result. Clean deadman is a JSON-RPC error, not
@@ -229,6 +232,7 @@ mod tests {
             timeout_secs: 30,
             contains: None,
             pattern: None,
+            mention: false,
         }
     }
 
@@ -370,6 +374,7 @@ mod tests {
             timeout_secs: 1200,
             contains: None,
             pattern: None,
+            mention: false,
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["timeout_secs"], 1200);

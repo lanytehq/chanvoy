@@ -1707,6 +1707,9 @@ pub struct WaitChannelV3Params {
     pub after: Option<String>,
     #[serde(default)]
     pub replace_wait_id: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5975,7 +5978,13 @@ impl MattermostWs {
 
         let channel_name = self.resolve_channel_name(&channel_id).await;
         let sender_username = self.resolve_username(&sender_id).await;
-        let mentioned = message_mentions_username(&message, &self.bot_username);
+        let mention_ids = parse_posted_mention_user_ids(data);
+        let mentioned = mentions_bot(
+            &self.my_user_id,
+            &self.bot_username,
+            mention_ids.as_deref(),
+            &message,
+        );
 
         let is_monitored = self
             .monitored_channels
@@ -6062,7 +6071,8 @@ impl MattermostWs {
                 .collect();
 
             for msg in new_messages {
-                let mentioned = message_mentions_username(&msg.message, &self.bot_username);
+                let mentioned =
+                    mentions_bot(&self.my_user_id, &self.bot_username, None, &msg.message);
                 let event = DaemonEvent {
                     seq: 0,
                     kind: DaemonEventKind::InboundMessage,
@@ -6283,6 +6293,40 @@ fn message_mentions_username(message: &str, username: &str) -> bool {
         search_start = boundary_index;
     }
     false
+}
+
+/// Canonical mention decision for wait `--mention`.
+///
+/// Trusted current-bot mention metadata (user ids) wins when present.
+/// Otherwise an exact `@username` token match; `@bot-suffix` is not a match.
+pub fn mentions_bot(
+    bot_user_id: &str,
+    bot_username: &str,
+    mentioned_user_ids: Option<&[String]>,
+    body: &str,
+) -> bool {
+    if let Some(ids) = mentioned_user_ids {
+        return ids.iter().any(|id| id == bot_user_id);
+    }
+    message_mentions_username(body, bot_username)
+}
+
+fn parse_posted_mention_user_ids(data: &Value) -> Option<Vec<String>> {
+    let raw = data.get("mentions")?;
+    if raw.is_null() {
+        return None;
+    }
+    if let Some(arr) = raw.as_array() {
+        return Some(
+            arr.iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+        );
+    }
+    if let Some(text) = raw.as_str() {
+        return serde_json::from_str::<Vec<String>>(text).ok();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -6806,6 +6850,32 @@ credential_mode = "env_name"
             "@agent-bravo-devlead-extra please review",
             "agent-bravo-devlead"
         ));
+    }
+
+    #[test]
+    fn mentions_bot_trusts_metadata_then_exact_token() {
+        let bot_id = "userid00000000000000000000";
+        let bot = "agent-bravo-devlead";
+        assert!(mentions_bot(
+            bot_id,
+            bot,
+            Some(&[bot_id.to_string()]),
+            "@Agent-Bravo-Devlead case variant"
+        ));
+        assert!(!mentions_bot(
+            bot_id,
+            bot,
+            Some(&["otherid0000000000000000001".into()]),
+            "@agent-bravo-devlead still in body"
+        ));
+        assert!(mentions_bot(bot_id, bot, None, "@agent-bravo-devlead hi"));
+        assert!(!mentions_bot(
+            bot_id,
+            bot,
+            None,
+            "@agent-bravo-devlead-extra hi"
+        ));
+        assert!(!mentions_bot(bot_id, bot, None, "@Agent-Bravo-Devlead hi"));
     }
 
     #[test]

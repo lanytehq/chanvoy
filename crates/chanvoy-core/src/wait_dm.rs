@@ -28,6 +28,9 @@ pub struct WaitDmV1Params {
     pub after: Option<String>,
     #[serde(default)]
     pub replace_wait_id: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

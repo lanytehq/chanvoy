@@ -613,6 +613,7 @@ async fn handle_client(
                             team: params.team.as_deref(),
                             contains: params.contains.as_deref(),
                             pattern: params.pattern.as_deref(),
+                            mention: params.mention,
                             after: params.after.as_deref(),
                             replace_wait_id: params.replace_wait_id.as_deref(),
                             emit_wait_ids: true,
@@ -732,6 +733,7 @@ async fn handle_client(
                             timeout_secs: params.timeout_secs,
                             contains: params.contains.as_deref(),
                             pattern: params.pattern.as_deref(),
+                            mention: params.mention,
                             after: params.after.as_deref(),
                             replace_wait_id: params.replace_wait_id.as_deref(),
                             deadline,
@@ -850,6 +852,7 @@ async fn handle_client(
                             timeout_secs: params.timeout_secs,
                             contains: params.contains.as_deref(),
                             pattern: params.pattern.as_deref(),
+                            mention: params.mention,
                             after: params.after.as_deref(),
                             replace_wait_id: params.replace_wait_id.as_deref(),
                             deadline,
@@ -1537,6 +1540,7 @@ async fn dispatch_request(
                     team: params.team.as_deref(),
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     emit_wait_ids: false,
@@ -1556,6 +1560,7 @@ async fn dispatch_request(
                         team: params.team.as_deref(),
                         contains: params.contains.as_deref(),
                         pattern: params.pattern.as_deref(),
+                        mention: false,
                         after: params.after.as_deref(),
                         replace_wait_id: None,
                         emit_wait_ids: false,
@@ -1576,6 +1581,7 @@ async fn dispatch_request(
                         team: params.team.as_deref(),
                         contains: params.contains.as_deref(),
                         pattern: params.pattern.as_deref(),
+                        mention: params.mention,
                         after: params.after.as_deref(),
                         replace_wait_id: params.replace_wait_id.as_deref(),
                         emit_wait_ids: true,
@@ -1600,6 +1606,7 @@ async fn dispatch_request(
                             timeout_secs: params.timeout_secs,
                             contains: params.contains.as_deref(),
                             pattern: params.pattern.as_deref(),
+                            mention: params.mention,
                             after: params.after.as_deref(),
                             replace_wait_id: params.replace_wait_id.as_deref(),
                             deadline,
@@ -1625,6 +1632,7 @@ async fn dispatch_request(
                             timeout_secs: params.timeout_secs,
                             contains: params.contains.as_deref(),
                             pattern: params.pattern.as_deref(),
+                            mention: params.mention,
                             after: params.after.as_deref(),
                             replace_wait_id: params.replace_wait_id.as_deref(),
                             deadline,
@@ -4049,8 +4057,9 @@ mod tests {
             }
         }
 
-        let pred = wait::WaitPredicate::compile("bot-bravo", "ch-ops-general", None, None)
-            .expect("compile");
+        let pred =
+            wait::WaitPredicate::compile("bot-bravo", "ch-ops-general", None, None, false, "bot")
+                .expect("compile");
 
         let ops_event = payload("ch-ops-general", "general", "p-ops-1");
         assert!(
