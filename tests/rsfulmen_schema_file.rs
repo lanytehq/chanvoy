@@ -1,8 +1,9 @@
 //! File-backed wait-params validation via rsfulmen 0.2.0.
 //!
 //! The schema file is an on-disk copy of the Chanvoy daemon RPC
-//! `wait_channel_v3` params schema. Chanvoy does not git-pin Crucible;
-//! this path is the catalog the crate does not embed.
+//! `wait_channel_v3` params schema, including the `mention` property.
+//! Chanvoy does not git-pin Crucible; this path is the catalog the crate
+//! does not embed.
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +32,15 @@ fn wait_channel_v3_params_schema_accepts_conforming_instance() {
     assert!(
         issues.is_empty(),
         "expected conforming wait params to pass, got {issues:?}"
+    );
+}
+
+#[test]
+fn wait_channel_v3_params_schema_accepts_mention_true() {
+    let issues = validate_fixture("conforming-mention.json");
+    assert!(
+        issues.is_empty(),
+        "expected mention:true wait params to pass, got {issues:?}"
     );
 }
 

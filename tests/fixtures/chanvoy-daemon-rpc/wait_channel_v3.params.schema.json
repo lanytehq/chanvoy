@@ -56,6 +56,10 @@
       "$ref": "#/$defs/nullable-string",
       "description": "Optional Rust-regex body pattern. Combines with contains using logical AND. Empty is refused. Compiled size is limited at runtime."
     },
+    "mention": {
+      "type": "boolean",
+      "description": "When true, only posts that mention this bot complete the wait. Logical AND with contains and pattern. Default false/absent. Non-matches are not tips."
+    },
     "after": {
       "$ref": "#/$defs/nullable-string",
       "description": "Exclusive baseline post id. Bound to the resolved channel before registry acquisition. Null or absent means tip-at-arm with seam protection after the waiter is admitted."
