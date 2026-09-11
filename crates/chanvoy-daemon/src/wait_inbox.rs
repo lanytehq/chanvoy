@@ -389,6 +389,11 @@ async fn prove_inbox_cursor(
         }
         return Ok(());
     }
+    if cursor.observed_ids.is_empty() {
+        return Err(cursor_uncertain(
+            "inbox cursor positive watermark with empty observed-id set is unprovable",
+        ));
+    }
     let catalog_max = catalog
         .iter()
         .map(|entry| entry.last_post_at)
@@ -1623,12 +1628,84 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("watermark")),
+            matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("empty") || msg.contains("watermark")),
             "{err}"
         );
         assert!(
             !matches!(err, CoreError::WaitTimeout(_)),
             "unprovable positive empty watermark must not be a clean deadman: {err}"
+        );
+        state
+            .wait_owners
+            .acquire_inbox(None, Duration::from_secs(2))
+            .await
+            .expect("inbox slot must still be free");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn positive_empty_watermark_with_witness_is_uncertain() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/users/{BOT_ID}/channels")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": DM_A,
+                    "name": dm_a(),
+                    "type": "D",
+                    "last_post_at": 1_780_000_000_300i64
+                }])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_A: {
+                        "id": POST_A,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "wake",
+                        "create_at": 1_780_000_000_100i64,
+                        "root_id": ""
+                    },
+                    POST_C: {
+                        "id": POST_C,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "later",
+                        "create_at": 1_780_000_000_300i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let mut cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID);
+        cursor.watermark = 1_780_000_000_300;
+        let raw = cursor.encode().unwrap();
+        let err = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 2,
+                contains: Some("wake"),
+                pattern: None,
+                after: Some(&raw),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("empty")),
+            "{err}"
+        );
+        assert!(
+            !matches!(err, CoreError::WaitTimeout(_)),
+            "positive empty watermark with a witness must not be a clean deadman: {err}"
         );
         state
             .wait_owners
