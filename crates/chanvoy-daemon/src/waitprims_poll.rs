@@ -763,6 +763,7 @@ mod tests {
             message: "own post".into(),
             create_at: 1,
             root_id: "p1".into(),
+            mention_user_ids: None,
         };
         let event = event_from_message(
             &message,
@@ -786,6 +787,7 @@ mod tests {
             message: body.into(),
             create_at: 1,
             root_id: id.into(),
+            mention_user_ids: None,
         }
     }
 

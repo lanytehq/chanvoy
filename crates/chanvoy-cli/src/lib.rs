@@ -500,6 +500,13 @@ struct WaitArgs {
     /// Rust regex over message body. Invalid/oversize patterns refuse before wait.
     #[arg(long, value_name = "REGEX")]
     pattern: Option<String>,
+    /// only wake when this bot is mentioned. ANDs with --contains / --pattern.
+    #[arg(
+        long,
+        help = "only wake when this bot is mentioned.",
+        long_help = "Only wake when this bot is mentioned. Not any @, not a username substring (@bot-suffix is a non-match). Logical AND with --contains and --pattern when those are set. Non-matching posts are not tips. --follow --mention live JSONL is mention-only. See docs/guides/wait-follow.md."
+    )]
+    mention: bool,
     /// Exclusive baseline post id: only posts after this id can wake the wait.
     #[arg(long, value_name = "POST_ID")]
     after: Option<String>,
@@ -1755,6 +1762,7 @@ async fn handle_wait(profile: &str, json: bool, args: WaitArgs) -> Result<(), Cl
             team: args.team.clone(),
             contains: args.contains.clone(),
             pattern: args.pattern.clone(),
+            mention: args.mention,
             after: args.after.clone(),
             replace_wait_id: args.replace_wait.clone(),
         })
@@ -1880,6 +1888,7 @@ async fn handle_wait_inbox(profile: &str, json: bool, args: WaitArgs) -> Result<
             timeout_secs,
             contains: args.contains.clone(),
             pattern: args.pattern.clone(),
+            mention: args.mention,
             after: args.after.clone(),
             replace_wait_id: args.replace_wait.clone(),
         })
@@ -1977,6 +1986,7 @@ async fn handle_wait_inbox_follow(
                 timeout_secs,
                 contains: args.contains.clone(),
                 pattern: args.pattern.clone(),
+                mention: args.mention,
                 after: args.after.clone(),
                 replace_wait_id: args.replace_wait.clone(),
             },
@@ -2147,6 +2157,7 @@ async fn handle_wait_dm(profile: &str, json: bool, args: WaitArgs) -> Result<(),
             timeout_secs,
             contains: args.contains.clone(),
             pattern: args.pattern.clone(),
+            mention: args.mention,
             after: args.after.clone(),
             replace_wait_id: args.replace_wait.clone(),
         })
@@ -2244,6 +2255,7 @@ async fn handle_wait_dm_follow(
                 timeout_secs,
                 contains: args.contains.clone(),
                 pattern: args.pattern.clone(),
+                mention: args.mention,
                 after: args.after.clone(),
                 replace_wait_id: args.replace_wait.clone(),
             },
@@ -2507,6 +2519,7 @@ async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result
                 team: args.team.clone(),
                 contains: args.contains.clone(),
                 pattern: args.pattern.clone(),
+                mention: args.mention,
                 after: args.after.clone(),
                 replace_wait_id: args.replace_wait.clone(),
             },
@@ -2642,6 +2655,7 @@ fn build_fan_in_params(args: &WaitArgs, timeout_secs: u64) -> Result<WaitChannel
         timeout_secs,
         contains: args.contains.clone(),
         pattern: args.pattern.clone(),
+        mention: args.mention,
     };
     validate_wait_channels_params(&params).map_err(|e| e.to_string())?;
     Ok(params)
@@ -6074,6 +6088,14 @@ mod tests {
             help.contains(WAIT_INBOX_HELP),
             "wait help must document --inbox: {help}"
         );
+        assert!(
+            help.contains("this bot is mentioned"),
+            "wait help must document --mention: {help}"
+        );
+        assert!(
+            help.contains("docs/guides/wait-follow.md"),
+            "wait help must point at wait-follow.md: {help}"
+        );
     }
 
     #[test]
@@ -6119,6 +6141,7 @@ mod tests {
             timeout: timeout.clone(),
             contains: None,
             pattern: None,
+            mention: false,
             after: None,
             team: None,
             replace_wait: None,
@@ -6137,6 +6160,7 @@ mod tests {
             timeout: timeout.clone(),
             contains: None,
             pattern: None,
+            mention: false,
             after: None,
             team: None,
             replace_wait: None,
@@ -6155,6 +6179,7 @@ mod tests {
             timeout: timeout.clone(),
             contains: None,
             pattern: None,
+            mention: false,
             after: None,
             team: None,
             replace_wait: None,
@@ -6177,6 +6202,7 @@ mod tests {
             timeout: timeout.clone(),
             contains: None,
             pattern: None,
+            mention: false,
             after: None,
             team: None,
             replace_wait: None,
@@ -6195,6 +6221,7 @@ mod tests {
             timeout: timeout.clone(),
             contains: None,
             pattern: None,
+            mention: false,
             after: Some("post".into()),
             team: None,
             replace_wait: None,
@@ -6213,6 +6240,7 @@ mod tests {
             timeout: timeout.clone(),
             contains: None,
             pattern: None,
+            mention: false,
             after: None,
             team: None,
             replace_wait: None,
@@ -6231,6 +6259,7 @@ mod tests {
             timeout,
             contains: Some("ASSENT".into()),
             pattern: None,
+            mention: false,
             after: None,
             team: None,
             replace_wait: None,
@@ -7322,6 +7351,7 @@ mod tests {
             message: "sent by an older daemon".to_string(),
             create_at: 1_700_000_000_000,
             root_id: String::new(),
+            mention_user_ids: None,
         };
 
         let rendered = format_message(&unknown_root);

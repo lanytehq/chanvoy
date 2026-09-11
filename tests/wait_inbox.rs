@@ -300,6 +300,7 @@ fn sample_live(wait_id: &str, post_id: &str, cursor: &str) -> WaitInboxFollowEve
             message: "hello".into(),
             create_at: 1_780_000_000_100,
             root_id: post_id.into(),
+            mention_user_ids: None,
         },
         false,
     )

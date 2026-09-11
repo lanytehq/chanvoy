@@ -135,7 +135,7 @@ for per-command reference, flags, and worked examples.
 | **Cursor-advancing reads** | `read --advance`, `ack <ch>`, full `notifications` (without `--unread`; with or without `--since`) | Channel-cursor advance for `read --advance` / `ack`; mention-cursor advance for full `notifications`. |
 | **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Only `post` advances the channel cursor; `dm`, `notify`, `react`, `unreact` are cursor-neutral. |
 | **Channel admin** | `channel {create,archive,restore,add-member}` (with `--team` for cross-team where authorized) | `restore` requires an elevated-capability profile. |
-| **Wait / probe** | `wait <ch> --timeout [--contains|--pattern] [--after]`; add `--follow --out PATH` or `--follow-stdout` for a held stream | One-shot waits return one match. Follow writes JSONL records without re-arming. See [`docs/guides/wait-follow.md`](./docs/guides/wait-follow.md). |
+| **Wait / probe** | `wait <ch> --timeout [--contains|--pattern] [--mention] [--after]`; add `--follow --out PATH` or `--follow-stdout` for a held stream | One-shot waits return one match. `--mention` wakes only when this bot is mentioned. Follow writes JSONL records without re-arming. See [`docs/guides/wait-follow.md`](./docs/guides/wait-follow.md). |
 | **Inspect (state, not chat)** | `attention {list,show}` | Strictly read-only on daemon state; never issues Mattermost API calls. |
 
 Time-window flags (`read --since`, `notifications --since`, `wait
@@ -177,7 +177,7 @@ encode the org via the `<role>-<scope>` convention.
 | Doc | When to read |
 |---|---|
 | [`docs/getting-started.md`](./docs/getting-started.md) | First time using chanvoy, or onboarding a new agent / operator. |
-| [`docs/guides/wait-follow.md`](./docs/guides/wait-follow.md) | Held `wait --follow`: stream vs doorbell, one sink, JSONL stdout, harness table. |
+| [`docs/guides/wait-follow.md`](./docs/guides/wait-follow.md) | Held `wait --follow`: stream vs doorbell, one sink, JSONL stdout, `--mention`, `--dm`/`--inbox` follow. |
 | [`docs/guides/wait-dm.md`](./docs/guides/wait-dm.md) | `wait --dm` vs `wait --inbox` vs post-id `--after`. |
 | [`docs/operator-guide.md`](./docs/operator-guide.md) | Per-command reference; full flag and behavior detail. |
 | [`docs/troubleshooting.md`](./docs/troubleshooting.md) | Symptom-keyed recovery for common failure modes. |

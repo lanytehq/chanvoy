@@ -48,8 +48,10 @@ pub(crate) const REST_IDLE: Duration = Duration::from_secs(2);
 pub struct WaitPredicate {
     my_user_id: String,
     channel_id: String,
+    bot_username: String,
     contains: Option<String>,
     pattern: Option<regex::Regex>,
+    mention: bool,
 }
 
 impl WaitPredicate {
@@ -61,6 +63,8 @@ impl WaitPredicate {
         channel_id: &str,
         contains: Option<&str>,
         pattern: Option<&str>,
+        mention: bool,
+        bot_username: &str,
     ) -> Result<Self, CoreError> {
         let contains = match contains {
             None => None,
@@ -106,8 +110,10 @@ impl WaitPredicate {
         Ok(Self {
             my_user_id: my_user_id.to_string(),
             channel_id: channel_id.to_string(),
+            bot_username: bot_username.to_string(),
             contains,
             pattern,
+            mention,
         })
     }
 
@@ -130,13 +136,23 @@ impl WaitPredicate {
     }
 
     pub fn matches_message(&self, message: &Message) -> bool {
-        message.user_id != self.my_user_id && self.body_matches(&message.message)
+        message.user_id != self.my_user_id
+            && self.body_matches(&message.message)
+            && self.mention_matches(&message.message)
     }
 
     pub fn matches_inbound(&self, payload: &InboundEventPayload) -> bool {
         payload.channel_id == self.channel_id
             && payload.sender_id != self.my_user_id
             && self.body_matches(&payload.message)
+            && self.mention_matches(&payload.message)
+    }
+
+    fn mention_matches(&self, body: &str) -> bool {
+        if !self.mention {
+            return true;
+        }
+        chanvoy_core::mentions_bot(&self.bot_username, body)
     }
 }
 
@@ -148,6 +164,7 @@ pub fn inbound_to_message(payload: &InboundEventPayload) -> Message {
         message: payload.message.clone(),
         create_at: payload.create_at,
         root_id: payload.root_id.clone(),
+        mention_user_ids: payload.mention_user_ids.clone(),
     }
 }
 
@@ -202,6 +219,7 @@ pub struct WaitRequest<'a> {
     pub team: Option<&'a str>,
     pub contains: Option<&'a str>,
     pub pattern: Option<&'a str>,
+    pub mention: bool,
     pub after: Option<&'a str>,
     pub replace_wait_id: Option<&'a str>,
     pub emit_wait_ids: bool,
@@ -230,6 +248,7 @@ pub async fn wait_with_params(
         team,
         contains,
         pattern,
+        mention,
         after,
         replace_wait_id,
         emit_wait_ids,
@@ -240,7 +259,14 @@ pub async fn wait_with_params(
 
     // Pure filter compile only (no provider). Ownership acquire is after
     // resolve + explicit-after bind and before subscribe/backfill.
-    WaitPredicate::compile("pending", "pending", contains, pattern)?;
+    WaitPredicate::compile(
+        "pending",
+        "pending",
+        contains,
+        pattern,
+        mention,
+        &state.profile.bot_username,
+    )?;
 
     let resolved = provider_retry(state, channel, deadline, || async {
         state.client.resolve_channel(channel, team).await
@@ -280,10 +306,19 @@ pub async fn wait_with_params(
 
     let inner = async {
         if is_monitored {
-            wait_push_path(state, channel, team, contains, pattern, after, deadline).await
+            wait_push_path(
+                state, channel, team, contains, pattern, mention, after, deadline,
+            )
+            .await
         } else {
-            let predicate =
-                WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
+            let predicate = WaitPredicate::compile(
+                &state.my_user_id,
+                &resolved.channel_id,
+                contains,
+                pattern,
+                mention,
+                &state.profile.bot_username,
+            )?;
             wait_rest_path(state, channel, &predicate, after, deadline).await
         }
     };
@@ -324,6 +359,7 @@ pub async fn wait_with_params_v3(
         team,
         contains,
         pattern,
+        mention,
         after,
         replace_wait_id,
         emit_wait_ids,
@@ -332,7 +368,14 @@ pub async fn wait_with_params_v3(
     validate_wait_channel_v3_strings(channel, team, contains, pattern, after)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
-    WaitPredicate::compile("pending", "pending", contains, pattern)?;
+    WaitPredicate::compile(
+        "pending",
+        "pending",
+        contains,
+        pattern,
+        mention,
+        &state.profile.bot_username,
+    )?;
     let monitored = channel_is_monitored(state, channel);
     if monitored {
         refuse_current_ws_failure(state, channel).await?;
@@ -383,8 +426,14 @@ pub async fn wait_with_params_v3(
     state.wait_owners.note_arm();
     let (session, guard) = lease.into_guard();
 
-    let predicate =
-        WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
+    let predicate = WaitPredicate::compile(
+        &state.my_user_id,
+        &resolved.channel_id,
+        contains,
+        pattern,
+        mention,
+        &state.profile.bot_username,
+    )?;
 
     let result = crate::waitprims_hold::run_single_channel_first_match(
         state,
@@ -424,6 +473,7 @@ pub async fn wait_with_params_follow(
         team,
         contains,
         pattern,
+        mention,
         after,
         replace_wait_id,
         ..
@@ -432,7 +482,14 @@ pub async fn wait_with_params_follow(
     validate_wait_channel_v3_strings(channel, team, contains, pattern, after)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
-    WaitPredicate::compile("pending", "pending", contains, pattern)?;
+    WaitPredicate::compile(
+        "pending",
+        "pending",
+        contains,
+        pattern,
+        mention,
+        &state.profile.bot_username,
+    )?;
     let monitored = channel_is_monitored(state, channel);
     if monitored {
         refuse_current_ws_failure(state, channel).await?;
@@ -477,8 +534,14 @@ pub async fn wait_with_params_follow(
     };
     state.wait_owners.note_arm();
     let (session, guard) = lease.into_guard();
-    let predicate =
-        WaitPredicate::compile(&state.my_user_id, &resolved.channel_id, contains, pattern)?;
+    let predicate = WaitPredicate::compile(
+        &state.my_user_id,
+        &resolved.channel_id,
+        contains,
+        pattern,
+        mention,
+        &state.profile.bot_username,
+    )?;
 
     crate::waitprims_hold::run_single_channel_follow(
         state,
@@ -516,6 +579,7 @@ pub struct WaitDmRequest<'a> {
     pub timeout_secs: u64,
     pub contains: Option<&'a str>,
     pub pattern: Option<&'a str>,
+    pub mention: bool,
     pub after: Option<&'a str>,
     pub replace_wait_id: Option<&'a str>,
     /// Absolute deadline captured at daemon RPC entry.
@@ -532,7 +596,14 @@ async fn admit_direct_channel(
         return Err(not_a_waitable_peer());
     }
     validate_wait_channel_v3_strings(req.username, None, req.contains, req.pattern, req.after)?;
-    WaitPredicate::compile("pending", "pending", req.contains, req.pattern)?;
+    WaitPredicate::compile(
+        "pending",
+        "pending",
+        req.contains,
+        req.pattern,
+        req.mention,
+        &state.profile.bot_username,
+    )?;
     let opened = provider_retry(state, req.username, req.deadline, || async {
         state
             .client
@@ -574,8 +645,14 @@ pub async fn wait_with_params_dm(
         .await?;
     state.wait_owners.note_arm();
     let (session, guard) = lease.into_guard();
-    let predicate =
-        WaitPredicate::compile(&state.my_user_id, &channel_id, req.contains, req.pattern)?;
+    let predicate = WaitPredicate::compile(
+        &state.my_user_id,
+        &channel_id,
+        req.contains,
+        req.pattern,
+        req.mention,
+        &state.profile.bot_username,
+    )?;
     let result = crate::waitprims_hold::run_single_channel_first_match(
         state,
         crate::waitprims_hold::FirstMatchWait {
@@ -634,8 +711,14 @@ pub async fn wait_with_params_dm_follow(
         .await?;
     state.wait_owners.note_arm();
     let (session, guard) = lease.into_guard();
-    let predicate =
-        WaitPredicate::compile(&state.my_user_id, &channel_id, req.contains, req.pattern)?;
+    let predicate = WaitPredicate::compile(
+        &state.my_user_id,
+        &channel_id,
+        req.contains,
+        req.pattern,
+        req.mention,
+        &state.profile.bot_username,
+    )?;
     let result = crate::waitprims_hold::run_single_channel_follow(
         state,
         crate::waitprims_hold::FirstMatchWait {
@@ -661,12 +744,14 @@ pub async fn wait_with_params_dm_follow(
 
 /// Monitored path: **subscribe first**, then resolve/compile/anchor/backfill
 /// while draining the receiver (devrev D1 / AC-W3).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn wait_push_path(
     state: &AppState,
     channel: &str,
     team: Option<&str>,
     contains: Option<&str>,
     pattern: Option<&str>,
+    mention: bool,
     after: Option<&str>,
     deadline: Instant,
 ) -> Result<WaitResult, CoreError> {
@@ -694,7 +779,14 @@ pub(crate) async fn wait_push_path(
             }
         }
     };
-    let predicate = WaitPredicate::compile(&state.my_user_id, &channel_id, contains, pattern)?;
+    let predicate = WaitPredicate::compile(
+        &state.my_user_id,
+        &channel_id,
+        contains,
+        pattern,
+        mention,
+        &state.profile.bot_username,
+    )?;
     let pred_channel = predicate.channel_id().to_string();
 
     let (scan_after, _rest_baseline) = {
@@ -1775,7 +1867,12 @@ mod tests {
     }
 
     fn pred(contains: Option<&str>, pattern: Option<&str>) -> WaitPredicate {
-        WaitPredicate::compile("bot", "ch-1", contains, pattern).expect("compile")
+        WaitPredicate::compile("bot", "ch-1", contains, pattern, false, "bot").expect("compile")
+    }
+
+    fn pred_mention() -> WaitPredicate {
+        WaitPredicate::compile("bot", "ch-1", None, None, true, "agent-bravo-devlead")
+            .expect("compile")
     }
 
     fn msg(id: &str, user: &str, body: &str, create_at: i64) -> Message {
@@ -1786,6 +1883,7 @@ mod tests {
             message: body.into(),
             create_at,
             root_id: id.into(),
+            mention_user_ids: None,
         }
     }
 
@@ -1807,6 +1905,7 @@ mod tests {
                 create_at,
                 received_at: create_at,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         })
     }
@@ -1840,34 +1939,34 @@ mod tests {
 
     #[test]
     fn empty_contains_refused() {
-        let err = WaitPredicate::compile("bot", "ch", Some(""), None).unwrap_err();
+        let err = WaitPredicate::compile("bot", "ch", Some(""), None, false, "bot").unwrap_err();
         assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
     }
 
     #[test]
     fn pattern_over_256_refused() {
         let big = "a".repeat(FILTER_SOURCE_MAX_BYTES + 1);
-        let err = WaitPredicate::compile("bot", "ch", None, Some(&big)).unwrap_err();
+        let err = WaitPredicate::compile("bot", "ch", None, Some(&big), false, "bot").unwrap_err();
         assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
     }
 
     #[test]
     fn contains_over_256_refused() {
         let big = "a".repeat(FILTER_SOURCE_MAX_BYTES + 1);
-        let err = WaitPredicate::compile("bot", "ch", Some(&big), None).unwrap_err();
+        let err = WaitPredicate::compile("bot", "ch", Some(&big), None, false, "bot").unwrap_err();
         assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
     }
 
     #[test]
     fn invalid_regex_refused() {
-        let err = WaitPredicate::compile("bot", "ch", None, Some("(")).unwrap_err();
+        let err = WaitPredicate::compile("bot", "ch", None, Some("("), false, "bot").unwrap_err();
         assert!(matches!(err, CoreError::WaitFilterInvalid(_)));
     }
 
     #[test]
     fn motivating_case_insensitive_patterns_compile_under_size_cap() {
         for pat in ["(?i)assent", "(?i)ASSENT|RATIFY", "(?i)assent|ratify"] {
-            WaitPredicate::compile("bot", "ch", None, Some(pat)).expect(pat);
+            WaitPredicate::compile("bot", "ch", None, Some(pat), false, "bot").expect(pat);
         }
     }
 
@@ -1877,6 +1976,51 @@ mod tests {
         let msgs = vec![msg("b", "u", "X late", 200), msg("a", "u", "X early", 100)];
         let hit = first_match(&msgs, &p, &HashSet::new()).unwrap();
         assert_eq!(hit.id, "a");
+    }
+
+    #[test]
+    fn mention_filter_requires_exact_bot_token() {
+        let p = pred_mention();
+        assert!(p.matches_message(&msg("1", "u", "@agent-bravo-devlead please", 1)));
+        assert!(!p.matches_message(&msg("2", "u", "ACK without mention", 1)));
+        assert!(!p.matches_message(&msg("3", "u", "@agent-bravo-devlead-extra suffix", 1)));
+        assert!(!p.matches_message(&msg("4", "bot", "@agent-bravo-devlead self", 1)));
+        let anded = WaitPredicate::compile(
+            "bot",
+            "ch-1",
+            Some("please"),
+            None,
+            true,
+            "agent-bravo-devlead",
+        )
+        .unwrap();
+        assert!(anded.matches_message(&msg("5", "u", "@agent-bravo-devlead please", 1)));
+        assert!(!anded.matches_message(&msg("6", "u", "@agent-bravo-devlead no", 1)));
+    }
+
+    #[test]
+    fn mention_case_variant_matches_inbound_and_rest_from_body() {
+        let p = pred_mention();
+        let body = "@Agent-Bravo-Devlead please";
+        let rest = msg("r1", "u", body, 1);
+        let inbound = InboundEventPayload {
+            profile: "t".into(),
+            provider: Provider::Mattermost,
+            channel_id: "ch-1".into(),
+            channel_name: "general".into(),
+            channel_type: String::new(),
+            post_id: "r1".into(),
+            root_id: "r1".into(),
+            sender_id: "u".into(),
+            sender_username: "alice".into(),
+            message: body.into(),
+            create_at: 1,
+            received_at: 1,
+            mentioned: false,
+            mention_user_ids: None,
+        };
+        assert!(p.matches_message(&rest));
+        assert!(p.matches_inbound(&inbound));
     }
 
     #[test]
@@ -1903,6 +2047,7 @@ mod tests {
             create_at: 1,
             received_at: 1,
             mentioned: false,
+            mention_user_ids: None,
         };
         assert!(p.matches_inbound(&good));
         let mut other = good.clone();
@@ -2163,6 +2308,7 @@ mod tests {
                 create_at: 1,
                 received_at: 1,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
         let mut rx = bus.subscribe();
@@ -2187,6 +2333,7 @@ mod tests {
                 create_at: 2,
                 received_at: 2,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
         let got = rx.try_recv().expect("post-sub event");
@@ -2307,6 +2454,7 @@ mod tests {
                 team: Some("org"),
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 emit_wait_ids: true,
@@ -2341,6 +2489,7 @@ mod tests {
             timeout_secs: 600,
             contains: None,
             pattern: None,
+            mention: false,
         };
         let started = std::time::Instant::now();
         let err = match crate::waitprims_fanin::wait_channels_first_match(&state, params).await {
@@ -2385,6 +2534,7 @@ mod tests {
                 team: Some("org"),
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 emit_wait_ids: true,
@@ -2414,6 +2564,7 @@ mod tests {
                 timeout_secs: 600,
                 contains: None,
                 pattern: None,
+                mention: false,
             },
         )
         .await;
@@ -2453,6 +2604,7 @@ mod tests {
                 team: Some("org"),
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 emit_wait_ids: true,
@@ -2482,6 +2634,7 @@ mod tests {
                 timeout_secs: 600,
                 contains: None,
                 pattern: None,
+                mention: false,
             },
         )
         .await;
@@ -2519,6 +2672,7 @@ mod tests {
                 team: Some("org"),
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 emit_wait_ids: true,
@@ -2548,6 +2702,7 @@ mod tests {
                 timeout_secs: 600,
                 contains: None,
                 pattern: None,
+                mention: false,
             },
         )
         .await;

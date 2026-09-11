@@ -371,6 +371,7 @@ async fn client_eof_releases_the_held_owner() {
             team: None,
             contains: None,
             pattern: None,
+            mention: false,
             after: None,
             replace_wait_id: None,
         })

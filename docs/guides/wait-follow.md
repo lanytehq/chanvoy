@@ -77,3 +77,21 @@ old follower has exited.
 
 Follow removes re-arm gaps only while that process lives. It is not a
 substitute for a host that cannot wake on a stdout line.
+
+## Mention filter
+
+`--mention` completes the wait only when **this bot** is mentioned. It is
+not any `@`, and not a substring of the username (`@bot-suffix` does not
+match). It is logical AND with `--contains` and `--pattern` when those
+are set. Non-mention peer posts are not tips and do not emit `live`
+JSONL on `--follow --mention`. Self-posts never match.
+
+`--mention` applies to a channel wait, fan-in, `--dm`, and `--inbox`.
+
+## Direct-message follow
+
+`--dm <username> --follow` waits on one peer conversation. `--after` is a
+Mattermost post id on that DM, not an inbox cursor.
+
+`--inbox --follow` waits on any DM to this bot. `--after` is the opaque
+`inv1.` inbox cursor from a prior inbox result. Do not pass a channel id.

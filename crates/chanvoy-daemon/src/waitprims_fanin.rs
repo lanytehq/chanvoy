@@ -246,6 +246,8 @@ pub(crate) async fn wait_channels_first_match(
         "pending",
         params.contains.as_deref(),
         params.pattern.as_deref(),
+        params.mention,
+        &state.profile.bot_username,
     )?;
     let push_selectors = push_dependent_selectors(&state.profile.monitored_channels, &params);
     if !push_selectors.is_empty() {
@@ -305,51 +307,53 @@ pub(crate) async fn wait_channels_first_match(
         let baseline_fut =
             establish_baseline(state, &qualified, &channel_id, after.as_deref(), deadline);
         tokio::select! {
-            biased;
-            _ = wait_any_cancel(&member_cancels) => {
-                return Err(replaced_from_sessions(&sessions));
-            }
-            result = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", baseline_fut) => {
-                let (scan, baseline) = result.map_err(|err| map_arm_err(&selector, err))?;
-                let after_eligible = if let Some(after) = after.as_deref() {
-                    let ch = channel_id.clone();
-                    let a = after.to_string();
-                    let page_fut = provider_retry(state, &qualified, deadline, || {
-                        let ch = ch.clone();
-                        let a = a.clone();
-                        async move { state.client.posts_after_by_channel_id(&ch, &a).await }
+                biased;
+                _ = wait_any_cancel(&member_cancels) => {
+                    return Err(replaced_from_sessions(&sessions));
+                }
+                result = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", baseline_fut) => {
+                    let (scan, baseline) = result.map_err(|err| map_arm_err(&selector, err))?;
+                    let after_eligible = if let Some(after) = after.as_deref() {
+                        let ch = channel_id.clone();
+                        let a = after.to_string();
+                        let page_fut = provider_retry(state, &qualified, deadline, || {
+                            let ch = ch.clone();
+                            let a = a.clone();
+                            async move { state.client.posts_after_by_channel_id(&ch, &a).await }
+                        });
+                        tokio::select! {
+                            biased;
+                            _ = wait_any_cancel(&member_cancels) => {
+                                return Err(replaced_from_sessions(&sessions));
+                            }
+                            page = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", page_fut) => {
+                                Some(page.map_err(|err| map_arm_err(&selector, err))?.into_iter().map(|m| m.id).collect())
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let predicate = WaitPredicate::compile(
+                        &state.my_user_id,
+                        &channel_id,
+                        params.contains.as_deref(),
+                        params.pattern.as_deref(),
+                       params.mention,
+            &state.profile.bot_username,
+        )?;
+                    built.push(FanArm {
+                        selector,
+                        channel_id,
+                        channel: qualified,
+                        after,
+                        prebound: Some(cursor_from_baseline(scan, baseline)),
+                        after_eligible,
+                        monitored,
+                        predicate,
+                        retained: Vec::new(),
                     });
-                    tokio::select! {
-                        biased;
-                        _ = wait_any_cancel(&member_cancels) => {
-                            return Err(replaced_from_sessions(&sessions));
-                        }
-                        page = crate::wait_channels::with_bus_drain(&mut rx, &mut bus, "fan-in", page_fut) => {
-                            Some(page.map_err(|err| map_arm_err(&selector, err))?.into_iter().map(|m| m.id).collect())
-                        }
-                    }
-                } else {
-                    None
-                };
-                let predicate = WaitPredicate::compile(
-                    &state.my_user_id,
-                    &channel_id,
-                    params.contains.as_deref(),
-                    params.pattern.as_deref(),
-                )?;
-                built.push(FanArm {
-                    selector,
-                    channel_id,
-                    channel: qualified,
-                    after,
-                    prebound: Some(cursor_from_baseline(scan, baseline)),
-                    after_eligible,
-                    monitored,
-                    predicate,
-                    retained: Vec::new(),
-                });
+                }
             }
-        }
     }
     drain_bus(&mut rx, &mut bus, "fan-in")?;
     for arm in &mut built {
@@ -925,6 +929,7 @@ mod tests {
             timeout_secs: 600,
             contains: None,
             pattern: None,
+            mention: false,
         };
         assert_eq!(
             push_dependent_selectors(&["push".into()], &params),
@@ -953,6 +958,7 @@ mod tests {
             message: "body".into(),
             create_at: 1,
             root_id: id.into(),
+            mention_user_ids: None,
         }
     }
 

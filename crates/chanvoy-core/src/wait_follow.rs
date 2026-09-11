@@ -26,6 +26,9 @@ pub struct WaitFollowV1Params {
     pub after: Option<String>,
     #[serde(default)]
     pub replace_wait_id: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,6 +305,7 @@ mod tests {
             message: "ready".into(),
             create_at: 1,
             root_id: "postid00000000000000000001".into(),
+            mention_user_ids: None,
         }
     }
 

@@ -1,6 +1,6 @@
 //! Inbox wait: any direct message to this bot.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -48,6 +48,7 @@ pub struct WaitInboxRequest<'a> {
     pub timeout_secs: u64,
     pub contains: Option<&'a str>,
     pub pattern: Option<&'a str>,
+    pub mention: bool,
     pub after: Option<&'a str>,
     pub replace_wait_id: Option<&'a str>,
     pub deadline: Instant,
@@ -94,7 +95,14 @@ async fn run_inbox(
     stream: Option<InboxFollowStreamSender>,
 ) -> Result<InboxOutcome, CoreError> {
     crate::wait::validate_wait_timeout_secs(req.timeout_secs)?;
-    WaitPredicate::compile("pending", "pending", req.contains, req.pattern)?;
+    WaitPredicate::compile(
+        "pending",
+        "pending",
+        req.contains,
+        req.pattern,
+        req.mention,
+        &state.profile.bot_username,
+    )?;
     let decoded_after = match req.after {
         Some(raw) => Some(InboxCursorV1::decode(
             raw,
@@ -137,7 +145,14 @@ async fn run_inbox(
         None => InboxCursorV1::empty(&state.profile.name, &state.my_user_id),
     };
     let mut proven = req.after.map(str::to_string);
-    let predicate = WaitPredicate::compile(&state.my_user_id, "inbox", req.contains, req.pattern)?;
+    let predicate = WaitPredicate::compile(
+        &state.my_user_id,
+        "inbox",
+        req.contains,
+        req.pattern,
+        req.mention,
+        &state.profile.bot_username,
+    )?;
 
     if let Some(stream) = stream.as_ref() {
         emit_inbox(
@@ -186,7 +201,7 @@ async fn run_inbox_armed(
     cursor: &mut InboxCursorV1,
     proven: &mut Option<String>,
     predicate: &WaitPredicate,
-    dms: &mut HashMap<String, CataloguedDm>,
+    dms: &mut BTreeMap<String, CataloguedDm>,
     catalog: &[DirectCatalogEntry],
     rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
     bus_buffer: &mut VecDeque<Arc<DaemonEvent>>,
@@ -197,8 +212,9 @@ async fn run_inbox_armed(
         *cursor = establish_arm_cursor(state, catalog, dms, req.deadline, &live_ids).await?;
         *proven = Some(cursor.encode()?);
     }
+    let mut observer = cursor.clone();
 
-    let backfill = collect_backfill(state, dms, cursor, predicate, req.deadline).await?;
+    let backfill = collect_backfill(state, dms, &mut observer, predicate, req.deadline).await?;
     for (entry, message) in backfill {
         match deliver(
             state,
@@ -225,6 +241,7 @@ async fn run_inbox_armed(
             stream,
             dms,
             cursor,
+            &mut observer,
             proven,
             predicate,
             event,
@@ -242,7 +259,7 @@ async fn run_inbox_armed(
     if current_reconnects(state).await > reconnects {
         reconnects = current_reconnects(state).await;
         recatalog(state, dms, req.deadline).await?;
-        let backfill = collect_backfill(state, dms, cursor, predicate, req.deadline).await?;
+        let backfill = collect_backfill(state, dms, &mut observer, predicate, req.deadline).await?;
         for (entry, message) in backfill {
             match deliver(
                 state,
@@ -273,7 +290,8 @@ async fn run_inbox_armed(
         if now_reconnects > reconnects {
             reconnects = now_reconnects;
             recatalog(state, dms, req.deadline).await?;
-            let backfill = collect_backfill(state, dms, cursor, predicate, req.deadline).await?;
+            let backfill =
+                collect_backfill(state, dms, &mut observer, predicate, req.deadline).await?;
             for (entry, message) in backfill {
                 match deliver(
                     state,
@@ -301,6 +319,7 @@ async fn run_inbox_armed(
                     stream,
                     dms,
                     cursor,
+                    &mut observer,
                     proven,
                     predicate,
                     event,
@@ -346,7 +365,7 @@ async fn resolve_catalog(
     state: &AppState,
     catalog: &[DirectCatalogEntry],
     deadline: Instant,
-) -> Result<HashMap<String, CataloguedDm>, CoreError> {
+) -> Result<BTreeMap<String, CataloguedDm>, CoreError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(cursor_uncertain(
@@ -354,7 +373,7 @@ async fn resolve_catalog(
         ));
     }
     let work = async {
-        let mut dms = HashMap::new();
+        let mut dms = BTreeMap::new();
         for entry in catalog {
             let peer_id = peer_user_id_from_dm_name(&entry.name, &state.my_user_id)
                 .ok_or_else(|| cursor_uncertain("inbox catalog entry is not a DM for this bot"))?;
@@ -455,7 +474,7 @@ async fn prove_inbox_cursor(
 
 async fn recatalog(
     state: &AppState,
-    dms: &mut HashMap<String, CataloguedDm>,
+    dms: &mut BTreeMap<String, CataloguedDm>,
     deadline: Instant,
 ) -> Result<(), CoreError> {
     let catalog = provider_list(state, deadline).await?;
@@ -496,7 +515,7 @@ fn buffered_post_ids(buffer: &VecDeque<Arc<DaemonEvent>>) -> HashSet<String> {
 async fn establish_arm_cursor(
     state: &AppState,
     catalog: &[DirectCatalogEntry],
-    dms: &HashMap<String, CataloguedDm>,
+    dms: &BTreeMap<String, CataloguedDm>,
     deadline: Instant,
     live_ids: &HashSet<String>,
 ) -> Result<InboxCursorV1, CoreError> {
@@ -546,15 +565,15 @@ async fn establish_arm_cursor(
 
 async fn collect_backfill(
     state: &AppState,
-    dms: &HashMap<String, CataloguedDm>,
-    cursor: &InboxCursorV1,
+    dms: &BTreeMap<String, CataloguedDm>,
+    scan: &mut InboxCursorV1,
     predicate: &WaitPredicate,
     deadline: Instant,
 ) -> Result<Vec<(CataloguedDm, Message)>, CoreError> {
-    let mut admitted = Vec::new();
     let mut remaining = INBOX_MAX_BACKFILL;
+    let mut candidates = Vec::new();
+    let since = scan.watermark.saturating_sub(1);
     for entry in dms.values() {
-        let since = cursor.watermark.saturating_sub(1);
         let (posts, consumed) = crate::wait::provider_retry(state, "inbox", deadline, || {
             let id = entry.id.clone();
             async move {
@@ -567,18 +586,27 @@ async fn collect_backfill(
         .await?;
         remaining = remaining.saturating_sub(consumed);
         for message in posts {
-            if predicate.matches_message(&message) && cursor.admits(message.create_at, &message.id)
-            {
-                admitted.push((entry.clone(), message));
+            if scan.admits(message.create_at, &message.id) {
+                candidates.push((entry.clone(), message));
             }
         }
     }
-    admitted.sort_by(|left, right| {
+    candidates.sort_by(|left, right| {
         left.1
             .create_at
             .cmp(&right.1.create_at)
             .then_with(|| left.1.id.cmp(&right.1.id))
     });
+    let mut admitted = Vec::new();
+    for (entry, message) in candidates {
+        if !scan.admits(message.create_at, &message.id) {
+            continue;
+        }
+        *scan = scan.advance(message.create_at, &message.id)?;
+        if predicate.matches_message(&message) {
+            admitted.push((entry, message));
+        }
+    }
     Ok(admitted)
 }
 
@@ -587,8 +615,9 @@ async fn handle_event(
     state: &AppState,
     session: &WaitSession,
     stream: Option<&InboxFollowStreamSender>,
-    dms: &mut HashMap<String, CataloguedDm>,
+    dms: &mut BTreeMap<String, CataloguedDm>,
     cursor: &mut InboxCursorV1,
+    observer: &mut InboxCursorV1,
     proven: &mut Option<String>,
     predicate: &WaitPredicate,
     event: Arc<DaemonEvent>,
@@ -644,7 +673,11 @@ async fn handle_event(
         entry
     };
     let message = inbound_to_message(payload);
-    if !predicate.matches_message(&message) || !cursor.admits(message.create_at, &message.id) {
+    if !observer.admits(message.create_at, &message.id) {
+        return Ok(None);
+    }
+    *observer = observer.advance(message.create_at, &message.id)?;
+    if !predicate.matches_message(&message) {
         return Ok(None);
     }
     deliver(
@@ -879,6 +912,7 @@ mod tests {
         EventBus, InboundEventPayload, MattermostClient, Profile, Provider, WsConnectionState,
         WsState, INBOX_PAGE_SIZE,
     };
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::sync::Mutex;
@@ -972,6 +1006,7 @@ mod tests {
                 create_at,
                 received_at: create_at,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         }
     }
@@ -1185,6 +1220,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -1214,6 +1250,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),
@@ -1263,6 +1300,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),
@@ -1322,6 +1360,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),
@@ -1405,6 +1444,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),
@@ -1479,6 +1519,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),
@@ -1492,6 +1533,210 @@ mod tests {
         let result = task.await.unwrap().expect("catch-up");
         assert_eq!(result.matched_post_id, POST_C);
         assert_eq!(result.peer_username, PEER_C);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mention_skips_ack_burst_and_wakes_on_bot_token() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        mount_one_dm_catalog(&server, 0).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_A: {
+                        "id": POST_A,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "ACK",
+                        "create_at": 1_780_000_000_100i64,
+                        "root_id": ""
+                    },
+                    POST_C: {
+                        "id": POST_C,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "@agent-bravo-devlead please",
+                        "create_at": 1_780_000_000_200i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID)
+            .encode()
+            .unwrap();
+        let result = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 3,
+                contains: None,
+                pattern: None,
+                mention: true,
+                after: Some(&cursor),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        )
+        .await
+        .expect("mention match");
+        assert_eq!(result.matched_post_id, POST_C);
+        let json = serde_json::to_value(&result.messages[0]).unwrap();
+        assert!(
+            json.get("mention_user_ids").is_none(),
+            "public message must not leak mention ids: {json}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mention_two_dms_older_mention_beats_newer_nonmatch() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        mount_two_dm_catalog(&server).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_A: {
+                        "id": POST_A,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "ACK later on first-sorted DM",
+                        "create_at": 1_780_000_000_300i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_C}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_C: {
+                        "id": POST_C,
+                        "channel_id": DM_C,
+                        "user_id": PEER_C_ID,
+                        "message": "@agent-bravo-devlead older",
+                        "create_at": 1_780_000_000_200i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID)
+            .encode()
+            .unwrap();
+        let result = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 3,
+                contains: None,
+                pattern: None,
+                mention: true,
+                after: Some(&cursor),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        )
+        .await
+        .expect("older mention");
+        assert_eq!(result.matched_post_id, POST_C);
+        assert_eq!(result.peer_username, PEER_C);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mention_reconnect_after_nonmatch_burst_delivers_later() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        struct CatalogSeq(std::sync::atomic::AtomicUsize);
+        impl wiremock::Respond for CatalogSeq {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": DM_A,
+                        "name": dm_a(),
+                        "type": "D",
+                        "last_post_at": 1_780_000_000_100i64
+                    }]))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                        {
+                            "id": DM_A,
+                            "name": dm_a(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_100i64
+                        },
+                        {
+                            "id": DM_C,
+                            "name": dm_c(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_400i64
+                        }
+                    ]))
+                }
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/users/{BOT_ID}/channels")))
+            .respond_with(CatalogSeq(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        mount_posts(&server, DM_A, POST_A, PEER_A_ID, 1_780_000_000_100, "ACK").await;
+        mount_posts(
+            &server,
+            DM_C,
+            POST_C,
+            PEER_C_ID,
+            1_780_000_000_400,
+            "@agent-bravo-devlead later",
+        )
+        .await;
+        let state = Arc::new(healthy_state(&server).await);
+        let empty = InboxCursorV1::empty(&state.profile.name, BOT_ID)
+            .encode()
+            .unwrap();
+        let ws = state.ws_state_holder.lock().await.clone().unwrap();
+        let wait_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            wait_with_params_inbox(
+                &wait_state,
+                WaitInboxRequest {
+                    timeout_secs: 3,
+                    contains: None,
+                    pattern: None,
+                    mention: true,
+                    after: Some(&empty),
+                    replace_wait_id: None,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        ws.reconnect_count.fetch_add(1, Ordering::SeqCst);
+        state.event_bus.emit(inbound(
+            "teamchan000000000000000001",
+            "town-square",
+            "",
+            "postid0000000000000000000t",
+            "userid00000000000000000009",
+            "human",
+            1_780_000_000_900,
+            "team noise",
+        ));
+        let result = task.await.unwrap().expect("mention after reconnect");
+        assert_eq!(result.matched_post_id, POST_C);
+        assert_eq!(result.peer_username, PEER_C);
+        let next = InboxCursorV1::decode(&result.next_inbox_cursor, &state.profile.name, BOT_ID)
+            .expect("public cursor");
+        assert_eq!(next.watermark, 1_780_000_000_400);
+        assert!(next.observed_ids.contains(POST_C));
+        assert!(!next.observed_ids.contains(POST_A));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1517,6 +1762,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -1553,6 +1799,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -1620,6 +1867,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: Some("wake"),
                 pattern: None,
+                mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -1692,6 +1940,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: Some("wake"),
                 pattern: None,
+                mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -1779,6 +2028,7 @@ mod tests {
                 timeout_secs: 3,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(3),
@@ -1831,6 +2081,7 @@ mod tests {
                 timeout_secs: 3,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(3),
@@ -1878,6 +2129,7 @@ mod tests {
                 timeout_secs: 3,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(3),
@@ -1906,6 +2158,7 @@ mod tests {
                     timeout_secs: 4,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(4),
@@ -1920,6 +2173,7 @@ mod tests {
                 timeout_secs: 1,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(1),
@@ -1941,6 +2195,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: Some(&existing_wait_id),
                     deadline: Instant::now() + Duration::from_secs(3),
@@ -1989,6 +2244,7 @@ mod tests {
                     timeout_secs: 2,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(2),
@@ -2055,6 +2311,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: Some(&cursor),
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),
@@ -2144,6 +2401,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -2174,6 +2432,7 @@ mod tests {
                 timeout_secs: 3,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(3),
@@ -2206,6 +2465,7 @@ mod tests {
                 timeout_secs: 3,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(3),
@@ -2237,6 +2497,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -2251,6 +2512,7 @@ mod tests {
                 timeout_secs: 2,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: None,
                 replace_wait_id: Some(&lease.wait_id),
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -2280,6 +2542,7 @@ mod tests {
                     timeout_secs: 4,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(4),
@@ -2369,6 +2632,7 @@ mod tests {
                         timeout_secs: 3,
                         contains: None,
                         pattern: None,
+                        mention: false,
                         after: Some(&cursor),
                         replace_wait_id: None,
                         deadline: Instant::now() + Duration::from_secs(3),
@@ -2406,6 +2670,7 @@ mod tests {
                 timeout_secs: 3,
                 contains: None,
                 pattern: None,
+                mention: false,
                 after: Some(&after),
                 replace_wait_id: None,
                 deadline: Instant::now() + Duration::from_secs(3),
@@ -2442,6 +2707,7 @@ mod tests {
                     timeout_secs: 3,
                     contains: None,
                     pattern: None,
+                    mention: false,
                     after: None,
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),

@@ -362,6 +362,7 @@ async fn dispatch_wait(
                     team: args.team,
                     contains: args.contains,
                     pattern: args.pattern,
+                    mention: false,
                     after: args.after,
                     replace_wait_id: args.replace_wait_id,
                 })
@@ -374,6 +375,7 @@ async fn dispatch_wait(
                 timeout_secs: args.timeout_secs,
                 contains: args.contains,
                 pattern: args.pattern,
+                mention: false,
             };
             validate_wait_channels_params(&params)
                 .map_err(|err| ToolErrorEnvelope::input(err.to_string()))?;

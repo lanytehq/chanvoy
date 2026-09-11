@@ -298,6 +298,9 @@ pub struct Message {
     /// which callers treat as "thread unknown".
     #[serde(default)]
     pub root_id: String,
+    /// Internal only. Never serialized on wait results (closed schemas).
+    #[serde(skip)]
+    pub mention_user_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -584,6 +587,9 @@ pub struct InboundEventPayload {
     pub create_at: i64,
     pub received_at: i64,
     pub mentioned: bool,
+    /// Provider mention user ids when the posted event carried them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_user_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -611,6 +617,7 @@ pub struct DaemonEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum DaemonEventPayloadInner {
     Inbound(InboundEventPayload),
     ConnectionStateChanged(ConnectionStateChangedPayload),
@@ -1707,6 +1714,9 @@ pub struct WaitChannelV3Params {
     pub after: Option<String>,
     #[serde(default)]
     pub replace_wait_id: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3336,6 +3346,7 @@ impl MattermostClient {
                     message: post.message,
                     create_at: post.create_at,
                     root_id,
+                    mention_user_ids: None,
                 }
             })
             .collect()
@@ -5975,7 +5986,7 @@ impl MattermostWs {
 
         let channel_name = self.resolve_channel_name(&channel_id).await;
         let sender_username = self.resolve_username(&sender_id).await;
-        let mentioned = message_mentions_username(&message, &self.bot_username);
+        let mentioned = mentions_bot(&self.bot_username, &message);
 
         let is_monitored = self
             .monitored_channels
@@ -6006,6 +6017,7 @@ impl MattermostWs {
                     create_at,
                     received_at: now_unix_millis(),
                     mentioned,
+                    mention_user_ids: None,
                 }),
             };
             self.event_bus.emit(event);
@@ -6027,6 +6039,7 @@ impl MattermostWs {
                     create_at,
                     received_at: now_unix_millis(),
                     mentioned: true,
+                    mention_user_ids: None,
                 }),
             };
             self.event_bus.emit(event);
@@ -6062,7 +6075,7 @@ impl MattermostWs {
                 .collect();
 
             for msg in new_messages {
-                let mentioned = message_mentions_username(&msg.message, &self.bot_username);
+                let mentioned = mentions_bot(&self.bot_username, &msg.message);
                 let event = DaemonEvent {
                     seq: 0,
                     kind: DaemonEventKind::InboundMessage,
@@ -6081,6 +6094,7 @@ impl MattermostWs {
                         create_at: msg.create_at,
                         received_at: now_unix_millis(),
                         mentioned,
+                        mention_user_ids: msg.mention_user_ids,
                     }),
                 };
                 self.event_bus.emit(event);
@@ -6267,12 +6281,13 @@ fn default_capability_class() -> CapabilityClass {
 }
 
 fn message_mentions_username(message: &str, username: &str) -> bool {
-    let needle = format!("@{username}");
+    let haystack = message.to_ascii_lowercase();
+    let needle = format!("@{}", username.to_ascii_lowercase());
     let mut search_start = 0;
-    while let Some(index) = message[search_start..].find(&needle) {
+    while let Some(index) = haystack[search_start..].find(&needle) {
         let absolute = search_start + index;
         let boundary_index = absolute + needle.len();
-        let boundary_ok = message
+        let boundary_ok = haystack
             .as_bytes()
             .get(boundary_index)
             .map(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte != b'-')
@@ -6283,6 +6298,15 @@ fn message_mentions_username(message: &str, username: &str) -> bool {
         search_start = boundary_index;
     }
     false
+}
+
+/// Canonical mention decision for wait `--mention`.
+///
+/// Same on every path: exact `@username` token in the body (`@bot-suffix` is
+/// not a match). Username match is ASCII case-insensitive so live and REST
+/// agree without invented REST mention-id fields.
+pub fn mentions_bot(bot_username: &str, body: &str) -> bool {
+    message_mentions_username(body, bot_username)
 }
 
 #[cfg(test)]
@@ -6332,6 +6356,7 @@ mod tests {
             message: "body".to_string(),
             create_at,
             root_id: id.to_string(),
+            mention_user_ids: None,
         }
     }
 
@@ -6809,6 +6834,30 @@ credential_mode = "env_name"
     }
 
     #[test]
+    fn mentions_bot_is_body_token_case_insensitive() {
+        let bot = "agent-bravo-devlead";
+        assert!(mentions_bot(bot, "@agent-bravo-devlead hi"));
+        assert!(mentions_bot(bot, "@Agent-Bravo-Devlead case variant"));
+        assert!(!mentions_bot(bot, "@agent-bravo-devlead-extra hi"));
+        assert!(!mentions_bot(bot, "no mention here"));
+    }
+
+    #[test]
+    fn wait_message_json_omits_internal_mention_ids() {
+        let message = Message {
+            id: "postid0000000000000000000a".into(),
+            user_id: "u".into(),
+            username: "alice".into(),
+            message: "@agent-bravo-devlead hi".into(),
+            create_at: 1,
+            root_id: "postid0000000000000000000a".into(),
+            mention_user_ids: Some(vec!["userid00000000000000000000".into()]),
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("mention_user_ids").is_none(), "{json}");
+    }
+
+    #[test]
     fn parses_monitored_channels_from_profile() {
         let profile: Profile = toml::from_str(
             r#"
@@ -6845,6 +6894,7 @@ monitored_channels = ["per-003", "per-004"]
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let notification = daemon_event_to_notification(&event);
@@ -6950,6 +7000,7 @@ monitored_channels = ["per-003", "per-004"]
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
 
@@ -6977,6 +7028,7 @@ monitored_channels = ["per-003", "per-004"]
                 create_at: 2000,
                 received_at: 2001,
                 mentioned: true,
+                mention_user_ids: None,
             }),
         });
 

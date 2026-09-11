@@ -105,6 +105,8 @@ async fn wait_channels_legacy_unused(
         "pending",
         params.contains.as_deref(),
         params.pattern.as_deref(),
+        params.mention,
+        &state.profile.bot_username,
     )?;
 
     let deadline = Instant::now() + Duration::from_secs(params.timeout_secs);
@@ -145,6 +147,8 @@ async fn wait_channels_legacy_unused(
             &channel_id,
             params.contains.as_deref(),
             params.pattern.as_deref(),
+            params.mention,
+            &state.profile.bot_username,
         )?;
         armed.push(ArmedArm {
             selector,
@@ -606,7 +610,7 @@ mod tests {
     use chanvoy_core::{DaemonEventKind, InboundEventPayload, Provider};
 
     fn pred(channel_id: &str) -> WaitPredicate {
-        WaitPredicate::compile("bot", channel_id, Some("ASSENT"), None).expect("pred")
+        WaitPredicate::compile("bot", channel_id, Some("ASSENT"), None, false, "bot").expect("pred")
     }
 
     fn inbound(channel_id: &str, post_id: &str, body: &str) -> Arc<DaemonEvent> {
@@ -627,6 +631,7 @@ mod tests {
                 create_at: 1,
                 received_at: 1,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         })
     }
@@ -663,7 +668,7 @@ mod tests {
 
     #[test]
     fn self_posts_never_match_on_any_arm() {
-        let p = WaitPredicate::compile("bot", "ch-a", Some("ASSENT"), None).unwrap();
+        let p = WaitPredicate::compile("bot", "ch-a", Some("ASSENT"), None, false, "bot").unwrap();
         let ev = Arc::new(DaemonEvent {
             seq: 1,
             kind: DaemonEventKind::InboundMessage,
@@ -681,6 +686,7 @@ mod tests {
                 create_at: 1,
                 received_at: 1,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
         let mut seam = FanInRetain::default();
