@@ -399,12 +399,10 @@ async fn prove_inbox_cursor(
             "inbox cursor watermark is ahead of the authenticated catalog",
         ));
     }
-    if cursor.observed_ids.is_empty() {
-        return Ok(());
-    }
     let mut remaining = INBOX_MAX_BACKFILL;
     let mut found = HashSet::new();
     let mut contradictory = false;
+    let mut saw_watermark_post = false;
     for entry in catalog {
         let since = cursor.watermark.saturating_sub(1);
         let (posts, consumed) = crate::wait::provider_retry(state, "inbox", deadline, || {
@@ -419,6 +417,9 @@ async fn prove_inbox_cursor(
         .await?;
         remaining = remaining.saturating_sub(consumed);
         for message in posts {
+            if message.create_at == cursor.watermark {
+                saw_watermark_post = true;
+            }
             if !cursor.observed_ids.contains(&message.id) {
                 continue;
             }
@@ -428,6 +429,11 @@ async fn prove_inbox_cursor(
                 found.insert(message.id);
             }
         }
+    }
+    if !saw_watermark_post {
+        return Err(cursor_uncertain(
+            "inbox cursor watermark is not present in authenticated history",
+        ));
     }
     if contradictory {
         return Err(cursor_uncertain(
@@ -1557,6 +1563,78 @@ mod tests {
             !matches!(err, CoreError::WaitTimeout(_)),
             "unprovable observed id must not be a clean deadman: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn positive_empty_watermark_without_history_is_uncertain() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/users/{BOT_ID}/channels")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": DM_A,
+                    "name": dm_a(),
+                    "type": "D",
+                    "last_post_at": 1_780_000_000_300i64
+                }])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_A: {
+                        "id": POST_A,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "wake",
+                        "create_at": 1_780_000_000_100i64,
+                        "root_id": ""
+                    },
+                    POST_C: {
+                        "id": POST_C,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "later",
+                        "create_at": 1_780_000_000_300i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let mut cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID);
+        cursor.watermark = 1_780_000_000_200;
+        let raw = cursor.encode().unwrap();
+        let err = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 2,
+                contains: Some("wake"),
+                pattern: None,
+                after: Some(&raw),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("watermark")),
+            "{err}"
+        );
+        assert!(
+            !matches!(err, CoreError::WaitTimeout(_)),
+            "unprovable positive empty watermark must not be a clean deadman: {err}"
+        );
+        state
+            .wait_owners
+            .acquire_inbox(None, Duration::from_secs(2))
+            .await
+            .expect("inbox slot must still be free");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
