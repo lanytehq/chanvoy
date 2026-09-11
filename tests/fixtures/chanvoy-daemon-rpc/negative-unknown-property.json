@@ -1,0 +1,5 @@
+{
+  "channel": "general",
+  "timeout_secs": 30,
+  "force": true
+}
