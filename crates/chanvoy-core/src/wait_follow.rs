@@ -4,6 +4,8 @@
 //! `schemas/common/chanvoy-daemon-rpc/v0/`. Chanvoy does not git-pin
 //! Crucible; these types are the local contract.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::Message;
@@ -508,6 +510,26 @@ fn validate_message_record(tip: &str, message: &Message) -> Result<(), &'static 
     Ok(())
 }
 
+/// Strict `(create_at, id)` order and unique ids. Equal keys fail.
+pub fn validate_strict_create_at_id_order<'a>(
+    keys: impl IntoIterator<Item = (i64, &'a str)>,
+) -> Result<(), &'static str> {
+    let mut prev: Option<(i64, &'a str)> = None;
+    let mut seen = HashSet::new();
+    for (create_at, id) in keys {
+        if !seen.insert(id) {
+            return Err("coalesced messages must have unique ids");
+        }
+        if let Some((prev_at, prev_id)) = prev {
+            if (create_at, id) <= (prev_at, prev_id) {
+                return Err("coalesced messages must be in strict (create_at, id) order");
+            }
+        }
+        prev = Some((create_at, id));
+    }
+    Ok(())
+}
+
 fn validate_v2_message_record(tip: &str, messages: &[Message]) -> Result<(), &'static str> {
     if messages.is_empty() || messages.len() > WAIT_FOLLOW_COALESCE_MAX_MESSAGES {
         return Err("follow v2 messages must contain 1 to 32 entries");
@@ -515,6 +537,11 @@ fn validate_v2_message_record(tip: &str, messages: &[Message]) -> Result<(), &'s
     for message in messages {
         validate_message_fields(message)?;
     }
+    validate_strict_create_at_id_order(
+        messages
+            .iter()
+            .map(|message| (message.create_at, message.id.as_str())),
+    )?;
     let last = &messages[messages.len() - 1];
     if !is_mattermost_post_id(tip) || tip != last.id {
         return Err("follow v2 tip must equal the last Mattermost message id");
@@ -688,6 +715,65 @@ mod tests {
             WaitFollowMode::Live,
             vec![message_n(1)],
             true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v2_reversed_pair_fails_validate() {
+        let event = WaitFollowV2Event {
+            schema: WaitFollowV2Schema::V2,
+            wait_id: "wait_0123456789abcdef0123456789abcdef".into(),
+            kind: WaitFollowV2EventKind::Live {
+                tip: "postid00000000000000000001".into(),
+                truncated: false,
+                messages: vec![message_n(2), message_n(1)],
+            },
+        };
+        assert!(event.validate().is_err());
+        assert!(WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            vec![message_n(2), message_n(1)],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v2_equal_create_at_must_be_id_ordered() {
+        let mut higher_id = message_n(2);
+        let mut lower_id = message_n(1);
+        higher_id.create_at = 7;
+        lower_id.create_at = 7;
+        assert!(WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            vec![higher_id.clone(), lower_id.clone()],
+            false,
+        )
+        .is_err());
+        WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            vec![lower_id, higher_id],
+            false,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn v2_equal_create_at_and_id_fails_validate() {
+        let first = message_n(1);
+        let mut dup = message_n(1);
+        dup.username = "other".into();
+        assert!(WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Backlog,
+            vec![first, dup],
+            false,
         )
         .is_err());
     }

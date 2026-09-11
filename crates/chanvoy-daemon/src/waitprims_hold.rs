@@ -38,7 +38,7 @@ use crate::wait::{
     empty_at_arm_observation, establish_baseline, one_message_result, provider_retry,
     wait_push_from_cursor, wait_rest_from_cursor, WaitPredicate,
 };
-use crate::wait_coalesce::CoalesceBuffer;
+use crate::wait_coalesce::{order_coalesced, CoalesceBuffer};
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::AppState;
 
@@ -169,6 +169,7 @@ pub(crate) async fn run_single_channel_follow(
     wait: FirstMatchWait<'_>,
     stream: crate::wait::FollowStreamSender,
     coalesce_ms: Option<u64>,
+    client_gone: CancellationToken,
 ) -> Result<WaitFollowResult, CoreError> {
     let release = Arc::new(LeaseRelease::new(wait.guard));
     let sidecar = MessageSidecar::new();
@@ -228,6 +229,7 @@ pub(crate) async fn run_single_channel_follow(
     let docs = admit_set_and_request(wait.channel, set, request)?;
     let wp_cancel = Cancel::new();
     let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
+    let _client_gone_fwd = CancelForward::spawn(client_gone, wp_cancel.clone());
 
     if let Some(ms) = coalesce_ms {
         validate_coalesce_ms(ms).map_err(CoreError::WaitFilterInvalid)?;
@@ -245,6 +247,8 @@ pub(crate) async fn run_single_channel_follow(
     let sink_wait_id = wait.session.wait_id.clone();
     let sink_coalesce = coalesce_buf.clone();
     let sink_deadline = deadline_tx.clone();
+    let sink_failed = Arc::new(AtomicBool::new(false));
+    let sink_failed_cb = Arc::clone(&sink_failed);
     let follow = run_follow(
         &observer,
         &clock,
@@ -260,6 +264,7 @@ pub(crate) async fn run_single_channel_follow(
             let wait_id = sink_wait_id.clone();
             let coalesce = sink_coalesce.clone();
             let deadline_tx = sink_deadline.clone();
+            let sink_failed = Arc::clone(&sink_failed_cb);
             async move {
                 let event_count = burst.events.len();
                 for (index, event) in burst.events.into_iter().enumerate() {
@@ -320,8 +325,15 @@ pub(crate) async fn run_single_channel_follow(
                             flushed
                         };
                         for flush in flushes {
-                            emit_coalesced_burst(&stream, &wait_id, flush, &tip_state, &last_error)
-                                .await?;
+                            emit_coalesced_burst(
+                                &stream,
+                                &wait_id,
+                                flush,
+                                &tip_state,
+                                &last_error,
+                                &sink_failed,
+                            )
+                            .await?;
                         }
                     } else {
                         let record = WaitFollowEvent::message(
@@ -395,6 +407,7 @@ pub(crate) async fn run_single_channel_follow(
             &wait.session.wait_id,
             &tip_state,
             &last_error,
+            &sink_failed,
         )
         .await
     } else {
@@ -403,14 +416,23 @@ pub(crate) async fn run_single_channel_follow(
     let end = match end {
         Ok(end) => end,
         Err(err) => {
-            let _ = flush_coalesce_buffer(
+            flush_coalesce_or_core(
                 coalesce_buf.as_ref(),
                 &stream,
                 &wait.session.wait_id,
                 &tip_state,
                 &last_error,
+                &sink_failed,
             )
-            .await;
+            .await?;
+            if sink_failed.load(Ordering::SeqCst) {
+                inner_cancel.cancel();
+                release.release();
+                if let Some(saved) = last_error.lock().ok().and_then(|mut slot| slot.take()) {
+                    return Err(saved);
+                }
+                return Err(map_waitprims_err(wait.channel, err));
+            }
             let reason = last_error
                 .lock()
                 .ok()
@@ -426,14 +448,15 @@ pub(crate) async fn run_single_channel_follow(
         }
     };
 
-    let _ = flush_coalesce_buffer(
+    flush_coalesce_or_core(
         coalesce_buf.as_ref(),
         &stream,
         &wait.session.wait_id,
         &tip_state,
         &last_error,
+        &sink_failed,
     )
-    .await;
+    .await?;
     let tip = tip_state.lock().ok().and_then(|current| current.clone());
     let (terminal_kind, result_kind) = match end {
         FollowEnd::Deadline => (
@@ -641,13 +664,19 @@ async fn emit_coalesced_burst(
     flush: crate::wait_coalesce::CoalesceFlush<Message>,
     tip_state: &Mutex<Option<String>>,
     last_error: &Mutex<Option<CoreError>>,
+    sink_failed: &AtomicBool,
 ) -> Result<(), waitprims_async::Error> {
-    let event =
-        WaitFollowV2Event::messages(wait_id, flush.mode, flush.items, false).map_err(|_| {
-            waitprims_core::ValidationError::new("/follow_sink", "invalid_event_document")
-        })?;
+    let items = order_coalesced(flush.items);
+    if items.is_empty() {
+        return Ok(());
+    }
+    let event = WaitFollowV2Event::messages(wait_id, flush.mode, items, false).map_err(|_| {
+        sink_failed.store(true, Ordering::SeqCst);
+        waitprims_core::ValidationError::new("/follow_sink", "invalid_event_document")
+    })?;
     let tip = event.tip().map(str::to_string);
     emit_follow_v2(stream, event).await.map_err(|err| {
+        sink_failed.store(true, Ordering::SeqCst);
         if let Ok(mut slot) = last_error.lock() {
             *slot = Some(err);
         }
@@ -670,6 +699,7 @@ async fn flush_coalesce_buffer(
     wait_id: &str,
     tip_state: &Mutex<Option<String>>,
     last_error: &Mutex<Option<CoreError>>,
+    sink_failed: &AtomicBool,
 ) -> Result<(), waitprims_async::Error> {
     let Some(buffer) = buffer else {
         return Ok(());
@@ -679,11 +709,34 @@ async fn flush_coalesce_buffer(
         .map_err(|_| waitprims_core::ValidationError::new("/follow_sink", "lock"))?
         .take();
     if let Some(flush) = flush {
-        emit_coalesced_burst(stream, wait_id, flush, tip_state, last_error).await?;
+        emit_coalesced_burst(stream, wait_id, flush, tip_state, last_error, sink_failed).await?;
     }
     Ok(())
 }
 
+async fn flush_coalesce_or_core(
+    buffer: Option<&Arc<Mutex<CoalesceBuffer<Message>>>>,
+    stream: &crate::wait::FollowStreamSender,
+    wait_id: &str,
+    tip_state: &Mutex<Option<String>>,
+    last_error: &Mutex<Option<CoreError>>,
+    sink_failed: &AtomicBool,
+) -> Result<(), CoreError> {
+    flush_coalesce_buffer(buffer, stream, wait_id, tip_state, last_error, sink_failed)
+        .await
+        .map_err(|_| {
+            last_error
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .unwrap_or_else(|| CoreError::WaitProviderDegraded {
+                    channel: "follow".into(),
+                    message: "held wait coalesce flush failed".into(),
+                })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn await_follow_with_coalesce<F>(
     follow: F,
     buffer: Arc<Mutex<CoalesceBuffer<Message>>>,
@@ -692,6 +745,7 @@ async fn await_follow_with_coalesce<F>(
     wait_id: &str,
     tip_state: &Mutex<Option<String>>,
     last_error: &Mutex<Option<CoreError>>,
+    sink_failed: &AtomicBool,
 ) -> Result<FollowEnd, waitprims_async::Error>
 where
     F: std::future::Future<Output = Result<FollowEnd, waitprims_async::Error>>,
@@ -701,7 +755,6 @@ where
         let next = *deadline_rx.borrow();
         tokio::select! {
             end = &mut follow => {
-                flush_coalesce_buffer(Some(&buffer), stream, wait_id, tip_state, last_error).await?;
                 return end;
             }
             _ = deadline_rx.changed() => {}
@@ -711,7 +764,7 @@ where
                     .map_err(|_| waitprims_core::ValidationError::new("/follow_sink", "lock"))?
                     .take_if_expired(Instant::now());
                 if let Some(flush) = flush {
-                    emit_coalesced_burst(stream, wait_id, flush, tip_state, last_error).await?;
+                    emit_coalesced_burst(stream, wait_id, flush, tip_state, last_error, sink_failed).await?;
                 }
             }
         }
@@ -2454,5 +2507,45 @@ mod tests {
                 .is_ok(),
             "owner remained held after terminal write ack and explicit release"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_flush_failure_leaves_tip_unacknowledged() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let buffer = Arc::new(Mutex::new(CoalesceBuffer::<Message>::new(10_000)));
+        buffer.lock().expect("lock").push(
+            WaitFollowMode::Live,
+            Message {
+                id: "postid00000000000000000001".into(),
+                user_id: "userid00000000000000000001".into(),
+                username: "reviewer".into(),
+                message: "held".into(),
+                create_at: 1,
+                root_id: "postid00000000000000000001".into(),
+                mention_user_ids: None,
+            },
+        );
+        let tip = Mutex::new(None);
+        let last_error = Mutex::new(None);
+        let sink_failed = AtomicBool::new(false);
+        let err = flush_coalesce_or_core(
+            Some(&buffer),
+            &tx,
+            "wait_0123456789abcdef0123456789abcdef",
+            &tip,
+            &last_error,
+            &sink_failed,
+        )
+        .await
+        .expect_err("closed sink must fail the flush");
+        assert!(tip.lock().expect("tip").is_none());
+        assert!(sink_failed.load(Ordering::SeqCst));
+        assert!(matches!(
+            err,
+            CoreError::WaitProviderDegraded { ref message, .. } if message.contains("stream")
+                || message.contains("flush")
+                || message.contains("closed")
+        ));
     }
 }

@@ -16,9 +16,10 @@ use tokio::sync::broadcast;
 use tokio::time::{timeout_at, Instant};
 
 use crate::wait::{inbound_to_message, WaitPredicate};
-use crate::wait_coalesce::{CoalesceBuffer, CoalesceFlush};
+use crate::wait_coalesce::{order_coalesced, CoalesceBuffer, CoalesceFlush};
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::AppState;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 pub enum InboxFollowStreamEvent {
@@ -92,7 +93,7 @@ pub async fn wait_with_params_inbox(
     state: &AppState,
     req: WaitInboxRequest<'_>,
 ) -> Result<WaitInboxV1Result, CoreError> {
-    let outcome = run_inbox(state, req, None).await?;
+    let outcome = run_inbox(state, req, None, CancellationToken::new()).await?;
     match outcome {
         InboxOutcome::Match(result) => Ok(result),
         InboxOutcome::Follow(_) => Err(cursor_uncertain("inbox one-shot produced a follow result")),
@@ -103,8 +104,9 @@ pub async fn wait_with_params_inbox_follow(
     state: &AppState,
     req: WaitInboxRequest<'_>,
     stream: InboxFollowStreamSender,
+    client_gone: CancellationToken,
 ) -> Result<WaitInboxFollowResult, CoreError> {
-    let outcome = run_inbox(state, req, Some(stream)).await?;
+    let outcome = run_inbox(state, req, Some(stream), client_gone).await?;
     match outcome {
         InboxOutcome::Follow(result) => Ok(result),
         InboxOutcome::Match(_) => Err(cursor_uncertain("inbox follow produced a one-shot result")),
@@ -120,6 +122,7 @@ async fn run_inbox(
     state: &AppState,
     req: WaitInboxRequest<'_>,
     stream: Option<InboxFollowStreamSender>,
+    client_gone: CancellationToken,
 ) -> Result<InboxOutcome, CoreError> {
     crate::wait::validate_wait_timeout_secs(req.timeout_secs)?;
     WaitPredicate::compile(
@@ -221,23 +224,25 @@ async fn run_inbox(
         &mut rx,
         &mut bus_buffer,
         reconnects_at_arm,
+        &client_gone,
     )
     .await;
-    if let Err(err) = &armed {
-        if stream.is_some() {
-            let _ = fail_outcome(
+    match armed {
+        Ok(outcome) => Ok(outcome),
+        Err(err) if stream.is_some() => {
+            fail_outcome(
                 &session,
                 stream.as_ref(),
                 &mut coalesce,
                 &mut cursor,
                 &mut proven,
-                inbox_fail_reason(err),
-                CoreError::WaitFilterInvalid("inbox follow failed".into()),
+                inbox_fail_reason(&err),
+                err,
             )
-            .await;
+            .await
         }
+        Err(err) => Err(err),
     }
-    armed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -255,6 +260,7 @@ async fn run_inbox_armed(
     rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
     bus_buffer: &mut VecDeque<Arc<DaemonEvent>>,
     mut reconnects: u64,
+    client_gone: &CancellationToken,
 ) -> Result<InboxOutcome, CoreError> {
     if req.after.is_none() {
         let live_ids = buffered_post_ids(bus_buffer);
@@ -338,6 +344,9 @@ async fn run_inbox_armed(
         if session.cancel.is_cancelled() {
             return replaced_outcome(session, stream, coalesce, cursor, proven).await;
         }
+        if client_gone.is_cancelled() {
+            return canceled_outcome(session, stream, coalesce, cursor, proven).await;
+        }
         let now_reconnects = current_reconnects(state).await;
         if now_reconnects > reconnects {
             reconnects = now_reconnects;
@@ -366,6 +375,9 @@ async fn run_inbox_armed(
 
         let coalesce_deadline = coalesce.as_ref().and_then(CoalesceBuffer::deadline);
         tokio::select! {
+            _ = client_gone.cancelled() => {
+                return canceled_outcome(session, stream, coalesce, cursor, proven).await;
+            }
             _ = sleep_until_opt(coalesce_deadline) => {
                 if let Some(buffer) = coalesce.as_mut() {
                     if let Some(flush) = buffer.take_if_expired(Instant::now()) {
@@ -828,8 +840,12 @@ async fn emit_coalesced_inbox(
     proven: &mut Option<String>,
     flush: CoalesceFlush<WaitInboxFollowV2Message>,
 ) -> Result<(), CoreError> {
+    let items = order_coalesced(flush.items);
+    if items.is_empty() {
+        return Ok(());
+    }
     let mut next = cursor.clone();
-    for item in &flush.items {
+    for item in &items {
         next = next.advance(item.message.create_at, &item.message.id)?;
     }
     let encoded = next.encode()?;
@@ -837,7 +853,7 @@ async fn emit_coalesced_inbox(
         session.wait_id.clone(),
         flush.mode,
         encoded.clone(),
-        flush.items,
+        items,
     )
     .map_err(cursor_uncertain)?;
     emit_inbox(stream, InboxFollowStreamEvent::V2(event)).await?;
@@ -1002,10 +1018,10 @@ async fn fail_outcome(
     reason: WaitInboxFailureReason,
     err: CoreError,
 ) -> Result<InboxOutcome, CoreError> {
+    flush_pending_inbox(stream, session, coalesce, cursor, proven).await?;
     if let Some(stream) = stream {
         let use_v2 = coalesce.is_some();
-        let _ = flush_pending_inbox(Some(stream), session, coalesce, cursor, proven).await;
-        let _ = emit_inbox(
+        emit_inbox(
             stream,
             follow_terminal_event(
                 use_v2,
@@ -1020,9 +1036,40 @@ async fn fail_outcome(
                 },
             ),
         )
-        .await;
+        .await?;
     }
     Err(err)
+}
+
+async fn canceled_outcome(
+    session: &WaitSession,
+    stream: Option<&InboxFollowStreamSender>,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
+    cursor: &mut InboxCursorV1,
+    proven: &mut Option<String>,
+) -> Result<InboxOutcome, CoreError> {
+    flush_pending_inbox(stream, session, coalesce, cursor, proven).await?;
+    if let Some(stream) = stream {
+        let use_v2 = coalesce.is_some();
+        emit_inbox(
+            stream,
+            follow_terminal_event(
+                use_v2,
+                session.wait_id.clone(),
+                WaitInboxFollowEventKind::Canceled {
+                    inbox_cursor: proven.clone(),
+                },
+                WaitInboxFollowV2EventKind::Canceled {
+                    inbox_cursor: proven.clone(),
+                },
+            ),
+        )
+        .await?;
+    }
+    Err(CoreError::WaitProviderDegraded {
+        channel: "inbox".into(),
+        message: "held wait canceled".into(),
+    })
 }
 
 async fn sleep_until_opt(deadline: Option<Instant>) {
@@ -2515,6 +2562,7 @@ mod tests {
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
                 tx,
+                CancellationToken::new(),
             )
             .await
         });
@@ -2843,6 +2891,7 @@ mod tests {
                         deadline: Instant::now() + Duration::from_secs(3),
                     },
                     tx,
+                    CancellationToken::new(),
                 )
                 .await
             }
@@ -2920,6 +2969,7 @@ mod tests {
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
                 tx,
+                CancellationToken::new(),
             )
             .await
         });
@@ -3026,6 +3076,7 @@ mod tests {
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
                 tx,
+                CancellationToken::new(),
             )
             .await
         });
@@ -3069,5 +3120,53 @@ mod tests {
         let _ = burst.written.send(Ok(()));
         drop(rx);
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn pending_flush_failure_does_not_emit_terminal() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let mut buffer = CoalesceBuffer::new(10_000);
+        assert!(buffer
+            .push(
+                WaitFollowMode::Live,
+                WaitInboxFollowV2Message {
+                    peer_username: PEER_A.into(),
+                    dm_name: dm_a(),
+                    message: Message {
+                        id: POST_A.into(),
+                        user_id: PEER_A_ID.into(),
+                        username: PEER_A.into(),
+                        message: "held".into(),
+                        create_at: 1,
+                        root_id: POST_A.into(),
+                        mention_user_ids: None,
+                    },
+                },
+            )
+            .is_empty());
+        let mut coalesce = Some(buffer);
+        let mut cursor = InboxCursorV1::empty("profile", BOT_ID);
+        let mut proven = None;
+        let session = WaitSession::for_test("wait_flush_fail", None, false);
+        let err = match fail_outcome(
+            &session,
+            Some(&tx),
+            &mut coalesce,
+            &mut cursor,
+            &mut proven,
+            WaitInboxFailureReason::ProviderFailed,
+            CoreError::WaitFilterInvalid("original".into()),
+        )
+        .await
+        {
+            Ok(_) => panic!("flush must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            !matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg == "original"),
+            "flush/sink error must replace the original terminal: {err}"
+        );
+        assert!(proven.is_none());
     }
 }

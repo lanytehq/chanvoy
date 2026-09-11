@@ -46,13 +46,13 @@ pub use wait_dm::{
     WAIT_DM_FOLLOW_V1_METHOD, WAIT_DM_FOLLOW_V2_METHOD, WAIT_DM_HELP, WAIT_DM_V1_METHOD,
 };
 pub use wait_follow::{
-    is_mattermost_post_id, validate_coalesce_ms, WaitFollowEvent, WaitFollowEventKind,
-    WaitFollowFailureReason, WaitFollowMode, WaitFollowResult, WaitFollowResultKind,
-    WaitFollowSchema, WaitFollowV1Params, WaitFollowV2Event, WaitFollowV2EventKind,
-    WaitFollowV2Params, WaitFollowV2Schema, WAIT_FOLLOW_COALESCE_MAX_MESSAGES,
-    WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_FOLLOW_COALESCE_MS_MIN, WAIT_FOLLOW_V1_EVENT_METHOD,
-    WAIT_FOLLOW_V1_EVENT_SCHEMA, WAIT_FOLLOW_V1_METHOD, WAIT_FOLLOW_V2_EVENT_METHOD,
-    WAIT_FOLLOW_V2_EVENT_SCHEMA, WAIT_FOLLOW_V2_METHOD,
+    is_mattermost_post_id, validate_coalesce_ms, validate_strict_create_at_id_order,
+    WaitFollowEvent, WaitFollowEventKind, WaitFollowFailureReason, WaitFollowMode,
+    WaitFollowResult, WaitFollowResultKind, WaitFollowSchema, WaitFollowV1Params,
+    WaitFollowV2Event, WaitFollowV2EventKind, WaitFollowV2Params, WaitFollowV2Schema,
+    WAIT_FOLLOW_COALESCE_MAX_MESSAGES, WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_FOLLOW_COALESCE_MS_MIN,
+    WAIT_FOLLOW_V1_EVENT_METHOD, WAIT_FOLLOW_V1_EVENT_SCHEMA, WAIT_FOLLOW_V1_METHOD,
+    WAIT_FOLLOW_V2_EVENT_METHOD, WAIT_FOLLOW_V2_EVENT_SCHEMA, WAIT_FOLLOW_V2_METHOD,
 };
 
 pub use wait_inbox::{

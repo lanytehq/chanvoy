@@ -4,10 +4,52 @@
 //! Later matches do not extend that deadline. Flush on window expiry, 32
 //! messages, phase change, or terminal. Never drop an admitted match.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
-use chanvoy_core::{WaitFollowMode, WAIT_FOLLOW_COALESCE_MAX_MESSAGES};
+use chanvoy_core::{
+    Message, WaitFollowMode, WaitInboxFollowV2Message, WAIT_FOLLOW_COALESCE_MAX_MESSAGES,
+};
 use tokio::time::Instant;
+
+/// Sort key for a coalesced burst: `(create_at, id)`.
+pub trait CoalesceOrder {
+    fn coalesce_create_at(&self) -> i64;
+    fn coalesce_id(&self) -> &str;
+}
+
+impl CoalesceOrder for Message {
+    fn coalesce_create_at(&self) -> i64 {
+        self.create_at
+    }
+
+    fn coalesce_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl CoalesceOrder for WaitInboxFollowV2Message {
+    fn coalesce_create_at(&self) -> i64 {
+        self.message.create_at
+    }
+
+    fn coalesce_id(&self) -> &str {
+        &self.message.id
+    }
+}
+
+/// Sort by `(create_at, id)` and drop duplicate ids, keeping the first
+/// after that sort.
+pub fn order_coalesced<T: CoalesceOrder>(mut items: Vec<T>) -> Vec<T> {
+    items.sort_by(|left, right| {
+        left.coalesce_create_at()
+            .cmp(&right.coalesce_create_at())
+            .then_with(|| left.coalesce_id().cmp(right.coalesce_id()))
+    });
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(item.coalesce_id().to_string()));
+    items
+}
 
 pub struct CoalesceFlush<T> {
     pub mode: WaitFollowMode,
@@ -117,5 +159,39 @@ mod tests {
         assert!(buf.push(WaitFollowMode::Live, 2).is_empty());
         assert_eq!(buf.deadline().unwrap(), first_deadline);
         assert!(buf.take_if_expired(first_deadline).is_some());
+    }
+
+    fn msg(id: &str, create_at: i64) -> Message {
+        Message {
+            id: id.into(),
+            user_id: "userid00000000000000000001".into(),
+            username: "reviewer".into(),
+            message: "body".into(),
+            create_at,
+            root_id: id.into(),
+            mention_user_ids: None,
+        }
+    }
+
+    #[test]
+    fn flush_of_reversed_arrivals_emits_sorted_unique_array() {
+        let mut buf = CoalesceBuffer::new(10_000);
+        let later = msg("postid00000000000000000002", 2);
+        let earlier = msg("postid00000000000000000001", 1);
+        let dup_later = msg("postid00000000000000000002", 2);
+        assert!(buf.push(WaitFollowMode::Live, later).is_empty());
+        assert!(buf.push(WaitFollowMode::Live, earlier).is_empty());
+        assert!(buf.push(WaitFollowMode::Live, dup_later).is_empty());
+        let flush = buf.take().unwrap();
+        let ordered = order_coalesced(flush.items);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].id, "postid00000000000000000001");
+        assert_eq!(ordered[1].id, "postid00000000000000000002");
+        chanvoy_core::validate_strict_create_at_id_order(
+            ordered
+                .iter()
+                .map(|message| (message.create_at, message.id.as_str())),
+        )
+        .unwrap();
     }
 }

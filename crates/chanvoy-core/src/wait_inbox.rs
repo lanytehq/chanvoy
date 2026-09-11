@@ -589,6 +589,11 @@ impl WaitInboxFollowV2Event {
                 return Err("inbox v2 item must name peer and dm_name");
             }
         }
+        crate::wait_follow::validate_strict_create_at_id_order(
+            messages
+                .iter()
+                .map(|item| (item.message.create_at, item.message.id.as_str())),
+        )?;
         let matched_post_id = messages.last().unwrap().message.id.clone();
         let kind = match mode {
             WaitFollowMode::Backlog => WaitInboxFollowV2EventKind::Backlog {
@@ -670,6 +675,11 @@ impl WaitInboxFollowV2Event {
                 {
                     return Err("next_inbox_cursor must not be a Mattermost post id");
                 }
+                crate::wait_follow::validate_strict_create_at_id_order(
+                    messages
+                        .iter()
+                        .map(|item| (item.message.create_at, item.message.id.as_str())),
+                )?;
                 Ok(())
             }
             WaitInboxFollowV2EventKind::Armed { replaced_wait_id } => {
@@ -944,5 +954,67 @@ mod tests {
         assert_eq!(value["messages"][1]["peer_username"], "agent-example");
         assert_eq!(value["next_inbox_cursor"], cursor);
         assert_eq!(value["truncated"], false);
+    }
+
+    #[test]
+    fn v2_reversed_pair_fails_validate() {
+        let cursor = InboxCursorV1::empty(PROFILE, BOT)
+            .advance(2, POST_HI)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let earlier = WaitInboxFollowV2Message {
+            peer_username: "dave-3leaps".into(),
+            dm_name: "aaaaaaaaaaaaaaaaaaaaaaaaaa__bbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            message: Message {
+                id: POST_LO.into(),
+                user_id: "userid00000000000000000001".into(),
+                username: "dave-3leaps".into(),
+                message: "earlier DM".into(),
+                create_at: 1,
+                root_id: POST_LO.into(),
+                mention_user_ids: None,
+            },
+        };
+        let later = WaitInboxFollowV2Message {
+            peer_username: "agent-example".into(),
+            dm_name: "cccccccccccccccccccccccccc__bbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            message: Message {
+                id: POST_HI.into(),
+                user_id: "userid00000000000000000002".into(),
+                username: "agent-example".into(),
+                message: "later DM".into(),
+                create_at: 2,
+                root_id: POST_HI.into(),
+                mention_user_ids: None,
+            },
+        };
+        assert!(WaitInboxFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            cursor.clone(),
+            vec![later.clone(), earlier.clone()],
+        )
+        .is_err());
+        let mut equal_hi = later;
+        let mut equal_lo = earlier;
+        equal_hi.message.create_at = 7;
+        equal_lo.message.create_at = 7;
+        assert!(WaitInboxFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            cursor.clone(),
+            vec![equal_hi.clone(), equal_lo.clone()],
+        )
+        .is_err());
+        WaitInboxFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            cursor,
+            vec![equal_lo, equal_hi],
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
     }
 }

@@ -4,6 +4,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{env, ffi::OsStr};
 
@@ -22,9 +23,8 @@ use chanvoy_core::{
     SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitChannelArm,
     WaitChannelSelector, WaitChannelV3Params, WaitChannelsParams, WaitChannelsResult,
     WaitDmFollowV2Params, WaitDmV1Params, WaitDmV1Result, WaitFollowEvent, WaitFollowEventKind,
-    WaitFollowMode, WaitFollowV1Params, WaitFollowV2Event, WaitFollowV2EventKind,
-    WaitFollowV2Params, WaitInboxFollowEvent, WaitInboxFollowV2Event, WaitInboxFollowV2EventKind,
-    WaitInboxFollowV2Params, WaitInboxFollowV2Schema, WaitInboxV1Params, WaitInboxV1Result,
+    WaitFollowMode, WaitFollowV1Params, WaitFollowV2Params, WaitInboxFollowEvent,
+    WaitInboxFollowV2Event, WaitInboxFollowV2Params, WaitInboxV1Params, WaitInboxV1Result,
     WaitResult, WsConnectionState, NOT_A_WAITABLE_PEER, POST_ID_NOT_INBOX_CURSOR,
     RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED,
     RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP,
@@ -35,6 +35,7 @@ use chrono::{TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -2002,6 +2003,9 @@ async fn handle_wait_inbox_follow(
         let callback_sink = Arc::clone(&sink);
         let client = daemon_client(profile);
         if let Some(coalesce_ms) = coalesce_ms {
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let saw_canceled = Arc::new(AtomicBool::new(false));
+            let saw_canceled_cb = Arc::clone(&saw_canceled);
             let follow = client.wait_inbox_follow_v2(
                 WaitInboxFollowV2Params {
                     timeout_secs,
@@ -2013,6 +2017,9 @@ async fn handle_wait_inbox_follow(
                     coalesce_ms,
                 },
                 |event: WaitInboxFollowV2Event| {
+                    if event.mode() == WaitFollowMode::Canceled {
+                        saw_canceled_cb.store(true, Ordering::SeqCst);
+                    }
                     if let Ok(mut slot) = callback_wait_id.lock() {
                         *slot = Some(event.wait_id.clone());
                     }
@@ -2032,36 +2039,9 @@ async fn handle_wait_inbox_follow(
                     }
                     Ok(())
                 },
+                Some(cancel_rx),
             );
-            tokio::pin!(follow);
-            tokio::select! {
-                result = &mut follow => result,
-                signal = tokio::signal::ctrl_c() => {
-                    let emitted = signal
-                        .map_err(std::io::Error::other)
-                        .and_then(|()| {
-                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
-                            let inbox_cursor = seen_cursor.lock().ok().and_then(|slot| slot.clone());
-                            let Some(wait_id) = wait_id else {
-                                return Ok(());
-                            };
-                            let canceled = WaitInboxFollowV2Event {
-                                schema: WaitInboxFollowV2Schema::V2,
-                                wait_id,
-                                kind: WaitInboxFollowV2EventKind::Canceled { inbox_cursor },
-                            };
-                            sink.lock()
-                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
-                                .emit_json(&canceled)
-                        });
-                    match emitted {
-                        Ok(()) => process::exit(130),
-                        Err(err) => {
-                            return exit_wait_hard(json, "inbox", "sink", false, &err.to_string());
-                        }
-                    }
-                }
-            }
+            await_v2_follow_or_ctrl_c(follow, cancel_tx, &seen_wait_id, &saw_canceled).await
         } else {
             let follow = client.wait_inbox_follow_v1(
                 WaitInboxV1Params {
@@ -2347,6 +2327,9 @@ async fn handle_wait_dm_follow(
         let callback_sink = Arc::clone(&sink);
         let client = daemon_client(profile);
         if let Some(coalesce_ms) = coalesce_ms {
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let saw_canceled = Arc::new(AtomicBool::new(false));
+            let saw_canceled_cb = Arc::clone(&saw_canceled);
             let follow = client.wait_dm_follow_v2(
                 WaitDmFollowV2Params {
                     username: username.clone(),
@@ -2359,6 +2342,9 @@ async fn handle_wait_dm_follow(
                     coalesce_ms,
                 },
                 |event| {
+                    if event.mode() == WaitFollowMode::Canceled {
+                        saw_canceled_cb.store(true, Ordering::SeqCst);
+                    }
                     if let Ok(mut slot) = callback_wait_id.lock() {
                         *slot = Some(event.wait_id.clone());
                     }
@@ -2370,34 +2356,9 @@ async fn handle_wait_dm_follow(
                         .emit_json(&event)
                         .map_err(DaemonError::from)
                 },
+                Some(cancel_rx),
             );
-            tokio::pin!(follow);
-            tokio::select! {
-                result = &mut follow => result,
-                signal = tokio::signal::ctrl_c() => {
-                    let emitted = signal
-                        .map_err(std::io::Error::other)
-                        .and_then(|()| {
-                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
-                            let Some(wait_id) = wait_id else {
-                                return Ok(());
-                            };
-                            let canceled = WaitFollowV2Event::terminal(
-                                wait_id,
-                                WaitFollowV2EventKind::Canceled,
-                            );
-                            sink.lock()
-                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
-                                .emit_json(&canceled)
-                        });
-                    match emitted {
-                        Ok(()) => process::exit(130),
-                        Err(err) => {
-                            return exit_wait_hard(json, &username, "sink", false, &err.to_string());
-                        }
-                    }
-                }
-            }
+            await_v2_follow_or_ctrl_c(follow, cancel_tx, &seen_wait_id, &saw_canceled).await
         } else {
             let follow = client.wait_dm_follow_v1(
                 WaitDmV1Params {
@@ -2500,6 +2461,30 @@ enum FollowSink {
 enum FollowWaitOutcome {
     Completed(Result<chanvoy_core::WaitFollowResult, DaemonError>),
     Interrupted(Result<(), std::io::Error>),
+}
+
+async fn await_v2_follow_or_ctrl_c<T>(
+    follow: impl std::future::Future<Output = Result<T, DaemonError>>,
+    cancel_tx: oneshot::Sender<()>,
+    armed: &Arc<Mutex<Option<String>>>,
+    saw_canceled: &AtomicBool,
+) -> Result<T, DaemonError> {
+    tokio::pin!(follow);
+    tokio::select! {
+        result = &mut follow => result,
+        signal = tokio::signal::ctrl_c() => {
+            let _ = signal;
+            if armed.lock().ok().and_then(|slot| slot.clone()).is_none() {
+                process::exit(130);
+            }
+            let _ = cancel_tx.send(());
+            let result = follow.await;
+            if saw_canceled.load(Ordering::SeqCst) {
+                process::exit(130);
+            }
+            result
+        }
+    }
 }
 
 impl FollowSink {
@@ -2693,6 +2678,9 @@ async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result
         let callback_sink = Arc::clone(&sink);
         let client = daemon_client(profile);
         if let Some(coalesce_ms) = coalesce_ms {
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let saw_canceled = Arc::new(AtomicBool::new(false));
+            let saw_canceled_cb = Arc::clone(&saw_canceled);
             let follow = client.wait_follow_v2(
                 WaitFollowV2Params {
                     channel: channel.clone(),
@@ -2706,6 +2694,9 @@ async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result
                     coalesce_ms,
                 },
                 |event| {
+                    if event.mode() == WaitFollowMode::Canceled {
+                        saw_canceled_cb.store(true, Ordering::SeqCst);
+                    }
                     if let Ok(mut slot) = callback_wait_id.lock() {
                         *slot = Some(event.wait_id.clone());
                     }
@@ -2717,29 +2708,11 @@ async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result
                         .emit_json(&event)
                         .map_err(DaemonError::from)
                 },
+                Some(cancel_rx),
             );
-            tokio::pin!(follow);
-            tokio::select! {
-                result = &mut follow => FollowWaitOutcome::Completed(result),
-                signal = tokio::signal::ctrl_c() => {
-                    let emitted = signal
-                        .map_err(std::io::Error::other)
-                        .and_then(|()| {
-                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
-                            let Some(wait_id) = wait_id else {
-                                return Ok(());
-                            };
-                            let canceled = WaitFollowV2Event::terminal(
-                                wait_id,
-                                WaitFollowV2EventKind::Canceled,
-                            );
-                            sink.lock()
-                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
-                                .emit_json(&canceled)
-                        });
-                    FollowWaitOutcome::Interrupted(emitted)
-                }
-            }
+            FollowWaitOutcome::Completed(
+                await_v2_follow_or_ctrl_c(follow, cancel_tx, &seen_wait_id, &saw_canceled).await,
+            )
         } else {
             let follow = client.wait_follow_v1(
                 WaitFollowV1Params {
