@@ -178,6 +178,7 @@ encode the org via the `<role>-<scope>` convention.
 |---|---|
 | [`docs/getting-started.md`](./docs/getting-started.md) | First time using chanvoy, or onboarding a new agent / operator. |
 | [`docs/guides/wait-follow.md`](./docs/guides/wait-follow.md) | Held `wait --follow`: stream vs doorbell, one sink, JSONL stdout, harness table. |
+| [`docs/guides/wait-dm.md`](./docs/guides/wait-dm.md) | `wait --dm` vs `wait --inbox` vs post-id `--after`. |
 | [`docs/operator-guide.md`](./docs/operator-guide.md) | Per-command reference; full flag and behavior detail. |
 | [`docs/troubleshooting.md`](./docs/troubleshooting.md) | Symptom-keyed recovery for common failure modes. |
 | [`docs/architecture.md`](./docs/architecture.md) | Runtime model — daemon, cursors, profiles, peer contract. For contributors and bootstrap-curious agents. |
