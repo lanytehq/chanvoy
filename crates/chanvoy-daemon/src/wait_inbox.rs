@@ -570,10 +570,10 @@ async fn collect_backfill(
     predicate: &WaitPredicate,
     deadline: Instant,
 ) -> Result<Vec<(CataloguedDm, Message)>, CoreError> {
-    let mut admitted = Vec::new();
     let mut remaining = INBOX_MAX_BACKFILL;
+    let mut candidates = Vec::new();
+    let since = scan.watermark.saturating_sub(1);
     for entry in dms.values() {
-        let since = scan.watermark.saturating_sub(1);
         let (posts, consumed) = crate::wait::provider_retry(state, "inbox", deadline, || {
             let id = entry.id.clone();
             async move {
@@ -586,21 +586,27 @@ async fn collect_backfill(
         .await?;
         remaining = remaining.saturating_sub(consumed);
         for message in posts {
-            if !scan.admits(message.create_at, &message.id) {
-                continue;
-            }
-            *scan = scan.advance(message.create_at, &message.id)?;
-            if predicate.matches_message(&message) {
-                admitted.push((entry.clone(), message));
+            if scan.admits(message.create_at, &message.id) {
+                candidates.push((entry.clone(), message));
             }
         }
     }
-    admitted.sort_by(|left, right| {
+    candidates.sort_by(|left, right| {
         left.1
             .create_at
             .cmp(&right.1.create_at)
             .then_with(|| left.1.id.cmp(&right.1.id))
     });
+    let mut admitted = Vec::new();
+    for (entry, message) in candidates {
+        if !scan.admits(message.create_at, &message.id) {
+            continue;
+        }
+        *scan = scan.advance(message.create_at, &message.id)?;
+        if predicate.matches_message(&message) {
+            admitted.push((entry, message));
+        }
+    }
     Ok(admitted)
 }
 
@@ -1581,6 +1587,139 @@ mod tests {
             json.get("mention_user_ids").is_none(),
             "public message must not leak mention ids: {json}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mention_two_dms_older_mention_beats_newer_nonmatch() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        mount_two_dm_catalog(&server).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_A: {
+                        "id": POST_A,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "@agent-bravo-devlead older",
+                        "create_at": 1_780_000_000_200i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_C}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_C: {
+                        "id": POST_C,
+                        "channel_id": DM_C,
+                        "user_id": PEER_C_ID,
+                        "message": "ACK later",
+                        "create_at": 1_780_000_000_300i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID)
+            .encode()
+            .unwrap();
+        let result = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 3,
+                contains: None,
+                pattern: None,
+                mention: true,
+                after: Some(&cursor),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        )
+        .await
+        .expect("older mention");
+        assert_eq!(result.matched_post_id, POST_A);
+        assert_eq!(result.peer_username, PEER_A);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mention_reconnect_after_nonmatch_burst_delivers_later() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        struct CatalogSeq(std::sync::atomic::AtomicUsize);
+        impl wiremock::Respond for CatalogSeq {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(150))
+                        .set_body_json(serde_json::json!([{
+                            "id": DM_A,
+                            "name": dm_a(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_100i64
+                        }]))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                        {
+                            "id": DM_A,
+                            "name": dm_a(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_100i64
+                        },
+                        {
+                            "id": DM_C,
+                            "name": dm_c(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_400i64
+                        }
+                    ]))
+                }
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/users/{BOT_ID}/channels")))
+            .respond_with(CatalogSeq(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        mount_posts(&server, DM_A, POST_A, PEER_A_ID, 1_780_000_000_100, "ACK").await;
+        mount_posts(
+            &server,
+            DM_C,
+            POST_C,
+            PEER_C_ID,
+            1_780_000_000_400,
+            "@agent-bravo-devlead later",
+        )
+        .await;
+        let state = Arc::new(healthy_state(&server).await);
+        let ws = state.ws_state_holder.lock().await.clone().unwrap();
+        let wait_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            wait_with_params_inbox(
+                &wait_state,
+                WaitInboxRequest {
+                    timeout_secs: 3,
+                    contains: None,
+                    pattern: None,
+                    mention: true,
+                    after: None,
+                    replace_wait_id: None,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        ws.reconnect_count.fetch_add(1, Ordering::SeqCst);
+        let result = task.await.unwrap().expect("mention after reconnect");
+        assert_eq!(result.matched_post_id, POST_C);
+        assert_eq!(result.peer_username, PEER_C);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
