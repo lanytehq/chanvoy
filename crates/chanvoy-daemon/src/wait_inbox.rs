@@ -1,6 +1,6 @@
 //! Inbox wait: any direct message to this bot.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -201,7 +201,7 @@ async fn run_inbox_armed(
     cursor: &mut InboxCursorV1,
     proven: &mut Option<String>,
     predicate: &WaitPredicate,
-    dms: &mut HashMap<String, CataloguedDm>,
+    dms: &mut BTreeMap<String, CataloguedDm>,
     catalog: &[DirectCatalogEntry],
     rx: &mut broadcast::Receiver<Arc<DaemonEvent>>,
     bus_buffer: &mut VecDeque<Arc<DaemonEvent>>,
@@ -365,7 +365,7 @@ async fn resolve_catalog(
     state: &AppState,
     catalog: &[DirectCatalogEntry],
     deadline: Instant,
-) -> Result<HashMap<String, CataloguedDm>, CoreError> {
+) -> Result<BTreeMap<String, CataloguedDm>, CoreError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(cursor_uncertain(
@@ -373,7 +373,7 @@ async fn resolve_catalog(
         ));
     }
     let work = async {
-        let mut dms = HashMap::new();
+        let mut dms = BTreeMap::new();
         for entry in catalog {
             let peer_id = peer_user_id_from_dm_name(&entry.name, &state.my_user_id)
                 .ok_or_else(|| cursor_uncertain("inbox catalog entry is not a DM for this bot"))?;
@@ -474,7 +474,7 @@ async fn prove_inbox_cursor(
 
 async fn recatalog(
     state: &AppState,
-    dms: &mut HashMap<String, CataloguedDm>,
+    dms: &mut BTreeMap<String, CataloguedDm>,
     deadline: Instant,
 ) -> Result<(), CoreError> {
     let catalog = provider_list(state, deadline).await?;
@@ -515,7 +515,7 @@ fn buffered_post_ids(buffer: &VecDeque<Arc<DaemonEvent>>) -> HashSet<String> {
 async fn establish_arm_cursor(
     state: &AppState,
     catalog: &[DirectCatalogEntry],
-    dms: &HashMap<String, CataloguedDm>,
+    dms: &BTreeMap<String, CataloguedDm>,
     deadline: Instant,
     live_ids: &HashSet<String>,
 ) -> Result<InboxCursorV1, CoreError> {
@@ -565,7 +565,7 @@ async fn establish_arm_cursor(
 
 async fn collect_backfill(
     state: &AppState,
-    dms: &HashMap<String, CataloguedDm>,
+    dms: &BTreeMap<String, CataloguedDm>,
     scan: &mut InboxCursorV1,
     predicate: &WaitPredicate,
     deadline: Instant,
@@ -615,7 +615,7 @@ async fn handle_event(
     state: &AppState,
     session: &WaitSession,
     stream: Option<&InboxFollowStreamSender>,
-    dms: &mut HashMap<String, CataloguedDm>,
+    dms: &mut BTreeMap<String, CataloguedDm>,
     cursor: &mut InboxCursorV1,
     observer: &mut InboxCursorV1,
     proven: &mut Option<String>,
@@ -1602,8 +1602,8 @@ mod tests {
                         "id": POST_A,
                         "channel_id": DM_A,
                         "user_id": PEER_A_ID,
-                        "message": "@agent-bravo-devlead older",
-                        "create_at": 1_780_000_000_200i64,
+                        "message": "ACK later on first-sorted DM",
+                        "create_at": 1_780_000_000_300i64,
                         "root_id": ""
                     }
                 }
@@ -1618,8 +1618,8 @@ mod tests {
                         "id": POST_C,
                         "channel_id": DM_C,
                         "user_id": PEER_C_ID,
-                        "message": "ACK later",
-                        "create_at": 1_780_000_000_300i64,
+                        "message": "@agent-bravo-devlead older",
+                        "create_at": 1_780_000_000_200i64,
                         "root_id": ""
                     }
                 }
@@ -1644,8 +1644,8 @@ mod tests {
         )
         .await
         .expect("older mention");
-        assert_eq!(result.matched_post_id, POST_A);
-        assert_eq!(result.peer_username, PEER_A);
+        assert_eq!(result.matched_post_id, POST_C);
+        assert_eq!(result.peer_username, PEER_C);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1656,14 +1656,12 @@ mod tests {
         impl wiremock::Respond for CatalogSeq {
             fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
                 if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                    ResponseTemplate::new(200)
-                        .set_delay(Duration::from_millis(150))
-                        .set_body_json(serde_json::json!([{
-                            "id": DM_A,
-                            "name": dm_a(),
-                            "type": "D",
-                            "last_post_at": 1_780_000_000_100i64
-                        }]))
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": DM_A,
+                        "name": dm_a(),
+                        "type": "D",
+                        "last_post_at": 1_780_000_000_100i64
+                    }]))
                 } else {
                     ResponseTemplate::new(200).set_body_json(serde_json::json!([
                         {
@@ -1698,6 +1696,9 @@ mod tests {
         )
         .await;
         let state = Arc::new(healthy_state(&server).await);
+        let empty = InboxCursorV1::empty(&state.profile.name, BOT_ID)
+            .encode()
+            .unwrap();
         let ws = state.ws_state_holder.lock().await.clone().unwrap();
         let wait_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
@@ -1708,18 +1709,33 @@ mod tests {
                     contains: None,
                     pattern: None,
                     mention: true,
-                    after: None,
+                    after: Some(&empty),
                     replace_wait_id: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
             .await
         });
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
         ws.reconnect_count.fetch_add(1, Ordering::SeqCst);
+        state.event_bus.emit(inbound(
+            "teamchan000000000000000001",
+            "town-square",
+            "",
+            "postid0000000000000000000t",
+            "userid00000000000000000009",
+            "human",
+            1_780_000_000_900,
+            "team noise",
+        ));
         let result = task.await.unwrap().expect("mention after reconnect");
         assert_eq!(result.matched_post_id, POST_C);
         assert_eq!(result.peer_username, PEER_C);
+        let next = InboxCursorV1::decode(&result.next_inbox_cursor, &state.profile.name, BOT_ID)
+            .expect("public cursor");
+        assert_eq!(next.watermark, 1_780_000_000_400);
+        assert!(next.observed_ids.contains(POST_C));
+        assert!(!next.observed_ids.contains(POST_A));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
