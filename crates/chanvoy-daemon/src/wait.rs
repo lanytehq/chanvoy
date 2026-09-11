@@ -8,6 +8,7 @@
 //! `create_at` exclusivity.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use chanvoy_core::{
     classify_wait_dm_username, is_dm_channel_name, not_a_waitable_peer,
     validate_wait_channel_v3_strings, CoreError, DaemonEvent, DaemonEventPayloadInner,
     InboundEventPayload, Message, WaitDmFollowResult, WaitDmV1Result, WaitResult,
-    WsConnectionState,
+    WsConnectionState, WsState,
 };
 use regex::RegexBuilder;
 use reqwest::StatusCode;
@@ -1470,6 +1471,31 @@ pub(crate) async fn refuse_current_ws_failure(
     let Some(ws) = ws else {
         return Ok(());
     };
+    refuse_ws_state(&ws, channel).await
+}
+
+/// Load reconnect generation, then refuse a currently failed observation path.
+///
+/// Inbox uses this so a reconnect that lands during the awaited health
+/// snapshot cannot become the baseline generation. The atomic counter is
+/// read before `status_snapshot`.
+pub(crate) async fn admit_push_observation(
+    state: &AppState,
+    channel: &str,
+) -> Result<u64, CoreError> {
+    let ws = {
+        let guard = state.ws_state_holder.lock().await;
+        guard.clone()
+    };
+    let Some(ws) = ws else {
+        return Ok(0);
+    };
+    let reconnects = ws.reconnect_count.load(Ordering::SeqCst);
+    refuse_ws_state(&ws, channel).await?;
+    Ok(reconnects)
+}
+
+async fn refuse_ws_state(ws: &WsState, channel: &str) -> Result<(), CoreError> {
     let snapshot = ws.status_snapshot().await;
     let connection = snapshot
         .connection_state

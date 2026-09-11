@@ -1,4 +1,4 @@
-//! PER-046 inbox wait: any direct message to this bot.
+//! Inbox wait: any direct message to this bot.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,11 +103,10 @@ async fn run_inbox(
         )?),
         None => None,
     };
-    crate::wait::refuse_current_ws_failure(state, "inbox").await?;
+    let reconnects_at_arm = crate::wait::admit_push_observation(state, "inbox").await?;
 
     let _arm = InboxArmGuard::arm(&state.inbox_armed);
     let mut rx = state.event_bus.subscribe();
-    let reconnects_at_arm = current_reconnects(state).await;
     let mut bus_buffer: VecDeque<Arc<DaemonEvent>> = VecDeque::new();
     drain_inbox_bus(&mut rx, &mut bus_buffer)?;
 
@@ -116,6 +115,12 @@ async fn run_inbox(
         return Err(inbox_capacity(format!(
             "inbox catalog exceeds {INBOX_MAX_DMS} direct channels"
         )));
+    }
+
+    let mut dms = resolve_catalog(state, &catalog, req.deadline).await?;
+    drain_inbox_bus(&mut rx, &mut bus_buffer)?;
+    if let Some(cursor) = decoded_after.as_ref() {
+        prove_inbox_cursor(state, cursor, &catalog, req.deadline).await?;
     }
 
     let remaining = req.deadline.saturating_duration_since(Instant::now());
@@ -133,9 +138,6 @@ async fn run_inbox(
     };
     let mut proven = req.after.map(str::to_string);
     let predicate = WaitPredicate::compile(&state.my_user_id, "inbox", req.contains, req.pattern)?;
-
-    let mut dms = resolve_catalog(state, &catalog, req.deadline).await?;
-    drain_inbox_bus(&mut rx, &mut bus_buffer)?;
 
     if let Some(stream) = stream.as_ref() {
         emit_inbox(
@@ -371,6 +373,73 @@ async fn resolve_catalog(
     tokio::time::timeout(remaining, work)
         .await
         .map_err(|_| cursor_uncertain("inbox catalog peer lookup exceeded the wait deadline"))?
+}
+
+async fn prove_inbox_cursor(
+    state: &AppState,
+    cursor: &InboxCursorV1,
+    catalog: &[DirectCatalogEntry],
+    deadline: Instant,
+) -> Result<(), CoreError> {
+    if cursor.watermark == 0 {
+        if !cursor.observed_ids.is_empty() {
+            return Err(cursor_uncertain(
+                "inbox cursor observed ids at zero watermark are unprovable",
+            ));
+        }
+        return Ok(());
+    }
+    let catalog_max = catalog
+        .iter()
+        .map(|entry| entry.last_post_at)
+        .max()
+        .unwrap_or(0);
+    if cursor.watermark > catalog_max {
+        return Err(cursor_uncertain(
+            "inbox cursor watermark is ahead of the authenticated catalog",
+        ));
+    }
+    if cursor.observed_ids.is_empty() {
+        return Ok(());
+    }
+    let mut remaining = INBOX_MAX_BACKFILL;
+    let mut found = HashSet::new();
+    let mut contradictory = false;
+    for entry in catalog {
+        let since = cursor.watermark.saturating_sub(1);
+        let (posts, consumed) = crate::wait::provider_retry(state, "inbox", deadline, || {
+            let id = entry.id.clone();
+            async move {
+                state
+                    .client
+                    .inbox_history_since(&id, since, remaining)
+                    .await
+            }
+        })
+        .await?;
+        remaining = remaining.saturating_sub(consumed);
+        for message in posts {
+            if !cursor.observed_ids.contains(&message.id) {
+                continue;
+            }
+            if message.create_at != cursor.watermark {
+                contradictory = true;
+            } else {
+                found.insert(message.id);
+            }
+        }
+    }
+    if contradictory {
+        return Err(cursor_uncertain(
+            "inbox cursor observed ids contradict authenticated history",
+        ));
+    }
+    if found.len() != cursor.observed_ids.len() {
+        return Err(cursor_uncertain(
+            "inbox cursor observed ids are not present in authenticated history",
+        ));
+    }
+    Ok(())
 }
 
 async fn recatalog(
@@ -1340,6 +1409,157 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_during_admission_snapshot_is_caught_up() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        struct CatalogSeq(std::sync::atomic::AtomicUsize);
+        impl wiremock::Respond for CatalogSeq {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(150))
+                        .set_body_json(serde_json::json!([{
+                            "id": DM_A,
+                            "name": dm_a(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_050i64
+                        }]))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                        {
+                            "id": DM_A,
+                            "name": dm_a(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_050i64
+                        },
+                        {
+                            "id": DM_C,
+                            "name": dm_c(),
+                            "type": "D",
+                            "last_post_at": 1_780_000_000_400i64
+                        }
+                    ]))
+                }
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/users/{BOT_ID}/channels")))
+            .respond_with(CatalogSeq(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        mount_posts(&server, DM_A, POST_A, PEER_A_ID, 1_780_000_000_050, "old").await;
+        mount_posts(
+            &server,
+            DM_C,
+            POST_C,
+            PEER_C_ID,
+            1_780_000_000_400,
+            "after outage",
+        )
+        .await;
+        let state = Arc::new(healthy_state(&server).await);
+        let ws = state.ws_state_holder.lock().await.clone().unwrap();
+        let hold = ws.connection_state.lock().await;
+        let wait_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            wait_with_params_inbox(
+                &wait_state,
+                WaitInboxRequest {
+                    timeout_secs: 3,
+                    contains: None,
+                    pattern: None,
+                    after: None,
+                    replace_wait_id: None,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ws.reconnect_count.fetch_add(1, Ordering::SeqCst);
+        drop(hold);
+        let result = task.await.unwrap().expect("catch-up");
+        assert_eq!(result.matched_post_id, POST_C);
+        assert_eq!(result.peer_username, PEER_C);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn future_watermark_cursor_is_uncertain() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        mount_one_dm_catalog(&server, 0).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {}
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let mut cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID);
+        cursor.watermark = 9_000_000_000_000;
+        let raw = cursor.encode().unwrap();
+        let err = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 2,
+                contains: None,
+                pattern: None,
+                after: Some(&raw),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("watermark")),
+            "{err}"
+        );
+        assert!(
+            !matches!(err, CoreError::WaitTimeout(_)),
+            "future watermark must not be a clean deadman: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fabricated_equal_watermark_id_is_uncertain() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        mount_one_dm_catalog(&server, 0).await;
+        mount_posts(&server, DM_A, POST_A, PEER_A_ID, 1_780_000_000_100, "real").await;
+        let state = healthy_state(&server).await;
+        let mut cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID);
+        cursor.watermark = 1_780_000_000_100;
+        cursor
+            .observed_ids
+            .insert("zzzzzz00000000000000000001".into());
+        let raw = cursor.encode().unwrap();
+        let err = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 2,
+                contains: None,
+                pattern: None,
+                after: Some(&raw),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("observed")),
+            "{err}"
+        );
+        assert!(
+            !matches!(err, CoreError::WaitTimeout(_)),
+            "unprovable observed id must not be a clean deadman: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_peers_self_post_ignored() {
         let server = MockServer::start().await;
         mount_baseline(&server).await;
@@ -1422,7 +1642,30 @@ mod tests {
         mount_one_dm_catalog(&server, 0).await;
         let high = "zzzzzz00000000000000000001";
         let low = "aaaaaa00000000000000000001";
-        mount_posts(&server, DM_A, low, PEER_A_ID, 1_780_000_000_100, "lower").await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    "zzzzzz00000000000000000001": {
+                        "id": high,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "higher",
+                        "create_at": 1_780_000_000_100i64,
+                        "root_id": ""
+                    },
+                    "aaaaaa00000000000000000001": {
+                        "id": low,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "lower",
+                        "create_at": 1_780_000_000_100i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
         let state = healthy_state(&server).await;
         let mut cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID);
         cursor = cursor.advance(1_780_000_000_100, high).unwrap();
