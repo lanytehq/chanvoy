@@ -1,6 +1,6 @@
 //! Inbox wait: any direct message to this bot.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -912,6 +912,7 @@ mod tests {
         EventBus, InboundEventPayload, MattermostClient, Profile, Provider, WsConnectionState,
         WsState, INBOX_PAGE_SIZE,
     };
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::sync::Mutex;
