@@ -21,11 +21,14 @@ use chanvoy_core::{
     Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
     SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitChannelArm,
     WaitChannelSelector, WaitChannelV3Params, WaitChannelsParams, WaitChannelsResult,
-    WaitDmV1Params, WaitDmV1Result, WaitFollowEvent, WaitFollowEventKind, WaitFollowMode,
-    WaitFollowV1Params, WaitInboxFollowEvent, WaitInboxV1Params, WaitInboxV1Result, WaitResult,
-    WsConnectionState, NOT_A_WAITABLE_PEER, POST_ID_NOT_INBOX_CURSOR, RPC_WAIT_ALREADY_ACTIVE,
-    RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED,
-    WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP, WAIT_INBOX_HELP,
+    WaitDmFollowV2Params, WaitDmV1Params, WaitDmV1Result, WaitFollowEvent, WaitFollowEventKind,
+    WaitFollowMode, WaitFollowV1Params, WaitFollowV2Event, WaitFollowV2EventKind,
+    WaitFollowV2Params, WaitInboxFollowEvent, WaitInboxFollowV2Event, WaitInboxFollowV2EventKind,
+    WaitInboxFollowV2Params, WaitInboxFollowV2Schema, WaitInboxV1Params, WaitInboxV1Result,
+    WaitResult, WsConnectionState, NOT_A_WAITABLE_PEER, POST_ID_NOT_INBOX_CURSOR,
+    RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED,
+    RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP,
+    WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_INBOX_HELP,
 };
 use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -491,7 +494,7 @@ struct WaitArgs {
     #[arg(
         long,
         default_value = "10",
-        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider/ownership failures exit 2 (never timeout:true).\n\nThis profile daemon allows one active wait per canonical channel. A second wait without --replace-wait <id> is a hard conflict. --replace-wait is compare-and-replace only (no --force). This is not a host-wide or cross-seat lock.\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nHeld follow is a stream, not a harness doorbell. --follow is single-channel and requires exactly one sink: --out PATH or --follow-stdout. --follow-stdout is JSONL-only (no human preamble on stdout). On a shared host pass --profile. After a terminal record, resume from the last live tip. It emits self-identifying JSONL while retaining the same waitprims bind: armed first, one message per backlog/live record, then an optional terminal record. Deadman exits 1; replacement or failed exits 2; Ctrl-C writes canceled and exits 130. Sink failure is a hard exit and releases the waiter.\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after, --team, and --replace-wait are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
+        long_help = "Deadman timeout for the wait. Bare integer = minutes (default 10 = 10m). Accepted suffixes: s/m/h/d (e.g., 30s, 5m, 4h, 2d). Rejected: uppercase 'M', 'mo'.\n\nOutcomes: match exits 0 with one message payload; clean deadman exits 1 with timeout:true; hard/config/provider/ownership failures exit 2 (never timeout:true).\n\nThis profile daemon allows one active wait per canonical channel. A second wait without --replace-wait <id> is a hard conflict. --replace-wait is compare-and-replace only (no --force). This is not a host-wide or cross-seat lock.\n\nFilters are case-sensitive by default; use --pattern '(?i)…' when case should not matter. Body-only matching; --contains and --pattern AND when both set. Empty filter values are refused. Each filter source is limited to 256 UTF-8 bytes; compiled regex size is limited to 64 KiB. --after is exclusive (only posts strictly after that id). Without --after, baseline is tip-at-arm (miss model A/B expected — prefer read then wait --after).\n\nHeld follow is a stream, not a harness doorbell. --follow is single-channel and requires exactly one sink: --out PATH or --follow-stdout. --follow-stdout is JSONL-only (no human preamble on stdout). On a shared host pass --profile. After a terminal record, resume from the last live tip. It emits self-identifying JSONL while retaining the same waitprims bind: armed first, backlog/live records (one message each unless --coalesce is set), then an optional terminal record. --coalesce is default off; recommended 5s, hard max 10s / 32 messages. See docs/guides/wait-follow.md. Deadman exits 1; replacement or failed exits 2; Ctrl-C writes canceled and exits 130. Sink failure is a hard exit and releases the waiter.\n\nFan-in: repeat --channel team/channel (2–8 arms). Use --after-channel team/channel=post-id per arm; --after, --team, and --replace-wait are refused in fan-in. First match wins under one shared deadline. A daemon that does not implement multi-channel wait is a hard failure — cycle it after install.\n\nThe bot's own posts never wake the wait (self-post ignore) — peer posts required for match dogfood."
     )]
     timeout: String,
     /// Literal body substring (case-sensitive). Self-posts never match.
@@ -523,7 +526,7 @@ struct WaitArgs {
     /// Keep one single-channel wait armed as a held stream (not a harness doorbell).
     #[arg(
         long,
-        long_help = "Held follow is a stream, not a harness doorbell. It keeps one single-channel wait armed and emits self-identifying JSONL records: armed first, then one message per backlog/live record, then an optional terminal record. Requires exactly one sink. After a terminal record, resume from the last live tip. On a shared host pass --profile so seats do not replace each other."
+        long_help = "Held follow is a stream, not a harness doorbell. It keeps one single-channel wait armed and emits self-identifying JSONL records: armed first, then backlog/live records, then an optional terminal record. Without --coalesce, each backlog/live record has one message. Optional --coalesce is default off (recommended 5s, hard max 10s / 32 messages). Requires exactly one sink. After a terminal record, resume from the last live tip. On a shared host pass --profile so seats do not replace each other."
     )]
     follow: bool,
     /// Append held-wait JSONL to a secure caller-named file.
@@ -542,6 +545,14 @@ struct WaitArgs {
         long_help = "Emit held-wait JSONL only on stdout. No human preamble on stdout. The static following-new-messages breadcrumb stays on stderr and never includes a post body. Requires --follow. Conflicts with --out (exactly one sink)."
     )]
     follow_stdout: bool,
+    /// Optional coalescing window for --follow. Default off. Recommended 5s; hard max 10s.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        requires = "follow",
+        long_help = "Optional coalescing window for --follow. Default off: omit this flag to keep one-message v1 records. Bare integer = seconds (5 and 5s are five seconds). Recommended 5s; hard maximum 10s / 32 messages. See docs/guides/wait-follow.md."
+    )]
+    coalesce: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1965,6 +1976,15 @@ async fn handle_wait_inbox_follow(
             "empty follow filters are refused",
         );
     }
+    let coalesce_ms = match args.coalesce.as_deref() {
+        None => None,
+        Some(raw) => match parse_coalesce_ms(raw) {
+            Ok(ms) => Some(ms),
+            Err(err) => {
+                return exit_wait_hard(json, "inbox", "input", false, &err);
+            }
+        },
+    };
     let sink = match open_follow_sink(&args) {
         Ok(sink) => Arc::new(Mutex::new(sink)),
         Err(err) => {
@@ -1981,63 +2001,126 @@ async fn handle_wait_inbox_follow(
         let callback_cursor = Arc::clone(&seen_cursor);
         let callback_sink = Arc::clone(&sink);
         let client = daemon_client(profile);
-        let follow = client.wait_inbox_follow_v1(
-            WaitInboxV1Params {
-                timeout_secs,
-                contains: args.contains.clone(),
-                pattern: args.pattern.clone(),
-                mention: args.mention,
-                after: args.after.clone(),
-                replace_wait_id: args.replace_wait.clone(),
-            },
-            |event: WaitInboxFollowEvent| {
-                if let Ok(mut slot) = callback_wait_id.lock() {
-                    *slot = Some(event.wait_id.clone());
-                }
-                callback_sink
-                    .lock()
-                    .map_err(|_| {
-                        DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
-                    })?
-                    .emit_json(&event)
-                    .map_err(DaemonError::from)?;
-                if matches!(event.mode(), WaitFollowMode::Backlog | WaitFollowMode::Live) {
-                    if let Some(cursor) = event.inbox_cursor() {
-                        if let Ok(mut slot) = callback_cursor.lock() {
-                            *slot = Some(cursor.to_string());
+        if let Some(coalesce_ms) = coalesce_ms {
+            let follow = client.wait_inbox_follow_v2(
+                WaitInboxFollowV2Params {
+                    timeout_secs,
+                    contains: args.contains.clone(),
+                    pattern: args.pattern.clone(),
+                    mention: args.mention,
+                    after: args.after.clone(),
+                    replace_wait_id: args.replace_wait.clone(),
+                    coalesce_ms,
+                },
+                |event: WaitInboxFollowV2Event| {
+                    if let Ok(mut slot) = callback_wait_id.lock() {
+                        *slot = Some(event.wait_id.clone());
+                    }
+                    callback_sink
+                        .lock()
+                        .map_err(|_| {
+                            DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                        })?
+                        .emit_json(&event)
+                        .map_err(DaemonError::from)?;
+                    if matches!(event.mode(), WaitFollowMode::Backlog | WaitFollowMode::Live) {
+                        if let Some(cursor) = event.inbox_cursor() {
+                            if let Ok(mut slot) = callback_cursor.lock() {
+                                *slot = Some(cursor.to_string());
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            tokio::pin!(follow);
+            tokio::select! {
+                result = &mut follow => result,
+                signal = tokio::signal::ctrl_c() => {
+                    let emitted = signal
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| {
+                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                            let inbox_cursor = seen_cursor.lock().ok().and_then(|slot| slot.clone());
+                            let Some(wait_id) = wait_id else {
+                                return Ok(());
+                            };
+                            let canceled = WaitInboxFollowV2Event {
+                                schema: WaitInboxFollowV2Schema::V2,
+                                wait_id,
+                                kind: WaitInboxFollowV2EventKind::Canceled { inbox_cursor },
+                            };
+                            sink.lock()
+                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                                .emit_json(&canceled)
+                        });
+                    match emitted {
+                        Ok(()) => process::exit(130),
+                        Err(err) => {
+                            return exit_wait_hard(json, "inbox", "sink", false, &err.to_string());
                         }
                     }
                 }
-                Ok(())
-            },
-        );
-        tokio::pin!(follow);
-        tokio::select! {
-            result = &mut follow => result,
-            signal = tokio::signal::ctrl_c() => {
-                let emitted = signal
-                    .map_err(std::io::Error::other)
-                    .and_then(|()| {
-                        let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
-                        let inbox_cursor = seen_cursor.lock().ok().and_then(|slot| slot.clone());
-                        let Some(wait_id) = wait_id else {
-                            return Ok(());
-                        };
-                        let canceled = WaitInboxFollowEvent {
-                            schema: chanvoy_core::WaitInboxFollowSchema::V1,
-                            wait_id,
-                            kind: chanvoy_core::WaitInboxFollowEventKind::Canceled {
-                                inbox_cursor,
-                            },
-                        };
-                        sink.lock()
-                            .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
-                            .emit_json(&canceled)
-                    });
-                match emitted {
-                    Ok(()) => process::exit(130),
-                    Err(err) => {
-                        return exit_wait_hard(json, "inbox", "sink", false, &err.to_string());
+            }
+        } else {
+            let follow = client.wait_inbox_follow_v1(
+                WaitInboxV1Params {
+                    timeout_secs,
+                    contains: args.contains.clone(),
+                    pattern: args.pattern.clone(),
+                    mention: args.mention,
+                    after: args.after.clone(),
+                    replace_wait_id: args.replace_wait.clone(),
+                },
+                |event: WaitInboxFollowEvent| {
+                    if let Ok(mut slot) = callback_wait_id.lock() {
+                        *slot = Some(event.wait_id.clone());
+                    }
+                    callback_sink
+                        .lock()
+                        .map_err(|_| {
+                            DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                        })?
+                        .emit_json(&event)
+                        .map_err(DaemonError::from)?;
+                    if matches!(event.mode(), WaitFollowMode::Backlog | WaitFollowMode::Live) {
+                        if let Some(cursor) = event.inbox_cursor() {
+                            if let Ok(mut slot) = callback_cursor.lock() {
+                                *slot = Some(cursor.to_string());
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            tokio::pin!(follow);
+            tokio::select! {
+                result = &mut follow => result,
+                signal = tokio::signal::ctrl_c() => {
+                    let emitted = signal
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| {
+                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                            let inbox_cursor = seen_cursor.lock().ok().and_then(|slot| slot.clone());
+                            let Some(wait_id) = wait_id else {
+                                return Ok(());
+                            };
+                            let canceled = WaitInboxFollowEvent {
+                                schema: chanvoy_core::WaitInboxFollowSchema::V1,
+                                wait_id,
+                                kind: chanvoy_core::WaitInboxFollowEventKind::Canceled {
+                                    inbox_cursor,
+                                },
+                            };
+                            sink.lock()
+                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                                .emit_json(&canceled)
+                        });
+                    match emitted {
+                        Ok(()) => process::exit(130),
+                        Err(err) => {
+                            return exit_wait_hard(json, "inbox", "sink", false, &err.to_string());
+                        }
                     }
                 }
             }
@@ -2077,8 +2160,13 @@ async fn handle_wait_inbox_follow(
             "inbox",
             "capability",
             false,
-            "the running daemon does not support wait --inbox --follow; cycle it with \
-             `chanvoy daemon stop` then `chanvoy auto-setup`",
+            if coalesce_ms.is_some() {
+                "the running daemon does not support wait --inbox --follow --coalesce; cycle it with \
+                 `chanvoy daemon stop` then `chanvoy auto-setup`"
+            } else {
+                "the running daemon does not support wait --inbox --follow; cycle it with \
+                 `chanvoy daemon stop` then `chanvoy auto-setup`"
+            },
         ),
         Err(err) => classify_wait_error(json, "inbox", timeout_secs, err),
     }
@@ -2235,6 +2323,15 @@ async fn handle_wait_dm_follow(
             "empty follow filters are refused",
         );
     }
+    let coalesce_ms = match args.coalesce.as_deref() {
+        None => None,
+        Some(raw) => match parse_coalesce_ms(raw) {
+            Ok(ms) => Some(ms),
+            Err(err) => {
+                return exit_wait_hard(json, &username, "input", false, &err);
+            }
+        },
+    };
     let sink = match open_follow_sink(&args) {
         Ok(sink) => Arc::new(Mutex::new(sink)),
         Err(err) => {
@@ -2249,50 +2346,104 @@ async fn handle_wait_dm_follow(
         let callback_wait_id = Arc::clone(&seen_wait_id);
         let callback_sink = Arc::clone(&sink);
         let client = daemon_client(profile);
-        let follow = client.wait_dm_follow_v1(
-            WaitDmV1Params {
-                username: username.clone(),
-                timeout_secs,
-                contains: args.contains.clone(),
-                pattern: args.pattern.clone(),
-                mention: args.mention,
-                after: args.after.clone(),
-                replace_wait_id: args.replace_wait.clone(),
-            },
-            |event| {
-                if let Ok(mut slot) = callback_wait_id.lock() {
-                    *slot = Some(event.wait_id.clone());
+        if let Some(coalesce_ms) = coalesce_ms {
+            let follow = client.wait_dm_follow_v2(
+                WaitDmFollowV2Params {
+                    username: username.clone(),
+                    timeout_secs,
+                    contains: args.contains.clone(),
+                    pattern: args.pattern.clone(),
+                    mention: args.mention,
+                    after: args.after.clone(),
+                    replace_wait_id: args.replace_wait.clone(),
+                    coalesce_ms,
+                },
+                |event| {
+                    if let Ok(mut slot) = callback_wait_id.lock() {
+                        *slot = Some(event.wait_id.clone());
+                    }
+                    callback_sink
+                        .lock()
+                        .map_err(|_| {
+                            DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                        })?
+                        .emit_json(&event)
+                        .map_err(DaemonError::from)
+                },
+            );
+            tokio::pin!(follow);
+            tokio::select! {
+                result = &mut follow => result,
+                signal = tokio::signal::ctrl_c() => {
+                    let emitted = signal
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| {
+                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                            let Some(wait_id) = wait_id else {
+                                return Ok(());
+                            };
+                            let canceled = WaitFollowV2Event::terminal(
+                                wait_id,
+                                WaitFollowV2EventKind::Canceled,
+                            );
+                            sink.lock()
+                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                                .emit_json(&canceled)
+                        });
+                    match emitted {
+                        Ok(()) => process::exit(130),
+                        Err(err) => {
+                            return exit_wait_hard(json, &username, "sink", false, &err.to_string());
+                        }
+                    }
                 }
-                callback_sink
-                    .lock()
-                    .map_err(|_| {
-                        DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
-                    })?
-                    .emit(&event)
-                    .map_err(DaemonError::from)
-            },
-        );
-        tokio::pin!(follow);
-        tokio::select! {
-            result = &mut follow => result,
-            signal = tokio::signal::ctrl_c() => {
-                let emitted = signal
-                    .map_err(std::io::Error::other)
-                    .and_then(|()| {
-                        let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
-                        let Some(wait_id) = wait_id else {
-                            return Ok(());
-                        };
-                        let canceled =
-                            WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Canceled);
-                        sink.lock()
-                            .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
-                            .emit(&canceled)
-                    });
-                match emitted {
-                    Ok(()) => process::exit(130),
-                    Err(err) => {
-                        return exit_wait_hard(json, &username, "sink", false, &err.to_string());
+            }
+        } else {
+            let follow = client.wait_dm_follow_v1(
+                WaitDmV1Params {
+                    username: username.clone(),
+                    timeout_secs,
+                    contains: args.contains.clone(),
+                    pattern: args.pattern.clone(),
+                    mention: args.mention,
+                    after: args.after.clone(),
+                    replace_wait_id: args.replace_wait.clone(),
+                },
+                |event| {
+                    if let Ok(mut slot) = callback_wait_id.lock() {
+                        *slot = Some(event.wait_id.clone());
+                    }
+                    callback_sink
+                        .lock()
+                        .map_err(|_| {
+                            DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                        })?
+                        .emit(&event)
+                        .map_err(DaemonError::from)
+                },
+            );
+            tokio::pin!(follow);
+            tokio::select! {
+                result = &mut follow => result,
+                signal = tokio::signal::ctrl_c() => {
+                    let emitted = signal
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| {
+                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                            let Some(wait_id) = wait_id else {
+                                return Ok(());
+                            };
+                            let canceled =
+                                WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Canceled);
+                            sink.lock()
+                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                                .emit(&canceled)
+                        });
+                    match emitted {
+                        Ok(()) => process::exit(130),
+                        Err(err) => {
+                            return exit_wait_hard(json, &username, "sink", false, &err.to_string());
+                        }
                     }
                 }
             }
@@ -2370,6 +2521,26 @@ impl FollowSink {
             }
         }
     }
+}
+
+fn parse_coalesce_ms(raw: &str) -> Result<u64, String> {
+    let secs = parse_time_window(raw, TimeWindowDefaultUnit::Seconds)?;
+    if secs == 0 {
+        return Err("wait --coalesce must be greater than zero".into());
+    }
+    let Some(ms) = secs.checked_mul(1000) else {
+        return Err(
+            "wait --coalesce maximum is 10s (recommended 5s, 32 messages); see docs/guides/wait-follow.md"
+                .into(),
+        );
+    };
+    if ms > WAIT_FOLLOW_COALESCE_MS_MAX {
+        return Err(
+            "wait --coalesce maximum is 10s (recommended 5s, 32 messages); see docs/guides/wait-follow.md"
+                .into(),
+        );
+    }
+    Ok(ms)
 }
 
 fn open_follow_sink(args: &WaitArgs) -> Result<FollowSink, CliError> {
@@ -2495,6 +2666,15 @@ async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result
             "empty follow filters are refused",
         );
     }
+    let coalesce_ms = match args.coalesce.as_deref() {
+        None => None,
+        Some(raw) => match parse_coalesce_ms(raw) {
+            Ok(ms) => Some(ms),
+            Err(err) => {
+                return exit_wait_hard(json, &channel, "input", false, &err);
+            }
+        },
+    };
 
     // Sink establishment precedes daemon admission: an unwritable or
     // unsafe path can never leave an unseen held wait behind.
@@ -2512,51 +2692,98 @@ async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result
         let callback_wait_id = Arc::clone(&seen_wait_id);
         let callback_sink = Arc::clone(&sink);
         let client = daemon_client(profile);
-        let follow = client.wait_follow_v1(
-            WaitFollowV1Params {
-                channel: channel.clone(),
-                timeout_secs,
-                team: args.team.clone(),
-                contains: args.contains.clone(),
-                pattern: args.pattern.clone(),
-                mention: args.mention,
-                after: args.after.clone(),
-                replace_wait_id: args.replace_wait.clone(),
-            },
-            |event| {
-                if let Ok(mut slot) = callback_wait_id.lock() {
-                    *slot = Some(event.wait_id.clone());
+        if let Some(coalesce_ms) = coalesce_ms {
+            let follow = client.wait_follow_v2(
+                WaitFollowV2Params {
+                    channel: channel.clone(),
+                    timeout_secs,
+                    team: args.team.clone(),
+                    contains: args.contains.clone(),
+                    pattern: args.pattern.clone(),
+                    mention: args.mention,
+                    after: args.after.clone(),
+                    replace_wait_id: args.replace_wait.clone(),
+                    coalesce_ms,
+                },
+                |event| {
+                    if let Ok(mut slot) = callback_wait_id.lock() {
+                        *slot = Some(event.wait_id.clone());
+                    }
+                    callback_sink
+                        .lock()
+                        .map_err(|_| {
+                            DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                        })?
+                        .emit_json(&event)
+                        .map_err(DaemonError::from)
+                },
+            );
+            tokio::pin!(follow);
+            tokio::select! {
+                result = &mut follow => FollowWaitOutcome::Completed(result),
+                signal = tokio::signal::ctrl_c() => {
+                    let emitted = signal
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| {
+                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                            let Some(wait_id) = wait_id else {
+                                return Ok(());
+                            };
+                            let canceled = WaitFollowV2Event::terminal(
+                                wait_id,
+                                WaitFollowV2EventKind::Canceled,
+                            );
+                            sink.lock()
+                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                                .emit_json(&canceled)
+                        });
+                    FollowWaitOutcome::Interrupted(emitted)
                 }
-                callback_sink
-                    .lock()
-                    .map_err(|_| {
-                        DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
-                    })?
-                    .emit(&event)
-                    .map_err(DaemonError::from)
-            },
-        );
-        tokio::pin!(follow);
-        tokio::select! {
-            result = &mut follow => FollowWaitOutcome::Completed(result),
-            signal = tokio::signal::ctrl_c() => {
-                let emitted = signal
-                    .map_err(std::io::Error::other)
-                    .and_then(|()| {
-                        let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
-                        let Some(wait_id) = wait_id else {
-                            return Ok(());
-                        };
-                        let canceled =
-                            WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Canceled);
-                        sink.lock()
-                            .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
-                            .emit(&canceled)
-                    });
-                // `follow` (and therefore its UDS) is still alive while the
-                // canceled record is written and flushed above. It drops only
-                // when this block exits.
-                FollowWaitOutcome::Interrupted(emitted)
+            }
+        } else {
+            let follow = client.wait_follow_v1(
+                WaitFollowV1Params {
+                    channel: channel.clone(),
+                    timeout_secs,
+                    team: args.team.clone(),
+                    contains: args.contains.clone(),
+                    pattern: args.pattern.clone(),
+                    mention: args.mention,
+                    after: args.after.clone(),
+                    replace_wait_id: args.replace_wait.clone(),
+                },
+                |event| {
+                    if let Ok(mut slot) = callback_wait_id.lock() {
+                        *slot = Some(event.wait_id.clone());
+                    }
+                    callback_sink
+                        .lock()
+                        .map_err(|_| {
+                            DaemonError::Io(std::io::Error::other("follow sink lock poisoned"))
+                        })?
+                        .emit(&event)
+                        .map_err(DaemonError::from)
+                },
+            );
+            tokio::pin!(follow);
+            tokio::select! {
+                result = &mut follow => FollowWaitOutcome::Completed(result),
+                signal = tokio::signal::ctrl_c() => {
+                    let emitted = signal
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| {
+                            let wait_id = seen_wait_id.lock().ok().and_then(|slot| slot.clone());
+                            let Some(wait_id) = wait_id else {
+                                return Ok(());
+                            };
+                            let canceled =
+                                WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Canceled);
+                            sink.lock()
+                                .map_err(|_| std::io::Error::other("follow sink lock poisoned"))?
+                                .emit(&canceled)
+                        });
+                    FollowWaitOutcome::Interrupted(emitted)
+                }
             }
         }
     };
@@ -2590,8 +2817,13 @@ async fn handle_wait_follow(profile: &str, json: bool, args: WaitArgs) -> Result
             &channel,
             "capability",
             false,
-            "the running daemon does not support wait --follow; cycle it with \
-             `chanvoy daemon stop` then `chanvoy auto-setup`",
+            if coalesce_ms.is_some() {
+                "the running daemon does not support wait --follow --coalesce; cycle it with \
+                 `chanvoy daemon stop` then `chanvoy auto-setup`"
+            } else {
+                "the running daemon does not support wait --follow; cycle it with \
+                 `chanvoy daemon stop` then `chanvoy auto-setup`"
+            },
         ),
         Err(err) => classify_wait_error(json, &channel, timeout_secs, err),
     }
@@ -6132,6 +6364,61 @@ mod tests {
     }
 
     #[test]
+    fn wait_help_mentions_coalesce_default_off() {
+        let mut cli = Cli::command();
+        let wait = cli
+            .find_subcommand_mut("wait")
+            .expect("wait subcommand is present");
+        let help = wait.render_long_help().to_string();
+        assert!(
+            help.contains("--coalesce") && help.contains("Default off"),
+            "wait help must document --coalesce as default off: {help}"
+        );
+        assert!(
+            help.contains("10s") && help.contains("32"),
+            "wait help must state the 10s / 32-message cap: {help}"
+        );
+        assert!(
+            help.contains("recommended 5s") || help.contains("Recommended 5s"),
+            "wait help must recommend 5s: {help}"
+        );
+        assert!(
+            !help.contains("coalesce is on by default"),
+            "wait help must not claim coalesce is on by default: {help}"
+        );
+    }
+
+    #[test]
+    fn parse_coalesce_ms_accepts_ten_seconds_and_refuses_eleven() {
+        assert_eq!(parse_coalesce_ms("5").unwrap(), 5000);
+        assert_eq!(parse_coalesce_ms("5s").unwrap(), 5000);
+        assert_eq!(parse_coalesce_ms("8s").unwrap(), 8000);
+        assert_eq!(parse_coalesce_ms("10s").unwrap(), 10_000);
+        assert!(parse_coalesce_ms("0").is_err());
+        assert!(parse_coalesce_ms("0s").is_err());
+        assert!(parse_coalesce_ms("11s").is_err());
+        assert!(parse_coalesce_ms("10001").is_err());
+    }
+
+    #[test]
+    fn wait_coalesce_requires_follow() {
+        let err =
+            Cli::try_parse_from(["chanvoy", "wait", "brief", "--coalesce", "5s"]).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("follow") || text.contains("--follow"),
+            "bare --coalesce must require --follow: {text}"
+        );
+        let inbox =
+            Cli::try_parse_from(["chanvoy", "wait", "--inbox", "--coalesce", "5s"]).unwrap_err();
+        let inbox_text = inbox.to_string();
+        assert!(
+            inbox_text.contains("follow") || inbox_text.contains("--follow"),
+            "--inbox --coalesce must require --follow: {inbox_text}"
+        );
+    }
+
+    #[test]
     fn fan_in_cli_shape_refuses_mix_bare_and_counts() {
         let timeout = "10s".to_string();
         let mix = WaitArgs {
@@ -6148,6 +6435,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            coalesce: None,
             dm: None,
             inbox: false,
         };
@@ -6167,6 +6455,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            coalesce: None,
             dm: None,
             inbox: false,
         };
@@ -6186,6 +6475,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            coalesce: None,
             dm: None,
             inbox: false,
         };
@@ -6209,6 +6499,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            coalesce: None,
             dm: None,
             inbox: false,
         };
@@ -6228,6 +6519,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            coalesce: None,
             dm: None,
             inbox: false,
         };
@@ -6247,6 +6539,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            coalesce: None,
             dm: None,
             inbox: false,
         };
@@ -6266,6 +6559,7 @@ mod tests {
             follow: false,
             out: None,
             follow_stdout: false,
+            coalesce: None,
             dm: None,
             inbox: false,
         };

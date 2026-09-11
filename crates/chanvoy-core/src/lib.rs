@@ -41,24 +41,33 @@ pub use wait_channels::{
 
 pub use wait_dm::{
     canonical_dm_name, classify_wait_dm_username, is_dm_channel_name, is_rfc_uuid,
-    map_inaccessible_peer, not_a_waitable_peer, DirectChannel, WaitDmFollowResult, WaitDmV1Params,
-    WaitDmV1Result, NOT_A_WAITABLE_PEER, WAIT_DM_FOLLOW_V1_METHOD, WAIT_DM_HELP, WAIT_DM_V1_METHOD,
+    map_inaccessible_peer, not_a_waitable_peer, DirectChannel, WaitDmFollowResult,
+    WaitDmFollowV2Params, WaitDmV1Params, WaitDmV1Result, NOT_A_WAITABLE_PEER,
+    WAIT_DM_FOLLOW_V1_METHOD, WAIT_DM_FOLLOW_V2_METHOD, WAIT_DM_HELP, WAIT_DM_V1_METHOD,
 };
 pub use wait_follow::{
-    is_mattermost_post_id, WaitFollowEvent, WaitFollowEventKind, WaitFollowFailureReason,
-    WaitFollowMode, WaitFollowResult, WaitFollowResultKind, WaitFollowSchema, WaitFollowV1Params,
-    WAIT_FOLLOW_V1_EVENT_METHOD, WAIT_FOLLOW_V1_EVENT_SCHEMA, WAIT_FOLLOW_V1_METHOD,
+    is_mattermost_post_id, validate_coalesce_ms, WaitFollowEvent, WaitFollowEventKind,
+    WaitFollowFailureReason, WaitFollowMode, WaitFollowResult, WaitFollowResultKind,
+    WaitFollowSchema, WaitFollowV1Params, WaitFollowV2Event, WaitFollowV2EventKind,
+    WaitFollowV2Params, WaitFollowV2Schema, WAIT_FOLLOW_COALESCE_MAX_MESSAGES,
+    WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_FOLLOW_COALESCE_MS_MIN, WAIT_FOLLOW_V1_EVENT_METHOD,
+    WAIT_FOLLOW_V1_EVENT_SCHEMA, WAIT_FOLLOW_V1_METHOD, WAIT_FOLLOW_V2_EVENT_METHOD,
+    WAIT_FOLLOW_V2_EVENT_SCHEMA, WAIT_FOLLOW_V2_METHOD,
 };
 
 pub use wait_inbox::{
     cursor_uncertain, inbox_capacity, peer_user_id_from_dm_name, refuse_inbox_after,
     DirectCatalogEntry, InboxCursorV1, WaitInboxFailureReason, WaitInboxFollowEvent,
     WaitInboxFollowEventKind, WaitInboxFollowResult, WaitInboxFollowResultKind,
-    WaitInboxFollowSchema, WaitInboxV1Params, WaitInboxV1Result, DM_CLASS_CHANNEL,
-    DM_CLASS_OWNERSHIP_KEY, DM_CLASS_TEAM, INBOX_CURSOR_MAX_BYTES, INBOX_CURSOR_PREFIX,
-    INBOX_MAX_BACKFILL, INBOX_MAX_DMS, INBOX_MAX_WATERMARK_IDS, INBOX_PAGE_SIZE,
-    POST_ID_NOT_INBOX_CURSOR, WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_EVENT_SCHEMA,
-    WAIT_INBOX_FOLLOW_V1_METHOD, WAIT_INBOX_HELP, WAIT_INBOX_V1_METHOD,
+    WaitInboxFollowSchema, WaitInboxFollowV2Event, WaitInboxFollowV2EventKind,
+    WaitInboxFollowV2Message, WaitInboxFollowV2Params, WaitInboxFollowV2Schema, WaitInboxV1Params,
+    WaitInboxV1Result, DM_CLASS_CHANNEL, DM_CLASS_OWNERSHIP_KEY, DM_CLASS_TEAM,
+    INBOX_CURSOR_MAX_BYTES, INBOX_CURSOR_PREFIX, INBOX_MAX_BACKFILL, INBOX_MAX_DMS,
+    INBOX_MAX_WATERMARK_IDS, INBOX_PAGE_SIZE, POST_ID_NOT_INBOX_CURSOR,
+    WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_EVENT_SCHEMA,
+    WAIT_INBOX_FOLLOW_V1_METHOD, WAIT_INBOX_FOLLOW_V2_EVENT_METHOD,
+    WAIT_INBOX_FOLLOW_V2_EVENT_SCHEMA, WAIT_INBOX_FOLLOW_V2_METHOD, WAIT_INBOX_HELP,
+    WAIT_INBOX_V1_METHOD,
 };
 
 pub use wait_registry::{

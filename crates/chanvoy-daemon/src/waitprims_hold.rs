@@ -16,8 +16,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chanvoy_core::{
-    CoreError, Message, WaitFollowEvent, WaitFollowEventKind, WaitFollowFailureReason,
-    WaitFollowMode, WaitFollowResult, WaitFollowResultKind, WaitResult,
+    validate_coalesce_ms, CoreError, Message, WaitFollowEvent, WaitFollowEventKind,
+    WaitFollowFailureReason, WaitFollowMode, WaitFollowResult, WaitFollowResultKind,
+    WaitFollowV2Event, WaitFollowV2EventKind, WaitResult, WAIT_FOLLOW_V1_EVENT_METHOD,
+    WAIT_FOLLOW_V2_EVENT_METHOD,
 };
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
@@ -36,6 +38,7 @@ use crate::wait::{
     empty_at_arm_observation, establish_baseline, one_message_result, provider_retry,
     wait_push_from_cursor, wait_rest_from_cursor, WaitPredicate,
 };
+use crate::wait_coalesce::CoalesceBuffer;
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::AppState;
 
@@ -165,6 +168,7 @@ pub(crate) async fn run_single_channel_follow(
     state: &AppState,
     wait: FirstMatchWait<'_>,
     stream: crate::wait::FollowStreamSender,
+    coalesce_ms: Option<u64>,
 ) -> Result<WaitFollowResult, CoreError> {
     let release = Arc::new(LeaseRelease::new(wait.guard));
     let sidecar = MessageSidecar::new();
@@ -225,12 +229,22 @@ pub(crate) async fn run_single_channel_follow(
     let wp_cancel = Cancel::new();
     let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
 
+    if let Some(ms) = coalesce_ms {
+        validate_coalesce_ms(ms).map_err(CoreError::WaitFilterInvalid)?;
+    }
+    let use_v2 = coalesce_ms.is_some();
+    let coalesce_buf =
+        coalesce_ms.map(|ms| Arc::new(Mutex::new(CoalesceBuffer::<Message>::new(ms))));
+    let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(None::<Instant>);
+
     let sink_stream = stream.clone();
     let sink_sidecar = sidecar.clone();
     let sink_error = Arc::clone(&last_error);
     let sink_tip = Arc::clone(&tip_state);
     let sink_channel = wait.channel.to_string();
     let sink_wait_id = wait.session.wait_id.clone();
+    let sink_coalesce = coalesce_buf.clone();
+    let sink_deadline = deadline_tx.clone();
     let follow = run_follow(
         &observer,
         &clock,
@@ -244,6 +258,8 @@ pub(crate) async fn run_single_channel_follow(
             let tip_state = Arc::clone(&sink_tip);
             let channel = sink_channel.clone();
             let wait_id = sink_wait_id.clone();
+            let coalesce = sink_coalesce.clone();
+            let deadline_tx = sink_deadline.clone();
             async move {
                 let event_count = burst.events.len();
                 for (index, event) in burst.events.into_iter().enumerate() {
@@ -294,29 +310,44 @@ pub(crate) async fn run_single_channel_follow(
                         FollowObservationPhase::Backlog => WaitFollowMode::Backlog,
                         FollowObservationPhase::Live => WaitFollowMode::Live,
                     };
-                    let record = WaitFollowEvent::message(
-                        wait_id.clone(),
-                        mode,
-                        entry.message,
-                        mode == WaitFollowMode::Backlog && index + 1 < event_count,
-                    )
-                    .map_err(|_| {
-                        waitprims_core::ValidationError::new(
-                            "/follow_sink",
-                            "invalid_event_document",
-                        )
-                    })?;
-                    emit_follow_event(&stream, record).await.map_err(|err| {
-                        if let Ok(mut slot) = last_error.lock() {
-                            *slot = Some(err);
+                    if let Some(buffer) = coalesce.as_ref() {
+                        let flushes = {
+                            let mut guard = buffer.lock().map_err(|_| {
+                                waitprims_core::ValidationError::new("/follow_sink", "lock")
+                            })?;
+                            let flushed = guard.push(mode, entry.message);
+                            let _ = deadline_tx.send(guard.deadline());
+                            flushed
+                        };
+                        for flush in flushes {
+                            emit_coalesced_burst(&stream, &wait_id, flush, &tip_state, &last_error)
+                                .await?;
                         }
-                        waitprims_async::Error::from(waitprims_core::ValidationError::new(
-                            "/follow_sink",
-                            "stream_write_failed",
-                        ))
-                    })?;
-                    if let Ok(mut current) = tip_state.lock() {
-                        *current = Some(proposed_tip.to_string());
+                    } else {
+                        let record = WaitFollowEvent::message(
+                            wait_id.clone(),
+                            mode,
+                            entry.message,
+                            mode == WaitFollowMode::Backlog && index + 1 < event_count,
+                        )
+                        .map_err(|_| {
+                            waitprims_core::ValidationError::new(
+                                "/follow_sink",
+                                "invalid_event_document",
+                            )
+                        })?;
+                        emit_follow_v1(&stream, record).await.map_err(|err| {
+                            if let Ok(mut slot) = last_error.lock() {
+                                *slot = Some(err);
+                            }
+                            waitprims_async::Error::from(waitprims_core::ValidationError::new(
+                                "/follow_sink",
+                                "stream_write_failed",
+                            ))
+                        })?;
+                        if let Ok(mut current) = tip_state.lock() {
+                            *current = Some(proposed_tip.to_string());
+                        }
                     }
                 }
                 Ok(())
@@ -347,34 +378,45 @@ pub(crate) async fn run_single_channel_follow(
         });
     }
 
-    emit_follow_event(
+    emit_armed(
         &stream,
-        WaitFollowEvent::armed(
-            wait.session.wait_id.clone(),
-            wait.session.replaced_wait_id.clone(),
-        ),
+        use_v2,
+        wait.session.wait_id.clone(),
+        wait.session.replaced_wait_id.clone(),
     )
     .await?;
 
-    let end = follow.await;
+    let end = if let Some(buffer) = coalesce_buf.clone() {
+        await_follow_with_coalesce(
+            follow,
+            buffer,
+            deadline_rx,
+            &stream,
+            &wait.session.wait_id,
+            &tip_state,
+            &last_error,
+        )
+        .await
+    } else {
+        follow.await
+    };
     let end = match end {
         Ok(end) => end,
         Err(err) => {
+            let _ = flush_coalesce_buffer(
+                coalesce_buf.as_ref(),
+                &stream,
+                &wait.session.wait_id,
+                &tip_state,
+                &last_error,
+            )
+            .await;
             let reason = last_error
                 .lock()
                 .ok()
                 .and_then(|slot| slot.as_ref().map(follow_failure_reason))
                 .unwrap_or(WaitFollowFailureReason::ProviderFailed);
-            emit_follow_event(
-                &stream,
-                WaitFollowEvent::terminal(
-                    wait.session.wait_id.clone(),
-                    WaitFollowEventKind::Failed {
-                        reason_code: reason,
-                    },
-                ),
-            )
-            .await?;
+            emit_failed(&stream, use_v2, wait.session.wait_id.clone(), reason).await?;
             inner_cancel.cancel();
             release.release();
             if let Some(saved) = last_error.lock().ok().and_then(|mut slot| slot.take()) {
@@ -384,6 +426,14 @@ pub(crate) async fn run_single_channel_follow(
         }
     };
 
+    let _ = flush_coalesce_buffer(
+        coalesce_buf.as_ref(),
+        &stream,
+        &wait.session.wait_id,
+        &tip_state,
+        &last_error,
+    )
+    .await;
     let tip = tip_state.lock().ok().and_then(|current| current.clone());
     let (terminal_kind, result_kind) = match end {
         FollowEnd::Deadline => (
@@ -393,14 +443,7 @@ pub(crate) async fn run_single_channel_follow(
         FollowEnd::Cancel => {
             let replaced_by_wait_id = wait.session.replaced_by_id();
             if replaced_by_wait_id.is_empty() {
-                emit_follow_event(
-                    &stream,
-                    WaitFollowEvent::terminal(
-                        wait.session.wait_id.clone(),
-                        WaitFollowEventKind::Canceled,
-                    ),
-                )
-                .await?;
+                emit_canceled(&stream, use_v2, wait.session.wait_id.clone()).await?;
                 inner_cancel.cancel();
                 release.release();
                 return Err(CoreError::WaitProviderDegraded {
@@ -421,16 +464,7 @@ pub(crate) async fn run_single_channel_follow(
         }
         FollowEnd::TerminalArm { reason_code, .. } => {
             let reason = follow_failure_reason_code(reason_code.as_str());
-            emit_follow_event(
-                &stream,
-                WaitFollowEvent::terminal(
-                    wait.session.wait_id.clone(),
-                    WaitFollowEventKind::Failed {
-                        reason_code: reason,
-                    },
-                ),
-            )
-            .await?;
+            emit_failed(&stream, use_v2, wait.session.wait_id.clone(), reason).await?;
             inner_cancel.cancel();
             release.release();
             if let Some(saved) = last_error.lock().ok().and_then(|mut slot| slot.take()) {
@@ -452,17 +486,13 @@ pub(crate) async fn run_single_channel_follow(
         })?;
     // The terminal line must cross the UDS write boundary before the
     // ownership guard is released or the terminal response is returned.
-    emit_follow_event(
-        &stream,
-        WaitFollowEvent::terminal(wait.session.wait_id.clone(), terminal_kind),
-    )
-    .await?;
+    emit_terminal(&stream, use_v2, wait.session.wait_id.clone(), terminal_kind).await?;
     inner_cancel.cancel();
     release.release();
     Ok(result)
 }
 
-async fn emit_follow_event(
+async fn emit_follow_v1(
     stream: &crate::wait::FollowStreamSender,
     event: WaitFollowEvent,
 ) -> Result<(), CoreError> {
@@ -472,9 +502,42 @@ async fn emit_follow_event(
             channel: "follow".into(),
             message: message.into(),
         })?;
+    let value = serde_json::to_value(&event).map_err(|err| CoreError::WaitProviderDegraded {
+        channel: "follow".into(),
+        message: err.to_string(),
+    })?;
+    emit_follow_event(stream, WAIT_FOLLOW_V1_EVENT_METHOD, value).await
+}
+
+async fn emit_follow_v2(
+    stream: &crate::wait::FollowStreamSender,
+    event: WaitFollowV2Event,
+) -> Result<(), CoreError> {
+    event
+        .validate()
+        .map_err(|message| CoreError::WaitProviderDegraded {
+            channel: "follow".into(),
+            message: message.into(),
+        })?;
+    let value = serde_json::to_value(&event).map_err(|err| CoreError::WaitProviderDegraded {
+        channel: "follow".into(),
+        message: err.to_string(),
+    })?;
+    emit_follow_event(stream, WAIT_FOLLOW_V2_EVENT_METHOD, value).await
+}
+
+async fn emit_follow_event(
+    stream: &crate::wait::FollowStreamSender,
+    method: &'static str,
+    event: serde_json::Value,
+) -> Result<(), CoreError> {
     let (written, receipt) = tokio::sync::oneshot::channel();
     stream
-        .send(crate::wait::FollowStreamRecord { event, written })
+        .send(crate::wait::FollowStreamRecord {
+            method,
+            event,
+            written,
+        })
         .await
         .map_err(|_| CoreError::WaitProviderDegraded {
             channel: "follow".into(),
@@ -490,6 +553,176 @@ async fn emit_follow_event(
             channel: "follow".into(),
             message,
         })
+}
+
+async fn emit_armed(
+    stream: &crate::wait::FollowStreamSender,
+    use_v2: bool,
+    wait_id: String,
+    replaced_wait_id: Option<String>,
+) -> Result<(), CoreError> {
+    if use_v2 {
+        emit_follow_v2(stream, WaitFollowV2Event::armed(wait_id, replaced_wait_id)).await
+    } else {
+        emit_follow_v1(stream, WaitFollowEvent::armed(wait_id, replaced_wait_id)).await
+    }
+}
+
+async fn emit_failed(
+    stream: &crate::wait::FollowStreamSender,
+    use_v2: bool,
+    wait_id: String,
+    reason_code: WaitFollowFailureReason,
+) -> Result<(), CoreError> {
+    if use_v2 {
+        emit_follow_v2(
+            stream,
+            WaitFollowV2Event::terminal(wait_id, WaitFollowV2EventKind::Failed { reason_code }),
+        )
+        .await
+    } else {
+        emit_follow_v1(
+            stream,
+            WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Failed { reason_code }),
+        )
+        .await
+    }
+}
+
+async fn emit_canceled(
+    stream: &crate::wait::FollowStreamSender,
+    use_v2: bool,
+    wait_id: String,
+) -> Result<(), CoreError> {
+    if use_v2 {
+        emit_follow_v2(
+            stream,
+            WaitFollowV2Event::terminal(wait_id, WaitFollowV2EventKind::Canceled),
+        )
+        .await
+    } else {
+        emit_follow_v1(
+            stream,
+            WaitFollowEvent::terminal(wait_id, WaitFollowEventKind::Canceled),
+        )
+        .await
+    }
+}
+
+async fn emit_terminal(
+    stream: &crate::wait::FollowStreamSender,
+    use_v2: bool,
+    wait_id: String,
+    kind: WaitFollowEventKind,
+) -> Result<(), CoreError> {
+    if use_v2 {
+        let kind = match kind {
+            WaitFollowEventKind::Deadman => WaitFollowV2EventKind::Deadman,
+            WaitFollowEventKind::Canceled => WaitFollowV2EventKind::Canceled,
+            WaitFollowEventKind::Replaced {
+                replaced_by_wait_id,
+            } => WaitFollowV2EventKind::Replaced {
+                replaced_by_wait_id,
+            },
+            WaitFollowEventKind::Failed { reason_code } => {
+                WaitFollowV2EventKind::Failed { reason_code }
+            }
+            _ => WaitFollowV2EventKind::Deadman,
+        };
+        emit_follow_v2(stream, WaitFollowV2Event::terminal(wait_id, kind)).await
+    } else {
+        emit_follow_v1(stream, WaitFollowEvent::terminal(wait_id, kind)).await
+    }
+}
+
+async fn emit_coalesced_burst(
+    stream: &crate::wait::FollowStreamSender,
+    wait_id: &str,
+    flush: crate::wait_coalesce::CoalesceFlush<Message>,
+    tip_state: &Mutex<Option<String>>,
+    last_error: &Mutex<Option<CoreError>>,
+) -> Result<(), waitprims_async::Error> {
+    let event =
+        WaitFollowV2Event::messages(wait_id, flush.mode, flush.items, false).map_err(|_| {
+            waitprims_core::ValidationError::new("/follow_sink", "invalid_event_document")
+        })?;
+    let tip = event.tip().map(str::to_string);
+    emit_follow_v2(stream, event).await.map_err(|err| {
+        if let Ok(mut slot) = last_error.lock() {
+            *slot = Some(err);
+        }
+        waitprims_async::Error::from(waitprims_core::ValidationError::new(
+            "/follow_sink",
+            "stream_write_failed",
+        ))
+    })?;
+    if let Some(tip) = tip {
+        if let Ok(mut current) = tip_state.lock() {
+            *current = Some(tip);
+        }
+    }
+    Ok(())
+}
+
+async fn flush_coalesce_buffer(
+    buffer: Option<&Arc<Mutex<CoalesceBuffer<Message>>>>,
+    stream: &crate::wait::FollowStreamSender,
+    wait_id: &str,
+    tip_state: &Mutex<Option<String>>,
+    last_error: &Mutex<Option<CoreError>>,
+) -> Result<(), waitprims_async::Error> {
+    let Some(buffer) = buffer else {
+        return Ok(());
+    };
+    let flush = buffer
+        .lock()
+        .map_err(|_| waitprims_core::ValidationError::new("/follow_sink", "lock"))?
+        .take();
+    if let Some(flush) = flush {
+        emit_coalesced_burst(stream, wait_id, flush, tip_state, last_error).await?;
+    }
+    Ok(())
+}
+
+async fn await_follow_with_coalesce<F>(
+    follow: F,
+    buffer: Arc<Mutex<CoalesceBuffer<Message>>>,
+    mut deadline_rx: tokio::sync::watch::Receiver<Option<Instant>>,
+    stream: &crate::wait::FollowStreamSender,
+    wait_id: &str,
+    tip_state: &Mutex<Option<String>>,
+    last_error: &Mutex<Option<CoreError>>,
+) -> Result<FollowEnd, waitprims_async::Error>
+where
+    F: std::future::Future<Output = Result<FollowEnd, waitprims_async::Error>>,
+{
+    tokio::pin!(follow);
+    loop {
+        let next = *deadline_rx.borrow();
+        tokio::select! {
+            end = &mut follow => {
+                flush_coalesce_buffer(Some(&buffer), stream, wait_id, tip_state, last_error).await?;
+                return end;
+            }
+            _ = deadline_rx.changed() => {}
+            _ = sleep_until_opt(next) => {
+                let flush = buffer
+                    .lock()
+                    .map_err(|_| waitprims_core::ValidationError::new("/follow_sink", "lock"))?
+                    .take_if_expired(Instant::now());
+                if let Some(flush) = flush {
+                    emit_coalesced_burst(stream, wait_id, flush, tip_state, last_error).await?;
+                }
+            }
+        }
+    }
+}
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 fn follow_failure_reason(error: &CoreError) -> WaitFollowFailureReason {
@@ -2132,7 +2365,7 @@ mod tests {
     async fn follow_callback_waits_for_actual_writer_ack() {
         let (stream, mut records) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
-            emit_follow_event(
+            emit_follow_v1(
                 &stream,
                 WaitFollowEvent::armed("wait_0123456789abcdef0123456789abcdef", None),
             )
@@ -2188,7 +2421,7 @@ mod tests {
         let (stream, mut records) = tokio::sync::mpsc::channel(1);
         let emit_wait_id = wait_id.clone();
         let task = tokio::spawn(async move {
-            emit_follow_event(
+            emit_follow_v1(
                 &stream,
                 WaitFollowEvent::terminal(emit_wait_id, WaitFollowEventKind::Deadman),
             )

@@ -10,8 +10,8 @@ mod common;
 use chanvoy_core::{
     canonical_dm_name, rpc_error, rpc_request, InboxCursorV1, JsonRpcRequest, JsonRpcResponse,
     Message, WaitFollowMode, WaitInboxFollowEvent, POST_ID_NOT_INBOX_CURSOR,
-    WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_METHOD, WAIT_INBOX_HELP,
-    WAIT_INBOX_V1_METHOD,
+    WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_METHOD, WAIT_INBOX_FOLLOW_V2_METHOD,
+    WAIT_INBOX_HELP, WAIT_INBOX_V1_METHOD,
 };
 use common::{run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
 use serde_json::json;
@@ -201,6 +201,33 @@ async fn old_follow_daemon_is_hard_capability() {
             "1s",
             "--follow",
             "--follow-stdout",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error_class"], "capability");
+}
+
+#[tokio::test]
+#[ignore = "integration: wait --inbox follow coalesce capability skew"]
+async fn old_coalesce_follow_daemon_is_hard_capability() {
+    let env = TestEnv::new("wait-inbox-follow-coalesce-cap").await;
+    env.write_default_profile(BOT_USER, "org-lanytehq");
+    let _server = fake_old_daemon(&env, WAIT_INBOX_FOLLOW_V2_METHOD).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "--inbox",
+            "--timeout",
+            "1s",
+            "--follow",
+            "--follow-stdout",
+            "--coalesce",
+            "5s",
         ],
     )
     .await;

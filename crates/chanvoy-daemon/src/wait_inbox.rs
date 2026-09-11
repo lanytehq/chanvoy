@@ -5,21 +5,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use chanvoy_core::{
-    cursor_uncertain, inbox_capacity, peer_user_id_from_dm_name, CoreError, DaemonEvent,
-    DaemonEventPayloadInner, DirectCatalogEntry, InboundEventPayload, InboxCursorV1, Message,
-    WaitFollowMode, WaitInboxFailureReason, WaitInboxFollowEvent, WaitInboxFollowEventKind,
-    WaitInboxFollowResult, WaitInboxFollowResultKind, WaitInboxV1Result, INBOX_MAX_BACKFILL,
-    INBOX_MAX_DMS,
+    cursor_uncertain, inbox_capacity, peer_user_id_from_dm_name, validate_coalesce_ms, CoreError,
+    DaemonEvent, DaemonEventPayloadInner, DirectCatalogEntry, InboundEventPayload, InboxCursorV1,
+    Message, WaitFollowMode, WaitInboxFailureReason, WaitInboxFollowEvent,
+    WaitInboxFollowEventKind, WaitInboxFollowResult, WaitInboxFollowResultKind,
+    WaitInboxFollowV2Event, WaitInboxFollowV2EventKind, WaitInboxFollowV2Message,
+    WaitInboxFollowV2Schema, WaitInboxV1Result, INBOX_MAX_BACKFILL, INBOX_MAX_DMS,
 };
 use tokio::sync::broadcast;
 use tokio::time::{timeout_at, Instant};
 
 use crate::wait::{inbound_to_message, WaitPredicate};
+use crate::wait_coalesce::{CoalesceBuffer, CoalesceFlush};
 use crate::wait_owner::{WaitGuard, WaitSession};
 use crate::AppState;
 
+#[derive(Debug)]
+pub enum InboxFollowStreamEvent {
+    V1(WaitInboxFollowEvent),
+    V2(WaitInboxFollowV2Event),
+}
+
+impl InboxFollowStreamEvent {
+    #[cfg(test)]
+    pub fn mode(&self) -> WaitFollowMode {
+        match self {
+            Self::V1(event) => event.mode(),
+            Self::V2(event) => event.mode(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn inbox_cursor(&self) -> Option<&str> {
+        match self {
+            Self::V1(event) => event.inbox_cursor(),
+            Self::V2(event) => event.inbox_cursor(),
+        }
+    }
+}
+
 pub struct InboxFollowStreamRecord {
-    pub event: WaitInboxFollowEvent,
+    pub event: InboxFollowStreamEvent,
     pub written: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -52,6 +78,7 @@ pub struct WaitInboxRequest<'a> {
     pub after: Option<&'a str>,
     pub replace_wait_id: Option<&'a str>,
     pub deadline: Instant,
+    pub coalesce_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -153,19 +180,38 @@ async fn run_inbox(
         req.mention,
         &state.profile.bot_username,
     )?;
+    let mut coalesce = if stream.is_some() {
+        match req.coalesce_ms {
+            Some(ms) => {
+                validate_coalesce_ms(ms).map_err(CoreError::WaitFilterInvalid)?;
+                Some(CoalesceBuffer::new(ms))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     if let Some(stream) = stream.as_ref() {
-        emit_inbox(
-            stream,
-            WaitInboxFollowEvent::armed(session.wait_id.clone(), session.replaced_wait_id.clone()),
-        )
-        .await?;
+        let armed = if coalesce.is_some() {
+            InboxFollowStreamEvent::V2(WaitInboxFollowV2Event::armed(
+                session.wait_id.clone(),
+                session.replaced_wait_id.clone(),
+            ))
+        } else {
+            InboxFollowStreamEvent::V1(WaitInboxFollowEvent::armed(
+                session.wait_id.clone(),
+                session.replaced_wait_id.clone(),
+            ))
+        };
+        emit_inbox(stream, armed).await?;
     }
 
     let armed = run_inbox_armed(
         state,
         &req,
         stream.as_ref(),
+        &mut coalesce,
         &session,
         &mut cursor,
         &mut proven,
@@ -182,7 +228,9 @@ async fn run_inbox(
             let _ = fail_outcome(
                 &session,
                 stream.as_ref(),
-                proven.clone(),
+                &mut coalesce,
+                &mut cursor,
+                &mut proven,
                 inbox_fail_reason(err),
                 CoreError::WaitFilterInvalid("inbox follow failed".into()),
             )
@@ -197,6 +245,7 @@ async fn run_inbox_armed(
     state: &AppState,
     req: &WaitInboxRequest<'_>,
     stream: Option<&InboxFollowStreamSender>,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
     session: &WaitSession,
     cursor: &mut InboxCursorV1,
     proven: &mut Option<String>,
@@ -220,6 +269,7 @@ async fn run_inbox_armed(
             state,
             session,
             stream,
+            coalesce,
             cursor,
             proven,
             &entry,
@@ -239,6 +289,7 @@ async fn run_inbox_armed(
             state,
             session,
             stream,
+            coalesce,
             dms,
             cursor,
             &mut observer,
@@ -265,6 +316,7 @@ async fn run_inbox_armed(
                 state,
                 session,
                 stream,
+                coalesce,
                 cursor,
                 proven,
                 &entry,
@@ -281,10 +333,10 @@ async fn run_inbox_armed(
 
     loop {
         if Instant::now() >= req.deadline {
-            return timeout_outcome(state, session, stream, proven.clone()).await;
+            return timeout_outcome(state, session, stream, coalesce, cursor, proven).await;
         }
         if session.cancel.is_cancelled() {
-            return replaced_outcome(session, stream, proven.clone()).await;
+            return replaced_outcome(session, stream, coalesce, cursor, proven).await;
         }
         let now_reconnects = current_reconnects(state).await;
         if now_reconnects > reconnects {
@@ -297,6 +349,7 @@ async fn run_inbox_armed(
                     state,
                     session,
                     stream,
+                    coalesce,
                     cursor,
                     proven,
                     &entry,
@@ -311,41 +364,58 @@ async fn run_inbox_armed(
             }
         }
 
-        match timeout_at(req.deadline, rx.recv()).await {
-            Ok(Ok(event)) => {
-                if let Some(outcome) = handle_event(
-                    state,
-                    session,
-                    stream,
-                    dms,
-                    cursor,
-                    &mut observer,
-                    proven,
-                    predicate,
-                    event,
-                    req.deadline,
-                )
-                .await?
-                {
-                    if stream.is_none() {
-                        return Ok(outcome);
+        let coalesce_deadline = coalesce.as_ref().and_then(CoalesceBuffer::deadline);
+        tokio::select! {
+            _ = sleep_until_opt(coalesce_deadline) => {
+                if let Some(buffer) = coalesce.as_mut() {
+                    if let Some(flush) = buffer.take_if_expired(Instant::now()) {
+                        let Some(stream) = stream else {
+                            continue;
+                        };
+                        emit_coalesced_inbox(stream, session, cursor, proven, flush).await?;
                     }
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                return Err(CoreError::WaitProviderDegraded {
-                    channel: "inbox".into(),
-                    message: "inbox event bus lagged".into(),
-                });
-            }
-            Ok(Err(broadcast::error::RecvError::Closed)) => {
-                return Err(CoreError::WaitProviderDegraded {
-                    channel: "inbox".into(),
-                    message: "inbox event bus closed".into(),
-                });
-            }
-            Err(_) => {
-                return timeout_outcome(state, session, stream, proven.clone()).await;
+            recv = timeout_at(req.deadline, rx.recv()) => {
+                match recv {
+                    Ok(Ok(event)) => {
+                        if let Some(outcome) = handle_event(
+                            state,
+                            session,
+                            stream,
+                            coalesce,
+                            dms,
+                            cursor,
+                            &mut observer,
+                            proven,
+                            predicate,
+                            event,
+                            req.deadline,
+                        )
+                        .await?
+                        {
+                            if stream.is_none() {
+                                return Ok(outcome);
+                            }
+                        }
+                    }
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                        return Err(CoreError::WaitProviderDegraded {
+                            channel: "inbox".into(),
+                            message: "inbox event bus lagged".into(),
+                        });
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        return Err(CoreError::WaitProviderDegraded {
+                            channel: "inbox".into(),
+                            message: "inbox event bus closed".into(),
+                        });
+                    }
+                    Err(_) => {
+                        return timeout_outcome(state, session, stream, coalesce, cursor, proven)
+                            .await;
+                    }
+                }
             }
         }
     }
@@ -615,6 +685,7 @@ async fn handle_event(
     state: &AppState,
     session: &WaitSession,
     stream: Option<&InboxFollowStreamSender>,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
     dms: &mut BTreeMap<String, CataloguedDm>,
     cursor: &mut InboxCursorV1,
     observer: &mut InboxCursorV1,
@@ -684,6 +755,7 @@ async fn handle_event(
         state,
         session,
         stream,
+        coalesce,
         cursor,
         proven,
         &entry,
@@ -698,12 +770,25 @@ async fn deliver(
     state: &AppState,
     session: &WaitSession,
     stream: Option<&InboxFollowStreamSender>,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
     cursor: &mut InboxCursorV1,
     proven: &mut Option<String>,
     entry: &CataloguedDm,
     message: Message,
     mode: WaitFollowMode,
 ) -> Result<Option<InboxOutcome>, CoreError> {
+    if let (Some(stream), Some(buffer)) = (stream, coalesce.as_mut()) {
+        let item = WaitInboxFollowV2Message {
+            peer_username: entry.peer_username.clone(),
+            dm_name: entry.name.clone(),
+            message,
+        };
+        let flushes = buffer.push(mode, item);
+        for flush in flushes {
+            emit_coalesced_inbox(stream, session, cursor, proven, flush).await?;
+        }
+        return Ok(None);
+    }
     let next = cursor.advance(message.create_at, &message.id)?;
     let encoded = next.encode()?;
     if let Some(stream) = stream {
@@ -717,7 +802,7 @@ async fn deliver(
             false,
         )
         .map_err(cursor_uncertain)?;
-        emit_inbox(stream, event).await?;
+        emit_inbox(stream, InboxFollowStreamEvent::V1(event)).await?;
         *cursor = next;
         *proven = Some(encoded);
         return Ok(None);
@@ -736,9 +821,71 @@ async fn deliver(
     })))
 }
 
+async fn emit_coalesced_inbox(
+    stream: &InboxFollowStreamSender,
+    session: &WaitSession,
+    cursor: &mut InboxCursorV1,
+    proven: &mut Option<String>,
+    flush: CoalesceFlush<WaitInboxFollowV2Message>,
+) -> Result<(), CoreError> {
+    let mut next = cursor.clone();
+    for item in &flush.items {
+        next = next.advance(item.message.create_at, &item.message.id)?;
+    }
+    let encoded = next.encode()?;
+    let event = WaitInboxFollowV2Event::messages(
+        session.wait_id.clone(),
+        flush.mode,
+        encoded.clone(),
+        flush.items,
+    )
+    .map_err(cursor_uncertain)?;
+    emit_inbox(stream, InboxFollowStreamEvent::V2(event)).await?;
+    *cursor = next;
+    *proven = Some(encoded);
+    Ok(())
+}
+
+async fn flush_pending_inbox(
+    stream: Option<&InboxFollowStreamSender>,
+    session: &WaitSession,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
+    cursor: &mut InboxCursorV1,
+    proven: &mut Option<String>,
+) -> Result<(), CoreError> {
+    let (Some(stream), Some(buffer)) = (stream, coalesce.as_mut()) else {
+        return Ok(());
+    };
+    if let Some(flush) = buffer.take() {
+        emit_coalesced_inbox(stream, session, cursor, proven, flush).await?;
+    }
+    Ok(())
+}
+
+fn follow_terminal_event(
+    use_v2: bool,
+    wait_id: String,
+    v1: WaitInboxFollowEventKind,
+    v2: WaitInboxFollowV2EventKind,
+) -> InboxFollowStreamEvent {
+    if use_v2 {
+        InboxFollowStreamEvent::V2(WaitInboxFollowV2Event {
+            schema: WaitInboxFollowV2Schema::V2,
+            wait_id,
+            kind: v2,
+        })
+    } else {
+        InboxFollowStreamEvent::V1(WaitInboxFollowEvent {
+            schema: chanvoy_core::WaitInboxFollowSchema::V1,
+            wait_id,
+            kind: v1,
+        })
+    }
+}
+
 async fn emit_inbox(
     stream: &InboxFollowStreamSender,
-    event: WaitInboxFollowEvent,
+    event: InboxFollowStreamEvent,
 ) -> Result<(), CoreError> {
     let (written, receipt) = tokio::sync::oneshot::channel();
     stream
@@ -765,7 +912,9 @@ async fn timeout_outcome(
     state: &AppState,
     session: &WaitSession,
     stream: Option<&InboxFollowStreamSender>,
-    proven: Option<String>,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
+    cursor: &mut InboxCursorV1,
+    proven: &mut Option<String>,
 ) -> Result<InboxOutcome, CoreError> {
     if crate::wait::refuse_current_ws_failure(state, "inbox")
         .await
@@ -776,22 +925,27 @@ async fn timeout_outcome(
             message: "websocket observation is currently unavailable; inbox deadline is not a clean deadman".into(),
         });
     }
+    flush_pending_inbox(stream, session, coalesce, cursor, proven).await?;
     if let Some(stream) = stream {
+        let use_v2 = coalesce.is_some();
         emit_inbox(
             stream,
-            WaitInboxFollowEvent {
-                schema: chanvoy_core::WaitInboxFollowSchema::V1,
-                wait_id: session.wait_id.clone(),
-                kind: WaitInboxFollowEventKind::Deadman {
+            follow_terminal_event(
+                use_v2,
+                session.wait_id.clone(),
+                WaitInboxFollowEventKind::Deadman {
                     inbox_cursor: proven.clone(),
                 },
-            },
+                WaitInboxFollowV2EventKind::Deadman {
+                    inbox_cursor: proven.clone(),
+                },
+            ),
         )
         .await?;
         return Ok(InboxOutcome::Follow(WaitInboxFollowResult {
             wait_id: session.wait_id.clone(),
             kind: WaitInboxFollowResultKind::Deadman {
-                inbox_cursor: proven,
+                inbox_cursor: proven.clone(),
             },
         }));
     }
@@ -801,27 +955,35 @@ async fn timeout_outcome(
 async fn replaced_outcome(
     session: &WaitSession,
     stream: Option<&InboxFollowStreamSender>,
-    proven: Option<String>,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
+    cursor: &mut InboxCursorV1,
+    proven: &mut Option<String>,
 ) -> Result<InboxOutcome, CoreError> {
     let replaced_by = session.replaced_by_id();
+    flush_pending_inbox(stream, session, coalesce, cursor, proven).await?;
     if let Some(stream) = stream {
+        let use_v2 = coalesce.is_some();
         emit_inbox(
             stream,
-            WaitInboxFollowEvent {
-                schema: chanvoy_core::WaitInboxFollowSchema::V1,
-                wait_id: session.wait_id.clone(),
-                kind: WaitInboxFollowEventKind::Replaced {
+            follow_terminal_event(
+                use_v2,
+                session.wait_id.clone(),
+                WaitInboxFollowEventKind::Replaced {
                     replaced_by_wait_id: replaced_by.clone(),
                     inbox_cursor: proven.clone(),
                 },
-            },
+                WaitInboxFollowV2EventKind::Replaced {
+                    replaced_by_wait_id: replaced_by.clone(),
+                    inbox_cursor: proven.clone(),
+                },
+            ),
         )
         .await?;
         return Ok(InboxOutcome::Follow(WaitInboxFollowResult {
             wait_id: session.wait_id.clone(),
             kind: WaitInboxFollowResultKind::Replaced {
                 replaced_by_wait_id: replaced_by,
-                inbox_cursor: proven,
+                inbox_cursor: proven.clone(),
             },
         }));
     }
@@ -834,25 +996,40 @@ async fn replaced_outcome(
 async fn fail_outcome(
     session: &WaitSession,
     stream: Option<&InboxFollowStreamSender>,
-    proven: Option<String>,
+    coalesce: &mut Option<CoalesceBuffer<WaitInboxFollowV2Message>>,
+    cursor: &mut InboxCursorV1,
+    proven: &mut Option<String>,
     reason: WaitInboxFailureReason,
     err: CoreError,
 ) -> Result<InboxOutcome, CoreError> {
     if let Some(stream) = stream {
+        let use_v2 = coalesce.is_some();
+        let _ = flush_pending_inbox(Some(stream), session, coalesce, cursor, proven).await;
         let _ = emit_inbox(
             stream,
-            WaitInboxFollowEvent {
-                schema: chanvoy_core::WaitInboxFollowSchema::V1,
-                wait_id: session.wait_id.clone(),
-                kind: WaitInboxFollowEventKind::Failed {
+            follow_terminal_event(
+                use_v2,
+                session.wait_id.clone(),
+                WaitInboxFollowEventKind::Failed {
                     reason_code: reason,
-                    inbox_cursor: proven,
+                    inbox_cursor: proven.clone(),
                 },
-            },
+                WaitInboxFollowV2EventKind::Failed {
+                    reason_code: reason,
+                    inbox_cursor: proven.clone(),
+                },
+            ),
         )
         .await;
     }
     Err(err)
+}
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 fn inbound_payload(event: &DaemonEvent) -> Option<&InboundEventPayload> {
@@ -1223,6 +1400,7 @@ mod tests {
                 mention: false,
                 after: None,
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -1253,6 +1431,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
@@ -1303,6 +1482,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
@@ -1363,6 +1543,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
@@ -1447,6 +1628,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
@@ -1522,6 +1704,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
@@ -1577,6 +1760,7 @@ mod tests {
                 mention: true,
                 after: Some(&cursor),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -1640,6 +1824,7 @@ mod tests {
                 mention: true,
                 after: Some(&cursor),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -1712,6 +1897,7 @@ mod tests {
                     mention: true,
                     after: Some(&empty),
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
@@ -1765,6 +1951,7 @@ mod tests {
                 mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -1802,6 +1989,7 @@ mod tests {
                 mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -1870,6 +2058,7 @@ mod tests {
                 mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -1943,6 +2132,7 @@ mod tests {
                 mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -2031,6 +2221,7 @@ mod tests {
                 mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -2084,6 +2275,7 @@ mod tests {
                 mention: false,
                 after: Some(&raw),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -2132,6 +2324,7 @@ mod tests {
                 mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -2161,6 +2354,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(4),
                 },
             )
@@ -2176,6 +2370,7 @@ mod tests {
                 mention: false,
                 after: None,
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(1),
             },
         )
@@ -2198,6 +2393,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: Some(&existing_wait_id),
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
             )
@@ -2247,6 +2443,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(2),
                 },
             )
@@ -2314,6 +2511,7 @@ mod tests {
                     mention: false,
                     after: Some(&cursor),
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
                 tx,
@@ -2404,6 +2602,7 @@ mod tests {
                 mention: false,
                 after: None,
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -2435,6 +2634,7 @@ mod tests {
                 mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -2468,6 +2668,7 @@ mod tests {
                 mention: false,
                 after: Some(&cursor),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -2500,6 +2701,7 @@ mod tests {
                 mention: false,
                 after: None,
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -2515,6 +2717,7 @@ mod tests {
                 mention: false,
                 after: None,
                 replace_wait_id: Some(&lease.wait_id),
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(2),
             },
         )
@@ -2545,6 +2748,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(4),
                 },
             )
@@ -2635,6 +2839,7 @@ mod tests {
                         mention: false,
                         after: Some(&cursor),
                         replace_wait_id: None,
+                        coalesce_ms: None,
                         deadline: Instant::now() + Duration::from_secs(3),
                     },
                     tx,
@@ -2673,6 +2878,7 @@ mod tests {
                 mention: false,
                 after: Some(&after),
                 replace_wait_id: None,
+                coalesce_ms: None,
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         )
@@ -2710,6 +2916,7 @@ mod tests {
                     mention: false,
                     after: None,
                     replace_wait_id: None,
+                    coalesce_ms: None,
                     deadline: Instant::now() + Duration::from_secs(3),
                 },
                 tx,
@@ -2769,5 +2976,98 @@ mod tests {
         );
         assert_eq!(failed_cursor, last_ok);
         assert!(last_ok.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn follow_coalesce_two_backlog_messages_are_one_v2_record() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        mount_one_dm_catalog(&server, 0).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_A: {
+                        "id": POST_A,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "one",
+                        "create_at": 1_780_000_000_100i64,
+                        "root_id": ""
+                    },
+                    POST_C: {
+                        "id": POST_C,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "two",
+                        "create_at": 1_780_000_000_200i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID)
+            .encode()
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let handle = tokio::spawn(async move {
+            wait_with_params_inbox_follow(
+                &state,
+                WaitInboxRequest {
+                    timeout_secs: 3,
+                    contains: None,
+                    pattern: None,
+                    mention: false,
+                    after: Some(&cursor),
+                    replace_wait_id: None,
+                    coalesce_ms: Some(80),
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+                tx,
+            )
+            .await
+        });
+        let armed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("armed")
+            .expect("open");
+        assert_eq!(armed.event.mode(), WaitFollowMode::Armed);
+        assert!(matches!(armed.event, InboxFollowStreamEvent::V2(_)));
+        let _ = armed.written.send(Ok(()));
+
+        let burst = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("coalesced backlog")
+            .expect("open");
+        assert_eq!(burst.event.mode(), WaitFollowMode::Backlog);
+        match &burst.event {
+            InboxFollowStreamEvent::V2(event) => {
+                let value = serde_json::to_value(event).expect("serialize");
+                assert!(value.get("tip").is_none());
+                match &event.kind {
+                    WaitInboxFollowV2EventKind::Backlog {
+                        matched_post_id,
+                        next_inbox_cursor,
+                        messages,
+                        truncated,
+                    } => {
+                        assert_eq!(messages.len(), 2);
+                        assert_eq!(messages[0].message.id, POST_A);
+                        assert_eq!(messages[1].message.id, POST_C);
+                        assert_eq!(matched_post_id, POST_C);
+                        assert!(next_inbox_cursor.starts_with("inv1."));
+                        assert_ne!(next_inbox_cursor.as_str(), POST_C);
+                        assert!(!*truncated);
+                    }
+                    other => panic!("expected backlog, got {other:?}"),
+                }
+            }
+            other => panic!("expected v2, got {other:?}"),
+        }
+        let _ = burst.written.send(Ok(()));
+        drop(rx);
+        let _ = handle.await;
     }
 }

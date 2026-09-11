@@ -7,6 +7,7 @@ use std::{env, fs, io};
 
 mod wait;
 mod wait_channels;
+mod wait_coalesce;
 mod wait_inbox;
 mod wait_owner;
 mod waitprims_fanin;
@@ -16,23 +17,25 @@ mod waitprims_poll;
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
     now_unix_millis, pid_path_for_profile, rpc_error, rpc_error_with_data, rpc_result,
-    socket_path_for_profile, store_attention_state, AckChannelParams, AckResult, AddMemberParams,
-    ArchiveChannelParams, AttentionShowParams, AttentionState, CapabilityClass, Channel,
-    CheckChannelParams, CheckResult, CoreError, CreateChannelParams, DaemonEvent, DaemonEventKind,
-    DaemonEventPayloadInner, DaemonHealth, DaemonStatus, DirectMessageParams, DmConversation,
-    EventBus, GetPostParams, IpcConfig, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    MattermostClient, MattermostWs, NotificationsParams, NotifyParams, PinParams, PinResult,
-    PinnedChannelParams, PostMessageParams, Profile, ProfileStatus, Provider, ReactParams,
-    ReactionResult, ReadChannelParams, ReadDirectMessageParams, ReadThreadParams, SearchParams,
-    SearchResult, ShutdownResult, SubscribeParams, SubscriptionAck, SubscriptionFilter,
-    UnpinParams, UnpinResult, UnreactParams, UnreadNotifications, UnsubscribeParams,
-    WaitChannelParams, WaitChannelV2Params, WaitChannelV3Params, WaitChannelsParams,
-    WaitChannelsResult, WaitDmV1Params, WaitFollowV1Params, WaitInboxV1Params, WaitResult, WsState,
-    RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED,
-    RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_V1_METHOD, WAIT_CHANNEL_V3_METHOD,
-    WAIT_DM_FOLLOW_V1_METHOD, WAIT_DM_V1_METHOD, WAIT_FOLLOW_V1_EVENT_METHOD,
-    WAIT_FOLLOW_V1_METHOD, WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_METHOD,
-    WAIT_INBOX_V1_METHOD,
+    socket_path_for_profile, store_attention_state, validate_coalesce_ms, AckChannelParams,
+    AckResult, AddMemberParams, ArchiveChannelParams, AttentionShowParams, AttentionState,
+    CapabilityClass, Channel, CheckChannelParams, CheckResult, CoreError, CreateChannelParams,
+    DaemonEvent, DaemonEventKind, DaemonEventPayloadInner, DaemonHealth, DaemonStatus,
+    DirectMessageParams, DmConversation, EventBus, GetPostParams, IpcConfig, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, MattermostClient, MattermostWs, NotificationsParams,
+    NotifyParams, PinParams, PinResult, PinnedChannelParams, PostMessageParams, Profile,
+    ProfileStatus, Provider, ReactParams, ReactionResult, ReadChannelParams,
+    ReadDirectMessageParams, ReadThreadParams, SearchParams, SearchResult, ShutdownResult,
+    SubscribeParams, SubscriptionAck, SubscriptionFilter, UnpinParams, UnpinResult, UnreactParams,
+    UnreadNotifications, UnsubscribeParams, WaitChannelParams, WaitChannelV2Params,
+    WaitChannelV3Params, WaitChannelsParams, WaitChannelsResult, WaitDmFollowV2Params,
+    WaitDmV1Params, WaitFollowV1Params, WaitFollowV2Params, WaitInboxFollowV2Params,
+    WaitInboxV1Params, WaitResult, WsState, RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED,
+    RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_V1_METHOD,
+    WAIT_CHANNEL_V3_METHOD, WAIT_DM_FOLLOW_V1_METHOD, WAIT_DM_FOLLOW_V2_METHOD, WAIT_DM_V1_METHOD,
+    WAIT_FOLLOW_V1_EVENT_METHOD, WAIT_FOLLOW_V1_METHOD, WAIT_FOLLOW_V2_EVENT_METHOD,
+    WAIT_FOLLOW_V2_METHOD, WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, WAIT_INBOX_FOLLOW_V1_METHOD,
+    WAIT_INBOX_FOLLOW_V2_EVENT_METHOD, WAIT_INBOX_FOLLOW_V2_METHOD, WAIT_INBOX_V1_METHOD,
 };
 use chanvoy_ipc::{IpcPeer, IpcPeerState};
 use serde::de::DeserializeOwned;
@@ -576,7 +579,9 @@ async fn handle_client(
                     break;
                 }
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
-                if request.method == WAIT_FOLLOW_V1_METHOD {
+                if request.method == WAIT_FOLLOW_V1_METHOD
+                    || request.method == WAIT_FOLLOW_V2_METHOD
+                {
                     if state.identity_drift.load(Ordering::Relaxed) {
                         let response = rpc_error(
                             request.id,
@@ -588,20 +593,60 @@ async fn handle_client(
                         line.clear();
                         continue;
                     }
-                    let params = match serde_json::from_value::<WaitFollowV1Params>(
-                        request.params.clone(),
-                    ) {
-                        Ok(params) => params,
-                        Err(err) => {
-                            let response = rpc_error(
-                                request.id,
-                                -32_007,
-                                format!("wait_follow_v1 input: {err}"),
-                            );
-                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
-                            line.clear();
-                            continue;
+                    let (params, coalesce_ms) = if request.method == WAIT_FOLLOW_V2_METHOD {
+                        match serde_json::from_value::<WaitFollowV2Params>(request.params.clone()) {
+                            Ok(params) => {
+                                if let Err(err) = validate_coalesce_ms(params.coalesce_ms) {
+                                    let response = rpc_error(
+                                        request.id,
+                                        -32_007,
+                                        format!("wait_follow_v2 input: {err}"),
+                                    );
+                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                    writer.write_all(b"\n").await?;
+                                    line.clear();
+                                    continue;
+                                }
+                                (
+                                    WaitFollowV1Params {
+                                        channel: params.channel,
+                                        timeout_secs: params.timeout_secs,
+                                        team: params.team,
+                                        contains: params.contains,
+                                        pattern: params.pattern,
+                                        after: params.after,
+                                        replace_wait_id: params.replace_wait_id,
+                                        mention: params.mention,
+                                    },
+                                    Some(params.coalesce_ms),
+                                )
+                            }
+                            Err(err) => {
+                                let response = rpc_error(
+                                    request.id,
+                                    -32_007,
+                                    format!("wait_follow_v2 input: {err}"),
+                                );
+                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                line.clear();
+                                continue;
+                            }
+                        }
+                    } else {
+                        match serde_json::from_value::<WaitFollowV1Params>(request.params.clone()) {
+                            Ok(params) => (params, None),
+                            Err(err) => {
+                                let response = rpc_error(
+                                    request.id,
+                                    -32_007,
+                                    format!("wait_follow_v1 input: {err}"),
+                                );
+                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                line.clear();
+                                continue;
+                            }
                         }
                     };
                     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
@@ -619,6 +664,7 @@ async fn handle_client(
                             emit_wait_ids: true,
                         },
                         stream_tx,
+                        coalesce_ms,
                     );
                     tokio::pin!(follow);
                     let mut eof_buf = String::new();
@@ -628,8 +674,8 @@ async fn handle_client(
                             Some(record) = stream_rx.recv() => {
                                 let notification = JsonRpcNotification {
                                     jsonrpc: "2.0".to_string(),
-                                    method: WAIT_FOLLOW_V1_EVENT_METHOD.to_string(),
-                                    params: to_value(record.event),
+                                    method: record.method.to_string(),
+                                    params: record.event,
                                 };
                                 let write_result = async {
                                     writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
@@ -647,8 +693,8 @@ async fn handle_client(
                                 while let Ok(record) = stream_rx.try_recv() {
                                     let notification = JsonRpcNotification {
                                         jsonrpc: "2.0".to_string(),
-                                        method: WAIT_FOLLOW_V1_EVENT_METHOD.to_string(),
-                                        params: to_value(record.event),
+                                        method: record.method.to_string(),
+                                        params: record.event,
                                     };
                                     let write_result = async {
                                         writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
@@ -683,7 +729,9 @@ async fn handle_client(
                     line.clear();
                     continue;
                 }
-                if request.method == WAIT_DM_FOLLOW_V1_METHOD {
+                if request.method == WAIT_DM_FOLLOW_V1_METHOD
+                    || request.method == WAIT_DM_FOLLOW_V2_METHOD
+                {
                     let started = WaitStarted::now();
                     if state.identity_drift.load(Ordering::Relaxed) {
                         let response = rpc_error(
@@ -696,20 +744,59 @@ async fn handle_client(
                         line.clear();
                         continue;
                     }
-                    let params = match serde_json::from_value::<WaitDmV1Params>(
-                        request.params.clone(),
-                    ) {
-                        Ok(params) => params,
-                        Err(err) => {
-                            let response = rpc_error(
-                                request.id,
-                                -32_007,
-                                format!("wait_dm_follow_v1 input: {err}"),
-                            );
-                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
-                            line.clear();
-                            continue;
+                    let (params, coalesce_ms) = if request.method == WAIT_DM_FOLLOW_V2_METHOD {
+                        match serde_json::from_value::<WaitDmFollowV2Params>(request.params.clone()) {
+                            Ok(params) => {
+                                if let Err(err) = validate_coalesce_ms(params.coalesce_ms) {
+                                    let response = rpc_error(
+                                        request.id,
+                                        -32_007,
+                                        format!("wait_dm_follow_v2 input: {err}"),
+                                    );
+                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                    writer.write_all(b"\n").await?;
+                                    line.clear();
+                                    continue;
+                                }
+                                (
+                                    WaitDmV1Params {
+                                        username: params.username,
+                                        timeout_secs: params.timeout_secs,
+                                        contains: params.contains,
+                                        pattern: params.pattern,
+                                        after: params.after,
+                                        replace_wait_id: params.replace_wait_id,
+                                        mention: params.mention,
+                                    },
+                                    Some(params.coalesce_ms),
+                                )
+                            }
+                            Err(err) => {
+                                let response = rpc_error(
+                                    request.id,
+                                    -32_007,
+                                    format!("wait_dm_follow_v2 input: {err}"),
+                                );
+                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                line.clear();
+                                continue;
+                            }
+                        }
+                    } else {
+                        match serde_json::from_value::<WaitDmV1Params>(request.params.clone()) {
+                            Ok(params) => (params, None),
+                            Err(err) => {
+                                let response = rpc_error(
+                                    request.id,
+                                    -32_007,
+                                    format!("wait_dm_follow_v1 input: {err}"),
+                                );
+                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                line.clear();
+                                continue;
+                            }
                         }
                     };
                     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
@@ -739,6 +826,7 @@ async fn handle_client(
                             deadline,
                         },
                         stream_tx,
+                        coalesce_ms,
                     );
                     tokio::pin!(follow);
                     let mut eof_buf = String::new();
@@ -748,8 +836,8 @@ async fn handle_client(
                             Some(record) = stream_rx.recv() => {
                                 let notification = JsonRpcNotification {
                                     jsonrpc: "2.0".to_string(),
-                                    method: WAIT_FOLLOW_V1_EVENT_METHOD.to_string(),
-                                    params: to_value(record.event),
+                                    method: record.method.to_string(),
+                                    params: record.event,
                                 };
                                 let write_result = async {
                                     writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
@@ -767,8 +855,8 @@ async fn handle_client(
                                 while let Ok(record) = stream_rx.try_recv() {
                                     let notification = JsonRpcNotification {
                                         jsonrpc: "2.0".to_string(),
-                                        method: WAIT_FOLLOW_V1_EVENT_METHOD.to_string(),
-                                        params: to_value(record.event),
+                                        method: record.method.to_string(),
+                                        params: record.event,
                                     };
                                     let write_result = async {
                                         writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
@@ -803,7 +891,9 @@ async fn handle_client(
                     line.clear();
                     continue;
                 }
-                if request.method == WAIT_INBOX_FOLLOW_V1_METHOD {
+                if request.method == WAIT_INBOX_FOLLOW_V1_METHOD
+                    || request.method == WAIT_INBOX_FOLLOW_V2_METHOD
+                {
                     let started = WaitStarted::now();
                     if state.identity_drift.load(Ordering::Relaxed) {
                         let response = rpc_error(
@@ -816,20 +906,60 @@ async fn handle_client(
                         line.clear();
                         continue;
                     }
-                    let params = match serde_json::from_value::<WaitInboxV1Params>(
-                        request.params.clone(),
-                    ) {
-                        Ok(params) => params,
-                        Err(err) => {
-                            let response = rpc_error(
-                                request.id,
-                                -32_007,
-                                format!("wait_inbox_follow_v1 input: {err}"),
-                            );
-                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
-                            line.clear();
-                            continue;
+                    let (params, coalesce_ms) = if request.method == WAIT_INBOX_FOLLOW_V2_METHOD {
+                        match serde_json::from_value::<WaitInboxFollowV2Params>(request.params.clone()) {
+                            Ok(params) => {
+                                if let Err(err) = validate_coalesce_ms(params.coalesce_ms) {
+                                    let response = rpc_error(
+                                        request.id,
+                                        -32_007,
+                                        format!("wait_inbox_follow_v2 input: {err}"),
+                                    );
+                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                    writer.write_all(b"\n").await?;
+                                    line.clear();
+                                    continue;
+                                }
+                                (
+                                    WaitInboxV1Params {
+                                        timeout_secs: params.timeout_secs,
+                                        contains: params.contains,
+                                        pattern: params.pattern,
+                                        after: params.after,
+                                        replace_wait_id: params.replace_wait_id,
+                                        mention: params.mention,
+                                    },
+                                    Some(params.coalesce_ms),
+                                )
+                            }
+                            Err(err) => {
+                                let response = rpc_error(
+                                    request.id,
+                                    -32_007,
+                                    format!("wait_inbox_follow_v2 input: {err}"),
+                                );
+                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                line.clear();
+                                continue;
+                            }
+                        }
+                    } else {
+                        match serde_json::from_value::<WaitInboxV1Params>(
+                            request.params.clone(),
+                        ) {
+                            Ok(params) => (params, None),
+                            Err(err) => {
+                                let response = rpc_error(
+                                    request.id,
+                                    -32_007,
+                                    format!("wait_inbox_follow_v1 input: {err}"),
+                                );
+                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                                writer.write_all(b"\n").await?;
+                                line.clear();
+                                continue;
+                            }
                         }
                     };
                     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
@@ -856,6 +986,7 @@ async fn handle_client(
                             after: params.after.as_deref(),
                             replace_wait_id: params.replace_wait_id.as_deref(),
                             deadline,
+                            coalesce_ms,
                         },
                         stream_tx,
                     );
@@ -865,10 +996,18 @@ async fn handle_client(
                         tokio::select! {
                             biased;
                             Some(record) = stream_rx.recv() => {
+                                let (method, params) = match record.event {
+                                    wait_inbox::InboxFollowStreamEvent::V1(event) => {
+                                        (WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, to_value(event))
+                                    }
+                                    wait_inbox::InboxFollowStreamEvent::V2(event) => {
+                                        (WAIT_INBOX_FOLLOW_V2_EVENT_METHOD, to_value(event))
+                                    }
+                                };
                                 let notification = JsonRpcNotification {
                                     jsonrpc: "2.0".to_string(),
-                                    method: WAIT_INBOX_FOLLOW_V1_EVENT_METHOD.to_string(),
-                                    params: to_value(record.event),
+                                    method: method.to_string(),
+                                    params,
                                 };
                                 let write_result = async {
                                     writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
@@ -884,10 +1023,18 @@ async fn handle_client(
                             }
                             result = &mut follow => {
                                 while let Ok(record) = stream_rx.try_recv() {
+                                    let (method, params) = match record.event {
+                                        wait_inbox::InboxFollowStreamEvent::V1(event) => {
+                                            (WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, to_value(event))
+                                        }
+                                        wait_inbox::InboxFollowStreamEvent::V2(event) => {
+                                            (WAIT_INBOX_FOLLOW_V2_EVENT_METHOD, to_value(event))
+                                        }
+                                    };
                                     let notification = JsonRpcNotification {
                                         jsonrpc: "2.0".to_string(),
-                                        method: WAIT_INBOX_FOLLOW_V1_EVENT_METHOD.to_string(),
-                                        params: to_value(record.event),
+                                        method: method.to_string(),
+                                        params,
                                     };
                                     let write_result = async {
                                         writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
@@ -1636,6 +1783,7 @@ async fn dispatch_request(
                             after: params.after.as_deref(),
                             replace_wait_id: params.replace_wait_id.as_deref(),
                             deadline,
+                            coalesce_ms: None,
                         },
                     )
                     .await
@@ -2088,10 +2236,13 @@ fn is_wait_rpc(method: &str) -> bool {
         "wait_channel" | "wait_channel_v2" | "wait_channels_v1"
     ) || method == WAIT_CHANNEL_V3_METHOD
         || method == WAIT_FOLLOW_V1_METHOD
+        || method == WAIT_FOLLOW_V2_METHOD
         || method == WAIT_DM_V1_METHOD
         || method == WAIT_DM_FOLLOW_V1_METHOD
+        || method == WAIT_DM_FOLLOW_V2_METHOD
         || method == WAIT_INBOX_V1_METHOD
         || method == WAIT_INBOX_FOLLOW_V1_METHOD
+        || method == WAIT_INBOX_FOLLOW_V2_METHOD
 }
 
 fn error_payload(error: &DaemonError) -> (i64, String, Option<serde_json::Value>) {
@@ -3575,6 +3726,84 @@ impl DaemonClient {
         }
     }
 
+    pub async fn wait_follow_v2<F>(
+        &self,
+        params: WaitFollowV2Params,
+        mut on_event: F,
+    ) -> Result<chanvoy_core::WaitFollowResult, DaemonError>
+    where
+        F: FnMut(chanvoy_core::WaitFollowV2Event) -> Result<(), DaemonError>,
+    {
+        if !self.socket_path.exists() {
+            return Err(DaemonError::NotRunning(
+                self.socket_path.display().to_string(),
+            ));
+        }
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let request =
+            chanvoy_core::rpc_request(WAIT_FOLLOW_V2_METHOD, serde_json::to_value(params)?);
+        stream
+            .write_all(serde_json::to_string(&request)?.as_bytes())
+            .await?;
+        stream.write_all(b"\n").await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait stream closed before terminal response".into(),
+                    data: None,
+                });
+            }
+            let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            line.clear();
+            if value.get("method").and_then(serde_json::Value::as_str)
+                == Some(WAIT_FOLLOW_V2_EVENT_METHOD)
+            {
+                let event: chanvoy_core::WaitFollowV2Event = serde_json::from_value(
+                    value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )?;
+                event.validate().map_err(|message| DaemonError::Rpc {
+                    code: -32_000,
+                    message: format!("invalid held wait stream record: {message}"),
+                    data: None,
+                })?;
+                on_event(event)?;
+                continue;
+            }
+            let response: JsonRpcResponse = serde_json::from_value(value)?;
+            if response.id != request.id {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait response id mismatch".into(),
+                    data: None,
+                });
+            }
+            if let Some(error) = response.error {
+                return Err(DaemonError::Rpc {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                });
+            }
+            let result = response.result.unwrap_or(serde_json::Value::Null);
+            let result: chanvoy_core::WaitFollowResult = serde_json::from_value(result)?;
+            result.validate().map_err(|message| DaemonError::Rpc {
+                code: -32_000,
+                message: format!("invalid held wait terminal result: {message}"),
+                data: None,
+            })?;
+            return Ok(result);
+        }
+    }
+
     pub async fn wait_dm_v1(
         &self,
         params: WaitDmV1Params,
@@ -3661,6 +3890,84 @@ impl DaemonClient {
         }
     }
 
+    pub async fn wait_dm_follow_v2<F>(
+        &self,
+        params: WaitDmFollowV2Params,
+        mut on_event: F,
+    ) -> Result<chanvoy_core::WaitDmFollowResult, DaemonError>
+    where
+        F: FnMut(chanvoy_core::WaitFollowV2Event) -> Result<(), DaemonError>,
+    {
+        if !self.socket_path.exists() {
+            return Err(DaemonError::NotRunning(
+                self.socket_path.display().to_string(),
+            ));
+        }
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let request =
+            chanvoy_core::rpc_request(WAIT_DM_FOLLOW_V2_METHOD, serde_json::to_value(params)?);
+        stream
+            .write_all(serde_json::to_string(&request)?.as_bytes())
+            .await?;
+        stream.write_all(b"\n").await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait stream closed before terminal response".into(),
+                    data: None,
+                });
+            }
+            let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            line.clear();
+            if value.get("method").and_then(serde_json::Value::as_str)
+                == Some(WAIT_FOLLOW_V2_EVENT_METHOD)
+            {
+                let event: chanvoy_core::WaitFollowV2Event = serde_json::from_value(
+                    value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )?;
+                event.validate().map_err(|message| DaemonError::Rpc {
+                    code: -32_000,
+                    message: format!("invalid held wait stream record: {message}"),
+                    data: None,
+                })?;
+                on_event(event)?;
+                continue;
+            }
+            let response: JsonRpcResponse = serde_json::from_value(value)?;
+            if response.id != request.id {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait response id mismatch".into(),
+                    data: None,
+                });
+            }
+            if let Some(error) = response.error {
+                return Err(DaemonError::Rpc {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                });
+            }
+            let result = response.result.unwrap_or(serde_json::Value::Null);
+            let result: chanvoy_core::WaitDmFollowResult = serde_json::from_value(result)?;
+            result.validate().map_err(|message| DaemonError::Rpc {
+                code: -32_000,
+                message: format!("invalid held wait terminal result: {message}"),
+                data: None,
+            })?;
+            return Ok(result);
+        }
+    }
+
     pub async fn wait_inbox_v1(
         &self,
         params: WaitInboxV1Params,
@@ -3708,6 +4015,79 @@ impl DaemonClient {
                 == Some(WAIT_INBOX_FOLLOW_V1_EVENT_METHOD)
             {
                 let event: chanvoy_core::WaitInboxFollowEvent = serde_json::from_value(
+                    value
+                        .get("params")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )?;
+                event.validate().map_err(|message| DaemonError::Rpc {
+                    code: -32_000,
+                    message: format!("invalid held wait stream record: {message}"),
+                    data: None,
+                })?;
+                on_event(event)?;
+                continue;
+            }
+            let response: JsonRpcResponse = serde_json::from_value(value)?;
+            if response.id != request.id {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait response id mismatch".into(),
+                    data: None,
+                });
+            }
+            if let Some(error) = response.error {
+                return Err(DaemonError::Rpc {
+                    code: error.code,
+                    message: error.message,
+                    data: error.data,
+                });
+            }
+            let result = response.result.unwrap_or(serde_json::Value::Null);
+            let result: chanvoy_core::WaitInboxFollowResult = serde_json::from_value(result)?;
+            return Ok(result);
+        }
+    }
+
+    pub async fn wait_inbox_follow_v2<F>(
+        &self,
+        params: WaitInboxFollowV2Params,
+        mut on_event: F,
+    ) -> Result<chanvoy_core::WaitInboxFollowResult, DaemonError>
+    where
+        F: FnMut(chanvoy_core::WaitInboxFollowV2Event) -> Result<(), DaemonError>,
+    {
+        if !self.socket_path.exists() {
+            return Err(DaemonError::NotRunning(
+                self.socket_path.display().to_string(),
+            ));
+        }
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let request =
+            chanvoy_core::rpc_request(WAIT_INBOX_FOLLOW_V2_METHOD, serde_json::to_value(params)?);
+        stream
+            .write_all(serde_json::to_string(&request)?.as_bytes())
+            .await?;
+        stream.write_all(b"\n").await?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "held wait stream closed before terminal response".into(),
+                    data: None,
+                });
+            }
+            let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            line.clear();
+            if value.get("method").and_then(serde_json::Value::as_str)
+                == Some(WAIT_INBOX_FOLLOW_V2_EVENT_METHOD)
+            {
+                let event: chanvoy_core::WaitInboxFollowV2Event = serde_json::from_value(
                     value
                         .get("params")
                         .cloned()

@@ -1,7 +1,8 @@
-//! `wait_follow_v1` daemon-RPC and JSONL stream types.
+//! `wait_follow_v1` / `wait_follow_v2` daemon-RPC and JSONL stream types.
 //!
 //! The normative schemas live in Crucible under
-//! `schemas/common/chanvoy-daemon-rpc/v0/`.
+//! `schemas/common/chanvoy-daemon-rpc/v0/`. Chanvoy does not git-pin
+//! Crucible; these types are the local contract.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,23 @@ use crate::Message;
 pub const WAIT_FOLLOW_V1_METHOD: &str = "wait_follow_v1";
 pub const WAIT_FOLLOW_V1_EVENT_METHOD: &str = "wait_follow_v1.event";
 pub const WAIT_FOLLOW_V1_EVENT_SCHEMA: &str = "wait_follow_v1.event";
+pub const WAIT_FOLLOW_V2_METHOD: &str = "wait_follow_v2";
+pub const WAIT_FOLLOW_V2_EVENT_METHOD: &str = "wait_follow_v2.event";
+pub const WAIT_FOLLOW_V2_EVENT_SCHEMA: &str = "wait_follow_v2.event";
+pub const WAIT_FOLLOW_COALESCE_MS_MIN: u64 = 1;
+pub const WAIT_FOLLOW_COALESCE_MS_MAX: u64 = 10_000;
+pub const WAIT_FOLLOW_COALESCE_MAX_MESSAGES: usize = 32;
+
+/// Refuse a v2 `coalesce_ms` outside `1..=10000`.
+pub fn validate_coalesce_ms(coalesce_ms: u64) -> Result<(), String> {
+    if (WAIT_FOLLOW_COALESCE_MS_MIN..=WAIT_FOLLOW_COALESCE_MS_MAX).contains(&coalesce_ms) {
+        Ok(())
+    } else {
+        Err(format!(
+            "coalesce_ms must be {WAIT_FOLLOW_COALESCE_MS_MIN}..={WAIT_FOLLOW_COALESCE_MS_MAX}"
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +47,28 @@ pub struct WaitFollowV1Params {
     /// When true, only posts that mention this bot complete the wait.
     #[serde(default)]
     pub mention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WaitFollowV2Params {
+    pub channel: String,
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub team: Option<String>,
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub replace_wait_id: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
+    /// Required live coalesce window in milliseconds (`1..=10000`).
+    pub coalesce_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +252,174 @@ impl WaitFollowEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WaitFollowV2Schema {
+    #[serde(rename = "wait_follow_v2.event")]
+    V2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitFollowV2Event {
+    pub schema: WaitFollowV2Schema,
+    pub wait_id: String,
+    #[serde(flatten)]
+    pub kind: WaitFollowV2EventKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WaitFollowV2EventKind {
+    Armed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaced_wait_id: Option<String>,
+    },
+    Backlog {
+        tip: String,
+        truncated: bool,
+        messages: Vec<Message>,
+    },
+    Live {
+        tip: String,
+        truncated: bool,
+        messages: Vec<Message>,
+    },
+    Deadman,
+    Canceled,
+    Replaced {
+        replaced_by_wait_id: String,
+    },
+    Failed {
+        reason_code: WaitFollowFailureReason,
+    },
+}
+
+impl WaitFollowV2Event {
+    pub fn armed(wait_id: impl Into<String>, replaced_wait_id: Option<String>) -> Self {
+        Self {
+            schema: WaitFollowV2Schema::V2,
+            wait_id: wait_id.into(),
+            kind: WaitFollowV2EventKind::Armed { replaced_wait_id },
+        }
+    }
+
+    pub fn messages(
+        wait_id: impl Into<String>,
+        mode: WaitFollowMode,
+        messages: Vec<Message>,
+        truncated: bool,
+    ) -> Result<Self, &'static str> {
+        validate_v2_message_record(
+            messages
+                .last()
+                .map(|message| message.id.as_str())
+                .unwrap_or_default(),
+            &messages,
+        )?;
+        let tip = messages
+            .last()
+            .expect("validate_v2_message_record requires 1..=32 messages")
+            .id
+            .clone();
+        let kind = match mode {
+            WaitFollowMode::Backlog if !truncated => WaitFollowV2EventKind::Backlog {
+                tip,
+                truncated: false,
+                messages,
+            },
+            WaitFollowMode::Live if !truncated => WaitFollowV2EventKind::Live {
+                tip,
+                truncated: false,
+                messages,
+            },
+            WaitFollowMode::Backlog | WaitFollowMode::Live => {
+                return Err("v2 follow records cannot be truncated")
+            }
+            _ => return Err("message record requires backlog or live mode"),
+        };
+        Ok(Self {
+            schema: WaitFollowV2Schema::V2,
+            wait_id: wait_id.into(),
+            kind,
+        })
+    }
+
+    pub fn terminal(wait_id: impl Into<String>, kind: WaitFollowV2EventKind) -> Self {
+        debug_assert!(matches!(
+            kind,
+            WaitFollowV2EventKind::Deadman
+                | WaitFollowV2EventKind::Canceled
+                | WaitFollowV2EventKind::Replaced { .. }
+                | WaitFollowV2EventKind::Failed { .. }
+        ));
+        Self {
+            schema: WaitFollowV2Schema::V2,
+            wait_id: wait_id.into(),
+            kind,
+        }
+    }
+
+    pub fn mode(&self) -> WaitFollowMode {
+        match self.kind {
+            WaitFollowV2EventKind::Armed { .. } => WaitFollowMode::Armed,
+            WaitFollowV2EventKind::Backlog { .. } => WaitFollowMode::Backlog,
+            WaitFollowV2EventKind::Live { .. } => WaitFollowMode::Live,
+            WaitFollowV2EventKind::Deadman => WaitFollowMode::Deadman,
+            WaitFollowV2EventKind::Canceled => WaitFollowMode::Canceled,
+            WaitFollowV2EventKind::Replaced { .. } => WaitFollowMode::Replaced,
+            WaitFollowV2EventKind::Failed { .. } => WaitFollowMode::Failed,
+        }
+    }
+
+    pub fn tip(&self) -> Option<&str> {
+        match &self.kind {
+            WaitFollowV2EventKind::Backlog { tip, .. }
+            | WaitFollowV2EventKind::Live { tip, .. } => Some(tip),
+            _ => None,
+        }
+    }
+
+    pub fn messages_slice(&self) -> &[Message] {
+        match &self.kind {
+            WaitFollowV2EventKind::Backlog { messages, .. }
+            | WaitFollowV2EventKind::Live { messages, .. } => messages,
+            _ => &[],
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_wait_id(&self.wait_id)?;
+        match &self.kind {
+            WaitFollowV2EventKind::Armed { replaced_wait_id } => {
+                if let Some(wait_id) = replaced_wait_id {
+                    validate_wait_id(wait_id)?;
+                }
+            }
+            WaitFollowV2EventKind::Backlog {
+                tip,
+                truncated,
+                messages,
+            }
+            | WaitFollowV2EventKind::Live {
+                tip,
+                truncated,
+                messages,
+            } => {
+                if *truncated {
+                    return Err("v2 follow records cannot be truncated");
+                }
+                validate_v2_message_record(tip, messages)?;
+            }
+            WaitFollowV2EventKind::Replaced {
+                replaced_by_wait_id,
+            } => validate_wait_id(replaced_by_wait_id)?,
+            WaitFollowV2EventKind::Deadman
+            | WaitFollowV2EventKind::Canceled
+            | WaitFollowV2EventKind::Failed { .. } => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WaitFollowResult {
     pub wait_id: String,
@@ -278,17 +486,38 @@ fn validate_optional_tip(tip: &Option<String>) -> Result<(), &'static str> {
     }
 }
 
-fn validate_message_record(tip: &str, message: &Message) -> Result<(), &'static str> {
-    if !is_mattermost_post_id(tip) || tip != message.id {
-        return Err("follow tip must equal its sole Mattermost message id");
+fn validate_message_fields(message: &Message) -> Result<(), &'static str> {
+    if !is_mattermost_post_id(&message.id) {
+        return Err("follow message id is not a Mattermost post id");
     }
-    if message.id.is_empty()
-        || message.user_id.is_empty()
+    if message.user_id.is_empty()
         || message.username.is_empty()
         || message.root_id.is_empty()
         || message.create_at < 0
     {
         return Err("follow message violates the event document");
+    }
+    Ok(())
+}
+
+fn validate_message_record(tip: &str, message: &Message) -> Result<(), &'static str> {
+    validate_message_fields(message)?;
+    if !is_mattermost_post_id(tip) || tip != message.id {
+        return Err("follow tip must equal its sole Mattermost message id");
+    }
+    Ok(())
+}
+
+fn validate_v2_message_record(tip: &str, messages: &[Message]) -> Result<(), &'static str> {
+    if messages.is_empty() || messages.len() > WAIT_FOLLOW_COALESCE_MAX_MESSAGES {
+        return Err("follow v2 messages must contain 1 to 32 entries");
+    }
+    for message in messages {
+        validate_message_fields(message)?;
+    }
+    let last = &messages[messages.len() - 1];
+    if !is_mattermost_post_id(tip) || tip != last.id {
+        return Err("follow v2 tip must equal the last Mattermost message id");
     }
     Ok(())
 }
@@ -374,5 +603,92 @@ mod tests {
             },
         };
         assert!(result.validate().is_err());
+    }
+
+    fn message_n(n: u8) -> Message {
+        let id = format!("postid000000000000000000{n:02}");
+        Message {
+            id: id.clone(),
+            user_id: "userid00000000000000000001".into(),
+            username: "reviewer".into(),
+            message: "ready".into(),
+            create_at: i64::from(n),
+            root_id: id,
+            mention_user_ids: None,
+        }
+    }
+
+    #[test]
+    fn v2_params_require_coalesce_ms_and_reject_unknown_fields() {
+        let missing = serde_json::json!({
+            "channel": "release-floor",
+            "timeout_secs": 60
+        });
+        assert!(serde_json::from_value::<WaitFollowV2Params>(missing).is_err());
+        let extra = serde_json::json!({
+            "channel": "release-floor",
+            "timeout_secs": 60,
+            "coalesce_ms": 1000,
+            "sink_path": "/tmp/must-not-cross-daemon-boundary"
+        });
+        assert!(serde_json::from_value::<WaitFollowV2Params>(extra).is_err());
+        validate_coalesce_ms(1).unwrap();
+        validate_coalesce_ms(8_000).unwrap();
+        validate_coalesce_ms(10_000).unwrap();
+        assert!(validate_coalesce_ms(0).is_err());
+        assert!(validate_coalesce_ms(10_001).is_err());
+    }
+
+    #[test]
+    fn v1_params_reject_coalesce_ms() {
+        let raw = serde_json::json!({
+            "channel": "release-floor",
+            "timeout_secs": 60,
+            "coalesce_ms": 1000
+        });
+        assert!(serde_json::from_value::<WaitFollowV1Params>(raw).is_err());
+    }
+
+    #[test]
+    fn v2_message_tip_is_the_last_id() {
+        let event = WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            vec![message_n(1), message_n(2)],
+            false,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["schema"], WAIT_FOLLOW_V2_EVENT_SCHEMA);
+        assert_eq!(value["tip"], value["messages"][1]["id"]);
+        assert_eq!(value["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(value["truncated"], false);
+        event.validate().unwrap();
+    }
+
+    #[test]
+    fn v2_refuses_empty_or_oversize_and_live_truncation() {
+        assert!(WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            vec![],
+            false,
+        )
+        .is_err());
+        let too_many: Vec<Message> = (1..=33).map(message_n).collect();
+        assert!(WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Backlog,
+            too_many,
+            false,
+        )
+        .is_err());
+        assert!(WaitFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            vec![message_n(1)],
+            true,
+        )
+        .is_err());
     }
 }
