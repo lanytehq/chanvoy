@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.lanyte.dev/common/chanvoy-daemon-rpc/v0/wait_channel_v3.params.schema.json",
+  "title": "Chanvoy wait_channel_v3 Parameters",
+  "description": "Strict parameters for one single-channel wait with profile-daemon single-waiter ownership and optional compare-and-replace.",
+  "type": "object",
+  "required": [
+    "channel",
+    "timeout_secs"
+  ],
+  "$defs": {
+    "nullable-string": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      ]
+    }
+  },
+  "properties": {
+    "channel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Requested channel name or team/channel selector. Canonical id is resolved at runtime before registry acquisition. The runtime additionally enforces a 256 UTF-8 byte limit."
+    },
+    "timeout_secs": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615,
+      "description": "Required positive u64 duration. The absolute deadline starts at RPC entry and activity does not extend it."
+    },
+    "team": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      ],
+      "description": "Optional explicit team override. Null or absent uses the existing resolver chain."
+    },
+    "contains": {
+      "$ref": "#/$defs/nullable-string",
+      "description": "Optional case-sensitive literal body substring. Empty is refused at runtime. The runtime additionally enforces a 256 UTF-8 byte limit; JSON Schema maxLength counts code points."
+    },
+    "pattern": {
+      "$ref": "#/$defs/nullable-string",
+      "description": "Optional Rust-regex body pattern. Combines with contains using logical AND. Empty is refused. Compiled size is limited at runtime."
+    },
+    "after": {
+      "$ref": "#/$defs/nullable-string",
+      "description": "Exclusive baseline post id. Bound to the resolved channel before registry acquisition. Null or absent means tip-at-arm with seam protection after the waiter is admitted."
+    },
+    "replace_wait_id": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Opaque wait id from a prior wait_already_active conflict. Compare-and-replace only; a malformed, stale, absent, or other-channel id is wait_conflict_changed, not a silent steal."
+        }
+      ]
+    }
+  },
+  "additionalProperties": false
+}

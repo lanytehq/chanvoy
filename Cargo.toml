@@ -57,6 +57,9 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 waitprims-async = { git = "https://github.com/3leaps/waitprims", tag = "v0.2.1" }
 waitprims-core = { git = "https://github.com/3leaps/waitprims", tag = "v0.2.1" }
+# File-backed JSON Schema only. `schema-validation` enables rsfulmen's
+# `crucible` feature (compile-required). Foundry catalogs stay off.
+rsfulmen = { version = "0.2.0", default-features = false, features = ["schema-validation"] }
 
 [dependencies]
 chanvoy-cli = { path = "crates/chanvoy-cli" }
@@ -71,6 +74,7 @@ chrono = { workspace = true }
 # by `AutoSetupDaemonGuard`'s sync-Drop force-kill path.
 libc = "0.2"
 serde_json = { workspace = true }
+rsfulmen = { workspace = true }
 # sysprims is the 3leaps-org primitive for process management. Used in the
 # restart harness for reliable SIGKILL delivery (tokio::process::Child::start_kill
 # has observed delivery gaps on macOS in a test context). Same git-pin pattern
