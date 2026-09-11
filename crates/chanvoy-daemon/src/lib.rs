@@ -3980,6 +3980,7 @@ mod tests {
                 create_at: 1000,
                 received_at: 1001,
                 mentioned,
+                mention_user_ids: None,
             }),
         }
     }
@@ -4054,6 +4055,7 @@ mod tests {
                 create_at: 2000,
                 received_at: 2001,
                 mentioned: false,
+                mention_user_ids: None,
             }
         }
 

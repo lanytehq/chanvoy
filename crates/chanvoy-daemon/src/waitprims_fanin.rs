@@ -958,6 +958,7 @@ mod tests {
             message: "body".into(),
             create_at: 1,
             root_id: id.into(),
+            mention_user_ids: None,
         }
     }
 

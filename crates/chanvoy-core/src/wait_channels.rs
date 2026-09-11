@@ -244,6 +244,7 @@ mod tests {
             message: "ASSENT".into(),
             create_at,
             root_id: id.into(),
+            mention_user_ids: None,
         }
     }
 

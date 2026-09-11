@@ -298,6 +298,9 @@ pub struct Message {
     /// which callers treat as "thread unknown".
     #[serde(default)]
     pub root_id: String,
+    /// Provider mention user ids when present. Absent/empty means token match only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_user_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -584,6 +587,9 @@ pub struct InboundEventPayload {
     pub create_at: i64,
     pub received_at: i64,
     pub mentioned: bool,
+    /// Provider mention user ids when the posted event carried them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_user_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -611,6 +617,7 @@ pub struct DaemonEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum DaemonEventPayloadInner {
     Inbound(InboundEventPayload),
     ConnectionStateChanged(ConnectionStateChangedPayload),
@@ -2953,6 +2960,9 @@ pub(crate) struct RawPost {
     /// Normalized to the post's own id on the way into a `Message`.
     #[serde(default)]
     pub root_id: String,
+    /// User ids this post mentioned, when the provider supplied them.
+    #[serde(default)]
+    pub mentions: Vec<String>,
 }
 
 /// The provider's envelope for any list-of-posts response: a ranked
@@ -3332,6 +3342,11 @@ impl MattermostClient {
                     .cloned()
                     .unwrap_or_else(|| post.user_id.clone());
                 let root_id = normalize_root_id(&post.root_id, &post.id);
+                let mention_user_ids = if post.mentions.is_empty() {
+                    None
+                } else {
+                    Some(post.mentions)
+                };
                 Message {
                     id: post.id,
                     user_id: post.user_id,
@@ -3339,6 +3354,7 @@ impl MattermostClient {
                     message: post.message,
                     create_at: post.create_at,
                     root_id,
+                    mention_user_ids,
                 }
             })
             .collect()
@@ -6015,6 +6031,7 @@ impl MattermostWs {
                     create_at,
                     received_at: now_unix_millis(),
                     mentioned,
+                    mention_user_ids: mention_ids.clone(),
                 }),
             };
             self.event_bus.emit(event);
@@ -6036,6 +6053,7 @@ impl MattermostWs {
                     create_at,
                     received_at: now_unix_millis(),
                     mentioned: true,
+                    mention_user_ids: mention_ids,
                 }),
             };
             self.event_bus.emit(event);
@@ -6071,8 +6089,12 @@ impl MattermostWs {
                 .collect();
 
             for msg in new_messages {
-                let mentioned =
-                    mentions_bot(&self.my_user_id, &self.bot_username, None, &msg.message);
+                let mentioned = mentions_bot(
+                    &self.my_user_id,
+                    &self.bot_username,
+                    msg.mention_user_ids.as_deref(),
+                    &msg.message,
+                );
                 let event = DaemonEvent {
                     seq: 0,
                     kind: DaemonEventKind::InboundMessage,
@@ -6091,6 +6113,7 @@ impl MattermostWs {
                         create_at: msg.create_at,
                         received_at: now_unix_millis(),
                         mentioned,
+                        mention_user_ids: msg.mention_user_ids,
                     }),
                 };
                 self.event_bus.emit(event);
@@ -6376,6 +6399,7 @@ mod tests {
             message: "body".to_string(),
             create_at,
             root_id: id.to_string(),
+            mention_user_ids: None,
         }
     }
 
@@ -6915,6 +6939,7 @@ monitored_channels = ["per-003", "per-004"]
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let notification = daemon_event_to_notification(&event);
@@ -7020,6 +7045,7 @@ monitored_channels = ["per-003", "per-004"]
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
 
@@ -7047,6 +7073,7 @@ monitored_channels = ["per-003", "per-004"]
                 create_at: 2000,
                 received_at: 2001,
                 mentioned: true,
+                mention_user_ids: None,
             }),
         });
 

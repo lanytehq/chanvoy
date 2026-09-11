@@ -305,6 +305,7 @@ mod tests {
             message: "ready".into(),
             create_at: 1,
             root_id: "postid00000000000000000001".into(),
+            mention_user_ids: None,
         }
     }
 

@@ -138,25 +138,26 @@ impl WaitPredicate {
     pub fn matches_message(&self, message: &Message) -> bool {
         message.user_id != self.my_user_id
             && self.body_matches(&message.message)
-            && self.mention_matches(None, &message.message)
+            && self.mention_matches(message.mention_user_ids.as_deref(), &message.message)
     }
 
     pub fn matches_inbound(&self, payload: &InboundEventPayload) -> bool {
         payload.channel_id == self.channel_id
             && payload.sender_id != self.my_user_id
             && self.body_matches(&payload.message)
-            && self.mention_matches(Some(payload.mentioned), &payload.message)
+            && self.mention_matches(payload.mention_user_ids.as_deref(), &payload.message)
     }
 
-    fn mention_matches(&self, metadata_mentioned: Option<bool>, body: &str) -> bool {
+    fn mention_matches(&self, mentioned_user_ids: Option<&[String]>, body: &str) -> bool {
         if !self.mention {
             return true;
         }
-        match metadata_mentioned {
-            Some(true) => true,
-            Some(false) => false,
-            None => chanvoy_core::mentions_bot(&self.my_user_id, &self.bot_username, None, body),
-        }
+        chanvoy_core::mentions_bot(
+            &self.my_user_id,
+            &self.bot_username,
+            mentioned_user_ids,
+            body,
+        )
     }
 }
 
@@ -168,6 +169,7 @@ pub fn inbound_to_message(payload: &InboundEventPayload) -> Message {
         message: payload.message.clone(),
         create_at: payload.create_at,
         root_id: payload.root_id.clone(),
+        mention_user_ids: payload.mention_user_ids.clone(),
     }
 }
 
@@ -1886,6 +1888,7 @@ mod tests {
             message: body.into(),
             create_at,
             root_id: id.into(),
+            mention_user_ids: None,
         }
     }
 
@@ -1907,6 +1910,7 @@ mod tests {
                 create_at,
                 received_at: create_at,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         })
     }
@@ -2000,6 +2004,49 @@ mod tests {
     }
 
     #[test]
+    fn mention_metadata_matches_inbound_and_rest_the_same() {
+        let p = pred_mention();
+        let body = "@Agent-Bravo-Devlead please";
+        let ids = vec!["bot".to_string()];
+        let rest = Message {
+            id: "r1".into(),
+            user_id: "u".into(),
+            username: "alice".into(),
+            message: body.into(),
+            create_at: 1,
+            root_id: "r1".into(),
+            mention_user_ids: Some(ids.clone()),
+        };
+        let inbound = InboundEventPayload {
+            profile: "t".into(),
+            provider: Provider::Mattermost,
+            channel_id: "ch-1".into(),
+            channel_name: "general".into(),
+            channel_type: String::new(),
+            post_id: "r1".into(),
+            root_id: "r1".into(),
+            sender_id: "u".into(),
+            sender_username: "alice".into(),
+            message: body.into(),
+            create_at: 1,
+            received_at: 1,
+            mentioned: true,
+            mention_user_ids: Some(ids),
+        };
+        assert!(p.matches_message(&rest));
+        assert!(p.matches_inbound(&inbound));
+        let token_only = msg("r2", "u", body, 1);
+        assert!(!p.matches_message(&token_only));
+        let inbound_token = InboundEventPayload {
+            mention_user_ids: None,
+            mentioned: false,
+            post_id: "r2".into(),
+            ..inbound.clone()
+        };
+        assert!(!p.matches_inbound(&inbound_token));
+    }
+
+    #[test]
     fn metacharacters_literal_under_contains() {
         let p = pred(Some("a+b"), None);
         assert!(p.matches_message(&msg("1", "u", "use a+b here", 1)));
@@ -2023,6 +2070,7 @@ mod tests {
             create_at: 1,
             received_at: 1,
             mentioned: false,
+            mention_user_ids: None,
         };
         assert!(p.matches_inbound(&good));
         let mut other = good.clone();
@@ -2283,6 +2331,7 @@ mod tests {
                 create_at: 1,
                 received_at: 1,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
         let mut rx = bus.subscribe();
@@ -2307,6 +2356,7 @@ mod tests {
                 create_at: 2,
                 received_at: 2,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
         let got = rx.try_recv().expect("post-sub event");

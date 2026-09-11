@@ -7351,6 +7351,7 @@ mod tests {
             message: "sent by an older daemon".to_string(),
             create_at: 1_700_000_000_000,
             root_id: String::new(),
+            mention_user_ids: None,
         };
 
         let rendered = format_message(&unknown_root);

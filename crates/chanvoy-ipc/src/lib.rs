@@ -1405,6 +1405,7 @@ mod tests {
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let frame = daemon_event_to_chat_notification(&event, "sub-1").expect("notification frame");
@@ -1445,6 +1446,7 @@ mod tests {
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let frame = daemon_event_to_chat_notification(&event, "sub-1").expect("notification frame");
@@ -1476,6 +1478,7 @@ mod tests {
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let filter = IpcSubscriptionFilter {
@@ -1505,6 +1508,7 @@ mod tests {
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let filter = IpcSubscriptionFilter {
@@ -1534,6 +1538,7 @@ mod tests {
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let matching = IpcSubscriptionFilter {
@@ -1569,6 +1574,7 @@ mod tests {
                 create_at: 1000,
                 received_at: 1001,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         };
         let filter = IpcSubscriptionFilter {

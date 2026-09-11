@@ -987,6 +987,7 @@ mod tests {
                 create_at,
                 received_at: create_at,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         }
     }

@@ -631,6 +631,7 @@ mod tests {
                 create_at: 1,
                 received_at: 1,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         })
     }
@@ -685,6 +686,7 @@ mod tests {
                 create_at: 1,
                 received_at: 1,
                 mentioned: false,
+                mention_user_ids: None,
             }),
         });
         let mut seam = FanInRetain::default();
