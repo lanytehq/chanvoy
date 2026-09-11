@@ -298,8 +298,8 @@ pub struct Message {
     /// which callers treat as "thread unknown".
     #[serde(default)]
     pub root_id: String,
-    /// Provider mention user ids when present. Absent/empty means token match only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Internal only. Never serialized on wait results (closed schemas).
+    #[serde(skip)]
     pub mention_user_ids: Option<Vec<String>>,
 }
 
@@ -2960,9 +2960,6 @@ pub(crate) struct RawPost {
     /// Normalized to the post's own id on the way into a `Message`.
     #[serde(default)]
     pub root_id: String,
-    /// User ids this post mentioned, when the provider supplied them.
-    #[serde(default)]
-    pub mentions: Vec<String>,
 }
 
 /// The provider's envelope for any list-of-posts response: a ranked
@@ -3342,11 +3339,6 @@ impl MattermostClient {
                     .cloned()
                     .unwrap_or_else(|| post.user_id.clone());
                 let root_id = normalize_root_id(&post.root_id, &post.id);
-                let mention_user_ids = if post.mentions.is_empty() {
-                    None
-                } else {
-                    Some(post.mentions)
-                };
                 Message {
                     id: post.id,
                     user_id: post.user_id,
@@ -3354,7 +3346,7 @@ impl MattermostClient {
                     message: post.message,
                     create_at: post.create_at,
                     root_id,
-                    mention_user_ids,
+                    mention_user_ids: None,
                 }
             })
             .collect()
@@ -5994,13 +5986,7 @@ impl MattermostWs {
 
         let channel_name = self.resolve_channel_name(&channel_id).await;
         let sender_username = self.resolve_username(&sender_id).await;
-        let mention_ids = parse_posted_mention_user_ids(data);
-        let mentioned = mentions_bot(
-            &self.my_user_id,
-            &self.bot_username,
-            mention_ids.as_deref(),
-            &message,
-        );
+        let mentioned = mentions_bot(&self.bot_username, &message);
 
         let is_monitored = self
             .monitored_channels
@@ -6031,7 +6017,7 @@ impl MattermostWs {
                     create_at,
                     received_at: now_unix_millis(),
                     mentioned,
-                    mention_user_ids: mention_ids.clone(),
+                    mention_user_ids: None,
                 }),
             };
             self.event_bus.emit(event);
@@ -6053,7 +6039,7 @@ impl MattermostWs {
                     create_at,
                     received_at: now_unix_millis(),
                     mentioned: true,
-                    mention_user_ids: mention_ids,
+                    mention_user_ids: None,
                 }),
             };
             self.event_bus.emit(event);
@@ -6089,12 +6075,7 @@ impl MattermostWs {
                 .collect();
 
             for msg in new_messages {
-                let mentioned = mentions_bot(
-                    &self.my_user_id,
-                    &self.bot_username,
-                    msg.mention_user_ids.as_deref(),
-                    &msg.message,
-                );
+                let mentioned = mentions_bot(&self.bot_username, &msg.message);
                 let event = DaemonEvent {
                     seq: 0,
                     kind: DaemonEventKind::InboundMessage,
@@ -6300,12 +6281,13 @@ fn default_capability_class() -> CapabilityClass {
 }
 
 fn message_mentions_username(message: &str, username: &str) -> bool {
-    let needle = format!("@{username}");
+    let haystack = message.to_ascii_lowercase();
+    let needle = format!("@{}", username.to_ascii_lowercase());
     let mut search_start = 0;
-    while let Some(index) = message[search_start..].find(&needle) {
+    while let Some(index) = haystack[search_start..].find(&needle) {
         let absolute = search_start + index;
         let boundary_index = absolute + needle.len();
-        let boundary_ok = message
+        let boundary_ok = haystack
             .as_bytes()
             .get(boundary_index)
             .map(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte != b'-')
@@ -6320,36 +6302,11 @@ fn message_mentions_username(message: &str, username: &str) -> bool {
 
 /// Canonical mention decision for wait `--mention`.
 ///
-/// Trusted current-bot mention metadata (user ids) wins when present.
-/// Otherwise an exact `@username` token match; `@bot-suffix` is not a match.
-pub fn mentions_bot(
-    bot_user_id: &str,
-    bot_username: &str,
-    mentioned_user_ids: Option<&[String]>,
-    body: &str,
-) -> bool {
-    if let Some(ids) = mentioned_user_ids {
-        return ids.iter().any(|id| id == bot_user_id);
-    }
+/// Same on every path: exact `@username` token in the body (`@bot-suffix` is
+/// not a match). Username match is ASCII case-insensitive so live and REST
+/// agree without invented REST mention-id fields.
+pub fn mentions_bot(bot_username: &str, body: &str) -> bool {
     message_mentions_username(body, bot_username)
-}
-
-fn parse_posted_mention_user_ids(data: &Value) -> Option<Vec<String>> {
-    let raw = data.get("mentions")?;
-    if raw.is_null() {
-        return None;
-    }
-    if let Some(arr) = raw.as_array() {
-        return Some(
-            arr.iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect(),
-        );
-    }
-    if let Some(text) = raw.as_str() {
-        return serde_json::from_str::<Vec<String>>(text).ok();
-    }
-    None
 }
 
 #[cfg(test)]
@@ -6877,29 +6834,27 @@ credential_mode = "env_name"
     }
 
     #[test]
-    fn mentions_bot_trusts_metadata_then_exact_token() {
-        let bot_id = "userid00000000000000000000";
+    fn mentions_bot_is_body_token_case_insensitive() {
         let bot = "agent-bravo-devlead";
-        assert!(mentions_bot(
-            bot_id,
-            bot,
-            Some(&[bot_id.to_string()]),
-            "@Agent-Bravo-Devlead case variant"
-        ));
-        assert!(!mentions_bot(
-            bot_id,
-            bot,
-            Some(&["otherid0000000000000000001".into()]),
-            "@agent-bravo-devlead still in body"
-        ));
-        assert!(mentions_bot(bot_id, bot, None, "@agent-bravo-devlead hi"));
-        assert!(!mentions_bot(
-            bot_id,
-            bot,
-            None,
-            "@agent-bravo-devlead-extra hi"
-        ));
-        assert!(!mentions_bot(bot_id, bot, None, "@Agent-Bravo-Devlead hi"));
+        assert!(mentions_bot(bot, "@agent-bravo-devlead hi"));
+        assert!(mentions_bot(bot, "@Agent-Bravo-Devlead case variant"));
+        assert!(!mentions_bot(bot, "@agent-bravo-devlead-extra hi"));
+        assert!(!mentions_bot(bot, "no mention here"));
+    }
+
+    #[test]
+    fn wait_message_json_omits_internal_mention_ids() {
+        let message = Message {
+            id: "postid0000000000000000000a".into(),
+            user_id: "u".into(),
+            username: "alice".into(),
+            message: "@agent-bravo-devlead hi".into(),
+            create_at: 1,
+            root_id: "postid0000000000000000000a".into(),
+            mention_user_ids: Some(vec!["userid00000000000000000000".into()]),
+        };
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("mention_user_ids").is_none(), "{json}");
     }
 
     #[test]

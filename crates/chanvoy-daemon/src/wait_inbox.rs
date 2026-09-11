@@ -212,8 +212,9 @@ async fn run_inbox_armed(
         *cursor = establish_arm_cursor(state, catalog, dms, req.deadline, &live_ids).await?;
         *proven = Some(cursor.encode()?);
     }
+    let mut observer = cursor.clone();
 
-    let backfill = collect_backfill(state, dms, cursor, predicate, req.deadline).await?;
+    let backfill = collect_backfill(state, dms, &mut observer, predicate, req.deadline).await?;
     for (entry, message) in backfill {
         match deliver(
             state,
@@ -240,6 +241,7 @@ async fn run_inbox_armed(
             stream,
             dms,
             cursor,
+            &mut observer,
             proven,
             predicate,
             event,
@@ -257,7 +259,7 @@ async fn run_inbox_armed(
     if current_reconnects(state).await > reconnects {
         reconnects = current_reconnects(state).await;
         recatalog(state, dms, req.deadline).await?;
-        let backfill = collect_backfill(state, dms, cursor, predicate, req.deadline).await?;
+        let backfill = collect_backfill(state, dms, &mut observer, predicate, req.deadline).await?;
         for (entry, message) in backfill {
             match deliver(
                 state,
@@ -288,7 +290,8 @@ async fn run_inbox_armed(
         if now_reconnects > reconnects {
             reconnects = now_reconnects;
             recatalog(state, dms, req.deadline).await?;
-            let backfill = collect_backfill(state, dms, cursor, predicate, req.deadline).await?;
+            let backfill =
+                collect_backfill(state, dms, &mut observer, predicate, req.deadline).await?;
             for (entry, message) in backfill {
                 match deliver(
                     state,
@@ -316,6 +319,7 @@ async fn run_inbox_armed(
                     stream,
                     dms,
                     cursor,
+                    &mut observer,
                     proven,
                     predicate,
                     event,
@@ -562,14 +566,14 @@ async fn establish_arm_cursor(
 async fn collect_backfill(
     state: &AppState,
     dms: &HashMap<String, CataloguedDm>,
-    cursor: &InboxCursorV1,
+    scan: &mut InboxCursorV1,
     predicate: &WaitPredicate,
     deadline: Instant,
 ) -> Result<Vec<(CataloguedDm, Message)>, CoreError> {
     let mut admitted = Vec::new();
     let mut remaining = INBOX_MAX_BACKFILL;
     for entry in dms.values() {
-        let since = cursor.watermark.saturating_sub(1);
+        let since = scan.watermark.saturating_sub(1);
         let (posts, consumed) = crate::wait::provider_retry(state, "inbox", deadline, || {
             let id = entry.id.clone();
             async move {
@@ -582,8 +586,11 @@ async fn collect_backfill(
         .await?;
         remaining = remaining.saturating_sub(consumed);
         for message in posts {
-            if predicate.matches_message(&message) && cursor.admits(message.create_at, &message.id)
-            {
+            if !scan.admits(message.create_at, &message.id) {
+                continue;
+            }
+            *scan = scan.advance(message.create_at, &message.id)?;
+            if predicate.matches_message(&message) {
                 admitted.push((entry.clone(), message));
             }
         }
@@ -604,6 +611,7 @@ async fn handle_event(
     stream: Option<&InboxFollowStreamSender>,
     dms: &mut HashMap<String, CataloguedDm>,
     cursor: &mut InboxCursorV1,
+    observer: &mut InboxCursorV1,
     proven: &mut Option<String>,
     predicate: &WaitPredicate,
     event: Arc<DaemonEvent>,
@@ -659,7 +667,11 @@ async fn handle_event(
         entry
     };
     let message = inbound_to_message(payload);
-    if !predicate.matches_message(&message) || !cursor.admits(message.create_at, &message.id) {
+    if !observer.admits(message.create_at, &message.id) {
+        return Ok(None);
+    }
+    *observer = observer.advance(message.create_at, &message.id)?;
+    if !predicate.matches_message(&message) {
         return Ok(None);
     }
     deliver(
@@ -1514,6 +1526,61 @@ mod tests {
         let result = task.await.unwrap().expect("catch-up");
         assert_eq!(result.matched_post_id, POST_C);
         assert_eq!(result.peer_username, PEER_C);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mention_skips_ack_burst_and_wakes_on_bot_token() {
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        mount_one_dm_catalog(&server, 0).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/channels/{DM_A}/posts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": {
+                    POST_A: {
+                        "id": POST_A,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "ACK",
+                        "create_at": 1_780_000_000_100i64,
+                        "root_id": ""
+                    },
+                    POST_C: {
+                        "id": POST_C,
+                        "channel_id": DM_A,
+                        "user_id": PEER_A_ID,
+                        "message": "@agent-bravo-devlead please",
+                        "create_at": 1_780_000_000_200i64,
+                        "root_id": ""
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let state = healthy_state(&server).await;
+        let cursor = InboxCursorV1::empty(&state.profile.name, BOT_ID)
+            .encode()
+            .unwrap();
+        let result = wait_with_params_inbox(
+            &state,
+            WaitInboxRequest {
+                timeout_secs: 3,
+                contains: None,
+                pattern: None,
+                mention: true,
+                after: Some(&cursor),
+                replace_wait_id: None,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        )
+        .await
+        .expect("mention match");
+        assert_eq!(result.matched_post_id, POST_C);
+        let json = serde_json::to_value(&result.messages[0]).unwrap();
+        assert!(
+            json.get("mention_user_ids").is_none(),
+            "public message must not leak mention ids: {json}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

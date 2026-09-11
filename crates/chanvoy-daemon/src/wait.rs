@@ -138,26 +138,21 @@ impl WaitPredicate {
     pub fn matches_message(&self, message: &Message) -> bool {
         message.user_id != self.my_user_id
             && self.body_matches(&message.message)
-            && self.mention_matches(message.mention_user_ids.as_deref(), &message.message)
+            && self.mention_matches(&message.message)
     }
 
     pub fn matches_inbound(&self, payload: &InboundEventPayload) -> bool {
         payload.channel_id == self.channel_id
             && payload.sender_id != self.my_user_id
             && self.body_matches(&payload.message)
-            && self.mention_matches(payload.mention_user_ids.as_deref(), &payload.message)
+            && self.mention_matches(&payload.message)
     }
 
-    fn mention_matches(&self, mentioned_user_ids: Option<&[String]>, body: &str) -> bool {
+    fn mention_matches(&self, body: &str) -> bool {
         if !self.mention {
             return true;
         }
-        chanvoy_core::mentions_bot(
-            &self.my_user_id,
-            &self.bot_username,
-            mentioned_user_ids,
-            body,
-        )
+        chanvoy_core::mentions_bot(&self.bot_username, body)
     }
 }
 
@@ -2004,19 +1999,10 @@ mod tests {
     }
 
     #[test]
-    fn mention_metadata_matches_inbound_and_rest_the_same() {
+    fn mention_case_variant_matches_inbound_and_rest_from_body() {
         let p = pred_mention();
         let body = "@Agent-Bravo-Devlead please";
-        let ids = vec!["bot".to_string()];
-        let rest = Message {
-            id: "r1".into(),
-            user_id: "u".into(),
-            username: "alice".into(),
-            message: body.into(),
-            create_at: 1,
-            root_id: "r1".into(),
-            mention_user_ids: Some(ids.clone()),
-        };
+        let rest = msg("r1", "u", body, 1);
         let inbound = InboundEventPayload {
             profile: "t".into(),
             provider: Provider::Mattermost,
@@ -2030,20 +2016,11 @@ mod tests {
             message: body.into(),
             create_at: 1,
             received_at: 1,
-            mentioned: true,
-            mention_user_ids: Some(ids),
+            mentioned: false,
+            mention_user_ids: None,
         };
         assert!(p.matches_message(&rest));
         assert!(p.matches_inbound(&inbound));
-        let token_only = msg("r2", "u", body, 1);
-        assert!(!p.matches_message(&token_only));
-        let inbound_token = InboundEventPayload {
-            mention_user_ids: None,
-            mentioned: false,
-            post_id: "r2".into(),
-            ..inbound.clone()
-        };
-        assert!(!p.matches_inbound(&inbound_token));
     }
 
     #[test]
