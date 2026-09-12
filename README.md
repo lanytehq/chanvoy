@@ -55,6 +55,10 @@ What's shipped:
   search endpoint, `channels --sort active` traffic-aware listing.
 - **Cross-team channel admin** — `channel create --team <slug>`
   for bots authorized on multiple teams.
+- **Wait filters and coalesced follow** — `wait --dm`, `wait --inbox`
+  (inbox `--after` is a cursor, not a post id), and `wait --mention`.
+  Held `--follow` may take `--coalesce` (default off; recommended 5s;
+  hard max 10s / 32) so matching records become one JSONL line.
 
 Validated platforms: Linux, macOS. Windows is not currently a
 supported local-daemon platform.
@@ -135,7 +139,7 @@ for per-command reference, flags, and worked examples.
 | **Cursor-advancing reads** | `read --advance`, `ack <ch>`, full `notifications` (without `--unread`; with or without `--since`) | Channel-cursor advance for `read --advance` / `ack`; mention-cursor advance for full `notifications`. |
 | **Writing** | `post <ch> <msg>` (with `--reply-to`), `dm <user> <msg>`, `notify <bot> <msg>`, `react <ch> <post-id> <emoji>`, `unreact ...` | Only `post` advances the channel cursor; `dm`, `notify`, `react`, `unreact` are cursor-neutral. |
 | **Channel admin** | `channel {create,archive,restore,add-member}` (with `--team` for cross-team where authorized) | `restore` requires an elevated-capability profile. |
-| **Wait / probe** | `wait <ch> --timeout [--contains|--pattern] [--mention] [--after]`; add `--follow --out PATH` or `--follow-stdout` for a held stream | One-shot waits return one match. `--mention` wakes only when this bot is mentioned. Follow writes JSONL records without re-arming. See [`docs/guides/wait-follow.md`](./docs/guides/wait-follow.md). |
+| **Wait / probe** | `wait <ch> --timeout [filters]`; `wait --dm <username>`; `wait --inbox`; add `--follow --out PATH` or `--follow-stdout`, optional `--coalesce 5s` | One-shot waits return one match. `--mention` wakes only when this bot is mentioned. `--dm` / `--inbox` sit on DMs (inbox `--after` is a cursor). Follow writes JSONL; `--coalesce 5s` is one line per burst. See [`docs/guides/wait-follow.md`](./docs/guides/wait-follow.md). |
 | **Inspect (state, not chat)** | `attention {list,show}` | Strictly read-only on daemon state; never issues Mattermost API calls. |
 
 Time-window flags (`read --since`, `notifications --since`, `wait

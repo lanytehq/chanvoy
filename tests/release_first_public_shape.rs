@@ -19,26 +19,34 @@ fn release_notes_are_final_dated_and_distribution_honest() {
 #[test]
 fn changelog_has_checkpoint_and_first_public_entries() {
     let changelog = include_str!("../CHANGELOG.md");
+    assert!(changelog.contains("## [0.3.2] - 2026-09-12"));
     assert!(changelog.contains("## [0.3.1] - 2026-08-27"));
     assert!(changelog.contains("## [0.3.0] - 2026-08-27"));
     assert!(changelog.contains("Signed development checkpoint only"));
+    assert!(!changelog.contains("## [0.3.2] - unreleased"));
     assert!(!changelog.contains("## [0.3.1] - unreleased"));
     assert!(!changelog.contains("## [0.3.0] - unreleased"));
 }
 
 #[test]
-fn root_release_notes_lead_with_first_public_and_date_the_checkpoint() {
+fn root_release_notes_lead_with_current_and_keep_three() {
     let notes = include_str!("../RELEASE_NOTES.md");
+    let current = notes
+        .find("## v0.3.2 - 2026-09-12")
+        .expect("root notes lead with the current release");
     let first_public = notes
         .find("## v0.3.1 - 2026-08-27")
         .expect("root notes include the first public release");
     let checkpoint = notes
         .find("## v0.3.0 - 2026-08-27")
         .expect("root notes include the dated checkpoint");
-    assert!(first_public < checkpoint);
+    assert!(current < first_public && first_public < checkpoint);
+    assert!(notes.contains("docs/releases/v0.3.2.md"));
     assert!(notes.contains("First public distribution"));
     assert!(notes.contains("docs/releases/v0.3.1.md"));
     assert!(notes.contains("Signed development checkpoint, not distributed"));
+    assert!(notes.contains("default off") || notes.contains("off unless you pass it"));
+    assert!(notes.contains("not published"));
     assert!(!notes.contains("v0.3.0 (unreleased)"));
     assert_eq!(
         notes

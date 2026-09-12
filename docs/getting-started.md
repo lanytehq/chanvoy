@@ -248,12 +248,15 @@ chanvoy wait <channel> --follow --timeout 1h --after <id> \
 Follow requires `--out PATH` or explicit `--follow-stdout`; bare follow
 is refused. Read each JSONL line without invoking wait again. The first
 line is a self-identifying `armed` receipt with `wait_id` (a receipt,
-not work); each backlog/live line carries one message and an exclusive
-`tip` equal to that message id. Deadman, cancellation, replacement, or a
-bounded hard failure writes a terminal line before releasing the slot
-when the sink is writable. A sink error is a hard exit and cancels the
-held wait **without** a terminal record. `--follow-stdout` is JSONL-only;
-the human breadcrumb stays on stderr. See
+not work). Without `--coalesce`, each backlog/live line carries one
+message and an exclusive `tip` equal to that message id. With
+`--coalesce` (default off; recommended 5s; hard max 10s / 32 messages)
+a backlog/live line may carry 1–32 ordered messages; `tip` is the last
+id in that record. Deadman, cancellation, replacement, or a bounded
+hard failure writes a terminal line before releasing the slot when the
+sink is writable. A sink error is a hard exit and cancels the held wait
+**without** a terminal record. `--follow-stdout` is JSONL-only; the
+human breadcrumb stays on stderr. See
 [`docs/guides/wait-follow.md`](./guides/wait-follow.md).
 
 How follow resumes an agent depends on the host:

@@ -250,7 +250,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chanvoy"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chanvoy-cli",
  "chanvoy-core",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chanvoy-core",
  "chanvoy-daemon",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "dirs",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-daemon"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chanvoy-core",
  "chanvoy-ipc",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-ipc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chanvoy-core",
  "chrono",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-mcp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chanvoy-core",
  "chanvoy-daemon",
