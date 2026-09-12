@@ -5,6 +5,37 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-09-12
+
+### Added
+
+- **`wait --dm <username>`.** Sit on one peer conversation without a
+  channel id. `--after` is a Mattermost post id on that DM.
+- **`wait --inbox`.** Sit on any direct message to this bot. `--after` is
+  an opaque inbox cursor (`inv1.…`), not a post id. JSON names the peer,
+  DM name, matched post, and next cursor separately.
+- **`wait --mention`.** Complete only when this bot is mentioned
+  (`@username` token, ASCII case-insensitive). `@bot-suffix` is not a
+  match. Logical AND with `--contains` and `--pattern`. Applies to
+  channel, fan-in, `--dm`, and `--inbox`.
+- **`wait --follow --coalesce`.** Optional burst window on held follow
+  (default **off**; recommended **5s**; hard max **10s** / 32 messages).
+  One JSONL record per burst; `tip` is the last message id. Omission
+  stays on one-message v1 records.
+- **File-backed wait-params schema checks.** On-disk JSON Schema
+  validation via rsfulmen 0.2.0 (`schema-validation` only).
+
+### Changed
+
+- **Held follow stdout is JSONL-only.** `--follow-stdout` emits one
+  record per line. With `--coalesce`, that line may contain 1–32
+  matching messages.
+
+### Distribution
+
+- v0.3.2 is distributed as signed GitHub Release binaries. It is not
+  published to crates.io.
+
 ## [0.3.1] - 2026-08-27
 
 ### Added
@@ -1048,7 +1079,8 @@ session-survival, hash-chained reconnect-health surface. Pre-this-changelog
 shipping history is captured in git log and the per-task briefs under
 `lanyte-productbook-internal/content/projmgmt/peers/`.
 
-[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/lanytehq/chanvoy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/lanytehq/chanvoy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lanytehq/chanvoy/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/lanytehq/chanvoy/compare/v0.2.0...v0.2.1
