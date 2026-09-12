@@ -2,6 +2,28 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.3.2 - 2026-09-12
+
+**Wait filters and optional follow coalescing** — operators can sit on one
+DM peer (`wait --dm`), on any DM to this bot (`wait --inbox`), or only on
+posts that mention this bot (`wait --mention`). Inbox `--after` is an
+opaque `inv1.` cursor, not a Mattermost post id; coalesced inbox follow
+resumes from `next_inbox_cursor`. `--mention` matches this bot's
+`@username` token (ASCII case-insensitive); `@bot-suffix` is not a
+match.
+
+`--follow --coalesce` is **off unless you pass it**. Five seconds is
+recommended; ten seconds / 32 messages is the hard maximum. Each burst is
+one JSONL line; `tip` is the last message id. `armed` is immediate; a
+pending burst flushes before a terminal record.
+
+The cut also pins rsfulmen 0.2.0 for file-backed JSON Schema checks of
+wait parameters. Signed GitHub Release binaries only; not on crates.io.
+Restart the profile daemon after install.
+
+See `docs/releases/v0.3.2.md` for upgrade notes and
+`docs/guides/wait-follow.md` / `docs/guides/wait-dm.md`.
+
 ## v0.3.1 - 2026-08-27
 
 **First public distribution** — v0.3.1 carries the cumulative operator and
@@ -42,19 +64,5 @@ v0.3.1.
 - **Compatibility**: source-breaking for Rust code building against `chanvoy-core` — `CoreError` is now `#[non_exhaustive]` and gained two variants, and `MattermostClient::read_thread` is deprecated and always refuses (use `read_thread_in_channel`). No on-disk or state migration; exit codes unchanged; a binary distribution needs no source rebuild. Cycle the daemon before using the new verbs, and review strict parsers of human output or stderr — default `read` rows and error text both changed. Messages gain an additive `root_id` in JSON.
 
 See `docs/releases/v0.3.0.md` for full notes.
-
-## v0.2.1 (May 2026)
-
-**Session-start ergonomics, conversation shape, discovery, and onboarding** — a new agent walking into a long-running channel can run the four-line ritual without scrolling history; multi-reviewer review cycles get cleaner via threaded replies + reactions; channel discovery (search + traffic-aware listing) lands; every chanvoy verb that touches a channel is now cross-team aware. Plus a major onboarding doc surface expansion.
-
-- **PER-023** — `chanvoy pinned`, `read --since-bootstrap`, general `--limit`, time-unit suffixes (`30s`/`5m`/`4h`/`2d`), `read --advance`, `chanvoy ack`. Four-line session-start ritual works end-to-end.
-- **PER-024** — `chanvoy post --reply-to` for threaded replies; `chanvoy react`/`unreact <channel> <post> <emoji>` for cursor-neutral acks. Channel positional + required for multi-provider portability. Idempotent on duplicate-react and missing-unreact.
-- **PER-025** — `chanvoy search <channel> <query>` with operator-conflict refusal (`in:`/`from:`/`before:`/`after:` against chanvoy-owned scope, quoted-region-aware). `chanvoy channels --sort active` adds `last_active` column; preserves PER-019 grouping (no flatten); `last_post_at: null` deterministic shape on missing-activity; `--primary-team --json` legacy preservation.
-- **Cross-team `channel create --team <slug>`** — closes the last cross-team admin-verb gap. Membership-checked: refuses `NotAMemberOfTeam` if the bot isn't a member of the requested team.
-- **PER-026** — agent-first `docs/getting-started.md`, symptom-keyed `docs/troubleshooting.md`, runtime-model `docs/architecture.md`. README + safety protocols rewritten chanvoy-specific.
-- **Bugfix**: `chanvoy pinned` URL `pinned_posts` → `pinned` (canonical MM v4 endpoint). Caught by prodmktg dogfooding during PER-026; wiremock-vs-real-API drift class flagged for v0.2.2 structural follow-up.
-- **Build**: `make release-prep` umbrella (goneat-driven license + vulnerability + SBOM generation). `rustls-webpki` 0.103.11 → 0.103.13 clears three RUSTSEC advisories.
-
-See `docs/releases/v0.2.1.md` for full notes.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_

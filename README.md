@@ -55,6 +55,10 @@ What's shipped:
   search endpoint, `channels --sort active` traffic-aware listing.
 - **Cross-team channel admin** — `channel create --team <slug>`
   for bots authorized on multiple teams.
+- **Wait filters and coalesced follow** — `wait --dm`, `wait --inbox`
+  (inbox `--after` is a cursor, not a post id), and `wait --mention`.
+  Held `--follow` may take `--coalesce` (default off; recommended 5s;
+  hard max 10s / 32) so matching records become one JSONL line.
 
 Validated platforms: Linux, macOS. Windows is not currently a
 supported local-daemon platform.
