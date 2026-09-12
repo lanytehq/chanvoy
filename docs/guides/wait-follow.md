@@ -28,7 +28,9 @@ forget a follower.
 `following new messages…` stays on stderr as a static breadcrumb and never
 includes a post body.
 
-Each stdout or `--out` line is one `wait_follow_v1.event` record:
+Each stdout or `--out` line is one self-identifying JSONL record.
+
+Without `--coalesce` (the default), records are `wait_follow_v1.event`:
 
 1. `armed` — a receipt that admission succeeded. Consumers must not treat it
    as work.
@@ -37,9 +39,16 @@ Each stdout or `--out` line is one `wait_follow_v1.event` record:
    new follow.
 3. at most one terminal: `deadman`, `canceled`, `replaced`, or `failed`.
 
+`--coalesce <duration>` is **off unless you pass it**. Bare `5` and `5s` are
+five seconds. Five seconds is recommended; ten seconds is the hard maximum.
+A burst holds at most 32 messages; hitting 32 flushes without dropping a
+match. Coalesced records use `wait_follow_v2.event` with `messages` of length
+1 through 32. `tip` equals the **last** message id in that record and is the
+resume baseline. `armed` is written immediately and is never delayed for the
+window. A pending burst is flushed before a terminal record.
+
 Message bodies are JSON-escaped, so a newline in a post cannot start a
-second record. Live coalesce (batching several posts into one record) is
-not available.
+second record.
 
 ## After the follower ends
 
@@ -48,10 +57,10 @@ A **new** wait is admitted only after a stream **terminal record** *or*
 gets a terminal JSONL line before lease release; a sink failure exits 2
 and releases the owner **without** a terminal record.
 
-Resume from the last validated **live** or `backlog` `tip`. If the stream
-emitted no message records, the previous explicit `--after` is still
-valid. If neither exists, drain and re-establish a baseline before
-re-arming. Self-posts never match.
+Resume from the last validated **live** or `backlog` `tip` (the last
+message id in that record). If the stream emitted no message records, the
+previous explicit `--after` is still valid. If neither exists, drain and
+re-establish a baseline before re-arming. Self-posts never match.
 
 | Stream terminal | Exit |
 | --------------- | ---: |
@@ -95,3 +104,9 @@ Mattermost post id on that DM, not an inbox cursor.
 
 `--inbox --follow` waits on any DM to this bot. `--after` is the opaque
 `inv1.` inbox cursor from a prior inbox result. Do not pass a channel id.
+
+`--inbox --follow --coalesce` inherits the same window (default off,
+recommended 5s, hard max 10s / 32). Coalesced records are
+`wait_inbox_follow_v2.event` with per-item `peer_username` and `dm_name`.
+There is no top-level `tip`; resume from `next_inbox_cursor` (an `inv1.`
+cursor, not a post id).

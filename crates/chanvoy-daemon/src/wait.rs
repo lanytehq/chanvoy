@@ -229,7 +229,8 @@ pub struct WaitRequest<'a> {
 /// writer. The waitprims callback does not return until the line has
 /// crossed this boundary.
 pub struct FollowStreamRecord {
-    pub event: chanvoy_core::WaitFollowEvent,
+    pub method: &'static str,
+    pub event: serde_json::Value,
     pub written: tokio::sync::oneshot::Sender<Result<(), String>>,
 }
 
@@ -466,6 +467,8 @@ pub async fn wait_with_params_follow(
     state: &AppState,
     req: WaitRequest<'_>,
     stream: FollowStreamSender,
+    coalesce_ms: Option<u64>,
+    client_gone: tokio_util::sync::CancellationToken,
 ) -> Result<chanvoy_core::WaitFollowResult, CoreError> {
     let WaitRequest {
         channel,
@@ -557,6 +560,8 @@ pub async fn wait_with_params_follow(
             guard,
         },
         stream,
+        coalesce_ms,
+        client_gone,
     )
     .await
 }
@@ -684,6 +689,8 @@ pub async fn wait_with_params_dm_follow(
     state: &AppState,
     req: WaitDmRequest<'_>,
     stream: FollowStreamSender,
+    coalesce_ms: Option<u64>,
+    client_gone: tokio_util::sync::CancellationToken,
 ) -> Result<WaitDmFollowResult, CoreError> {
     let deadline = req.deadline;
     let (channel_id, dm_name) = admit_direct_channel(state, &req).await?;
@@ -733,6 +740,8 @@ pub async fn wait_with_params_dm_follow(
             guard,
         },
         stream,
+        coalesce_ms,
+        client_gone,
     )
     .await?;
     Ok(WaitDmFollowResult::from_follow(

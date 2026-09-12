@@ -8,13 +8,18 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::wait_follow::{is_mattermost_post_id, WaitFollowMode};
+use crate::wait_follow::{
+    is_mattermost_post_id, WaitFollowMode, WAIT_FOLLOW_COALESCE_MAX_MESSAGES,
+};
 use crate::{CoreError, Message};
 
 pub const WAIT_INBOX_V1_METHOD: &str = "wait_inbox_v1";
 pub const WAIT_INBOX_FOLLOW_V1_METHOD: &str = "wait_inbox_follow_v1";
 pub const WAIT_INBOX_FOLLOW_V1_EVENT_METHOD: &str = "wait_inbox_follow_v1.event";
 pub const WAIT_INBOX_FOLLOW_V1_EVENT_SCHEMA: &str = "wait_inbox_follow_v1.event";
+pub const WAIT_INBOX_FOLLOW_V2_METHOD: &str = "wait_inbox_follow_v2";
+pub const WAIT_INBOX_FOLLOW_V2_EVENT_METHOD: &str = "wait_inbox_follow_v2.event";
+pub const WAIT_INBOX_FOLLOW_V2_EVENT_SCHEMA: &str = "wait_inbox_follow_v2.event";
 pub const WAIT_INBOX_HELP: &str = "wait for any DM to this bot; do not pass a channel id.";
 pub const INBOX_CURSOR_PREFIX: &str = "inv1.";
 pub const INBOX_CURSOR_MAX_BYTES: usize = 32 * 1024;
@@ -42,6 +47,25 @@ pub struct WaitInboxV1Params {
     /// When true, only posts that mention this bot complete the wait.
     #[serde(default)]
     pub mention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WaitInboxFollowV2Params {
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub replace_wait_id: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
+    /// Required live coalesce window in milliseconds (`1..=10000`).
+    pub coalesce_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +168,67 @@ pub enum WaitInboxFollowResultKind {
     },
     Replaced {
         replaced_by_wait_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inbox_cursor: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WaitInboxFollowV2Schema {
+    #[serde(rename = "wait_inbox_follow_v2.event")]
+    V2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WaitInboxFollowV2Message {
+    pub peer_username: String,
+    pub dm_name: String,
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitInboxFollowV2Event {
+    pub schema: WaitInboxFollowV2Schema,
+    pub wait_id: String,
+    #[serde(flatten)]
+    pub kind: WaitInboxFollowV2EventKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WaitInboxFollowV2EventKind {
+    Armed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaced_wait_id: Option<String>,
+    },
+    Backlog {
+        matched_post_id: String,
+        next_inbox_cursor: String,
+        truncated: bool,
+        messages: Vec<WaitInboxFollowV2Message>,
+    },
+    Live {
+        matched_post_id: String,
+        next_inbox_cursor: String,
+        truncated: bool,
+        messages: Vec<WaitInboxFollowV2Message>,
+    },
+    Deadman {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inbox_cursor: Option<String>,
+    },
+    Canceled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inbox_cursor: Option<String>,
+    },
+    Replaced {
+        replaced_by_wait_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inbox_cursor: Option<String>,
+    },
+    Failed {
+        reason_code: WaitInboxFailureReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inbox_cursor: Option<String>,
     },
@@ -470,6 +555,159 @@ impl WaitInboxFollowEvent {
     }
 }
 
+impl WaitInboxFollowV2Event {
+    pub fn armed(wait_id: impl Into<String>, replaced_wait_id: Option<String>) -> Self {
+        Self {
+            schema: WaitInboxFollowV2Schema::V2,
+            wait_id: wait_id.into(),
+            kind: WaitInboxFollowV2EventKind::Armed { replaced_wait_id },
+        }
+    }
+
+    pub fn messages(
+        wait_id: impl Into<String>,
+        mode: WaitFollowMode,
+        next_inbox_cursor: String,
+        messages: Vec<WaitInboxFollowV2Message>,
+    ) -> Result<Self, &'static str> {
+        if messages.is_empty() || messages.len() > WAIT_FOLLOW_COALESCE_MAX_MESSAGES {
+            return Err("inbox v2 messages must contain 1 to 32 entries");
+        }
+        if next_inbox_cursor == messages.last().unwrap().message.id
+            || is_mattermost_post_id(&next_inbox_cursor)
+        {
+            return Err("next_inbox_cursor must not be a Mattermost post id");
+        }
+        if !next_inbox_cursor.starts_with(INBOX_CURSOR_PREFIX) {
+            return Err("next_inbox_cursor must be an inv1. inbox cursor");
+        }
+        for item in &messages {
+            if !is_mattermost_post_id(&item.message.id) {
+                return Err("inbox message id is not a Mattermost post id");
+            }
+            if item.peer_username.is_empty() || item.dm_name.is_empty() {
+                return Err("inbox v2 item must name peer and dm_name");
+            }
+        }
+        crate::wait_follow::validate_strict_create_at_id_order(
+            messages
+                .iter()
+                .map(|item| (item.message.create_at, item.message.id.as_str())),
+        )?;
+        let matched_post_id = messages.last().unwrap().message.id.clone();
+        let kind = match mode {
+            WaitFollowMode::Backlog => WaitInboxFollowV2EventKind::Backlog {
+                matched_post_id,
+                next_inbox_cursor,
+                truncated: false,
+                messages,
+            },
+            WaitFollowMode::Live => WaitInboxFollowV2EventKind::Live {
+                matched_post_id,
+                next_inbox_cursor,
+                truncated: false,
+                messages,
+            },
+            _ => return Err("message record requires backlog or live mode"),
+        };
+        Ok(Self {
+            schema: WaitInboxFollowV2Schema::V2,
+            wait_id: wait_id.into(),
+            kind,
+        })
+    }
+
+    pub fn mode(&self) -> WaitFollowMode {
+        match self.kind {
+            WaitInboxFollowV2EventKind::Armed { .. } => WaitFollowMode::Armed,
+            WaitInboxFollowV2EventKind::Backlog { .. } => WaitFollowMode::Backlog,
+            WaitInboxFollowV2EventKind::Live { .. } => WaitFollowMode::Live,
+            WaitInboxFollowV2EventKind::Deadman { .. } => WaitFollowMode::Deadman,
+            WaitInboxFollowV2EventKind::Canceled { .. } => WaitFollowMode::Canceled,
+            WaitInboxFollowV2EventKind::Replaced { .. } => WaitFollowMode::Replaced,
+            WaitInboxFollowV2EventKind::Failed { .. } => WaitFollowMode::Failed,
+        }
+    }
+
+    pub fn inbox_cursor(&self) -> Option<&str> {
+        match &self.kind {
+            WaitInboxFollowV2EventKind::Backlog {
+                next_inbox_cursor, ..
+            }
+            | WaitInboxFollowV2EventKind::Live {
+                next_inbox_cursor, ..
+            } => Some(next_inbox_cursor.as_str()),
+            WaitInboxFollowV2EventKind::Deadman { inbox_cursor }
+            | WaitInboxFollowV2EventKind::Canceled { inbox_cursor }
+            | WaitInboxFollowV2EventKind::Failed { inbox_cursor, .. }
+            | WaitInboxFollowV2EventKind::Replaced { inbox_cursor, .. } => inbox_cursor.as_deref(),
+            WaitInboxFollowV2EventKind::Armed { .. } => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.wait_id.is_empty() || self.wait_id.len() > 64 {
+            return Err("inbox wait id must contain 1 to 64 bytes");
+        }
+        match &self.kind {
+            WaitInboxFollowV2EventKind::Backlog {
+                matched_post_id,
+                next_inbox_cursor,
+                truncated,
+                messages,
+            }
+            | WaitInboxFollowV2EventKind::Live {
+                matched_post_id,
+                next_inbox_cursor,
+                truncated,
+                messages,
+            } => {
+                if *truncated {
+                    return Err("inbox v2 records cannot be truncated");
+                }
+                if messages.is_empty() || messages.len() > WAIT_FOLLOW_COALESCE_MAX_MESSAGES {
+                    return Err("inbox v2 messages must contain 1 to 32 entries");
+                }
+                if matched_post_id != &messages.last().unwrap().message.id {
+                    return Err("matched_post_id must equal the last message id");
+                }
+                if is_mattermost_post_id(next_inbox_cursor) || next_inbox_cursor == matched_post_id
+                {
+                    return Err("next_inbox_cursor must not be a Mattermost post id");
+                }
+                crate::wait_follow::validate_strict_create_at_id_order(
+                    messages
+                        .iter()
+                        .map(|item| (item.message.create_at, item.message.id.as_str())),
+                )?;
+                Ok(())
+            }
+            WaitInboxFollowV2EventKind::Armed { replaced_wait_id } => {
+                if let Some(wait_id) = replaced_wait_id {
+                    if wait_id.is_empty() || wait_id.len() > 64 {
+                        return Err("replaced wait id must contain 1 to 64 bytes");
+                    }
+                }
+                Ok(())
+            }
+            WaitInboxFollowV2EventKind::Replaced {
+                replaced_by_wait_id,
+                inbox_cursor,
+            } => {
+                if replaced_by_wait_id.is_empty() || replaced_by_wait_id.len() > 64 {
+                    return Err("replaced_by wait id must contain 1 to 64 bytes");
+                }
+                validate_optional_inbox_cursor(inbox_cursor)
+            }
+            WaitInboxFollowV2EventKind::Deadman { inbox_cursor }
+            | WaitInboxFollowV2EventKind::Canceled { inbox_cursor }
+            | WaitInboxFollowV2EventKind::Failed { inbox_cursor, .. } => {
+                validate_optional_inbox_cursor(inbox_cursor)
+            }
+        }
+    }
+}
+
 fn validate_optional_inbox_cursor(cursor: &Option<String>) -> Result<(), &'static str> {
     match cursor {
         None => Ok(()),
@@ -665,5 +903,118 @@ mod tests {
         );
         let err = InboxCursorV1::decode(&raw, PROFILE, BOT).unwrap_err();
         assert!(matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("canonical")));
+    }
+
+    #[test]
+    fn v2_live_burst_nests_message_and_binds_last_id() {
+        let cursor = InboxCursorV1::empty(PROFILE, BOT)
+            .advance(2, POST_HI)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let first = WaitInboxFollowV2Message {
+            peer_username: "dave-3leaps".into(),
+            dm_name: "aaaaaaaaaaaaaaaaaaaaaaaaaa__bbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            message: Message {
+                id: POST_LO.into(),
+                user_id: "userid00000000000000000001".into(),
+                username: "dave-3leaps".into(),
+                message: "first DM".into(),
+                create_at: 1,
+                root_id: POST_LO.into(),
+                mention_user_ids: None,
+            },
+        };
+        let second = WaitInboxFollowV2Message {
+            peer_username: "agent-example".into(),
+            dm_name: "cccccccccccccccccccccccccc__bbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            message: Message {
+                id: POST_HI.into(),
+                user_id: "userid00000000000000000002".into(),
+                username: "agent-example".into(),
+                message: "second DM".into(),
+                create_at: 2,
+                root_id: POST_HI.into(),
+                mention_user_ids: None,
+            },
+        };
+        let event = WaitInboxFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            cursor.clone(),
+            vec![first, second],
+        )
+        .unwrap();
+        event.validate().unwrap();
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["schema"], WAIT_INBOX_FOLLOW_V2_EVENT_SCHEMA);
+        assert_eq!(value["matched_post_id"], POST_HI);
+        assert!(value.get("tip").is_none());
+        assert_eq!(value["messages"][0]["message"]["id"], POST_LO);
+        assert_eq!(value["messages"][1]["peer_username"], "agent-example");
+        assert_eq!(value["next_inbox_cursor"], cursor);
+        assert_eq!(value["truncated"], false);
+    }
+
+    #[test]
+    fn v2_reversed_pair_fails_validate() {
+        let cursor = InboxCursorV1::empty(PROFILE, BOT)
+            .advance(2, POST_HI)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let earlier = WaitInboxFollowV2Message {
+            peer_username: "dave-3leaps".into(),
+            dm_name: "aaaaaaaaaaaaaaaaaaaaaaaaaa__bbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            message: Message {
+                id: POST_LO.into(),
+                user_id: "userid00000000000000000001".into(),
+                username: "dave-3leaps".into(),
+                message: "earlier DM".into(),
+                create_at: 1,
+                root_id: POST_LO.into(),
+                mention_user_ids: None,
+            },
+        };
+        let later = WaitInboxFollowV2Message {
+            peer_username: "agent-example".into(),
+            dm_name: "cccccccccccccccccccccccccc__bbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            message: Message {
+                id: POST_HI.into(),
+                user_id: "userid00000000000000000002".into(),
+                username: "agent-example".into(),
+                message: "later DM".into(),
+                create_at: 2,
+                root_id: POST_HI.into(),
+                mention_user_ids: None,
+            },
+        };
+        assert!(WaitInboxFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            cursor.clone(),
+            vec![later.clone(), earlier.clone()],
+        )
+        .is_err());
+        let mut equal_hi = later;
+        let mut equal_lo = earlier;
+        equal_hi.message.create_at = 7;
+        equal_lo.message.create_at = 7;
+        assert!(WaitInboxFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            cursor.clone(),
+            vec![equal_hi.clone(), equal_lo.clone()],
+        )
+        .is_err());
+        WaitInboxFollowV2Event::messages(
+            "wait_0123456789abcdef0123456789abcdef",
+            WaitFollowMode::Live,
+            cursor,
+            vec![equal_lo, equal_hi],
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
     }
 }

@@ -12,6 +12,7 @@ use crate::{CoreError, Message};
 
 pub const WAIT_DM_V1_METHOD: &str = "wait_dm_v1";
 pub const WAIT_DM_FOLLOW_V1_METHOD: &str = "wait_dm_follow_v1";
+pub const WAIT_DM_FOLLOW_V2_METHOD: &str = "wait_dm_follow_v2";
 pub const NOT_A_WAITABLE_PEER: &str = "not a waitable peer";
 pub const WAIT_DM_HELP: &str = "wait for a DM from this user; do not pass a channel id.";
 
@@ -31,6 +32,26 @@ pub struct WaitDmV1Params {
     /// When true, only posts that mention this bot complete the wait.
     #[serde(default)]
     pub mention: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WaitDmFollowV2Params {
+    pub username: String,
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub contains: Option<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub replace_wait_id: Option<String>,
+    /// When true, only posts that mention this bot complete the wait.
+    #[serde(default)]
+    pub mention: bool,
+    /// Required live coalesce window in milliseconds (`1..=10000`).
+    pub coalesce_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

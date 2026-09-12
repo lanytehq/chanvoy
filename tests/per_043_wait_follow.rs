@@ -10,7 +10,7 @@ mod common;
 
 use chanvoy_core::{
     rpc_error, rpc_request, JsonRpcRequest, WaitFollowEvent, WaitFollowEventKind, WaitFollowMode,
-    WaitFollowV1Params, WAIT_FOLLOW_V1_METHOD,
+    WaitFollowV1Params, WaitFollowV2Event, WAIT_FOLLOW_V1_METHOD, WAIT_FOLLOW_V2_METHOD,
 };
 use common::{run_chanvoy, spawn_daemon, stop_daemon_cleanly, TestEnv};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -753,5 +753,261 @@ async fn follow_stdout_jsonl_escapes_newline_and_keeps_stderr_static() {
         !stderr.contains("peer-body") && !stderr.contains(FAKE_EVENT),
         "stderr must not carry the post body: {stderr}"
     );
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
+async fn fake_old_v2_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
+    let listener = UnixListener::bind(env.socket_path()).expect("bind old daemon");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("request");
+        let request: JsonRpcRequest = serde_json::from_str(line.trim_end()).expect("decode");
+        assert_eq!(request.method, WAIT_FOLLOW_V2_METHOD);
+        let response = rpc_error(request.id, -32601, "unknown method wait_follow_v2");
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+            .await
+            .expect("response");
+    })
+}
+
+#[tokio::test]
+#[ignore = "integration: held wait coalesce capability skew"]
+async fn coalesce_against_old_daemon_is_hard_capability() {
+    let env = TestEnv::new("per-048-follow-coalesce-capability").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    let server = fake_old_v2_daemon(&env).await;
+    let out = env.runtime_dir().join("capability.jsonl");
+    let output = run_chanvoy(
+        &env,
+        &[
+            "--json",
+            "wait",
+            "brief-per-043",
+            "--follow",
+            "--out",
+            out.to_str().unwrap(),
+            "--timeout",
+            "1s",
+            "--coalesce",
+            "5s",
+        ],
+    )
+    .await;
+    server.await.expect("old daemon");
+    assert_eq!(output.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error_class"], "capability");
+}
+
+#[tokio::test]
+#[ignore = "integration: held wait coalesce omitted stays v1"]
+async fn coalesce_omitted_still_emits_one_message_v1() {
+    let env = TestEnv::new("per-048-follow-v1-default").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("brief-per-043", "channel-per-048-v1")
+        .await;
+    env.mock_post_lookup(POST_0, "channel-per-048-v1", true)
+        .await;
+    env.mock_user_lookup("user-1", "reviewer-one").await;
+    mount_after(
+        &env,
+        "channel-per-048-v1",
+        POST_0,
+        &[(POST_1, "user-1", "first", 1_700_000_000_001)],
+    )
+    .await;
+    mount_after(&env, "channel-per-048-v1", POST_1, &[]).await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = env.runtime_dir().join("follow.jsonl");
+    let output = run_chanvoy(
+        &env,
+        &[
+            "wait",
+            "brief-per-043",
+            "--follow",
+            "--out",
+            out.to_str().unwrap(),
+            "--after",
+            POST_0,
+            "--timeout",
+            "1s",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let raw = std::fs::read_to_string(&out).expect("follow jsonl");
+    let events: Vec<WaitFollowEvent> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event json"))
+        .collect();
+    assert!(events.iter().all(|event| event.validate().is_ok()), "{raw}");
+    let live_or_backlog: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.mode(), WaitFollowMode::Backlog | WaitFollowMode::Live))
+        .collect();
+    assert_eq!(live_or_backlog.len(), 1, "{raw}");
+    assert_eq!(live_or_backlog[0].messages().len(), 1);
+    assert!(raw.contains("wait_follow_v1.event"));
+    assert!(!raw.contains("wait_follow_v2.event"));
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
+#[tokio::test]
+#[ignore = "integration: held wait coalesce burst"]
+async fn coalesce_two_posts_in_window_are_one_record() {
+    let env = TestEnv::new("per-048-follow-coalesce-two").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("brief-per-043", "channel-per-048-two")
+        .await;
+    env.mock_post_lookup(POST_0, "channel-per-048-two", true)
+        .await;
+    env.mock_user_lookup("user-1", "reviewer-one").await;
+    env.mock_user_lookup("user-2", "reviewer-two").await;
+    mount_after(
+        &env,
+        "channel-per-048-two",
+        POST_0,
+        &[
+            (POST_1, "user-1", "first", 1_700_000_000_001),
+            (POST_2, "user-2", "second", 1_700_000_000_002),
+        ],
+    )
+    .await;
+    mount_after(
+        &env,
+        "channel-per-048-two",
+        POST_1,
+        &[(POST_2, "user-2", "second", 1_700_000_000_002)],
+    )
+    .await;
+    mount_after(&env, "channel-per-048-two", POST_2, &[]).await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = env.runtime_dir().join("follow.jsonl");
+    let output = run_chanvoy(
+        &env,
+        &[
+            "wait",
+            "brief-per-043",
+            "--follow",
+            "--out",
+            out.to_str().unwrap(),
+            "--after",
+            POST_0,
+            "--timeout",
+            "1s",
+            "--coalesce",
+            "5s",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let raw = std::fs::read_to_string(&out).expect("follow jsonl");
+    let events: Vec<WaitFollowV2Event> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("v2 event json"))
+        .collect();
+    assert!(events.iter().all(|event| event.validate().is_ok()), "{raw}");
+    assert_eq!(events[0].mode(), WaitFollowMode::Armed);
+    let bursts: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.mode(), WaitFollowMode::Backlog | WaitFollowMode::Live))
+        .collect();
+    assert_eq!(bursts.len(), 1, "{raw}");
+    assert_eq!(bursts[0].messages_slice().len(), 2);
+    assert_eq!(bursts[0].tip(), Some(POST_2));
+    assert_eq!(events.last().unwrap().mode(), WaitFollowMode::Deadman);
+    assert!(stop_daemon_cleanly(&env, daemon).await);
+}
+
+#[tokio::test]
+#[ignore = "integration: held wait coalesce mention filter"]
+async fn coalesce_mention_ignores_non_mentions() {
+    let env = TestEnv::new("per-048-follow-coalesce-mention").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("brief-per-043", "channel-per-048-mention")
+        .await;
+    env.mock_post_lookup(POST_0, "channel-per-048-mention", true)
+        .await;
+    env.mock_user_lookup("user-1", "reviewer-one").await;
+    env.mock_user_lookup("user-2", "reviewer-two").await;
+    mount_after(
+        &env,
+        "channel-per-048-mention",
+        POST_0,
+        &[
+            (
+                POST_1,
+                "user-1",
+                "noise without a mention",
+                1_700_000_000_001,
+            ),
+            (
+                POST_2,
+                "user-2",
+                "@agent-bravo-devlead first",
+                1_700_000_000_002,
+            ),
+        ],
+    )
+    .await;
+    mount_after(
+        &env,
+        "channel-per-048-mention",
+        POST_1,
+        &[(
+            POST_2,
+            "user-2",
+            "@agent-bravo-devlead first",
+            1_700_000_000_002,
+        )],
+    )
+    .await;
+    mount_after(&env, "channel-per-048-mention", POST_2, &[]).await;
+
+    let daemon = spawn_daemon(&env).await;
+    let out = env.runtime_dir().join("follow.jsonl");
+    let output = run_chanvoy(
+        &env,
+        &[
+            "wait",
+            "brief-per-043",
+            "--follow",
+            "--mention",
+            "--out",
+            out.to_str().unwrap(),
+            "--after",
+            POST_0,
+            "--timeout",
+            "1s",
+            "--coalesce",
+            "5s",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let raw = std::fs::read_to_string(&out).expect("follow jsonl");
+    let events: Vec<WaitFollowV2Event> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("v2 event json"))
+        .collect();
+    let bursts: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.mode(), WaitFollowMode::Backlog | WaitFollowMode::Live))
+        .collect();
+    assert_eq!(bursts.len(), 1, "{raw}");
+    assert_eq!(bursts[0].messages_slice().len(), 1);
+    assert_eq!(bursts[0].tip(), Some(POST_2));
     assert!(stop_daemon_cleanly(&env, daemon).await);
 }
