@@ -882,7 +882,13 @@ async fn coalesce_two_posts_in_window_are_one_record() {
         ],
     )
     .await;
-    mount_after(&env, "channel-per-048-two", POST_1, &[]).await;
+    mount_after(
+        &env,
+        "channel-per-048-two",
+        POST_1,
+        &[(POST_2, "user-2", "second", 1_700_000_000_002)],
+    )
+    .await;
     mount_after(&env, "channel-per-048-two", POST_2, &[]).await;
 
     let daemon = spawn_daemon(&env).await;
@@ -954,6 +960,18 @@ async fn coalesce_mention_ignores_non_mentions() {
                 1_700_000_000_002,
             ),
         ],
+    )
+    .await;
+    mount_after(
+        &env,
+        "channel-per-048-mention",
+        POST_1,
+        &[(
+            POST_2,
+            "user-2",
+            "@agent-bravo-devlead first",
+            1_700_000_000_002,
+        )],
     )
     .await;
     mount_after(&env, "channel-per-048-mention", POST_2, &[]).await;
