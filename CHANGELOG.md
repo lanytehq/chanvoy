@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel id. `--after` is a Mattermost post id on that DM.
 - **`wait --inbox`.** Sit on any direct message to this bot. `--after` is
   an opaque inbox cursor (`inv1.…`), not a post id. JSON names the peer,
-  DM name, matched post, and next cursor separately.
+  DM name, matched post, and next cursor separately. Coalesced inbox
+  follow resumes from `next_inbox_cursor`.
 - **`wait --mention`.** Complete only when this bot is mentioned
   (`@username` token, ASCII case-insensitive). `@bot-suffix` is not a
   match. Logical AND with `--contains` and `--pattern`. Applies to
