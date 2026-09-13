@@ -2499,20 +2499,11 @@ pub async fn migrate_attention_state(
             .await
         {
             Ok(resolved) => {
-                state.channels.insert(
-                    attention_key_for(&resolved.team_name, &resolved.channel_name),
-                    ChannelCursorState {
-                        last_seen_post_id: legacy_state.last_seen_post_id,
-                        updated_at: legacy_state.updated_at,
-                        last_known_stale: legacy_state.last_known_stale,
-                        last_checked_at: legacy_state.last_checked_at,
-                        channel_id: resolved.channel_id,
-                        team_id: resolved.team_id,
-                        team_name: resolved.team_name,
-                        channel_name: resolved.channel_name,
-                    },
-                );
-                migrated += 1;
+                if migrate_resolved_attention_cursor(state, &legacy_name, legacy_state, resolved) {
+                    migrated += 1;
+                } else {
+                    skipped += 1;
+                }
             }
             Err(_) => {
                 // Primary missed; try the fallback path with strict
@@ -2520,20 +2511,16 @@ pub async fn migrate_attention_state(
                 // quarantine; none → skip.
                 match client.resolve_channel(&legacy_name, None).await {
                     Ok(resolved) => {
-                        state.channels.insert(
-                            attention_key_for(&resolved.team_name, &resolved.channel_name),
-                            ChannelCursorState {
-                                last_seen_post_id: legacy_state.last_seen_post_id,
-                                updated_at: legacy_state.updated_at,
-                                last_known_stale: legacy_state.last_known_stale,
-                                last_checked_at: legacy_state.last_checked_at,
-                                channel_id: resolved.channel_id,
-                                team_id: resolved.team_id,
-                                team_name: resolved.team_name,
-                                channel_name: resolved.channel_name,
-                            },
-                        );
-                        migrated += 1;
+                        if migrate_resolved_attention_cursor(
+                            state,
+                            &legacy_name,
+                            legacy_state,
+                            resolved,
+                        ) {
+                            migrated += 1;
+                        } else {
+                            skipped += 1;
+                        }
                     }
                     Err(CoreError::AmbiguousChannel { teams, .. }) => {
                         state.quarantined.push(QuarantinedCursor {
@@ -2561,6 +2548,37 @@ pub async fn migrate_attention_state(
         quarantined,
         skipped,
     })
+}
+
+/// Move one resolved legacy cursor without replacing a qualified cursor that
+/// may already contain newer state. Post ids are opaque provider values, so
+/// migration cannot safely order two independently-written cursors. Preserve
+/// both records and defer operator-visible cleanup instead of guessing.
+fn migrate_resolved_attention_cursor(
+    state: &mut AttentionState,
+    legacy_name: &str,
+    legacy_state: ChannelCursorState,
+    resolved: ResolvedChannel,
+) -> bool {
+    let qualified_key = attention_key_for(&resolved.team_name, &resolved.channel_name);
+    if state.channels.contains_key(&qualified_key) {
+        state.channels.insert(legacy_name.to_string(), legacy_state);
+        return false;
+    }
+    state.channels.insert(
+        qualified_key,
+        ChannelCursorState {
+            last_seen_post_id: legacy_state.last_seen_post_id,
+            updated_at: legacy_state.updated_at,
+            last_known_stale: legacy_state.last_known_stale,
+            last_checked_at: legacy_state.last_checked_at,
+            channel_id: resolved.channel_id,
+            team_id: resolved.team_id,
+            team_name: resolved.team_name,
+            channel_name: resolved.channel_name,
+        },
+    );
+    true
 }
 
 /// PER-019: return value of [`migrate_attention_state`] for daemon-side
@@ -9329,6 +9347,47 @@ monitored_channels = ["per-003", "per-004"]
             assert_eq!(state.quarantined.len(), 1);
             assert_eq!(state.quarantined[0].legacy_channel_name, "general");
             assert_eq!(state.quarantined[0].ambiguous_teams.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn migration_never_overwrites_an_existing_qualified_cursor() {
+            let server = MockServer::start().await;
+            mock_team_by_slug(&server, "org-lanytehq", "team-lanytehq").await;
+            mock_channel_in_team(&server, "team-lanytehq", "general", "ch-general").await;
+
+            let legacy = ChannelCursorState {
+                last_seen_post_id: Some("legacy-post".to_string()),
+                updated_at: Some(100),
+                ..ChannelCursorState::default()
+            };
+            let qualified = ChannelCursorState {
+                last_seen_post_id: Some("qualified-post".to_string()),
+                updated_at: Some(200),
+                channel_id: "ch-general".to_string(),
+                team_id: "team-lanytehq".to_string(),
+                team_name: "org-lanytehq".to_string(),
+                channel_name: "general".to_string(),
+                ..ChannelCursorState::default()
+            };
+            let mut state = AttentionState {
+                channels: BTreeMap::from([
+                    ("general".to_string(), legacy.clone()),
+                    ("org-lanytehq/general".to_string(), qualified.clone()),
+                ]),
+                ..AttentionState::default()
+            };
+
+            let client = MattermostClient::new(&test_profile(&server.uri()), "tok".into()).unwrap();
+            let outcome = migrate_attention_state(&mut state, &client).await.unwrap();
+
+            assert_eq!(outcome.migrated, 0);
+            assert_eq!(outcome.skipped, 1);
+            assert_eq!(state.channels.get("general"), Some(&legacy));
+            assert_eq!(
+                state.channels.get("org-lanytehq/general"),
+                Some(&qualified),
+                "opaque post ids cannot be ordered, so migration must preserve both"
+            );
         }
     }
 }

@@ -108,9 +108,13 @@ Five things happen, in order:
    detached daemon child reads the bootstrap-state file, validates it
    (freshness + profile fingerprint + nonce), then binds its UDS
    socket. No `whoami()`-style network call for its **own** identity.
-   The WebSocket connection opens after bind; if WS auth fails, the
-   daemon stays bound on the socket and reconnects on its existing
-   schedule (gateway-friendly, sandbox-friendly).
+   Mandatory local attention state and pending poll transactions are recovered
+   before the accept loop begins. Legacy attention-key migration is then run as
+   one bounded best-effort background pass: provider slowness cannot delay the
+   local readiness RPC, and migration publishes only if cursor state did not
+   change while resolution was in flight. The WebSocket connection opens after
+   bind; if WS auth fails, the daemon stays bound on the socket and reconnects
+   on its existing schedule (gateway-friendly, sandbox-friendly).
 
    **Bounded claim.** This covers the daemon's primary identity only. A
    profile carrying a `[reduce]` policy also builds its family-identity
@@ -188,7 +192,10 @@ foreground-debug.
 If a background daemon exits during startup, the starting command fails
 with a startup-failure classification naming the stage it died in
 (before or after consuming the bootstrap handoff) rather than a bare
-"not running" — the two call for different operator actions.
+"not running" — the two call for different operator actions. The diagnostic
+includes an explicit `RUST_LOG=info ... daemon serve` foreground command;
+`RUST_LOG=debug` provides more detail and `Ctrl-C` ends that owned foreground
+process.
 
 ### Restart and recovery
 

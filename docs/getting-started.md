@@ -491,7 +491,7 @@ shell instead:
 
 ```bash
 # In a parent shell that has full socket access:
-chanvoy --profile <role>-<scope> daemon serve
+RUST_LOG=info chanvoy --profile <role>-<scope> daemon serve
 # Wait for "websocket authenticated and healthy" or equivalent.
 
 # Then from the sandboxed shell, with the runtime dir bridged in:
@@ -501,7 +501,9 @@ chanvoy read <channel> --since 1h
 
 `daemon serve` (foreground) is the debug variant of `daemon start`.
 It stays attached to the spawning shell so you can `Ctrl-C` it,
-follow logs, and own the process lifetime explicitly. Operators can
+follow startup logs, and own the process lifetime explicitly. Use
+`RUST_LOG=debug` for more detail; unset `RUST_LOG` to restore normal
+logging. Operators can
 wrap it in `tmux` or a launchd / systemd unit for stability.
 
 ### Path 3: escalate

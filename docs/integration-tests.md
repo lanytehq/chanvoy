@@ -242,6 +242,14 @@ settle.
   the process table, not the pid file, because the failure mode is a
   child alive *without* having written one — plus no pid file, socket, or
   orphaned handoff, and that a retry yields exactly one daemon
+- `daemon_start_is_ready_while_legacy_attention_migration_is_slow` — writes a
+  legacy bare-key cursor and delays its provider channel lookup for 30 seconds;
+  background start must answer its local readiness RPC well inside the
+  10-second budget and stop cleanly while bounded migration is still waiting
+- `daemon_serve_with_info_logging_reports_startup_stages` — runs the documented
+  foreground diagnostic with `RUST_LOG=info` and requires socket-bound,
+  local-state-recovered, WebSocket-task-started, and listening stage events
+  before clean shutdown
 - `daemon_start_requires_explicit_profile_selection` — the
   command-to-policy mapping, which core resolver unit tests do not cover:
   bare `daemon start` refuses both the `active_profile` marker and the

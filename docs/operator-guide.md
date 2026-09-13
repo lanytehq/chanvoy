@@ -1106,7 +1106,8 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
   - requires an explicit profile (`--profile`, `CHANVOY_PROFILE`, or a sourced agent identity)
   - never creates or refreshes a profile, moves the `active_profile` marker, seeds cursors, or rewrites `bot_username` — use `auto-setup` for those
 - `chanvoy --profile <name> daemon serve` — **foreground diagnostic mode**
-  - runs attached to your terminal: logs to stdout/stderr, `Ctrl-C` stops it
+  - run as `RUST_LOG=info chanvoy --profile <name> daemon serve` to show startup stages; `RUST_LOG=debug` enables more detail and unsetting it restores normal logging
+  - runs attached to your terminal: logs are written to stderr, `Ctrl-C` stops it
   - not a background start; the difference from `daemon start` is lifetime and detachment, not just where stdio points
   - use it to watch a daemon that fails to start under `daemon start`
 - `chanvoy daemon status`
@@ -1120,7 +1121,8 @@ Observed lifecycle behavior:
 
 - `auto-setup` and `daemon start` share one durable-spawn primitive, so a daemon started either way has the same lifetime: it is its own session leader and outlives the shell or agent tool invocation that started it
 - stale socket + dead pid cleanup works on the next `daemon start` or `auto-setup`
-- a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; re-run the same profile under `daemon serve` to see the underlying error
+- a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; its diagnostic provides the `RUST_LOG=info ... daemon serve` foreground recipe
+- legacy attention-key migration is bounded, best-effort maintenance after local state recovery; slow or unavailable Mattermost REST does not delay local socket readiness
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior
 
 ## Sandboxed Agent Contexts
@@ -1234,7 +1236,7 @@ prompt can be answered):
 
 ```bash
 # In one shell, with network approval granted to this command:
-chanvoy --profile <name> daemon serve
+RUST_LOG=info chanvoy --profile <name> daemon serve
 
 # Once the foreground daemon prints "websocket authenticated and healthy",
 # subsequent commands from the same sandbox can use it:
@@ -1242,6 +1244,11 @@ chanvoy daemon status
 chanvoy read <channel> --since 60
 chanvoy post <channel> "..."
 ```
+
+Use `RUST_LOG=debug` for more detail. Unset `RUST_LOG` to restore normal
+logging, and stop the foreground daemon with `Ctrl-C`. A successful foreground
+start does not prove detached cold-start behavior: another `auto-setup` may
+simply reuse the foreground daemon already serving the profile socket.
 
 This path is the rare-case fallback; for typical Codex / sandbox-exec
 operator flows, prefer `auto-setup`.

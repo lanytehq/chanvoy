@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record per line. With `--coalesce`, that line may contain 1–32
   matching messages.
 
+### Fixed
+
+- **Daemon readiness with legacy attention state.** Provider-backed cursor
+  migration now runs as bounded best-effort maintenance after local state
+  recovery, so slow or unavailable Mattermost REST cannot make a healthy
+  daemon miss its startup budget. Startup failures now include an explicit
+  foreground logging command.
+
 ### Distribution
 
 - v0.3.2 is distributed as signed GitHub Release binaries. It is not
