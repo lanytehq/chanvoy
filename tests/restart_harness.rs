@@ -37,7 +37,7 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use chanvoy_core::{rpc_result, JsonRpcRequest, Profile};
+use chanvoy_core::{rpc_result, AttentionState, ChannelCursorState, JsonRpcRequest, Profile};
 use common::{
     kill_daemon, read_attention_state, run_chanvoy, spawn_daemon, stop_daemon_cleanly,
     wait_for_ws_failure, TestEnv,
@@ -1257,6 +1257,214 @@ fn process_holds_path(pid: u32, path: &std::path::Path) -> bool {
         Ok(o) if o.status.success() => !o.stdout.is_empty(),
         _ => false,
     }
+}
+
+/// Legacy attention repair is provider-backed maintenance, not local daemon
+/// readiness. A channel lookup delayed well beyond the parent's startup budget
+/// must not make `daemon start` kill an otherwise serviceable child.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_start_is_ready_while_legacy_attention_migration_is_slow() {
+    let env = TestEnv::new("slow-legacy-ready").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-migration", "agent-bravo-devlead", "team-id-456")
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/v4/teams/team-id-456/channels/name/legacy-channel",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "id": "legacy-channel-id",
+                    "name": "legacy-channel"
+                }))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&env.mock)
+        .await;
+    let state = AttentionState {
+        channels: std::collections::BTreeMap::from([(
+            "legacy-channel".to_string(),
+            ChannelCursorState {
+                last_seen_post_id: Some("legacy-post".to_string()),
+                ..ChannelCursorState::default()
+            },
+        )]),
+        ..AttentionState::default()
+    };
+    std::fs::write(
+        env.state_path(),
+        serde_json::to_vec_pretty(&state).expect("serialize legacy attention state"),
+    )
+    .expect("write legacy attention state");
+    std::fs::set_permissions(env.state_path(), std::fs::Permissions::from_mode(0o600))
+        .expect("set attention state permissions");
+
+    let _guard = env.daemon_guard();
+    let started_at = std::time::Instant::now();
+    let out = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        out.status.success(),
+        "slow optional migration must not fail local startup; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started_at.elapsed() < Duration::from_secs(8),
+        "startup should answer well inside the 10-second budget while migration runs separately"
+    );
+    assert!(
+        env.socket_path().exists(),
+        "successful background start must leave its daemon socket"
+    );
+
+    let stop = run_chanvoy(&env, &["daemon", "stop"]).await;
+    assert!(
+        stop.status.success(),
+        "daemon must stop cleanly while migration is delayed; stderr={}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// Prove the spawned maintenance task is connected to the daemon's live state
+/// and durable store, not merely that slow work no longer blocks readiness.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_persists_successful_legacy_migration_while_serving() {
+    let env = TestEnv::new("legacy-migration-persists").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-migration", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("legacy-channel", "legacy-channel-id")
+        .await;
+    let legacy_cursor = ChannelCursorState {
+        last_seen_post_id: Some("legacy-post".to_string()),
+        updated_at: Some(1_778_000_000_000),
+        last_known_stale: true,
+        last_checked_at: Some(1_778_000_000_100),
+        ..ChannelCursorState::default()
+    };
+    let state = AttentionState {
+        channels: std::collections::BTreeMap::from([(
+            "legacy-channel".to_string(),
+            legacy_cursor.clone(),
+        )]),
+        ..AttentionState::default()
+    };
+    std::fs::write(
+        env.state_path(),
+        serde_json::to_vec_pretty(&state).expect("serialize legacy attention state"),
+    )
+    .expect("write legacy attention state");
+    std::fs::set_permissions(env.state_path(), std::fs::Permissions::from_mode(0o600))
+        .expect("set attention state permissions");
+
+    let _guard = env.daemon_guard();
+    let start = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        start.status.success(),
+        "daemon must become ready; stderr={}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let migrated = loop {
+        let current = read_attention_state(&env).expect("attention state remains readable");
+        if !current.channels.contains_key("legacy-channel") {
+            if let Some(cursor) = current.channels.get("org-lanytehq/legacy-channel") {
+                break cursor.clone();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spawned migration did not persist the qualified cursor before its deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(migrated.last_seen_post_id, legacy_cursor.last_seen_post_id);
+    assert_eq!(migrated.updated_at, legacy_cursor.updated_at);
+    assert_eq!(migrated.last_known_stale, legacy_cursor.last_known_stale);
+    assert_eq!(migrated.last_checked_at, legacy_cursor.last_checked_at);
+    assert_eq!(migrated.channel_id, "legacy-channel-id");
+    assert_eq!(migrated.team_id, "team-id-456");
+    assert_eq!(migrated.team_name, "org-lanytehq");
+    assert_eq!(migrated.channel_name, "legacy-channel");
+
+    let status = run_chanvoy(&env, &["daemon", "status"]).await;
+    assert!(
+        status.status.success(),
+        "daemon must still serve after migration; stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stop = run_chanvoy(&env, &["daemon", "stop"]).await;
+    assert!(
+        stop.status.success(),
+        "daemon must stop cleanly after migration; stderr={}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// The foreground command recommended by startup failures must emit useful
+/// privacy-safe stages before it blocks in the accept loop.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_serve_with_info_logging_reports_startup_stages() {
+    let env = TestEnv::new("serve-info-stages").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-info", "agent-bravo-devlead", "team-id-456")
+        .await;
+
+    let child = env
+        .chanvoy_command()
+        .env("RUST_LOG", "info")
+        .arg("--profile")
+        .arg(&env.profile_name)
+        .arg("daemon")
+        .arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn foreground daemon with info logging");
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let status = run_chanvoy(&env, &["daemon", "status"]).await;
+        if status.status.success() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "foreground daemon did not reach readiness; stderr={}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let stop = run_chanvoy(&env, &["daemon", "stop"]).await;
+    assert!(stop.status.success(), "foreground daemon must stop cleanly");
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("foreground daemon exit timeout")
+        .expect("wait for foreground daemon");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let observed = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    for expected in [
+        "chanvoy daemon local socket bound",
+        "chanvoy daemon local attention state recovered",
+        "chanvoy websocket observation task started",
+        "chanvoy daemon listening",
+    ] {
+        assert!(
+            observed.contains(expected),
+            "foreground info output must include {expected:?}; observed={observed}"
+        );
+    }
+    assert!(
+        !stdout.contains("chanvoy daemon local socket bound")
+            && stderr.contains("chanvoy daemon local socket bound"),
+        "tracing must stay on stderr so stdout receipts and JSON remain parseable; observed={observed}"
+    );
 }
 
 /// Write a `[reduce]`-configured stream profile plus its family profile, with

@@ -798,6 +798,7 @@ pub async fn run() -> Result<(), CliError> {
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .without_time()
         .try_init();
 }
@@ -4263,11 +4264,12 @@ fn daemon_child_startup_error(
     handoff_pending: bool,
 ) -> CliError {
     let stage = if handoff_pending {
-        "before consuming the bootstrap handoff (failed during profile load, token load, \
-         or reduce-policy setup)"
+        "before consuming the bootstrap handoff (profile/token load, reduce-policy setup, \
+         or local runtime preparation)"
     } else {
         "after consuming the bootstrap handoff, so it failed past identity resolution \
-         (socket bind, runtime-dir permissions, attention-state load, or token/WebSocket setup)"
+         (socket bind, socket/pid permissions, local attention-state load, or pending local \
+         transaction recovery)"
     };
     let detail = match failure {
         SpawnFailure::ChildExited(status) => format!(
@@ -4276,7 +4278,7 @@ fn daemon_child_startup_error(
         ),
         SpawnFailure::WedgedAndTerminated => format!(
             "background daemon was still not answering its socket at the end of the startup \
-             budget, {stage}; it was wedged (blocked dependency probe or slow WebSocket init), \
+             budget, {stage}; it was wedged during mandatory local startup, \
              so it has been terminated and reaped rather than left running unowned"
         ),
         SpawnFailure::TerminationUnconfirmed { pid, detail } => {
@@ -4295,8 +4297,9 @@ fn daemon_child_startup_error(
     CliError::DaemonStartup {
         profile: profile_name.to_string(),
         detail: format!(
-            "{detail}. Run `chanvoy --profile {profile_name} daemon serve` in the \
-             foreground to see the underlying error"
+            "{detail}. Run `RUST_LOG=info chanvoy --profile {profile_name} daemon serve` in a \
+             foreground shell to see startup stages; use `RUST_LOG=debug` for more detail, \
+             unset `RUST_LOG` to restore normal logging, and stop the foreground daemon with Ctrl-C"
         ),
     }
 }
@@ -7388,6 +7391,16 @@ mod tests {
         assert!(
             detail.contains("before consuming the bootstrap handoff"),
             "handoff-pending stage must be reported: {detail}"
+        );
+        assert!(
+            detail.contains("RUST_LOG=info chanvoy --profile unit-profile daemon serve")
+                && detail.contains("RUST_LOG=debug")
+                && detail.contains("Ctrl-C"),
+            "startup failure must provide an actionable foreground diagnostic recipe: {detail}"
+        );
+        assert!(
+            !detail.contains("WebSocket"),
+            "post-readiness websocket setup must not be named as a local startup blocker: {detail}"
         );
     }
 

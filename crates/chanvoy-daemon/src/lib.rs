@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::{env, fs, io};
 
 mod wait;
@@ -46,6 +47,11 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::time::Instant as WaitStarted;
 
 use tracing::{info, warn};
+
+/// Best-effort legacy cursor repair must never become a daemon-readiness
+/// dependency. This bounds the whole provider-backed pass, independently of
+/// the number of legacy records or any individual HTTP request.
+const ATTENTION_MIGRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
@@ -323,6 +329,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     fs::write(&pid_path, std::process::id().to_string())?;
     fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
+    info!(profile = profile_name, "chanvoy daemon local socket bound");
 
     let ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>> = Arc::new(Mutex::new(None));
     let event_bus: Arc<EventBus> = Arc::new(EventBus::new(256));
@@ -360,45 +367,24 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         _ => None,
     };
 
-    // PER-019 load-time migration: walk pre-PER-019 cursor entries
-    // (keyed by bare channel name) and rewrite them under qualified
-    // `<team_name>/<channel_name>` keys. Ambiguous names quarantine.
-    // Idempotent — already-qualified entries are skipped.
     let mut attention = load_attention_state(&profile.name)?;
-    match chanvoy_core::migrate_attention_state(&mut attention, &client).await {
-        Ok(outcome) if outcome.migrated + outcome.quarantined > 0 => {
-            info!(
-                profile = profile_name,
-                migrated = outcome.migrated,
-                quarantined = outcome.quarantined,
-                skipped = outcome.skipped,
-                "PER-019 attention-state migration completed"
-            );
-            // Persist the rewritten state so write-time paths land in
-            // qualified-key territory.
-            store_attention_state(&profile.name, &attention)?;
-        }
-        Ok(_) => {
-            // Nothing to migrate — no-op.
-        }
-        Err(err) => {
-            // Migration is best-effort at startup; if the team-list
-            // endpoint is unreachable now, write paths will resolve
-            // lazily and the legacy entries will be rewritten on
-            // first cursor update. Don't block daemon startup.
-            tracing::warn!(
-                profile = profile_name,
-                %err,
-                "PER-019 attention-state migration deferred — write paths will retry"
-            );
-        }
-    }
-
     let poll_cursors =
         waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
     poll_cursors
         .apply_pending_txn(&mut attention)
         .map_err(DaemonError::from)?;
+    let legacy_attention_records = attention
+        .channels
+        .keys()
+        .filter(|key| !key.contains('/'))
+        .count();
+    info!(
+        profile = profile_name,
+        channel_records = attention.channels.len(),
+        legacy_records = legacy_attention_records,
+        quarantined_records = attention.quarantined.len(),
+        "chanvoy daemon local attention state recovered"
+    );
 
     let inbox_armed = Arc::new(AtomicU64::new(0));
     let state = Arc::new(AppState {
@@ -418,6 +404,26 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         fanin_replay: waitprims_fanin::FanInReplayStore::new(),
         inbox_armed: inbox_armed.clone(),
     });
+
+    // Legacy cursor migration is provider-backed, optional maintenance. It
+    // must not delay the local control plane: snapshot now, resolve without a
+    // state lock after this task is spawned, and publish only if the live state
+    // still equals the snapshot. A concurrent cursor write therefore wins and
+    // causes this one bounded pass to defer rather than clobbering newer state.
+    if legacy_attention_records > 0 {
+        let migration_state = Arc::clone(&state.attention_state);
+        let migration_client = state.client.clone();
+        let migration_profile = profile.name.clone();
+        tokio::spawn(async move {
+            run_attention_migration(
+                migration_profile,
+                migration_state,
+                migration_client,
+                ATTENTION_MIGRATION_TIMEOUT,
+            )
+            .await;
+        });
+    }
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
 
@@ -440,6 +446,10 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             ws_ref.run(ws_shutdown_rx).await;
         });
         *ws_state_holder.lock().await = Some(ws_state);
+        info!(
+            profile = profile_name,
+            "chanvoy websocket observation task started"
+        );
     }
 
     // PER-014 post-bind drift probe. Bind-first: the local UDS is already
@@ -517,6 +527,108 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         profile: profile_name.to_string(),
         socket_path,
     })
+}
+
+async fn run_attention_migration(
+    profile_name: String,
+    attention_state: Arc<Mutex<AttentionState>>,
+    client: MattermostClient,
+    deadline: Duration,
+) {
+    let snapshot = attention_state.lock().await.clone();
+    let legacy_records = snapshot
+        .channels
+        .keys()
+        .filter(|key| !key.contains('/'))
+        .count();
+    if legacy_records == 0 {
+        return;
+    }
+    info!(
+        profile = %profile_name,
+        legacy_records,
+        timeout_ms = deadline.as_millis(),
+        "attention-state legacy migration started after local recovery"
+    );
+
+    let mut migrated_state = snapshot.clone();
+    let outcome = match tokio::time::timeout(
+        deadline,
+        chanvoy_core::migrate_attention_state(&mut migrated_state, &client),
+    )
+    .await
+    {
+        Err(_) => {
+            warn!(
+                profile = %profile_name,
+                legacy_records,
+                timeout_ms = deadline.as_millis(),
+                "attention-state legacy migration timed out and was deferred"
+            );
+            return;
+        }
+        Ok(Err(err)) => {
+            warn!(
+                profile = %profile_name,
+                error = %err,
+                "attention-state legacy migration failed and was deferred"
+            );
+            return;
+        }
+        Ok(Ok(outcome)) => outcome,
+    };
+
+    let mut live = attention_state.lock().await;
+    let published = if outcome.migrated + outcome.quarantined > 0 {
+        match publish_attention_migration_if_unchanged(
+            |candidate| store_attention_state(&profile_name, candidate).map(|_| ()),
+            &mut live,
+            &snapshot,
+            migrated_state,
+        ) {
+            Ok(published) => published,
+            Err(err) => {
+                warn!(
+                    profile = %profile_name,
+                    error = %err,
+                    "attention-state legacy migration could not be persisted and was deferred"
+                );
+                return;
+            }
+        }
+    } else {
+        *live == snapshot
+    };
+    if !published {
+        info!(
+            profile = %profile_name,
+            migrated = outcome.migrated,
+            quarantined = outcome.quarantined,
+            skipped = outcome.skipped,
+            "attention-state legacy migration deferred because live cursor state changed"
+        );
+        return;
+    }
+    info!(
+        profile = %profile_name,
+        migrated = outcome.migrated,
+        quarantined = outcome.quarantined,
+        skipped = outcome.skipped,
+        "attention-state legacy migration completed"
+    );
+}
+
+fn publish_attention_migration_if_unchanged(
+    persist: impl FnOnce(&AttentionState) -> Result<(), CoreError>,
+    live: &mut AttentionState,
+    snapshot: &AttentionState,
+    migrated: AttentionState,
+) -> Result<bool, CoreError> {
+    if live != snapshot {
+        return Ok(false);
+    }
+    persist_then_publish_attention_state(persist, live, |_| migrated)?;
+    Ok(true)
 }
 
 /// Local-only readiness check for the daemon UDS socket. Use this when
@@ -4293,6 +4405,85 @@ mod tests {
             "the profile credential must be loaded once and reused; a second \
              load can pair surfaces with different identities"
         );
+    }
+
+    #[test]
+    fn deferred_migration_does_not_overwrite_a_concurrent_cursor_update() {
+        let legacy = chanvoy_core::ChannelCursorState {
+            last_seen_post_id: Some("legacy-post".to_string()),
+            ..chanvoy_core::ChannelCursorState::default()
+        };
+        let snapshot = AttentionState {
+            channels: std::collections::BTreeMap::from([("general".to_string(), legacy)]),
+            ..AttentionState::default()
+        };
+        let mut migrated = snapshot.clone();
+        migrated.channels.remove("general");
+        migrated.channels.insert(
+            "org-lanytehq/general".to_string(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("legacy-post".to_string()),
+                channel_name: "general".to_string(),
+                team_name: "org-lanytehq".to_string(),
+                ..chanvoy_core::ChannelCursorState::default()
+            },
+        );
+
+        let mut live = snapshot.clone();
+        live.channels.insert(
+            "org-lanytehq/general".to_string(),
+            chanvoy_core::ChannelCursorState {
+                last_seen_post_id: Some("newer-post".to_string()),
+                channel_name: "general".to_string(),
+                team_name: "org-lanytehq".to_string(),
+                ..chanvoy_core::ChannelCursorState::default()
+            },
+        );
+        let live_before = live.clone();
+        let mut persisted = false;
+
+        let published = publish_attention_migration_if_unchanged(
+            |_| {
+                persisted = true;
+                Ok(())
+            },
+            &mut live,
+            &snapshot,
+            migrated,
+        )
+        .unwrap();
+
+        assert!(!published);
+        assert!(!persisted);
+        assert_eq!(live, live_before);
+    }
+
+    #[test]
+    fn deferred_migration_persists_before_publishing() {
+        let snapshot = AttentionState::default();
+        let mut migrated = AttentionState::default();
+        migrated.channels.insert(
+            "org-lanytehq/general".to_string(),
+            chanvoy_core::ChannelCursorState::default(),
+        );
+        let expected = migrated.clone();
+        let mut live = snapshot.clone();
+        let mut persisted = None;
+
+        let published = publish_attention_migration_if_unchanged(
+            |candidate| {
+                persisted = Some(candidate.clone());
+                Ok(())
+            },
+            &mut live,
+            &snapshot,
+            migrated,
+        )
+        .unwrap();
+
+        assert!(published);
+        assert_eq!(persisted, Some(expected.clone()));
+        assert_eq!(live, expected);
     }
 
     #[test]

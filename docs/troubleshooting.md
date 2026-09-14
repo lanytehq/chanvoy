@@ -328,9 +328,11 @@ permissions on it are wrong for your sandboxed user.
    it survives across sessions.
 
 2. **Run the daemon in a parent shell.** If the sandbox can't reach
-   any path the daemon can also reach, run `chanvoy daemon serve`
-   in a parent shell with full access; bridge the runtime path into
-   the sandbox so the sandboxed CLI can hit the socket.
+   any path the daemon can also reach, run
+   `RUST_LOG=info chanvoy --profile <name> daemon serve` in a parent
+   shell with full access; bridge the runtime path into the sandbox so
+   the sandboxed CLI can hit the socket. Use `RUST_LOG=debug` for more
+   detail and stop the foreground daemon with `Ctrl-C`.
 
 3. **Escalate.** If neither of the above works, ask the supervisor
    or operator who sourced your identity profile (or whoever your
