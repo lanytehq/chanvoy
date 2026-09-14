@@ -1326,6 +1326,84 @@ async fn daemon_start_is_ready_while_legacy_attention_migration_is_slow() {
     );
 }
 
+/// Prove the spawned maintenance task is connected to the daemon's live state
+/// and durable store, not merely that slow work no longer blocks readiness.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_persists_successful_legacy_migration_while_serving() {
+    let env = TestEnv::new("legacy-migration-persists").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-migration", "agent-bravo-devlead", "team-id-456")
+        .await;
+    env.mock_channel_lookup("legacy-channel", "legacy-channel-id")
+        .await;
+    let legacy_cursor = ChannelCursorState {
+        last_seen_post_id: Some("legacy-post".to_string()),
+        updated_at: Some(1_778_000_000_000),
+        last_known_stale: true,
+        last_checked_at: Some(1_778_000_000_100),
+        ..ChannelCursorState::default()
+    };
+    let state = AttentionState {
+        channels: std::collections::BTreeMap::from([(
+            "legacy-channel".to_string(),
+            legacy_cursor.clone(),
+        )]),
+        ..AttentionState::default()
+    };
+    std::fs::write(
+        env.state_path(),
+        serde_json::to_vec_pretty(&state).expect("serialize legacy attention state"),
+    )
+    .expect("write legacy attention state");
+    std::fs::set_permissions(env.state_path(), std::fs::Permissions::from_mode(0o600))
+        .expect("set attention state permissions");
+
+    let _guard = env.daemon_guard();
+    let start = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        start.status.success(),
+        "daemon must become ready; stderr={}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let migrated = loop {
+        let current = read_attention_state(&env).expect("attention state remains readable");
+        if !current.channels.contains_key("legacy-channel") {
+            if let Some(cursor) = current.channels.get("org-lanytehq/legacy-channel") {
+                break cursor.clone();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spawned migration did not persist the qualified cursor before its deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(migrated.last_seen_post_id, legacy_cursor.last_seen_post_id);
+    assert_eq!(migrated.updated_at, legacy_cursor.updated_at);
+    assert_eq!(migrated.last_known_stale, legacy_cursor.last_known_stale);
+    assert_eq!(migrated.last_checked_at, legacy_cursor.last_checked_at);
+    assert_eq!(migrated.channel_id, "legacy-channel-id");
+    assert_eq!(migrated.team_id, "team-id-456");
+    assert_eq!(migrated.team_name, "org-lanytehq");
+    assert_eq!(migrated.channel_name, "legacy-channel");
+
+    let status = run_chanvoy(&env, &["daemon", "status"]).await;
+    assert!(
+        status.status.success(),
+        "daemon must still serve after migration; stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stop = run_chanvoy(&env, &["daemon", "stop"]).await;
+    assert!(
+        stop.status.success(),
+        "daemon must stop cleanly after migration; stderr={}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
 /// The foreground command recommended by startup failures must emit useful
 /// privacy-safe stages before it blocks in the accept loop.
 #[tokio::test]
