@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.2] - unreleased
 
+### Daemon lifecycle
+
+- Slow or inconclusive remote health checks preserve responsive daemons and
+  in-flight waits. Start, setup and doctor distinguish identity refusal from
+  remote degradation and report observation readiness separately.
 ### Release provenance
 
 - Read-only native artifact CI and maintainer-created, receipt-bound drafts.

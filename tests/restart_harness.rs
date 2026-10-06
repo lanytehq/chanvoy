@@ -374,7 +374,7 @@ async fn clean_fake_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
     let profile = env.profile_name.clone();
     let socket_json = socket_path.clone();
     tokio::spawn(async move {
-        for expected in ["daemon_status", "seed_cursors"] {
+        for expected in ["daemon_observation", "profile_status", "daemon_status"] {
             let (stream, _) = listener.accept().await.expect("accept fake daemon client");
             let (reader, mut writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
@@ -386,6 +386,16 @@ async fn clean_fake_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
             let request: JsonRpcRequest =
                 serde_json::from_str(line.trim_end()).expect("decode fake daemon request");
             assert_eq!(request.method, expected);
+            if expected == "daemon_observation" {
+                let response = chanvoy_core::rpc_error(request.id, -32601, "method not found");
+                writer
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                continue;
+            }
             let value = if expected == "daemon_status" {
                 serde_json::json!({
                     "profile_name": profile,
@@ -400,7 +410,8 @@ async fn clean_fake_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
                     "binary": chanvoy_core::resolve_host_build_info(),
                 })
             } else {
-                serde_json::json!({"outcomes": []})
+                serde_json::json!({"profile_name":profile,"socket_path":socket_json,"role":"test","scope":"test",
+                    "provider":"mattermost","bot_username":"agent-bravo-devlead","server_url":"http://mattermost.test.invalid"})
             };
             let response = rpc_result(request.id, value);
             writer
@@ -454,55 +465,47 @@ async fn auto_setup_reuses_clean_generation_matched_daemon_without_pid_change() 
     server.await.expect("fake daemon completed");
 }
 
-/// A generation-matched, identity-ownable daemon with a current websocket
-/// failure must never be reported as reused/successful. The HTTP-only test
-/// provider cannot establish a healthy replacement websocket, so this pins
-/// the permitted refusal branch after auto-setup cycles the failed daemon.
+/// Closed observation admission preserves the responsive process without
+/// certifying that an observation wait is ready. Start and setup agree.
 #[tokio::test]
 #[ignore = "integration: run via make test-integration"]
-async fn auto_setup_refuses_success_when_ownable_ws_repair_cannot_recover() {
+async fn auto_setup_preserves_daemon_when_observation_admission_is_closed() {
     let env = TestEnv::new("auto-setup-ws-degraded").await;
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     env.mock_baseline("bot-id-ws", "agent-bravo-devlead", "team-id-ws")
         .await;
     env.mock_empty_memberships("team-id-ws").await;
-
     let mut daemon = spawn_daemon(&env).await;
     wait_for_ws_failure(&env).await;
-    let old_pid = read_daemon_pid(&env).expect("failed daemon pid");
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
-        auto_setup_command(&env, "lanytehq", "bravo-devlead").output(),
-    )
-    .await
-    .expect("auto-setup repair remains bounded")
-    .expect("auto-setup subprocess");
-    assert_eq!(
-        output.status.code(),
-        Some(4),
-        "failed WS repair must not report reuse/success; stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("auto-setup error JSON");
-    assert_eq!(report["error_code"], "daemon_start");
-    assert!(report["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("did not restore healthy websocket")));
-    tokio::time::timeout(Duration::from_secs(2), daemon.wait())
+    let old_pid = read_daemon_pid(&env).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let inode = std::fs::metadata(env.socket_path()).unwrap().ino();
+    let out = auto_setup_command(&env, "lanytehq", "bravo-devlead")
+        .output()
         .await
-        .expect("the known-degraded daemon exits within the cleanup bound")
-        .expect("wait for known-degraded daemon");
+        .unwrap();
     assert!(
-        sysprims_proc::get_process(old_pid).is_err(),
-        "the known-degraded daemon must have been stopped and reaped"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
     );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["daemon_state"], "already_running");
+    assert_eq!(report["daemon_disposition"], "degraded-remote");
+    assert_eq!(report["observation_ready"], false);
+    let start = run_chanvoy(&env, &["--json", "daemon", "start"]).await;
     assert!(
-        !env.socket_path().exists(),
-        "an unsuccessful replacement must be cleaned up"
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stdout)
     );
+    let report: serde_json::Value = serde_json::from_slice(&start.stdout).unwrap();
+    assert_eq!(report["daemon_disposition"], "degraded-remote");
+    assert_eq!(report["observation_ready"], false);
+    assert_eq!(read_daemon_pid(&env), Some(old_pid));
+    assert_eq!(std::fs::metadata(env.socket_path()).unwrap().ino(), inode);
+    assert!(daemon.try_wait().unwrap().is_none());
+    assert!(stop_daemon_cleanly(&env, daemon).await);
 }
 
 /// Read the persisted profile TOML for this env's profile.
@@ -515,15 +518,8 @@ fn read_persisted_profile(env: &TestEnv) -> Profile {
     toml::from_str(&contents).expect("profile parses")
 }
 
-/// F5 — `stop_daemon_if_present` stale-socket subcase.
-///
-/// Simulates a prior daemon that crashed leaving its socket file behind
-/// (common on machine crash / OOM kill). `auto-setup` must recover without
-/// hanging: `stop_daemon_if_present` sees the socket, issues a shutdown
-/// RPC which fails with `NotRunning` (connect refused), treats that as
-/// no-op, and proceeds. `ensure_daemon_running` then spawns a fresh
-/// daemon which `daemon::start()` unblocks by removing the stale socket
-/// before binding.
+/// A stale socket can be released when its recorded predecessor is confirmed
+/// dead and the socket has no live owner.
 #[tokio::test]
 #[ignore = "integration: run via make test-integration"]
 async fn auto_setup_recovers_from_stale_socket() {
@@ -635,8 +631,9 @@ async fn auto_setup_stops_zombie_and_respawns() {
         .expect("subprocess run");
     assert!(
         out2.status.success(),
-        "second auto-setup must recover from zombie daemon; exit={} stderr={}",
+        "second auto-setup must recover from zombie daemon; exit={} stdout={} stderr={}",
         out2.status,
+        String::from_utf8_lossy(&out2.stdout),
         String::from_utf8_lossy(&out2.stderr)
     );
 
@@ -710,8 +707,9 @@ async fn auto_setup_promotes_reuse_to_refreshed_on_bot_username_drift() {
     assert!(
         out2.status.success(),
         "second auto-setup must succeed (reuse→refreshed promotion); \
-         exit={} stderr={}",
+         exit={} stdout={} stderr={}",
         out2.status,
+        String::from_utf8_lossy(&out2.stdout),
         String::from_utf8_lossy(&out2.stderr)
     );
 
@@ -1441,7 +1439,12 @@ async fn daemon_serve_with_info_logging_reports_startup_stages() {
     }
 
     let stop = run_chanvoy(&env, &["daemon", "stop"]).await;
-    assert!(stop.status.success(), "foreground daemon must stop cleanly");
+    assert!(
+        stop.status.success(),
+        "foreground daemon must stop cleanly: stdout={} stderr={}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
         .expect("foreground daemon exit timeout")

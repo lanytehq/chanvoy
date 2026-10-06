@@ -106,6 +106,23 @@ This single command:
 - Starts the daemon if it isn't already running
 - Seeds channel cursors so subsequent `chanvoy check <channel>` calls return useful state without a fresh time-window probe
 
+Start, auto-setup and doctor report `daemon_disposition` and a separate
+`observation_ready` field (`true`, `false` or unknown/null):
+
+| Disposition | Meaning | Lifecycle exit |
+| --- | --- | --- |
+| `healthy` | Expected remote identity verified and admission open | 0 |
+| `degraded-remote` | Local RPC answers; remote identity or observation readiness is inconclusive/degraded | 0 |
+| `identity-refused` | Authoritative identity rejection or username mismatch | Nonzero |
+| `unresponsive-local` | Local RPC did not answer within its budget | Nonzero |
+
+A timeout, connection failure or server error preserves a responsive daemon.
+Closed/recovering WebSocket admission also preserves it. A successful lifecycle
+receipt does not mean a wait can observe messages. Old daemons with missing typed
+fields report unknown evidence, rather than inferred token failure. Setup skips
+cursor seeding while degraded and keeps existing waits intact. Explicit profile
+refresh still requires fresh parent validation and a predecessor stop.
+
 Subsequent `chanvoy ...` commands work without `--profile` — the resolver picks the canonical profile from your sourced env automatically. Required env: `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN` (or the env name configured by `CHANVOY_TOKEN_ENV_NAME`).
 
 ### Manual path (debugging or custom scenarios)
@@ -442,9 +459,10 @@ sync when skew is real. A post at or after the emitted `--since` boundary
 that is still missing is a request/provider question, not NTP (see
 [troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)).
 
-Exit codes: **0** all checks pass · **1** any soft finding (clock
+Exit codes: **0** all scored checks pass, including uncertainty-only
+`degraded-remote` · **1** an independent soft finding (clock
 `elevated_*` / `suspected_*` / unavailable, generation mismatch or not
-scored, channel throttle warn, daemon mattermost_ok false) · **2** hard
+scored outside remote degradation, channel throttle warn) · **2** hard
 failure (auth / identity mismatch, channel hard fail, daemon unreachable
 or identity drift).
 

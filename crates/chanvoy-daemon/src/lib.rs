@@ -89,13 +89,17 @@ struct AppState {
     ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>>,
     ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>>,
     attention_state: Arc<Mutex<AttentionState>>,
-    /// PER-014 drift floor. Set by the post-bind probe (and refreshed by
-    /// every `daemon_status` call) when `whoami()` returns a username that
-    /// does not match the configured `bot_username`. Network-backed RPCs
+    /// Combined authoritative refusal floor: rejected identity credential or
+    /// observed username mismatch. Unknown probes preserve it. Network RPCs,
+    /// event forwarding and routed IPC all share the existing gate.
+    /// The separate observed drift bit keeps legacy username drift truthful.
+    /// Network-backed RPCs
     /// inspect this and refuse with a clear diagnostic; the local socket
     /// stays bound so operators can query `daemon_status` to learn what's
     /// wrong.
     identity_drift: Arc<AtomicBool>,
+    observed_identity_drift: Arc<AtomicBool>,
+    probe_gate: Arc<chanvoy_core::recovery::IdentityProbeGate>,
     /// PER-035: the family-identity writer this profile reduces to, if a
     /// `[reduce]` policy is configured. `None` ⇒ no reduction; every
     /// write posts under `client`'s identity (today's behavior). Built
@@ -126,6 +130,68 @@ struct ReduceWriter {
 }
 
 impl AppState {
+    async fn probe_identity(&self) -> chanvoy_core::recovery::IdentityProbe {
+        self.probe_gate
+            .probe_with_drift(
+                &self.client,
+                Duration::from_millis(chanvoy_core::STATUS_PROBE_TIMEOUT_MS),
+                &self.profile.bot_username,
+                &self.identity_drift,
+                &self.observed_identity_drift,
+            )
+            .await
+    }
+    async fn observation_status(
+        &self,
+        probe: chanvoy_core::recovery::IdentityProbe,
+    ) -> DaemonStatus {
+        let ws_snapshot = {
+            let ws_guard = self.ws_state_holder.lock().await;
+            match ws_guard.as_ref() {
+                Some(ws) => ws.status_snapshot().await,
+                None => chanvoy_core::WsStatusSnapshot {
+                    connection_state: None,
+                    last_event_at: None,
+                    last_error: None,
+                    reconnect_count: None,
+                    last_disconnect_at: None,
+                    last_recovered_at: None,
+                    suspected_gap: None,
+                    catchup_in_flight: None,
+                    admission_closed: None,
+                    recovering_until: 0,
+                },
+            }
+        };
+        let ipc_snapshot = match &self.ipc_state {
+            Some(s) => {
+                let g = s.lock().await;
+                chanvoy_core::IpcStatusSnapshot {
+                    connected: Some(g.connected),
+                    peer_id: g.peer_id.clone(),
+                    reconnect_count: Some(g.reconnect_count),
+                }
+            }
+            None => chanvoy_core::IpcStatusSnapshot {
+                connected: None,
+                peer_id: None,
+                reconnect_count: None,
+            },
+        };
+
+        chanvoy_core::build_daemon_status_typed(
+            self.profile.name.clone(),
+            self.socket_path.clone(),
+            self.profile.bot_username.clone(),
+            probe,
+            ws_snapshot,
+            ipc_snapshot,
+            now_unix_millis(),
+            self.identity_drift.load(Ordering::Acquire),
+            self.observed_identity_drift.load(Ordering::Acquire),
+        )
+    }
+
     /// PER-035: pick the client that performs the terminal write for a
     /// channel that resolved into `resolved_team`. Reduces to the family
     /// identity iff a reduction policy is configured AND the channel
@@ -398,6 +464,8 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         ipc_state,
         attention_state: Arc::new(Mutex::new(attention)),
         identity_drift,
+        observed_identity_drift: Arc::new(AtomicBool::new(false)),
+        probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
         reduce_writer,
         wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
         poll_cursors,
@@ -452,46 +520,13 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         );
     }
 
-    // PER-014 post-bind drift probe. Bind-first: the local UDS is already
-    // listening. Probe-after: this runs asynchronously so the bind result
-    // is not gated on Mattermost reachability — sandbox-blocked or
-    // unreachable network surfaces as `mattermost_ok=false` via
-    // `daemon_status`, never a startup failure. On identity mismatch
-    // (whoami returns a different username than the configured
-    // `bot_username`), we set the `identity_drift` bit; network-backed
-    // RPCs surface this with a clear diagnostic. The local socket stays
-    // bound regardless so operators can query `daemon_status` to learn
-    // what's wrong. Per @agent-bravo-devrev's drift-floor framing
-    // (#per-014, 2026-04-27).
+    // Coordinated post-bind probing never gates local startup or stacks with status.
     {
         let probe_state = Arc::clone(&state);
         tokio::spawn(async move {
-            let probe = chanvoy_core::probe_whoami(
-                &probe_state.client,
-                chanvoy_core::STATUS_PROBE_TIMEOUT_MS,
-            )
-            .await;
-            match probe {
-                Ok(username) => {
-                    if !probe_state.profile.bot_username.is_empty()
-                        && username != probe_state.profile.bot_username
-                    {
-                        probe_state.identity_drift.store(true, Ordering::Relaxed);
-                        warn!(
-                            expected = %probe_state.profile.bot_username,
-                            actual = %username,
-                            "post-bind whoami probe surfaced identity drift; daemon stays bound, network RPCs will refuse"
-                        );
-                    }
-                }
-                Err(err) => {
-                    info!(
-                        profile = %probe_state.profile.name,
-                        error = %err,
-                        "post-bind whoami probe failed (sandbox-blocked or transient); daemon_status will retry on each call"
-                    );
-                }
-            }
+            let probe = probe_state.probe_identity().await;
+            info!(profile=%probe_state.profile.name,outcome=?probe.outcome,
+                "post-bind identity probe completed");
         });
     }
 
@@ -694,7 +729,7 @@ async fn handle_client(
                 if request.method == WAIT_FOLLOW_V1_METHOD
                     || request.method == WAIT_FOLLOW_V2_METHOD
                 {
-                    if state.identity_drift.load(Ordering::Relaxed) {
+                    if state.identity_drift.load(Ordering::Acquire) {
                         let response = rpc_error(
                             request.id,
                             -32_000,
@@ -853,7 +888,7 @@ async fn handle_client(
                     || request.method == WAIT_DM_FOLLOW_V2_METHOD
                 {
                     let started = WaitStarted::now();
-                    if state.identity_drift.load(Ordering::Relaxed) {
+                    if state.identity_drift.load(Ordering::Acquire) {
                         let response = rpc_error(
                             request.id,
                             -32_000,
@@ -1023,7 +1058,7 @@ async fn handle_client(
                     || request.method == WAIT_INBOX_FOLLOW_V2_METHOD
                 {
                     let started = WaitStarted::now();
-                    if state.identity_drift.load(Ordering::Relaxed) {
+                    if state.identity_drift.load(Ordering::Acquire) {
                         let response = rpc_error(
                             request.id,
                             -32_000,
@@ -1285,7 +1320,7 @@ async fn handle_client(
                         // `profile_status` / attention RPCs stay
                         // answerable. Per @agent-bravo-devrev's PR #16
                         // finding, 2026-04-27.
-                        if state.identity_drift.load(Ordering::Relaxed) {
+                        if state.identity_drift.load(Ordering::Acquire) {
                             continue;
                         }
                         let subs = state.subscriptions.lock().await;
@@ -1389,6 +1424,7 @@ fn event_matches_filter(event: &DaemonEvent, filter: &SubscriptionFilter) -> boo
 /// (Per @agent-bravo-devrev's PR #16 finding, 2026-04-27.)
 const LOCAL_ONLY_METHODS: &[&str] = &[
     "daemon_status",
+    "daemon_observation",
     "profile_status",
     "unsubscribe",
     "attention_list",
@@ -1422,7 +1458,7 @@ async fn dispatch_request(
     // local socket stays bound regardless. Per @agent-bravo-devrev's
     // drift-floor framing (#per-014, 2026-04-27).
     let method = request.method.as_str();
-    if state.identity_drift.load(Ordering::Relaxed) && !LOCAL_ONLY_METHODS.contains(&method) {
+    if state.identity_drift.load(Ordering::Acquire) && !LOCAL_ONLY_METHODS.contains(&method) {
         return DispatchOutcome {
             response: rpc_error(
                 request.id,
@@ -2024,63 +2060,22 @@ async fn dispatch_request(
             server_url: state.profile.server_url.clone(),
             socket_path: state.socket_path.clone(),
         })),
-        "daemon_status" => {
-            use std::sync::atomic::Ordering;
-            let ws_snapshot = {
-                let ws_guard = state.ws_state_holder.lock().await;
-                match ws_guard.as_ref() {
-                    Some(ws) => ws.status_snapshot().await,
-                    None => chanvoy_core::WsStatusSnapshot {
-                        connection_state: None,
-                        last_event_at: None,
-                        last_error: None,
-                        reconnect_count: None,
-                        last_disconnect_at: None,
-                        last_recovered_at: None,
-                        suspected_gap: None,
-                        catchup_in_flight: None,
-                        admission_closed: None,
-                        recovering_until: 0,
-                    },
-                }
+        "daemon_status" | "daemon_observation" => {
+            let probe = if method == "daemon_status" {
+                state.probe_identity().await
+            } else {
+                chanvoy_core::recovery::IdentityProbe::unknown()
             };
-            let ipc_snapshot = match &state.ipc_state {
-                Some(s) => {
-                    let g = s.lock().await;
-                    chanvoy_core::IpcStatusSnapshot {
-                        connected: Some(g.connected),
-                        peer_id: g.peer_id.clone(),
-                        reconnect_count: Some(g.reconnect_count),
-                    }
-                }
-                None => chanvoy_core::IpcStatusSnapshot {
-                    connected: None,
-                    peer_id: None,
-                    reconnect_count: None,
-                },
-            };
-            let whoami_result =
-                chanvoy_core::probe_whoami(&state.client, chanvoy_core::STATUS_PROBE_TIMEOUT_MS)
-                    .await;
-            // PER-014: keep the drift bit fresh — the post-bind one-shot
-            // probe seeds it, but `daemon_status` is the live signal that
-            // re-validates each call. A previously-tripped drift can also
-            // recover here (e.g., bot identity restored externally).
-            if let Ok(ref username) = whoami_result {
-                if !state.profile.bot_username.is_empty() {
-                    let drifted = *username != state.profile.bot_username;
-                    state.identity_drift.store(drifted, Ordering::Relaxed);
-                }
+            match tokio::time::timeout(Duration::from_millis(500), state.observation_status(probe))
+                .await
+            {
+                Ok(status) => Ok(to_value(status)),
+                Err(_) => Err(DaemonError::Rpc {
+                    code: -32_000,
+                    message: "local observation snapshot timed out".into(),
+                    data: None,
+                }),
             }
-            Ok(to_value(chanvoy_core::build_daemon_status(
-                state.profile.name.clone(),
-                state.socket_path.clone(),
-                state.profile.bot_username.clone(),
-                whoami_result,
-                ws_snapshot,
-                ipc_snapshot,
-                now_unix_millis(),
-            )))
         }
         "seed_cursors" => seed_cursors(state)
             .await
@@ -4265,6 +4260,10 @@ impl DaemonClient {
         self.call("profile_status", serde_json::json!({})).await
     }
 
+    pub async fn daemon_observation(&self) -> Result<DaemonStatus, DaemonError> {
+        self.call("daemon_observation", serde_json::json!({})).await
+    }
+
     pub async fn daemon_status(&self) -> Result<DaemonStatus, DaemonError> {
         self.call("daemon_status", serde_json::json!({})).await
     }
@@ -4375,6 +4374,32 @@ mod compat_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_is_allowed_without_opening_network_methods_under_refusal() {
+        assert_eq!(
+            LOCAL_ONLY_METHODS,
+            &[
+                "daemon_status",
+                "daemon_observation",
+                "profile_status",
+                "unsubscribe",
+                "attention_list",
+                "attention_show",
+                "shutdown"
+            ]
+        );
+        for network in [
+            "subscribe",
+            "whoami",
+            "read",
+            "wait",
+            "post",
+            "seed_cursors",
+        ] {
+            assert!(!LOCAL_ONLY_METHODS.contains(&network));
+        }
+    }
 
     /// The daemon reads the profile's credential exactly once.
     ///

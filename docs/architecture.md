@@ -56,6 +56,62 @@ subset (CLI + daemon); the channel 260 surface is documented in
 [STD-006 peer contract](https://github.com/lanytehq/crucible/tree/main/schemas/ipc)
 but not wired into the daemon yet.
 
+### Local observation and identity status
+
+The existing `daemon_status` local RPC takes `{}` and returns `DaemonStatus`;
+it includes a bounded authenticated identity probe. The additive
+`daemon_observation` RPC also takes `{}` and returns that status shape using
+local snapshots only. It performs no provider request, credential resolution,
+WebSocket setup, cursor write, migration, profile refresh or lifecycle operation.
+Both methods are allowed while identity is refused. The allowlist's name
+`LOCAL_ONLY_METHODS` describes refusal policy, rather than absence of network I/O.
+
+Two optional/defaulted fields provide additive wire compatibility:
+`remote_probe` is `verified`, `rejected-credential`, `timeout`, `unavailable` or
+`unknown`; missing/null or future spellings mean unknown. `identity_refused` is
+true, false or absent/null (unknown). Existing readers can ignore these additions.
+An observed wrong username or positive legacy drift remains a refusal.
+Configured username fallback is metadata, not observed identity proof.
+
+`daemon_observation` returns `remote_probe=unknown`, `mattermost_ok=false`
+(unverified by this call), configured username fallback and no fabricated provider
+error. It reports in-process refusal and authoritative observation admission
+without clearing either. Refusal is not persisted across daemon restarts. Only a
+successful expected identity clears it; authenticated identity-probe 401/403 or
+wrong username sets it. Inconclusive probes retain the existing latch.
+
+Identity probing allows one outstanding daemon-side future, including post-bind
+probing. Concurrent callers return unknown instead of queueing another probe.
+The provider budget is two seconds; CLI status allows that budget plus 750 ms
+transport margin. Local liveness and observation use a separate 750 ms budget.
+Start, setup and doctor share a ten-second health-assessment deadline. An RPC
+is not started without its full server budget and transport margin remaining;
+local responsiveness checks retain their independent budget. Each entry point
+starts at most four identity probes, including parent and generation probes.
+Predecessor shutdown and durable child startup have their own bounded lifecycle
+phases; cursor seeding is a separate existing operation.
+Observation state is sampled after provider I/O. Provider uncertainty or closed
+observation admission preserves a responsive daemon: healthy identity and
+observation readiness are separate properties.
+
+The CLI falls back from `daemon_observation` only on typed method-not-found
+(`-32601`), using bounded `profile_status` for local responsiveness and bounded
+`daemon_status` for compatible diagnostics. Missing typed evidence cannot certify
+healthy identity or authorize replacement. These are local RPC changes only;
+no routed IPC/channel-260 request or response shape changes.
+
+| Responsive local RPC | Remote evidence | Refusal latch | Admission | Disposition |
+| --- | --- | --- | --- | --- |
+| No | Any | Any | Any | `unresponsive-local` |
+| Yes | Rejected credential or observed wrong username | Any | Any | `identity-refused` |
+| Yes | Inconclusive | True | Any | `identity-refused` |
+| Yes | Expected username verified | False | Open | `healthy` |
+| Yes | Expected username verified | False | Closed, recovering or unknown | `degraded-remote` |
+| Yes | Inconclusive or old fields missing | False or unknown | Any | `degraded-remote` |
+
+The local receipt's `observation_ready` remains independent of this table.
+Neither successful disposition opens admission or ends an in-flight wait.
+
 ### Why a daemon at all?
 
 Two reasons:

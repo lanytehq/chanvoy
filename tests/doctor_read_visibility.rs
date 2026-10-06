@@ -34,7 +34,7 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(0),
         "stdout={stdout} stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -46,8 +46,10 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
     );
 
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
-    assert_eq!(v["exit_code"], 1, "report={stdout}");
+    assert_eq!(v["exit_code"], 0, "report={stdout}");
     assert_eq!(v["daemon"]["check"], "warn");
+    assert_eq!(v["daemon_disposition"], "degraded-remote");
+    assert_eq!(v["observation_ready"], false);
     assert_eq!(v["daemon"]["health"], "degraded");
     assert!(v["daemon"]["ws_last_error"].as_str().is_some());
     assert!(v["daemon"]["ws_reconnect_count"].as_u64().is_some());
@@ -65,7 +67,7 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
 
     let human = run_chanvoy(&env, &["doctor", "ops-updates"]).await;
     let human_stdout = String::from_utf8_lossy(&human.stdout);
-    assert_eq!(human.status.code(), Some(1), "{human_stdout}");
+    assert_eq!(human.status.code(), Some(0), "{human_stdout}");
     assert!(
         human_stdout.contains("ws_connection_state:"),
         "{human_stdout}"

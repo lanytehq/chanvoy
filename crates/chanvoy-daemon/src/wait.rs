@@ -1806,6 +1806,8 @@ mod tests {
             ipc_state: None,
             attention_state: Arc::new(tokio::sync::Mutex::new(AttentionState::default())),
             identity_drift: Arc::new(AtomicBool::new(false)),
+            observed_identity_drift: Arc::new(AtomicBool::new(false)),
+            probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
             reduce_writer: None,
             wait_owners: Arc::new(crate::wait_owner::WaitOwnerRegistry::new()),
             poll_cursors: crate::waitprims_poll::PollCursorStore::for_test("test"),
