@@ -1,97 +1,54 @@
 #!/usr/bin/env bash
-# Verify minisign + GPG signatures on release assets locally before
-# upload. Run by `make release-verify-signatures`; composite gate
-# `make release-verify` chains this with verify-public-keys.sh.
-#
-# Verification model:
-#   - For each chanvoy-v*-* binary, expect a .minisig and verify
-#     against the bundled chanvoy.pub
-#   - For checksums.txt, expect a .asc and verify against the GPG
-#     keyring (or CHANVOY_GPG_HOMEDIR override)
-#
-# Fails on any missing signature or mismatch.
+# Verify both detached formats on both manifests in an isolated keyring.
 set -euo pipefail
-
-usage() {
-    cat <<'EOF'
-Usage: verify-signatures.sh <release-dir>
-
-  release-dir  Directory containing binaries + signatures + chanvoy.pub
-
-Environment:
-  CHANVOY_MINISIGN_PUB   Path to minisign public key
-                         (default: <release-dir>/chanvoy.pub)
-  CHANVOY_GPG_HOMEDIR    Optional GPG homedir override
-
-Example:
-  scripts/verify-signatures.sh release/v0.2.2
-EOF
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+directory="${1:-dist/release}"
+# shellcheck source=release-common.sh
+# shellcheck disable=SC1091
+source "$root/scripts/release-common.sh"
+bash "$root/scripts/validate-release-assets.sh" "$directory" signed >/dev/null
+bash "$root/scripts/verify-checksums.sh" "$directory" >/dev/null
+bash "$root/scripts/verify-public-keys.sh" "$directory" >/dev/null
+temporary_gpg="$(mktemp -d "${TMPDIR:-/tmp}/chanvoy-signature-check.XXXXXX")"
+trap 'gpgconf --homedir "$temporary_gpg" --kill all >/dev/null 2>&1 || true; rm -rf "$temporary_gpg"' EXIT
+chmod 700 "$temporary_gpg"
+gpg --homedir "$temporary_gpg" --batch --import "$directory/chanvoy.gpg.asc" >/dev/null 2>&1 || {
+	echo 'error: public signing pin import failed' >&2
+	exit 1
 }
-
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    usage
-    exit 0
-fi
-
-if [ "$#" -ne 1 ]; then
-    usage >&2
-    exit 1
-fi
-
-release_dir="$1"
-minisign_pub="${CHANVOY_MINISIGN_PUB:-${release_dir}/chanvoy.pub}"
-gpg_homedir="${CHANVOY_GPG_HOMEDIR:-}"
-
-if [ ! -f "$minisign_pub" ]; then
-    echo "error: minisign public key not found at ${minisign_pub}" >&2
-    exit 1
-fi
-
-if ! command -v minisign >/dev/null 2>&1; then
-    echo "error: minisign is required" >&2
-    exit 1
-fi
-
-binaries=()
-while IFS= read -r path; do
-    binaries+=("$path")
-done < <(find "$release_dir" -maxdepth 1 -type f -name 'chanvoy-v*-*' \
-    ! -name '*.minisig' ! -name '*.asc' | sort)
-
-if [ "${#binaries[@]}" -eq 0 ]; then
-    echo "error: no chanvoy-v*-* binaries found in ${release_dir}" >&2
-    exit 1
-fi
-
-for binary in "${binaries[@]}"; do
-    sig="${binary}.minisig"
-    if [ ! -f "$sig" ]; then
-        echo "error: missing minisign signature ${sig}" >&2
-        exit 1
-    fi
-    minisign -V -p "$minisign_pub" -m "$binary" -x "$sig"
+primary="$(awk '$1=="gpg" {print $2}' "$directory/expected-fingerprints.txt")"
+signer="$(gpg --homedir "$temporary_gpg" --batch --with-colons --with-subkey-fingerprint --list-keys 2>/dev/null |
+	awk -F: '$1=="sub" {s=1;cap=$12;next} s && $1=="fpr" {if (cap ~ /s/) print $10; s=0}')"
+[[ "$signer" =~ ^[0-9A-F]{40}$ && "$primary" =~ ^[0-9A-F]{40}$ && "$signer" != "$primary" ]] || {
+	echo 'error: reviewed pin must hold one signing subkey' >&2
+	exit 1
+}
+for manifest in SHA256SUMS SHA512SUMS; do
+	minisign -Vm "$directory/$manifest" -p "$directory/chanvoy.pub" \
+		-x "$directory/$manifest.minisig" >/dev/null 2>&1 || {
+		echo 'error: required minisign manifest signature invalid' >&2
+		exit 1
+	}
+	gpg --homedir "$temporary_gpg" --batch --status-fd 1 \
+		--verify "$directory/$manifest.asc" "$directory/$manifest" >"$temporary_gpg/status" 2>/dev/null || {
+		echo 'error: required GPG manifest signature invalid' >&2
+		exit 1
+	}
+	awk -v primary="$primary" -v permitted="$signer" '
+      $1=="[GNUPG:]" && $2=="VALIDSIG" {valid++; subkey=$3; signer_primary=$NF}
+      $1=="[GNUPG:]" && $2=="GOODSIG" {good++}
+      $1=="[GNUPG:]" && $2 ~ /^(EXPKEYSIG|EXPSIG|REVKEYSIG|KEYREVOKED|BADSIG|ERRSIG)$/ {bad++}
+      END {if (bad || good!=1 || valid!=1 || signer_primary!=primary || subkey!=permitted) exit 1}
+    ' "$temporary_gpg/status" || { echo 'error: manifest signer, expiry or revocation check failed' >&2; exit 1; }
 done
-
-# GPG signature over checksums.txt is MANDATORY for v0.2.2 trust posture
-# (devrev review of PR #33, 2026-05-17). The brief's external-adopter
-# verification commands rely on both minisign-per-binary AND
-# gpg --verify checksums.txt.asc; an opt-out path would let a release
-# ship without manifest-level authenticity. To deliberately omit GPG,
-# that is a brief-level decision, not an impl-level silent skip.
-asc="${release_dir}/checksums.txt.asc"
-if [ ! -f "$asc" ]; then
-    echo "error: missing GPG signature over checksums.txt: ${asc}" >&2
-    echo "       run 'make release-sign' with CHANVOY_PGP_KEY_ID set" >&2
-    exit 1
-fi
-if ! command -v gpg >/dev/null 2>&1; then
-    echo "error: gpg is required to verify ${asc}" >&2
-    exit 1
-fi
-gpg_args=(--verify "$asc" "${release_dir}/checksums.txt")
-if [ -n "$gpg_homedir" ]; then
-    gpg_args=(--homedir "$gpg_homedir" "${gpg_args[@]}")
-fi
-gpg "${gpg_args[@]}"
-
-echo "[ok] signature verification passed (${#binaries[@]} binaries + checksums.txt manifest)"
+cmp -s "$directory/checksums.txt.asc" "$directory/SHA256SUMS.asc" || {
+	echo 'error: legacy checksum signature differs from manifest signature' >&2; exit 1;
+}
+inventory="$(release_binary_signatures)"
+while IFS= read -r signature; do
+	minisign -Vm "$directory/${signature%.minisig}" -p "$directory/chanvoy.pub" \
+		-x "$directory/$signature" >/dev/null 2>&1 || {
+		echo 'error: required per-binary minisign signature invalid' >&2; exit 1;
+	}
+done <<<"$inventory"
+echo '[ok] all four required manifest signatures verified'

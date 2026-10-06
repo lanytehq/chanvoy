@@ -1,7 +1,7 @@
-//! Fingerprint contract: decernor 0.1.4 inserter + verifier.
+//! Fingerprint contract: decernor 0.1.8 inserter + verifier.
 //!
 //! Tests stub `decernor` so CI does not need the binary. A live-path
-//! test runs only when `DECERNOR` (or PATH) is 0.1.4+.
+//! test runs only when `DECERNOR` (or PATH) is 0.1.8+.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -18,9 +18,19 @@ fn insert_script() -> PathBuf {
     repo_root().join("scripts/insert-expected-fingerprints.sh")
 }
 
-fn verify_script() -> PathBuf {
-    repo_root().join("scripts/verify-public-keys.sh")
+// Standalone historical TXT helpers are separate from receipt-bound release verification.
+const VERIFY_LEGACY: &str = r#"
+set -euo pipefail
+source "$1/scripts/lib/fingerprint-contract.sh"
+bin="$(chanvoy_require_decernor)"
+contract="$(chanvoy_read_expected_contract "$3")" || {
+  echo 'error: TBD placeholder or malformed contract' >&2; exit 1;
 }
+read -r mini gpg <<<"$contract"
+[[ "$mini" == "$(chanvoy_minisign_blob_fp "$bin" "$2/chanvoy.pub")" &&
+   "$gpg" == "$(chanvoy_gpg_primary_fp "$bin" "$2/chanvoy.gpg.asc")" ]]
+echo '[ok] historical public exports match explicit TXT contract'
+"#;
 
 fn check_decernor_script() -> PathBuf {
     repo_root().join("scripts/check-decernor.sh")
@@ -92,7 +102,11 @@ impl StubDecernor {
             r#"#!/usr/bin/env bash
 set -euo pipefail
 if [ "${{1:-}}" = "version" ]; then
-  echo "decernor {version}"
+  if [ "${{2:-}}" = "-e" ]; then
+    printf '%s\n' 'Version: {version}' 'Commit: synthetic' 'Build Date: synthetic' 'Go Version: synthetic' 'Gofulmen: synthetic' 'Crucible: synthetic'
+  else
+    echo "decernor {version}"
+  fi
   exit 0
 fi
 if [ "${{1:-}}" != "fingerprint" ]; then
@@ -160,10 +174,13 @@ fn run_insert(decernor: &Path, minisign: &Path, gpg: &Path, output: &Path) -> st
 
 fn run_verify(decernor: &Path, release_dir: &Path, expected: &Path) -> std::process::Output {
     Command::new("bash")
-        .arg(verify_script())
+        .arg("-c")
+        .arg(VERIFY_LEGACY)
+        .arg("legacy-verifier")
+        .arg(repo_root())
         .arg(release_dir)
         .env("DECERNOR", decernor)
-        .env("CHANVOY_EXPECTED_FINGERPRINTS", expected)
+        .arg(expected)
         .output()
         .expect("verify")
 }
@@ -178,7 +195,7 @@ fn stdout_of(out: &std::process::Output) -> String {
 
 #[test]
 fn happy_path_writes_both_lines_and_verify_passes() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let dest = dir.path().join("expected-fingerprints.txt");
@@ -205,7 +222,7 @@ fn happy_path_writes_both_lines_and_verify_passes() {
 
 #[test]
 fn missing_file_leaves_dest_unchanged() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let dest = dir.path().join("expected-fingerprints.txt");
@@ -222,7 +239,7 @@ fn missing_file_leaves_dest_unchanged() {
 
 #[test]
 fn private_marker_refuses_and_leaves_dest() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     fs::write(
@@ -250,7 +267,7 @@ fn minisign_blob_mismatch_or_duplicate_refuses() {
         r#"{"schema_version":"v0","kind":"minisign","class":"public","algorithm":"sha256","fingerprint":"91f40ebe76f5af9f554c8e32ff52a46937363cc8c303bf826fa30e52f037a340","fingerprint_scheme":"minisign-public-blob-sha256-v1","confidence":"high"}"#,
         r#"{"schema_version":"v0","kind":"minisign","class":"public","algorithm":"sha256","fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fingerprint_scheme":"minisign-public-blob-sha256-v1","confidence":"high"}"#
     );
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, &mini);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, &mini);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let dest = dir.path().join("expected-fingerprints.txt");
@@ -290,7 +307,7 @@ fn gpg_not_unique_primary_refuses() {
     "confidence": "high"
   }
 ]"#;
-    let stub = StubDecernor::new("0.1.4", gpg, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", gpg, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let dest = dir.path().join("expected-fingerprints.txt");
@@ -320,13 +337,13 @@ fn old_decernor_version_is_refused() {
         &dest,
     );
     assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("too old"));
+    assert!(stderr_of(&out).contains("Decernor >= 0.1.8"));
     assert_eq!(fs::read_to_string(&dest).unwrap(), TBD_CONTRACT);
 }
 
 #[test]
 fn verify_rejects_duplicate_minisign_line() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let v = run_verify(
@@ -340,7 +357,7 @@ fn verify_rejects_duplicate_minisign_line() {
 
 #[test]
 fn verify_rejects_extra_field() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let v = run_verify(&stub.bin, dir.path(), &fixture("expected-extra-field.txt"));
@@ -350,7 +367,7 @@ fn verify_rejects_extra_field() {
 
 #[test]
 fn verify_rejects_unknown_algo() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let v = run_verify(&stub.bin, dir.path(), &fixture("expected-unknown-algo.txt"));
@@ -360,7 +377,7 @@ fn verify_rejects_unknown_algo() {
 
 #[test]
 fn verify_rejects_malformed_hex() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let v = run_verify(
@@ -374,7 +391,7 @@ fn verify_rejects_malformed_hex() {
 
 #[test]
 fn prerelease_decernor_version_is_refused() {
-    let stub = StubDecernor::new("0.1.4-rc1", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8-rc1", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let dest = dir.path().join("expected-fingerprints.txt");
@@ -388,7 +405,7 @@ fn prerelease_decernor_version_is_refused() {
     assert!(!out.status.success());
     let err = stderr_of(&out);
     assert!(
-        err.contains("could not parse version") || err.contains("too old"),
+        err.contains("identity/version mismatch") || err.contains("Decernor >= 0.1.8"),
         "unexpected stderr: {err}"
     );
     assert_eq!(fs::read_to_string(&dest).unwrap(), TBD_CONTRACT);
@@ -408,12 +425,12 @@ fn malformed_decernor_version_is_refused() {
         &dest,
     );
     assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("could not parse version"));
+    assert!(stderr_of(&out).contains("identity/version mismatch"));
 }
 
 #[test]
-fn check_decernor_preflight_accepts_stable_014() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+fn check_decernor_preflight_accepts_stable_018() {
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let out = Command::new("bash")
         .arg(check_decernor_script())
         .env("DECERNOR", &stub.bin)
@@ -424,12 +441,12 @@ fn check_decernor_preflight_accepts_stable_014() {
         "preflight failed: {}",
         stderr_of(&out)
     );
-    assert!(stdout_of(&out).contains("decernor 0.1.4"));
+    assert!(stdout_of(&out).contains("decernor 0.1.8"));
 }
 
 #[test]
 fn check_decernor_preflight_rejects_prerelease() {
-    let stub = StubDecernor::new("0.1.4-rc1", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8-rc1", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let out = Command::new("bash")
         .arg(check_decernor_script())
         .env("DECERNOR", &stub.bin)
@@ -440,7 +457,7 @@ fn check_decernor_preflight_rejects_prerelease() {
 
 #[test]
 fn verify_fails_closed_on_tbd_placeholders() {
-    let stub = StubDecernor::new("0.1.4", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+    let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
     let dir = TempDir::new().unwrap();
     seed_publics(dir.path());
     let dest = dir.path().join("expected-fingerprints.txt");
@@ -451,7 +468,7 @@ fn verify_fails_closed_on_tbd_placeholders() {
 }
 
 #[test]
-fn live_decernor_014_on_fixtures() {
+fn live_decernor_018_on_fixtures() {
     let override_bin = std::env::var("DECERNOR")
         .ok()
         .filter(|p| Path::new(p).is_file());
@@ -467,8 +484,8 @@ fn live_decernor_014_on_fixtures() {
         return;
     }
     let text = String::from_utf8_lossy(&ver.stdout);
-    if !text.contains("0.1.4") && !text.contains("0.1.5") && !text.contains("0.2.") {
-        eprintln!("skip: decernor is not >= 0.1.4 ({text:?})");
+    if !text.contains("0.1.8") && !text.contains("0.1.9") && !text.contains("0.2.") {
+        eprintln!("skip: decernor is not >= 0.1.8 ({text:?})");
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -502,9 +519,12 @@ fn live_decernor_014_on_fixtures() {
     assert!(body.contains("gpg       5D8E7478C4EA08D97D39139CCEEA5771AED0966B"));
     let mut verify = Command::new("bash");
     verify
-        .arg(verify_script())
+        .arg("-c")
+        .arg(VERIFY_LEGACY)
+        .arg("legacy-verifier")
+        .arg(repo_root())
         .arg(dir.path())
-        .env("CHANVOY_EXPECTED_FINGERPRINTS", &dest);
+        .arg(&dest);
     if let Some(b) = &override_bin {
         verify.env("DECERNOR", b);
     } else {

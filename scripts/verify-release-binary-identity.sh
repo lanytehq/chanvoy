@@ -1,84 +1,21 @@
 #!/usr/bin/env bash
-# Execute a downloaded host binary and verify its embedded release identity.
-
+# Authenticate the exact staged cut before executing its canonical host binary.
 set -euo pipefail
-
-usage() {
-	cat >&2 <<'EOF'
-Usage: verify-release-binary-identity.sh <release-tag> <release-dir> [test-binary]
-
-Production callers omit test-binary so the canonical host artifact is selected
-from uname. The explicit path exists only for isolated verifier tests.
-EOF
-}
-
-fail() {
-	echo "error: $*" >&2
-	exit 1
-}
-
-[ "$#" -ge 2 ] && [ "$#" -le 3 ] || {
-	usage
-	exit 2
-}
-
-tag="$1"
-release_dir="$2"
-binary="${3:-}"
-
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
-	fail "not inside a git repository"
-cd "$repo_root"
-
-[ -f VERSION ] || fail "VERSION file not found"
-version="$(tr -d '[:space:]' <VERSION)"
-[ "$tag" = "v${version}" ] ||
-	fail "release tag ${tag} does not match VERSION ${version}"
-
-tagged_commit="$(git rev-parse "${tag}^{}" 2>/dev/null)" ||
-	fail "could not resolve annotated tag ${tag}"
-expected_commit="$(printf '%s' "$tagged_commit" | cut -c1-7)"
-
-if [ -z "$binary" ]; then
-	case "$(uname -s):$(uname -m)" in
-	Darwin:arm64) platform="macos-aarch64" ;;
-	Linux:x86_64) platform="linux-x86_64" ;;
-	Linux:aarch64 | Linux:arm64) platform="linux-aarch64" ;;
-	*) fail "no release artifact mapping for host $(uname -s)/$(uname -m)" ;;
-	esac
-	binary="${release_dir}/chanvoy-${tag}-${platform}"
-fi
-
-[ -f "$binary" ] || fail "downloaded host binary not found: ${binary}"
-chmod u+x "$binary"
-
-set +e
-identity="$("$binary" version --extended 2>&1)"
-identity_status=$?
-set -e
-[ "$identity_status" -eq 0 ] || {
-	printf '%s\n' "$identity" >&2
-	fail "downloaded host binary identity command failed"
-}
-
-reported_version="$(
-	printf '%s\n' "$identity" |
-		awk '$1 == "chanvoy" && NF == 2 { count += 1; value = $2 } END { if (count == 1) print value }'
-)"
-reported_commit="$(
-	printf '%s\n' "$identity" |
-		awk '$1 == "Commit:" && NF == 2 { count += 1; value = $2 } END { if (count == 1) print value }'
-)"
-reported_dirty="$(
-	printf '%s\n' "$identity" |
-		awk '$1 == "Dirty:" && NF == 2 { count += 1; value = $2 } END { if (count == 1) print value }'
-)"
-
-[ "$reported_version" = "$version" ] ||
-	fail "downloaded binary version ${reported_version:-missing} does not match ${version}"
-[ "$reported_commit" = "$expected_commit" ] ||
-	fail "downloaded binary commit ${reported_commit:-missing} does not match tagged commit ${expected_commit}"
-[ "$reported_dirty" = "false" ] ||
-	fail "downloaded binary must report Dirty: false (got ${reported_dirty:-missing})"
-
-echo "[ok] downloaded host binary identity matches ${tag} at ${expected_commit} (Dirty: false)"
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+# shellcheck source=release-common.sh
+# shellcheck disable=SC1091
+source "$root/scripts/release-common.sh"
+[[ $# == 2 ]] || { echo 'usage: verify-release-binary-identity.sh <tag> <directory>' >&2; exit 2; }
+CHANVOY_RELEASE_TAG="$(release_tag "$1")"
+export CHANVOY_RELEASE_TAG
+directory="$2"
+bash "$root/scripts/verify-signatures.sh" "$directory" >/dev/null
+commit="$(awk -F= '$1=="commit" {print $2}' "$directory.anchor")"
+case "$(uname -s):$(uname -m)" in
+Darwin:arm64) platform=macos-aarch64 ;;
+Linux:x86_64) platform=linux-x86_64 ;;
+Linux:aarch64 | Linux:arm64) platform=linux-aarch64 ;;
+*) echo 'error: host has no native release artifact' >&2; exit 1 ;;
+esac
+binary="$directory/chanvoy-$CHANVOY_RELEASE_TAG-$platform"
+bash "$root/scripts/lib/verify-release-identity.sh" "$binary" "${CHANVOY_RELEASE_TAG#v}" "$commit"

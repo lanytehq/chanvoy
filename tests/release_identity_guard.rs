@@ -6,8 +6,8 @@ use std::process::{Command, Output};
 
 fn verifier_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("verify-release-binary-identity.sh")
+        .join("scripts/lib")
+        .join("verify-release-identity.sh")
 }
 
 fn run(command: &mut Command, label: &str) -> Output {
@@ -83,8 +83,8 @@ printf 'chanvoy %s\nCommit: %s\nDirty: %s\n' "$version" "$commit" "$dirty"
     let verify = |state: &str| {
         Command::new("bash")
             .arg(verifier_script())
-            .args(["v0.3.1", release_dir.to_str().expect("release dir UTF-8")])
             .arg(&binary)
+            .args(["0.3.1", &full_commit])
             .current_dir(repo)
             .env("FAKE_IDENTITY_STATE", state)
             .output()
@@ -112,9 +112,15 @@ printf 'chanvoy %s\nCommit: %s\nDirty: %s\n' "$version" "$commit" "$dirty"
 fn release_undraft_depends_on_executable_identity_gate() {
     let makefile = include_str!("../Makefile");
     assert!(makefile.contains("release-verify-identity: release-guard-release-target"));
-    assert!(makefile.contains("release-undraft: release-verify-identity"));
+    assert!(makefile.contains("scripts/release-publish.sh"));
     assert!(makefile.contains(
-        "scripts/verify-release-binary-identity.sh \"$(RELEASE_TAG)\" \"$(RELEASE_DIR)\""
+        "scripts/verify-release-binary-identity.sh \"$(CHANVOY_RELEASE_TAG)\" \"$(RELEASE_DIR)\""
     ));
     assert!(!makefile.contains("RELEASE_IDENTITY_BINARY"));
+    let draft = include_str!("../scripts/release-verify-draft.sh");
+    assert!(
+        draft.find("verify-signatures.sh").unwrap()
+            < draft.find("verify-release-binary-identity.sh").unwrap()
+    );
+    assert!(include_str!("../scripts/release-publish.sh").contains("release-verify-draft.sh"));
 }

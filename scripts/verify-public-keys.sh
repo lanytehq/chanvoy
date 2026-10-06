@@ -1,101 +1,48 @@
 #!/usr/bin/env bash
-# Verify bundled public-key files match the checked-in contract by
-# recomputing the same decernor 0.1.4 records the inserter wrote.
-#
-# Load-bearing trust contract per devrev pin #4 (2026-05-09):
-# verification asserts against stable checked-in fingerprints, not
-# "some key file exists."
+# Verify public-only release exports against independently trusted tagged anchors.
 set -euo pipefail
-
-usage() {
-    cat <<'EOF'
-Usage: verify-public-keys.sh <release-dir>
-
-  release-dir  Directory containing chanvoy.pub and chanvoy.gpg.asc
-
-Environment:
-  CHANVOY_EXPECTED_FINGERPRINTS  Path to expected-fingerprints file
-                                  (default: keys/expected-fingerprints.txt
-                                   relative to repo root)
-  DECERNOR                       Explicit decernor binary (must be 0.1.4+)
-
-Checks (all mandatory):
-  - chanvoy.pub and chanvoy.gpg.asc are both present
-  - Neither file contains private-key markers
-  - expected file has both lines, neither TBD
-  - recomputed minisign-public-blob-sha256-v1 matches
-  - recomputed GPG primary (--gpg-role primary) matches
-
-Example:
-  scripts/verify-public-keys.sh release/v0.3.0
-EOF
-}
-
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    usage
-    exit 0
-fi
-
-if [ "$#" -ne 1 ]; then
-    usage >&2
-    exit 1
-fi
-
-release_dir="$1"
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-repo_root="$(cd "${script_dir}/.." && pwd)"
-# shellcheck source=lib/fingerprint-contract.sh
-source "${script_dir}/lib/fingerprint-contract.sh"
-fingerprints_file="${CHANVOY_EXPECTED_FINGERPRINTS:-${repo_root}/keys/expected-fingerprints.txt}"
-
-if [ ! -f "$fingerprints_file" ]; then
-    echo "error: expected-fingerprints file not found at ${fingerprints_file}" >&2
-    exit 1
-fi
-
-for key in "${release_dir}/chanvoy.pub" "${release_dir}/chanvoy.gpg.asc"; do
-    if [ ! -f "$key" ]; then
-        echo "error: missing public key file: ${key}" >&2
-        echo "       run 'make release-export-keys' with both" >&2
-        echo "       CHANVOY_MINISIGN_PUB and CHANVOY_PGP_KEY_ID set" >&2
-        exit 1
-    fi
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+# shellcheck source=release-decernor.sh
+# shellcheck disable=SC1091
+source "$root/scripts/release-decernor.sh"
+resolve_release_decernor ceremony
+directory="${1:-dist/release}"
+bash "$root/scripts/release-verify-staged-data.sh" "$directory" >/dev/null
+minisign_public="$directory/chanvoy.pub"
+pgp_public="$directory/chanvoy.gpg.asc"
+for public in "$minisign_public" "$pgp_public"; do
+	[[ -f "$public" && -s "$public" && ! -L "$public" ]] || {
+		echo 'error: exported public key is missing or unsafe' >&2
+		exit 1
+	}
 done
-
-chanvoy_refuse_private "${release_dir}/chanvoy.pub"
-chanvoy_refuse_private "${release_dir}/chanvoy.gpg.asc"
-
-parsed=""
-parse_status=0
-parsed="$(chanvoy_read_expected_contract "$fingerprints_file")" || parse_status=$?
-if [ "$parse_status" -eq 2 ]; then
-    echo "error: fingerprint contract still contains a TBD placeholder in ${fingerprints_file}" >&2
-    echo "       run scripts/insert-expected-fingerprints.sh against exported public files" >&2
-    echo "       (decernor 0.1.4+). Do not hand-type hex." >&2
-    exit 1
+grep -q '^untrusted comment:' "$minisign_public" || { echo 'error: malformed minisign public export' >&2; exit 1; }
+grep -q '^-----BEGIN PGP PUBLIC KEY BLOCK-----$' "$pgp_public" || { echo 'error: malformed GPG public export' >&2; exit 1; }
+if grep -qi 'secret' "$minisign_public" || grep -q 'PRIVATE KEY BLOCK' "$pgp_public"; then
+	echo 'error: private material forbidden in public exports' >&2
+	exit 1
 fi
-if [ "$parse_status" -ne 0 ]; then
-    exit 1
-fi
-expected_minisign="${parsed%%$'\t'*}"
-expected_gpg="${parsed#*$'\t'}"
-
-bin="$(chanvoy_require_decernor)"
-
-actual_minisign="$(chanvoy_minisign_blob_fp "$bin" "${release_dir}/chanvoy.pub")"
-actual_gpg="$(chanvoy_gpg_primary_fp "$bin" "${release_dir}/chanvoy.gpg.asc")"
-
-if [ "$actual_minisign" != "$expected_minisign" ]; then
-    echo "error: minisign fingerprint mismatch" >&2
-    echo "  expected: $expected_minisign" >&2
-    echo "  actual:   $actual_minisign" >&2
-    exit 1
-fi
-if [ "$actual_gpg" != "$expected_gpg" ]; then
-    echo "error: GPG fingerprint mismatch" >&2
-    echo "  expected: $expected_gpg" >&2
-    echo "  actual:   $actual_gpg" >&2
-    exit 1
-fi
-
-echo "[ok] public-key fingerprints match expected values"
+for kind in gpg minisign; do
+	if [[ "$kind" == gpg ]]; then public="$pgp_public"; else public="$minisign_public"; fi
+	if "$RELEASE_DECERNOR_BIN" fingerprint "$public" --kind "$kind" --class private \
+		--fail-on-empty --path-mode none >/dev/null 2>&1; then
+		echo 'error: private material forbidden in public exports' >&2
+		exit 1
+	else
+		[[ "$?" == 3 ]] || { echo 'error: public-only inspection failed' >&2; exit 1; }
+	fi
+done
+commit="$(awk -F= '$1=="commit" {print $2}' "$directory.anchor")"
+# The public export must be exactly the reviewed pin, not an enlarged keyring
+# export that quietly grants an additional signing subkey.
+pin="$(mktemp "${TMPDIR:-/tmp}/chanvoy-public-pin.XXXXXX")"
+trap 'rm -f "$pin"' EXIT
+git -C "$root" cat-file blob "$commit:docs/security/release-signing-keys.asc" >"$pin"
+cmp -s "$pin" "$pgp_public" || { echo 'error: public GPG export differs from reviewed tagged pin' >&2; exit 1; }
+"$RELEASE_DECERNOR_BIN" fingerprint verify \
+	--anchors "$directory/expected-fingerprints.txt" --anchors-ndjson "$directory/expected-fingerprints.ndjson" \
+	--gpg "$pgp_public" --minisign "$minisign_public" >/dev/null 2>&1 || {
+	echo 'error: public exports differ from trusted tagged fingerprint pair' >&2
+	exit 1
+}
+echo '[ok] public-only exports match the independently trusted tagged anchors'

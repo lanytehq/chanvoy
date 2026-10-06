@@ -1,109 +1,78 @@
 #!/usr/bin/env bash
-# Produce minisign + GPG signatures over chanvoy release assets.
-#
-# Signature model (per PER-030 brief verification snippets):
-#   - minisign signs each binary individually (one .minisig per binary)
-#     → external operators can verify any single download
-#   - GPG signs checksums.txt (single .asc over the manifest)
-#     → operators can verify the whole asset set via the manifest
-#
-# Signing keys are NEVER in CI. Per PER-030's manual-signing v0.2.2
-# baseline: Dave runs this locally; the keys have passphrases; nothing
-# touches GHA runners.
+# Maintainer-only: sign both exact checksum manifests in both required formats.
 set -euo pipefail
-
-usage() {
-    cat <<'EOF'
-Usage: sign-release-assets.sh <release-tag> <release-dir>
-
-  release-tag   GitHub release tag (e.g., v0.2.2)
-  release-dir   Directory containing chanvoy binaries + checksums.txt
-
-Environment:
-  CHANVOY_MINISIGN_KEY   Path to minisign secret key (required)
-  CHANVOY_PGP_KEY_ID     GPG key ID for checksums.txt signature (required;
-                         omitting it would produce a release that fails
-                         verify-signatures.sh — see PR #33 review)
-  CHANVOY_GPG_HOMEDIR    Optional GPG homedir override
-
-Produces:
-  <release-dir>/chanvoy-v*-*.minisig   one per binary (minisign)
-  <release-dir>/checksums.txt.asc      single (GPG over the manifest)
-
-Example:
-  CHANVOY_MINISIGN_KEY=~/.minisign/chanvoy.key \
-  CHANVOY_PGP_KEY_ID=ABC123... \
-    scripts/sign-release-assets.sh v0.2.2 release/v0.2.2
-EOF
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+# shellcheck source=release-common.sh
+# shellcheck disable=SC1091
+source "$root/scripts/release-common.sh"
+directory="${1:-dist/release}"
+tag="$(release_tag)"
+require_release_guard "$directory" >/dev/null
+bash "$root/scripts/release-verify-staged-data.sh" "$directory" >/dev/null
+bash "$root/scripts/validate-release-assets.sh" "$directory" checksummed >/dev/null
+bash "$root/scripts/verify-checksums.sh" "$directory" >/dev/null
+require_complete_pgp_config
+[[ -n "${CHANVOY_MINISIGN_KEY:-}" && -n "${CHANVOY_MINISIGN_PUB:-}" ]] || {
+	echo 'error: approved external minisign secret and public inputs required' >&2
+	exit 1
 }
-
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-    usage
-    exit 0
-fi
-
-if [ "$#" -ne 2 ]; then
-    usage >&2
-    exit 1
-fi
-
-release_tag="$1"
-release_dir="$2"
-minisign_key="${CHANVOY_MINISIGN_KEY:-}"
-pgp_key_id="${CHANVOY_PGP_KEY_ID:-}"
-gpg_homedir="${CHANVOY_GPG_HOMEDIR:-}"
-
-if [ -z "$minisign_key" ]; then
-    echo "error: CHANVOY_MINISIGN_KEY is required" >&2
-    exit 1
-fi
-
-if [ -z "$pgp_key_id" ]; then
-    echo "error: CHANVOY_PGP_KEY_ID is required" >&2
-    echo "       GPG signature over checksums.txt is mandatory for v0.2.2" >&2
-    echo "       trust posture (devrev PR #33 review)" >&2
-    exit 1
-fi
-
-if ! command -v minisign >/dev/null 2>&1; then
-    echo "error: minisign is required" >&2
-    exit 1
-fi
-
-if ! command -v gpg >/dev/null 2>&1; then
-    echo "error: gpg is required" >&2
-    exit 1
-fi
-
-if [ ! -f "${release_dir}/checksums.txt" ]; then
-    echo "error: missing ${release_dir}/checksums.txt" >&2
-    echo "       run 'make release-checksums' first" >&2
-    exit 1
-fi
-
-# minisign each binary individually.
-binaries=()
-while IFS= read -r path; do
-    binaries+=("$path")
-done < <(find "$release_dir" -maxdepth 1 -type f -name 'chanvoy-v*-*' \
-    ! -name '*.minisig' ! -name '*.asc' | sort)
-
-if [ "${#binaries[@]}" -eq 0 ]; then
-    echo "error: no chanvoy-v*-* binaries found in ${release_dir}" >&2
-    exit 1
-fi
-
-for binary in "${binaries[@]}"; do
-    minisign -S -s "$minisign_key" -m "$binary" -x "${binary}.minisig"
+python3 - "$root" "$CHANVOY_MINISIGN_KEY" "$CHANVOY_MINISIGN_PUB" "$CHANVOY_GPG_HOMEDIR" <<'PY'
+import pathlib
+import sys
+root, secret, public, home = (pathlib.Path(p) for p in sys.argv[1:])
+for path in (secret, public, home):
+    if not path.is_absolute() or any(p.is_symlink() for p in (path, *path.parents)):
+        raise SystemExit('error: explicit absolute nonsymlink signing inputs required')
+if not secret.is_file() or not public.is_file() or not home.is_dir():
+    raise SystemExit('error: configured signing inputs unavailable')
+if any(p.resolve().is_relative_to(root) for p in (secret, home)):
+    raise SystemExit('error: private signing inputs must be outside the repository')
+PY
+listing="$(gpg --homedir "$CHANVOY_GPG_HOMEDIR" --batch --with-colons --fingerprint \
+	--with-subkey-fingerprint --list-keys "${CHANVOY_PGP_KEY_ID%!}" 2>/dev/null)" || {
+	echo 'error: selected signing subkey unavailable' >&2; exit 1;
+}
+primary="$(awk -F: '$1=="pub" {p=1;next} p && $1=="fpr" {print $10;exit}' <<<"$listing")"
+subkey="$(awk -F: -v selected="${CHANVOY_PGP_KEY_ID%!}" \
+	'$1=="sub" {s=1;cap=$12;valid=$2;next} s && $1=="fpr" {if ($10==selected && cap ~ /s/ && valid !~ /[erd]/) print $10; s=0}' <<<"$listing")"
+[[ "$primary" == "$CHANVOY_GPG_SIGNING_FINGERPRINT" && "$subkey!" == "$CHANVOY_PGP_KEY_ID" ]] || {
+	echo 'error: selected live signing subkey must belong to approved primary' >&2; exit 1;
+}
+# Public inputs must match the tagged trust root before any signature is made.
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/chanvoy-sign-preflight.XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+commit="$(awk -F= '$1=="commit" {print $2}' "$directory.anchor")"
+git -C "$root" cat-file blob "$commit:docs/security/release-signing-keys.asc" >"$scratch/pin.asc"
+# shellcheck source=release-decernor.sh
+# shellcheck disable=SC1091
+source "$root/scripts/release-decernor.sh"
+resolve_release_decernor ceremony
+"$RELEASE_DECERNOR_BIN" fingerprint verify --anchors "$directory/expected-fingerprints.txt" \
+	--anchors-ndjson "$directory/expected-fingerprints.ndjson" --gpg "$scratch/pin.asc" \
+	--minisign "$CHANVOY_MINISIGN_PUB" >/dev/null 2>&1 || { echo 'error: signing public inputs differ from tagged anchors' >&2; exit 1; }
+permitted="$(gpg --homedir "$scratch" --batch --with-colons --with-subkey-fingerprint --show-keys "$scratch/pin.asc" 2>/dev/null |
+	awk -F: '$1=="sub" {s=1;cap=$12;next} s && $1=="fpr" {if (cap ~ /s/) print $10; s=0}')"
+[[ "$permitted!" == "$CHANVOY_PGP_KEY_ID" ]] || { echo 'error: signing selector differs from reviewed pin' >&2; exit 1; }
+require_release_guard "$directory" >/dev/null
+for manifest in SHA256SUMS SHA512SUMS; do
+	printf '[info] Signing %s in both formats; enter a passphrase if prompted.\n' "$manifest"
+	minisign -S -s "$CHANVOY_MINISIGN_KEY" -m "$directory/$manifest" \
+		-t "chanvoy $tag" -x "$directory/$manifest.minisig" >/dev/null 2>&1 || {
+		echo 'error: minisign signing failed; inspect partial local outputs before retrying' >&2; exit 1;
+	}
+	gpg --homedir "$CHANVOY_GPG_HOMEDIR" --batch --armor --detach-sign \
+		--local-user "$CHANVOY_PGP_KEY_ID" --output "$directory/$manifest.asc" \
+		"$directory/$manifest" >/dev/null 2>&1 || {
+		echo 'error: GPG signing failed; inspect partial local outputs before retrying' >&2; exit 1;
+	}
 done
-
-# GPG sign checksums.txt (manifest-level signature). Mandatory.
-gpg_args=(--batch --yes --armor --local-user "$pgp_key_id")
-if [ -n "$gpg_homedir" ]; then
-    gpg_args+=(--homedir "$gpg_homedir")
-fi
-gpg "${gpg_args[@]}" \
-    --output "${release_dir}/checksums.txt.asc" \
-    --detach-sign "${release_dir}/checksums.txt"
-
-echo "[ok] signed ${#binaries[@]} binaries + checksums.txt manifest for ${release_tag}"
+cp "$directory/SHA256SUMS.asc" "$directory/checksums.txt.asc"
+inventory="$(release_binary_signatures)"
+while IFS= read -r signature; do
+	minisign -S -s "$CHANVOY_MINISIGN_KEY" -m "$directory/${signature%.minisig}" \
+		-t "chanvoy $tag" -x "$directory/$signature" >/dev/null 2>&1 || {
+		echo 'error: binary signing failed; inspect partial local outputs before retrying' >&2; exit 1;
+	}
+done <<<"$inventory"
+bash "$root/scripts/validate-release-assets.sh" "$directory" signed-without-keys >/dev/null
+echo '[ok] both checksum manifests signed in both formats'

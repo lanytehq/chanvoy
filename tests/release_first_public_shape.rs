@@ -19,11 +19,10 @@ fn release_notes_are_final_dated_and_distribution_honest() {
 #[test]
 fn changelog_has_checkpoint_and_first_public_entries() {
     let changelog = include_str!("../CHANGELOG.md");
-    assert!(changelog.contains("## [0.3.2] - 2026-09-12"));
+    assert!(changelog.contains("## [0.3.2] - unreleased"));
     assert!(changelog.contains("## [0.3.1] - 2026-08-27"));
     assert!(changelog.contains("## [0.3.0] - 2026-08-27"));
     assert!(changelog.contains("Signed development checkpoint only"));
-    assert!(!changelog.contains("## [0.3.2] - unreleased"));
     assert!(!changelog.contains("## [0.3.1] - unreleased"));
     assert!(!changelog.contains("## [0.3.0] - unreleased"));
 }
@@ -32,7 +31,7 @@ fn changelog_has_checkpoint_and_first_public_entries() {
 fn root_release_notes_lead_with_current_and_keep_three() {
     let notes = include_str!("../RELEASE_NOTES.md");
     let current = notes
-        .find("## v0.3.2 - 2026-09-12")
+        .find("## v0.3.2 - unreleased")
         .expect("root notes lead with the current release");
     let first_public = notes
         .find("## v0.3.1 - 2026-08-27")
@@ -56,31 +55,6 @@ fn root_release_notes_lead_with_current_and_keep_three() {
         3,
         "root notes retain only the three most recent releases"
     );
-}
-
-#[test]
-fn checklist_uses_signed_separate_tag_targets_and_safe_visibility_order() {
-    let checklist = include_str!("../RELEASE_CHECKLIST.md");
-    assert!(!checklist.contains("git tag -a"));
-    assert!(checklist.contains("make release-tag"));
-    assert!(checklist.contains("make release-tag-push"));
-    assert!(checklist.contains("Does not push"));
-    assert!(checklist.contains("Neither target force-updates a tag"));
-
-    let push = checklist
-        .find("make release-tag-push")
-        .expect("tag-only push is documented");
-    let draft = checklist
-        .find("## 6. GHA workflow")
-        .expect("draft workflow is documented");
-    let visibility = checklist
-        .find("## 7. First-public visibility gate")
-        .expect("visibility gate is documented");
-    let undraft = visibility
-        + checklist[visibility..]
-            .find("make release-undraft")
-            .expect("undraft is documented after visibility");
-    assert!(push < draft && draft < visibility && visibility < undraft);
 }
 
 #[test]

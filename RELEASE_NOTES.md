@@ -2,7 +2,7 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
-## v0.3.2 - 2026-09-12
+## v0.3.2 - unreleased
 
 **Wait filters and optional follow coalescing** — operators can sit on one
 DM peer (`wait --dm`), on any DM to this bot (`wait --inbox`), or only on
