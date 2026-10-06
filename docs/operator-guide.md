@@ -121,7 +121,7 @@ Closed/recovering WebSocket admission also preserves it. A successful lifecycle
 receipt does not mean a wait can observe messages. Old daemons with missing typed
 fields report unknown evidence, rather than inferred token failure. Setup skips
 cursor seeding while degraded and keeps existing waits intact. Explicit profile
-refresh still requires fresh parent validation and a predecessor stop.
+refresh still requires fresh parent validation and an owned predecessor stop.
 
 Subsequent `chanvoy ...` commands work without `--profile` — the resolver picks the canonical profile from your sourced env automatically. Required env: `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN` (or the env name configured by `CHANVOY_TOKEN_ENV_NAME`).
 
@@ -135,6 +135,29 @@ chanvoy daemon start
 ```
 
 Use this path only when you have a specific reason to deviate from the canonical flow.
+
+### Confirmed daemon shutdown
+
+`chanvoy --profile <name> daemon stop` reports success only after the predecessor
+has terminated. The CLI checks its executable path, explicit daemon/profile
+arguments, native process birth identity, runtime file identity and the Unix
+socket's kernel peer PID before requesting shutdown or sending a force signal.
+An older process image at the same executable path remains eligible; a different
+path, a Linux deleted executable, missing identity evidence or changed runtime
+files prevents automatic stop.
+
+Unknown liveness, denied process inspection, failed signaling and a survivor
+after the grace window return nonzero with the PID and attempted operation.
+Runtime files remain in place, and an automatic replacement is blocked. An
+orphan socket without a readable predecessor PID is also retained. A confirmed
+dead predecessor's unchanged files can be removed only when the socket has no
+live owner.
+
+The exit observer uses macOS kernel process notifications or Linux pidfds
+(kernel 5.3 or newer); unavailable observation fails conservatively. Process
+identity checks harden accidental races within the existing Unix-account
+boundary. They do not make PID-based signal delivery atomic or add isolation
+between processes belonging to the same account.
 
 ## Profile and Team Naming Convention
 

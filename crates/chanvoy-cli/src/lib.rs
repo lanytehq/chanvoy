@@ -1,5 +1,6 @@
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 mod daemon_assessment;
+mod lifecycle;
 use chanvoy_core::recovery::DaemonDisposition;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -32,7 +33,7 @@ use chanvoy_core::{
     RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP,
     WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_INBOX_HELP,
 };
-use chanvoy_daemon::{daemon_client, ping, start, status, stop, DaemonError};
+use chanvoy_daemon::{daemon_client, ping, start, status, DaemonError};
 use chrono::{TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -56,7 +57,7 @@ pub enum CliError {
     #[error("{disposition:?}: {detail}")]
     DaemonAssessment {
         disposition: DaemonDisposition,
-        detail: &'static str,
+        detail: String,
     },
     /// CHAN-TASK-001: a background daemon spawn that never reached
     /// readiness. Distinct from `Daemon(NotRunning)` — that means "no daemon
@@ -3385,7 +3386,7 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
             )
         }
         DaemonCommand::Stop => {
-            stop(profile).await?;
+            stop_daemon_if_present(profile).await?;
             if json {
                 println!(
                     "{}",
@@ -4112,7 +4113,8 @@ async fn ensure_daemon_running_assessed(
         if daemon_reuse_decision(status, &identity.username) == DaemonReuseDecision::RefuseForeign {
             return Err(CliError::DaemonAssessment {
                 disposition: DaemonDisposition::IdentityRefused,
-                detail: "daemon's observed identity belongs to another profile; state retained",
+                detail: "daemon's observed identity belongs to another profile; state retained"
+                    .into(),
             });
         }
     }
@@ -4127,16 +4129,22 @@ async fn ensure_daemon_running_assessed(
     if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
         return Err(CliError::DaemonAssessment {
             disposition: DaemonDisposition::IdentityRefused,
-            detail: "parent identity does not match the persisted profile",
+            detail: "parent identity does not match the persisted profile".into(),
         });
     }
-    stop_daemon_if_present(&profile.name).await?;
+    if let Err(error) = stop_daemon_if_present(&profile.name).await {
+        return Err(CliError::DaemonAssessment {
+            disposition: assessment.disposition,
+            detail: error.to_string(),
+        });
+    }
     spawn_durable_daemon(profile, identity, &profile.name).await?;
     let assessment = daemon_assessment::assess_until(profile, deadline).await;
     if !assessment.disposition.successful() {
         return Err(CliError::DaemonAssessment {
             disposition: assessment.disposition,
-            detail: "newly started daemon did not establish usable local identity; state retained",
+            detail: "newly started daemon did not establish usable local identity; state retained"
+                .into(),
         });
     }
     Ok(DaemonLaunch {
@@ -4484,61 +4492,9 @@ fn detach_into_new_session(_cmd: &mut Command) {
     // detachment story is Unix-shaped (setsid / process groups).
 }
 
-/// Request bounded shutdown of the predecessor before a replacement spawn.
-const SHUTDOWN_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Stop only a revalidated predecessor and retain state unless death is confirmed.
 async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
-    let socket = socket_path_for_profile(profile);
-    if !socket.exists() {
-        return Ok(());
-    }
-    // Try graceful shutdown with a bounded timeout. A wedged daemon
-    // (SIGSTOPed, deadlocked, or stuck on a blocking dependency) holds
-    // the socket but never accepts the shutdown RPC. If the RPC doesn't
-    // complete in SHUTDOWN_RPC_TIMEOUT, fall through to the pid-file
-    // force-kill fallback instead of blocking auto-setup indefinitely.
-    let stop_outcome = tokio::time::timeout(SHUTDOWN_RPC_TIMEOUT, stop(profile)).await;
-    match stop_outcome {
-        Ok(Ok(_)) => {}
-        Ok(Err(DaemonError::NotRunning(_))) => return Ok(()),
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => {
-            // RPC timed out — daemon is wedged. Fall through to force-kill.
-        }
-    }
-    for _ in 0..20 {
-        if !socket_path_for_profile(profile).exists() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    // Socket still present after the shutdown grace window. Force-kill
-    // the pid recorded in the runtime-dir pid file, then sweep the
-    // SIGKILL-orphaned runtime files (SIGKILL skips the daemon's own
-    // `cleanup_runtime_files`). Uses `kill` via std::process::Command
-    // instead of pulling sysprims into the prod graph — a single-purpose
-    // shell-out is cheaper than a new prod dependency for one fallback.
-    if let Some(pid) = read_daemon_pid_for_force_kill(profile) {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        // Wait for the process to be reaped so the next start() doesn't
-        // see an inconsistent pid/socket state.
-        for _ in 0..20 {
-            if !is_pid_alive(pid) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-        // Sweep SIGKILL-orphaned runtime files. Ignoring errors because
-        // either file may already be absent.
-        let _ = std::fs::remove_file(socket_path_for_profile(profile));
-        let _ = std::fs::remove_file(pid_path_for_profile(profile));
-        return Ok(());
-    }
-    Err(CliError::Bootstrap(format!(
-        "daemon for profile {profile} did not exit within the shutdown grace \
-         window and no pid file was readable for the force-kill fallback"
-    )))
+    lifecycle::stop(profile).await.map_err(CliError::Bootstrap)
 }
 
 /// Read the daemon's pid from the runtime-dir pid file. Returns None on any

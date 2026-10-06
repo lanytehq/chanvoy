@@ -538,6 +538,12 @@ async fn auto_setup_recovers_from_stale_socket() {
         socket.exists(),
         "stale socket must be planted before auto-setup"
     );
+    std::fs::write(
+        env.chanvoy_runtime_dir()
+            .join(format!("{}.pid", env.profile_name)),
+        reaped_pid().await.to_string(),
+    )
+    .expect("record confirmed dead predecessor");
 
     let out = auto_setup_command(&env, "lanytehq", "bravo-devlead")
         .output()
@@ -560,6 +566,37 @@ async fn auto_setup_recovers_from_stale_socket() {
     );
 
     teardown_auto_setup_daemon(&env).await;
+}
+
+/// Missing predecessor identity must not be treated as a successful stop.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_retains_socket_without_readable_predecessor_pid() {
+    let env = TestEnv::new("socket-without-pid").await;
+    env.mock_baseline("synthetic-bot", "agent-bravo-devlead", "synthetic-team")
+        .await;
+    env.mock_empty_memberships("synthetic-team").await;
+    let socket = env.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    drop(listener);
+    let before = std::fs::metadata(&socket).unwrap();
+    let out = auto_setup_command(&env, "lanytehq", "bravo-devlead")
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["message"]
+        .as_str()
+        .unwrap()
+        .contains("state retained"));
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), before.ino());
+    assert!(!env
+        .chanvoy_runtime_dir()
+        .join(format!("{}.pid", env.profile_name))
+        .exists());
 }
 
 /// F6 — `ensure_daemon_running` zombie-stop path.

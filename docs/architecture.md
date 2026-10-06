@@ -259,7 +259,7 @@ Three restart shapes, all handled idempotently:
 
 | Shape | Detection | Recovery |
 |---|---|---|
-| Stale socket file (daemon died, file remains) | Bind fails with `EADDRINUSE`, then probe shows no listener | `auto-setup` / `daemon start` remove the stale file and bind fresh — no manual file movement |
+| Stale socket file (daemon died, file remains) | Local RPC has no listener | Start/setup clean only unchanged files of a confirmed-dead recorded predecessor with no live socket owner; missing identity retains state |
 | Wedged daemon (alive but unresponsive) | Ping over UDS times out | `auto-setup` / `daemon start` `SIGKILL` it via the pid file and respawn |
 | Identity drift (token now authenticates as a different bot) | Periodic `whoami()` re-check returns a different bot id | Daemon stays bound on the socket but refuses network-backed RPCs (`post`, `read`, `check`, `notifications`, `search`, `react`, etc.) with a clear diagnostic. `daemon status` remains queryable. Recovery: re-run `auto-setup` to re-validate end-to-end. |
 
