@@ -19,6 +19,45 @@ pub(super) struct Assessment {
     pub observation_ready: Option<bool>,
 }
 
+impl Assessment {
+    pub(super) fn from_status(status: DaemonStatus, expected: &str) -> Self {
+        Self {
+            disposition: status_disposition(&status, expected),
+            observation_ready: observation_ready(&status),
+            status: Some(status),
+        }
+    }
+
+    /// Later inconclusive evidence cannot erase a refusal observed during this
+    /// operation. Only a verified expected identity with an explicitly clear
+    /// latch can do so; a configured-name fallback is never that evidence.
+    pub(super) fn absorb(&mut self, mut next: Self, expected: &str) {
+        if self.disposition == DaemonDisposition::IdentityRefused
+            && next.disposition != DaemonDisposition::IdentityRefused
+            && !next
+                .status
+                .as_ref()
+                .is_some_and(|s| verified_expected_identity(s, expected))
+        {
+            next.disposition = DaemonDisposition::IdentityRefused;
+        }
+        *self = next;
+    }
+}
+
+pub(super) fn observed_username(status: &DaemonStatus) -> Option<&str> {
+    (status.remote_probe == Some(RemoteProbeOutcome::Verified)
+        && status.mattermost_ok
+        && !status.mattermost_username.is_empty())
+    .then_some(status.mattermost_username.as_str())
+}
+
+pub(super) fn verified_expected_identity(status: &DaemonStatus, expected: &str) -> bool {
+    status.identity_refused == Some(false)
+        && !status.mattermost_identity_drift.unwrap_or(false)
+        && observed_username(status) == Some(expected)
+}
+
 pub(super) fn observation_ready(status: &DaemonStatus) -> Option<bool> {
     if let Some(closed) = status.ws_observation_admission_closed {
         return Some(!closed);
@@ -37,11 +76,8 @@ pub(super) fn status_disposition(status: &DaemonStatus, expected: &str) -> Daemo
     };
     let probe = IdentityProbe {
         outcome,
-        observed_username: if outcome == RemoteProbeOutcome::Verified
-            && status.mattermost_ok
-            && !status.mattermost_username.is_empty()
-        {
-            Some(status.mattermost_username.clone())
+        observed_username: if outcome == RemoteProbeOutcome::Verified {
+            observed_username(status).map(str::to_owned)
         } else {
             None
         },

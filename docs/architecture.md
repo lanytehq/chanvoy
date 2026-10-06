@@ -260,7 +260,7 @@ Three restart shapes, all handled idempotently:
 | Shape | Detection | Recovery |
 |---|---|---|
 | Stale socket file (daemon died, file remains) | Local RPC has no listener | Start/setup clean only unchanged files of a confirmed-dead recorded predecessor with no live socket owner; missing identity retains state |
-| Wedged daemon (alive but unresponsive) | Ping over UDS times out | `auto-setup` / `daemon start` `SIGKILL` it via the pid file and respawn |
+| Wedged daemon (alive but unresponsive) | Local UDS probe times out | After fresh parent validation, revalidate process/runtime ownership around shutdown and any force signal; cleanup and successor require confirmed termination |
 | Identity drift (token now authenticates as a different bot) | Periodic `whoami()` re-check returns a different bot id | Daemon stays bound on the socket but refuses network-backed RPCs (`post`, `read`, `check`, `notifications`, `search`, `react`, etc.) with a clear diagnostic. `daemon status` remains queryable. Recovery: re-run `auto-setup` to re-validate end-to-end. |
 
 The drift gate is intentionally one-way: the daemon doesn't try to

@@ -859,6 +859,9 @@ struct RestartOwnership {
 /// the profile: `chanvoy --profile <name> whoami`.
 fn preflight_failure_summary(err: &CliError) -> String {
     match err {
+        CliError::IdentityRejected { status } => {
+            format!("server rejected this environment's credential (HTTP {status})")
+        }
         // `CoreError::Api` is every non-success response, not only a refusal
         // of this credential. Reading them all as "your credential was
         // rejected" would send an operator to re-source an identity that is
@@ -911,58 +914,89 @@ fn score_generation(
 
 async fn probe_restart_ownership(profile_name: &str) -> RestartOwnership {
     let profile = match load_profile(profile_name) {
-        Ok(p) => p,
-        Err(e) => {
+        Ok(profile) => profile,
+        Err(error) => {
             return RestartOwnership {
                 ownable: false,
-                profile: profile_name.to_string(),
+                profile: profile_name.into(),
                 cli_username: None,
                 daemon_username: None,
-                reason: format!("profile load failed: {e}"),
-            };
-        }
-    };
-    let identity = match validate_persisted_profile_identity(&profile).await {
-        Ok(id) => id,
-        Err(e) => {
-            return RestartOwnership {
-                ownable: false,
-                profile: profile_name.to_string(),
-                cli_username: None,
-                daemon_username: None,
-                reason: format!("start preflight failed: {}", preflight_failure_summary(&e)),
-            };
-        }
-    };
-    match status(profile_name).await {
-        Ok(st) => {
-            let daemon_user = st.mattermost_username.clone();
-            if identity.username == daemon_user {
-                RestartOwnership {
-                    ownable: true,
-                    profile: profile_name.to_string(),
-                    cli_username: Some(identity.username),
-                    daemon_username: Some(daemon_user),
-                    reason: "cli whoami matches daemon-reported identity".into(),
-                }
-            } else {
-                RestartOwnership {
-                    ownable: false,
-                    profile: profile_name.to_string(),
-                    cli_username: Some(identity.username),
-                    daemon_username: Some(daemon_user),
-                    reason: "cli whoami does not match daemon-reported identity".into(),
-                }
+                reason: format!("profile load failed: {error}"),
             }
         }
-        Err(e) => RestartOwnership {
+    };
+    probe_restart_ownership_with_status(&profile, daemon_assessment::deadline())
+        .await
+        .0
+}
+
+fn ownership_from_status(
+    profile: &Profile,
+    identity: &Identity,
+    status: &DaemonStatus,
+) -> RestartOwnership {
+    let ownable = daemon_assessment::verified_expected_identity(status, &identity.username);
+    RestartOwnership {
+        ownable,
+        profile: profile.name.clone(),
+        cli_username: Some(identity.username.clone()),
+        daemon_username: daemon_assessment::observed_username(status).map(str::to_owned),
+        reason: if ownable {
+            "cli whoami matches a verified daemon identity"
+        } else {
+            "daemon identity is refused or unverified; configured fallback cannot prove ownership"
+        }
+        .into(),
+    }
+}
+
+/// Return the actual daemon evidence as well as the ownership verdict, so a
+/// diagnostic cannot discard a refusal discovered by its generation probe.
+async fn probe_restart_ownership_with_status(
+    profile: &Profile,
+    deadline: tokio::time::Instant,
+) -> (RestartOwnership, Option<DaemonStatus>) {
+    let identity =
+        match within_health_budget(deadline, validate_persisted_profile_identity(profile)).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                return (
+                    RestartOwnership {
+                        ownable: false,
+                        profile: profile.name.clone(),
+                        cli_username: None,
+                        daemon_username: None,
+                        reason: format!(
+                            "start preflight failed: {}",
+                            preflight_failure_summary(&error)
+                        ),
+                    },
+                    None,
+                )
+            }
+        };
+    if deadline.saturating_duration_since(tokio::time::Instant::now())
+        >= daemon_assessment::REMOTE_BUDGET
+    {
+        if let Ok(Ok(status)) =
+            tokio::time::timeout(daemon_assessment::REMOTE_BUDGET, status(&profile.name)).await
+        {
+            return (
+                ownership_from_status(profile, &identity, &status),
+                Some(status),
+            );
+        }
+    }
+    (
+        RestartOwnership {
             ownable: false,
-            profile: profile_name.to_string(),
+            profile: profile.name.clone(),
             cli_username: Some(identity.username),
             daemon_username: None,
-            reason: format!("daemon unreachable for ownership probe: {e}"),
+            reason: "daemon identity probe unavailable within the remaining budget".into(),
         },
-    }
+        None,
+    )
 }
 
 async fn handle_version(
@@ -5125,14 +5159,48 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     let mut hard_failure = false;
 
     // --- daemon reachability + status (best-effort) ---
-    let assessment = daemon_assessment::assess_until(&profile, deadline).await;
+    let mut assessment = daemon_assessment::assess_until(&profile, deadline).await;
+    let cli_info = resolve_host_build_info();
+    let mut ownership = RestartOwnership {
+        ownable: false,
+        profile: profile_name.into(),
+        cli_username: None,
+        daemon_username: None,
+        reason: "generation not scored without bounded verified identity evidence".into(),
+    };
+    if assessment.disposition == DaemonDisposition::Healthy
+        && deadline.saturating_duration_since(tokio::time::Instant::now())
+            >= daemon_assessment::REMOTE_BUDGET
+    {
+        let (probed_ownership, later) =
+            probe_restart_ownership_with_status(&profile, deadline).await;
+        ownership = probed_ownership;
+        let next = if let Some(status) = later {
+            daemon_assessment::Assessment::from_status(status, &profile.bot_username)
+        } else if let Ok(Ok(local)) = tokio::time::timeout(
+            daemon_assessment::LOCAL_BUDGET,
+            daemon_client(profile_name).daemon_observation(),
+        )
+        .await
+        {
+            daemon_assessment::Assessment::from_status(local, &profile.bot_username)
+        } else {
+            daemon_assessment::Assessment {
+                disposition: DaemonDisposition::DegradedRemote,
+                status: None,
+                observation_ready: None,
+            }
+        };
+        assessment.absorb(next, &profile.bot_username);
+    }
+
     let mut daemon_disposition = assessment.disposition;
     let observation_ready = assessment.observation_ready;
-    let (daemon_check, daemon_block, daemon_binary) = match assessment.status {
+    let (_initial_daemon_check, mut daemon_block, daemon_binary) = match assessment.status {
         Some(st) => {
             let drifted = st.mattermost_identity_drift.unwrap_or(false);
             let ws_degraded = daemon_ws_degraded(&st);
-            let (check, daemon_hard_failure) = doctor_daemon_assessment(&st, &profile.bot_username);
+            let (check, daemon_hard_failure) = doctor_disposition_assessment(daemon_disposition);
             hard_failure |= daemon_hard_failure;
             if check != CheckVerdict::Warn {
                 checks.push(check);
@@ -5155,7 +5223,9 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     ws_reconnect_count: st.ws_reconnect_count,
                     ws_catchup_in_flight: st.ws_catchup_in_flight,
                     ws_observation_admission_closed: st.ws_observation_admission_closed,
-                    reason: if drifted {
+                    reason: if daemon_disposition == DaemonDisposition::IdentityRefused {
+                        Some("daemon reports authoritative identity refusal; network RPCs are refused".into())
+                    } else if drifted {
                         Some(
                             "daemon reports identity drift; network RPCs through the daemon are refused"
                                 .into(),
@@ -5208,39 +5278,17 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         }
     };
 
-    // --- generation (reuse ownership gate; no bare active_profile greenwash) ---
-    let cli_info = resolve_host_build_info();
-    let ownership = if daemon_disposition == DaemonDisposition::Healthy
-        && deadline.saturating_duration_since(tokio::time::Instant::now())
-            >= daemon_assessment::REMOTE_BUDGET
-    {
-        tokio::time::timeout(
-            daemon_assessment::REMOTE_BUDGET,
-            probe_restart_ownership(profile_name),
-        )
-        .await
-        .ok()
-    } else {
-        None
-    }
-    .unwrap_or_else(|| RestartOwnership {
-        ownable: false,
-        profile: profile_name.into(),
-        cli_username: None,
-        daemon_username: None,
-        reason: "generation not scored without bounded verified identity evidence".into(),
-    });
     let daemon_info = daemon_binary;
     let (generation_scored, generation_match) =
         score_generation(Some(&ownership), &cli_info, daemon_info.as_ref());
-    let generation_check = if !generation_scored {
+    let mut generation_check = if !generation_scored {
         CheckVerdict::Unavailable
     } else if generation_match == Some(true) {
         CheckVerdict::Pass
     } else {
         CheckVerdict::Warn
     };
-    let generation_block = DoctorGenerationBlock {
+    let mut generation_block = DoctorGenerationBlock {
         check: generation_check,
         generation_scored,
         generation_match,
@@ -5495,6 +5543,24 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         None
     };
 
+    // Keep the final receipt aligned with all identity evidence discovered by
+    // this operation, including the independent parent probe. A parent success
+    // cannot clear an authoritative daemon refusal observed above.
+    let (daemon_check, _) = doctor_disposition_assessment(daemon_disposition);
+    if daemon_disposition == DaemonDisposition::IdentityRefused {
+        hard_failure = true;
+        daemon_block.reason =
+            Some("authoritative identity refusal observed during this diagnostic".into());
+        generation_block.generation_scored = false;
+        generation_block.generation_match = None;
+        generation_block.ownership.ownable = false;
+        generation_block.ownership.reason =
+            "authoritative identity refusal prevents ownership scoring".into();
+        generation_block.reason =
+            Some("generation not scored after authoritative identity refusal".into());
+        generation_check = CheckVerdict::Unavailable;
+        generation_block.check = generation_check;
+    }
     // Independent clock/channel findings still score. Unobserved metadata
     // caused solely by an inconclusive identity probe is diagnostic only.
     if generation_check != CheckVerdict::Unavailable
@@ -5537,8 +5603,13 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     Ok(())
 }
 
+#[cfg(test)]
 fn doctor_daemon_assessment(status: &DaemonStatus, expected: &str) -> (CheckVerdict, bool) {
-    match daemon_assessment::status_disposition(status, expected) {
+    doctor_disposition_assessment(daemon_assessment::status_disposition(status, expected))
+}
+
+fn doctor_disposition_assessment(disposition: DaemonDisposition) -> (CheckVerdict, bool) {
+    match disposition {
         DaemonDisposition::Healthy => (CheckVerdict::Pass, false),
         DaemonDisposition::DegradedRemote => (CheckVerdict::Warn, false),
         _ => (CheckVerdict::Fail, true),
@@ -7925,6 +7996,59 @@ mod tests {
 
     const COMMIT_A: &str = "aaaaaaa1111111aaaaaaa1111111aaaaaaa11111";
     const COMMIT_B: &str = "bbbbbbb2222222bbbbbbb2222222bbbbbbb22222";
+
+    #[test]
+    fn generation_ownership_requires_observed_typed_identity() {
+        let profile = sample_profile();
+        let identity: Identity = serde_json::from_value(
+            serde_json::json!({"id":"synthetic-bot","username":"agent-seat","is_bot":true}),
+        )
+        .unwrap();
+        let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        assert!(ownership_from_status(&profile, &identity, &status).ownable);
+        for outcome in [
+            chanvoy_core::recovery::RemoteProbeOutcome::Unknown,
+            chanvoy_core::recovery::RemoteProbeOutcome::Timeout,
+            chanvoy_core::recovery::RemoteProbeOutcome::Unavailable,
+            chanvoy_core::recovery::RemoteProbeOutcome::RejectedCredential,
+        ] {
+            status.remote_probe = Some(outcome);
+            status.mattermost_ok = false;
+            let ownership = ownership_from_status(&profile, &identity, &status);
+            assert!(!ownership.ownable);
+            assert!(ownership.daemon_username.is_none());
+        }
+        status.remote_probe = None;
+        status.identity_refused = None;
+        status.mattermost_ok = true;
+        assert!(!ownership_from_status(&profile, &identity, &status).ownable);
+        status.remote_probe = Some(chanvoy_core::recovery::RemoteProbeOutcome::Verified);
+        status.identity_refused = Some(true);
+        assert!(!ownership_from_status(&profile, &identity, &status).ownable);
+    }
+
+    #[test]
+    fn assessment_retains_refusal_through_unknown_and_clears_on_expected_success() {
+        let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        status.identity_refused = Some(true);
+        let mut assessment =
+            daemon_assessment::Assessment::from_status(status.clone(), "agent-seat");
+        status.remote_probe = Some(chanvoy_core::recovery::RemoteProbeOutcome::Unknown);
+        status.identity_refused = Some(false);
+        status.mattermost_ok = false;
+        assessment.absorb(
+            daemon_assessment::Assessment::from_status(status.clone(), "agent-seat"),
+            "agent-seat",
+        );
+        assert_eq!(assessment.disposition, DaemonDisposition::IdentityRefused);
+        status.remote_probe = Some(chanvoy_core::recovery::RemoteProbeOutcome::Verified);
+        status.mattermost_ok = true;
+        assessment.absorb(
+            daemon_assessment::Assessment::from_status(status, "agent-seat"),
+            "agent-seat",
+        );
+        assert_eq!(assessment.disposition, DaemonDisposition::Healthy);
+    }
 
     #[test]
     fn generation_matched_live_ws_error_preserves_a_degraded_daemon() {

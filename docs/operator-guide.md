@@ -1140,9 +1140,10 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
 ## Daemon Lifecycle
 
 - `chanvoy --profile <name> daemon start` — **durable background start**
-  - validates the token, bot identity, and team access **in this process**, then spawns a detached daemon that survives the invocation
-  - reports `already running` if an existing daemon is healthy (network-aware check: a daemon holding a revoked or drifted credential is replaced, not reused)
-  - reconciles a stale socket and a dead pid file automatically — no manual file movement
+  - preserves a locally responsive healthy or degraded daemon; remote uncertainty or closed observation admission does not trigger replacement
+  - before starting or replacing a daemon, validates the current parent credential, bot identity and team access; the new daemon is detached and survives the invocation
+  - replaces an authoritatively refused predecessor only after independent process/runtime ownership and confirmed termination; unresolved identity retains state
+  - cleans stale runtime files only for a confirmed-dead recorded predecessor with no live socket owner
   - refuses when the live credential authenticates as a different bot than the profile records
   - requires an explicit profile (`--profile`, `CHANVOY_PROFILE`, or a sourced agent identity)
   - never creates or refreshes a profile, moves the `active_profile` marker, seeds cursors, or rewrites `bot_username` — use `auto-setup` for those
@@ -1154,14 +1155,14 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
 - `chanvoy daemon status`
   - reports socket path, profile, and Mattermost health
 - `chanvoy --profile <name> daemon stop`
-  - stops a running daemon
-  - returns `NotRunning` if the daemon is already absent
+  - confirms termination of an independently owned predecessor before reporting success
+  - succeeds when both runtime files are absent; uncertain residue or liveness returns nonzero with state retained
   - requires an explicit profile
 
 Observed lifecycle behavior:
 
 - `auto-setup` and `daemon start` share one durable-spawn primitive, so a daemon started either way has the same lifetime: it is its own session leader and outlives the shell or agent tool invocation that started it
-- stale socket + dead pid cleanup works on the next `daemon start` or `auto-setup`
+- stale socket + recorded dead PID cleanup is guarded by unchanged runtime identity and absence of a live socket owner
 - a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; its diagnostic provides the `RUST_LOG=info ... daemon serve` foreground recipe
 - legacy attention-key migration is bounded, best-effort maintenance after local state recovery; slow or unavailable Mattermost REST does not delay local socket readiness
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior
