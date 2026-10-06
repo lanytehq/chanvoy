@@ -1,243 +1,176 @@
-name: release
-
-# PER-031: tag-triggered build/draft-only release workflow.
-#
-# Triggered ONLY on tag push matching v*. No pull_request,
-# pull_request_target, or workflow_dispatch (per secrev 2026-05-09 pin:
-# secrets and release material stay out of untrusted PR contexts; manual
-# dispatch is not needed for v0.2.2 baseline).
-#
-# Workflow's job is to compile and draft. Signing is local-only per the
-# manual-signing v0.2.2 baseline (PER-030 RELEASE_CHECKLIST.md flow).
-
-'on':
+name: Release
+on:
   push:
-    tags:
-      - 'v*'
-
-# Workflow-default permissions are read-only. Each job either inherits
-# this or pins it explicitly. Only the final aggregate job overrides
-# to contents: write — it is the only step that mutates repository
-# state (creating the draft release + uploading assets).
-#
-# Per secrev 2026-05-11 PR #56 medium finding + cxotech absorption pin:
-# job-level least privilege. No id-token: write, no actions: write, no
-# packages: write anywhere.
+    tags: ['v*']
 permissions:
   contents: read
-
 env:
   CARGO_TERM_COLOR: always
-  MSRV: "1.89.0"
-
 jobs:
-  validate-version:
-    name: Validate VERSION matches tag
-    runs-on: ubuntu-22.04
+  validate:
+    name: Verify exact signed tag
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Validate VERSION matches tag
-        id: version
+      version: ${{ steps.identity.outputs.version }}
+      commit: ${{ steps.identity.outputs.commit }}
+      tag_object: ${{ steps.identity.outputs.tag_object }}
+    defaults:
+      run:
         shell: bash
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-pinned verification helper
+        run: bash scripts/release-install-decernor.sh
+      - name: Verify annotated object, version, pin and GitHub status
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANVOY_RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          file_version="$(cat VERSION)"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [ "$file_version" != "$tag_version" ]; then
-            echo "VERSION mismatch: file=$file_version tag=$tag_version"
-            exit 1
-          fi
-          echo "version=$file_version" >> "$GITHUB_OUTPUT"
-          echo "Validated VERSION=$file_version against tag=$GITHUB_REF_NAME"
-
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          authorization="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          bash scripts/release-restore-tag-ref.sh
+          bash scripts/release-guard-tag-version.sh
+          bash scripts/verify-pinned-tag.sh
+          object="$(git rev-parse "refs/tags/$CHANVOY_RELEASE_TAG")"
+          commit="$(git rev-parse HEAD)"
+          tag_json="$(gh api "repos/lanytehq/chanvoy/git/tags/$object")"
+          jq -e --arg tag "$CHANVOY_RELEASE_TAG" --arg commit "$commit" \
+            '.tag == $tag and .object.type == "commit" and .object.sha == $commit and
+            .verification.verified == true and .verification.reason == "valid"' \
+            <<<"$tag_json" >/dev/null
+          printf 'tag_object=%s\ncommit=%s\nversion=%s\n' "$object" "$commit" "$(cat VERSION)" >>"$GITHUB_OUTPUT"
   build:
-    name: Build (${{ matrix.asset_name }})
-    needs: validate-version
-    runs-on: ${{ matrix.os }}
+    name: Binary (${{ matrix.platform }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            asset_os: linux
-            asset_arch: x86_64
-            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-linux-x86_64
-          # Native arm64 build on the Arm-Limited managed self-hosted
-          # runner deployed for lanytehq. Native > cross-compile here:
-          # the binary that ships is the binary that built+tested on
-          # actual aarch64 hardware (no wrong-glibc / wrong-symbol-
-          # version surprises). Scales naturally to Windows-arm64 when
-          # that lands in a v0.2.3+ brief.
-          - os: ubuntu-latest-arm64-s
+            platform: linux-x86_64
+          - runner: ubuntu-latest-arm64-s
             target: aarch64-unknown-linux-gnu
-            asset_os: linux
-            asset_arch: aarch64
-            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-linux-aarch64
-          - os: macos-14
+            platform: linux-aarch64
+          - runner: macos-14
             target: aarch64-apple-darwin
-            asset_os: macos
-            asset_arch: aarch64
-            asset_name: chanvoy-v${{ needs.validate-version.outputs.version }}-macos-aarch64
-    timeout-minutes: 15
+            platform: macos-aarch64
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout exact verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
-          fetch-depth: 1
+          ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
-      - name: Setup Rust ${{ env.MSRV }}
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.89.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # master (pinned commit)
         with:
-          toolchain: ${{ env.MSRV }}
-          targets: ${{ matrix.target }}
-      # make build-release invokes `cargo build --release --locked` per
-      # AC 7a (entarch P2). The --locked contract lives in the Makefile,
-      # not as a workflow-only bypass, so local `make build-release` and
-      # CI `make build-release` resolve dependencies identically. Every
-      # matrix row builds natively on its target architecture — no
-      # cross-compile gymnastics, no extra linker setup.
-      - name: Build release binary
-        shell: bash
+          toolchain: 1.89.0
+      - name: Verify native host
         env:
-          CARGO_BUILD_TARGET: ${{ matrix.target }}
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: test "$(rustc -vV | awk '/^host:/{print $2}')" = "$EXPECTED_TARGET"
+      - name: Build standalone binary
+        run: make build-release
+      - name: Stage exact binary
+        id: binary
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          make build-release
-      - name: Stage release asset
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/chanvoy" "dist/${{ matrix.asset_name }}"
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+          asset="chanvoy-v${RELEASE_VERSION}-${RELEASE_PLATFORM}"
+          cp target/release/chanvoy "$asset"
+          printf 'asset=%s\n' "$asset" >>"$GITHUB_OUTPUT"
+      - name: Upload exact binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: build-${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          name: binary-${{ matrix.platform }}
+          path: ${{ steps.binary.outputs.asset }}
           if-no-files-found: error
           retention-days: 7
-
-  draft-release:
-    name: Publish Draft Release
-    needs: [validate-version, build]
-    runs-on: ubuntu-22.04
-    # Only this job needs contents: write — it is the sole step that
-    # mutates repository state via `gh release create`. Build matrix
-    # jobs run with contents: read.
+  sbom:
+    name: Versioned CycloneDX SBOM
+    needs: validate
+    runs-on: ubuntu-latest
     permissions:
-      contents: write
-    # Job-level GH_TOKEN: a single source-inspectable reference,
-    # set to the ephemeral workflow token, scoped by this job's
-    # `permissions: contents: write` (entarch 2026-05-11 P3 + cxotech
-    # absorption pin). Inherited by every step on this job — no
-    # PATs, no fine-grained tokens, no maintainer/org-level
-    # credentials, no long-lived secrets.
-    env:
-      GH_TOKEN: ${{ github.token }}
-    timeout-minutes: 10
+      contents: read
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout exact verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
-          fetch-depth: 1
+          ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - name: Generate SBOM with pinned Syft
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "$PWD:/src:ro" --workdir /src \
+            anchore/syft@sha256:f94e5d9fce1f2278491a8e3a63bd5f6ddb81fdfdbb8bf7a1637565c1d5344357 \
+            dir:. --output cyclonedx-json >"sbom-${RELEASE_VERSION}.cdx.json"
+          test -s "sbom-${RELEASE_VERSION}.cdx.json"
+      - name: Upload exact SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          path: artifacts
-          pattern: build-*
+          name: sbom
+          path: sbom-${{ needs.validate.outputs.version }}.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+  packages:
+    name: Exact base inventory
+    needs: [validate, build, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Download all three native artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: binary-*
+          path: dist/release
           merge-multiple: true
-      - name: Stage release assets and generate checksums
-        id: stage
-        shell: bash
+      - name: Download SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: sbom
+          path: dist/release
+      - name: Assert canonical complete base inventory
         env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
+          CHANVOY_RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          mkdir -p dist
-          mv artifacts/chanvoy-v"$VERSION"-* dist/
-          cd dist
-          ls -la
-          # SHA-256 over each binary in stable sort order.
-          find . -maxdepth 1 -name "chanvoy-v$VERSION-*" -printf '%f\n' \
-            | sort \
-            | xargs shasum -a 256 \
-            > checksums.txt
-          echo "--- checksums.txt ---"
-          cat checksums.txt
-      - name: Verify release notes exist
-        shell: bash
-        env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
-        run: |
-          set -euo pipefail
-          notes="docs/releases/v${VERSION}.md"
-          if [ ! -f "$notes" ]; then
-            echo "ERROR: release notes missing at $notes"
-            echo "Create the release notes file before pushing the tag."
-            exit 1
-          fi
-          echo "Found release notes: $notes"
-      # GH_TOKEN is inherited from the job env block above (single
-      # source-inspectable reference; see job-level env comment).
-      - name: Create draft release
-        shell: bash
-        env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          cd dist
-          assets=(checksums.txt)
-          while IFS= read -r f; do
-            assets+=("$f")
-          done < <(find . -maxdepth 1 -name "chanvoy-v$VERSION-*" -printf '%f\n' | sort)
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft \
-            --title "chanvoy v${VERSION}" \
-            --notes-file "../docs/releases/v${VERSION}.md" \
-            "${assets[@]}"
-          url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
-          echo "Draft release created: $url"
-      - name: Job summary
-        shell: bash
-        env:
-          VERSION: ${{ needs.validate-version.outputs.version }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
-          {
-            echo "## Draft release for $TAG"
-            echo ""
-            echo "URL: $url"
-            echo ""
-            echo "### Assets"
-            echo '```'
-            ls -1 dist/
-            echo '```'
-            echo ""
-            echo "### checksums.txt"
-            echo '```'
-            cat dist/checksums.txt
-            echo '```'
-            echo ""
-            echo "Next steps (Dave runs locally per PER-030 RELEASE_CHECKLIST.md):"
-            echo "1. \`make release-download\`"
-            echo "2. \`make release-sign\`"
-            echo "3. \`make release-verify\`"
-            echo "4. \`make release-upload\`"
-            echo "5. \`make release-undraft\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          cp LICENSE-MIT LICENSE-APACHE dist/release/
+          bash scripts/validate-release-assets.sh dist/release base
+      - name: Upload exact workflow packages only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: release-packages-${{ github.ref_name }}
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7

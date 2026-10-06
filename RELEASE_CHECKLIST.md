@@ -1,351 +1,162 @@
-# chanvoy Release Checklist
+# Chanvoy release checklist
 
-Canonical step-by-step procedure for cutting a `vX.Y.Z` chanvoy release.
-This file lives at the repo root and is **public-readable** so external
-adopters can verify a downloaded binary against the stable key
-fingerprints below without needing org access.
+The maintainer signs locally. Tag CI has `contents: read`, builds exactly three
+native binaries with locked dependencies, and uploads artifacts. It does not
+create a GitHub draft, publish a release, or receive signing keys.
 
-Release model: **manual signing** as the v0.2.2 baseline.
-- CI ([`.github/workflows/release.yml`](.github/workflows/release.yml))
-  produces a draft GitHub release on tag push.
-- Dave runs `make release-download` → `release-sign` → `release-verify`
-  → `release-upload` → `release-undraft` **locally**.
-- Signing keys never touch CI.
+## Prepare the reviewed cut
 
-GHA-automated signing using a separate automation-variant key is
-deliberately deferred to a later release.
+Merge the independently reviewed release changes. Finalize the actual date in
+`CHANGELOG.md`, `RELEASE_NOTES.md` and `docs/releases/vX.Y.Z.md` before signing.
+Run fresh `make release-prep`, hosted checks and `make release-smoke`. The live
+smoke creates a disposable Mattermost channel; failed smoke stops the ceremony.
+Use clean main synchronized with live origin/main. Signing and publication each
+require the maintainer's separate approval.
 
-Canonical release sequence (top-to-bottom; each numbered section
-below corresponds to one step):
-
-```
-make release-prep      → release-smoke → release-preflight
-release-tag → release-tag-push → GHA produces draft
-(first public release only) verify draft → visibility PRIVATE → PUBLIC
-make release-download  → release-sign → release-verify
-make release-upload    → release-undraft
-release announcement   → operational announcement
-```
-
----
-
-## 1. Pre-release verification
-
-- [ ] All feature PRs for this release are merged to `main`
-- [ ] `main` CI is green
-- [ ] Working tree is clean (`git status` empty)
-- [ ] `VERSION` matches `Cargo.toml` workspace + crate versions
-      (`make version-check`)
-- [ ] Release notes exist at `docs/releases/vX.Y.Z.md`
-      (see §11 — must inline fingerprints + verification
-      commands OR hard-pointer to this file)
-- [ ] `keys/expected-fingerprints.txt` contains both stable public-key
-      fingerprints with no `TBD` values
-- [ ] All planned briefs for this release are at "done" status
-
-### Initialize or rotate the fingerprint contract
-
-Run this only when establishing or rotating the release-signing keyset.
-Start from the repository root. The host release environment must provide
-`CHANVOY_MINISIGN_PUB`, `CHANVOY_PGP_KEY_ID`, and, when the public GPG
-key is in a dedicated keyring, `CHANVOY_GPG_HOMEDIR`. Host-specific
-profile paths stay outside this repository.
+Configure existing approved inputs outside the checkout:
 
 ```bash
-(
-  set -euo pipefail
-  cd /path/to/chanvoy
-  : "${CHANVOY_MINISIGN_PUB:?set CHANVOY_MINISIGN_PUB}"
-  : "${CHANVOY_PGP_KEY_ID:?set CHANVOY_PGP_KEY_ID}"
-  if [ -n "$(git status --porcelain=v1)" ]; then
-    echo "error: fingerprint update requires a clean working tree" >&2
-    git status --short >&2
-    exit 1
-  fi
-  public_key_dir="$(mktemp -d)"
-
-  make release-export-keys RELEASE_DIR="$public_key_dir"
-  make insert-expected-fingerprints \
-    MINISIGN_PUB="$public_key_dir/chanvoy.pub" \
-    GPG_ASC="$public_key_dir/chanvoy.gpg.asc"
-  make release-verify-keys RELEASE_DIR="$public_key_dir"
-
-  fingerprint_git_status="$(git status --porcelain=v1)"
-  case "$fingerprint_git_status" in
-    "") echo "[--] fingerprint contract is already current" ;;
-    " M keys/expected-fingerprints.txt") ;;
-    *)
-      echo "error: expected only keys/expected-fingerprints.txt to change" >&2
-      git status --short >&2
-      exit 1
-      ;;
-  esac
-  git diff --check
-  git diff -- keys/expected-fingerprints.txt
-)
+export CHANVOY_RELEASE_TAG=vX.Y.Z
+export CHANVOY_DECERNOR_BIN=/absolute/path/to/decernor
+export CHANVOY_GPG_SIGNING_FINGERPRINT=<approved-40-uppercase-hex-primary>
+export CHANVOY_PGP_KEY_ID='<approved-40-uppercase-hex-signing-subkey>!'
+export CHANVOY_GPG_HOMEDIR=/absolute/path/to/isolated/gnupg
+export CHANVOY_MINISIGN_KEY=/absolute/path/to/minisign-secret.key
+export CHANVOY_MINISIGN_PUB=/absolute/path/to/minisign.pub
+export CHANVOY_TAGGER_NAME='3 Leaps Infosec Team'
+export CHANVOY_TAGGER_EMAIL=infosec@3leaps.net
+export CHANVOY_TAG_MESSAGE_DIR=/absolute/external/path/vX.Y.Z
 ```
 
-The export contains public material only. The inserter writes both
-fingerprints atomically from `decernor` records; the verification target
-independently recomputes and compares both values. Stop if the export is
-incomplete, any command fails, an unexpected file changes, or a `TBD`
-value remains.
+Decernor must be a regular executable at the explicit absolute path, version
+**0.1.8 or later** with matching short and extended identity. The primary and
+exact signing subkey must match the reviewed public pin. Private material stays
+outside the repository and CI. These commands do not generate new keys.
+An optional `CHANVOY_APPROVED_ENV_LOADER` must be an external absolute regular
+shell file already approved by the maintainer; it cannot change the intended cut.
 
-## 2. `make release-prep` (commit-cycle gate)
+## Public trust setup and rotation
 
-Runs the full per-PR gate plus license / security / SBOM scans.
+This is a separate reviewed change before the release tag. Independently confirm
+the approved existing GPG primary, exactly one live signing subkey, and minisign
+public-blob SHA-256. Do not copy fingerprints from another product or hand-edit
+hex. Use `make release-export-pin` for the initial public ASC and
+`make release-insert-anchors` for the TXT/NDJSON pair. Both refuse silent overwrite.
+The existing TXT-only layout requires explicit rotation approval:
 
 ```bash
-make release-prep
+old_txt_sha256=$(shasum -a 256 keys/expected-fingerprints.txt | awk '{print $1}')
+bash scripts/release-insert-anchors.sh --rotate-from "$old_txt_sha256"
+# When replacing an existing ASC, independently review its prior digest first:
+# bash scripts/release-export-pin.sh --replace-from <reviewed-current-asc-sha256>
+make release-validate-pin
 ```
 
-Expects: `pr-final ✓` (clippy + tests + restart_harness + MSRV `--locked`
-+ workflow-lint), `license-check ✓`, `security-scan ✓` (0 high / 0
-critical), SBOM generated under `sbom/`.
+Review the resulting ASC and paired anchors independently, including public-only
+content, subkey capabilities, expiration/revocation and re-derived fingerprints.
+Publish the reviewed old/new identity and effective version in the rotation notice.
+Retain [v0.3.1 verification](docs/security/release-verification.md#historical-v031).
+Tooling alone does not supply or approve new public identities.
 
-## 3. `make release-smoke` (PER-032)
-
-Live-Mattermost URL-shape smoke against a disposable test channel.
-
-```bash
-make release-smoke
-```
-
-**A failed smoke halts the release cycle here** — no tag is created,
-no draft release exists, no signed artifacts are produced. Fix the
-underlying URL/contract issue and re-run before proceeding.
-
-## 4. `make release-preflight` (pre-tag readiness gate)
-
-Pre-tag, non-draft-dependent gate. Validates clean tree, version sync,
-no conflicting tag/release, tooling on PATH, signing keys present.
+## Prepare, sign and push the tag separately
 
 ```bash
-export CHANVOY_MINISIGN_KEY=/path/to/minisign-secret-key
-export CHANVOY_PGP_KEY_ID=ABC123...
-export CHANVOY_GPG_HOMEDIR=/path/to/isolated/gnupg
-export CHANVOY_RELEASE_TAG="v$(cat VERSION)"
-export RELEASE_TAG="$CHANVOY_RELEASE_TAG"
+make release-prepare-tag-message
+# Review/edit the public external message.txt; preparation preserves an existing file.
 make release-preflight
-```
-
-Checks (each fails fast with a clear hint):
-- `make release-prep` green
-- Working tree clean (`git status` empty)
-- `VERSION` + `Cargo.toml` consistent
-- No conflicting `vX.Y.Z` tag locally OR on origin
-- No published GitHub release for this version
-- `gh`, `minisign`, `gpg` available on PATH
-- `decernor` **0.1.4+** available (`DECERNOR=` override allowed; strict `X.Y.Z` only)
-- `CHANVOY_MINISIGN_KEY` set and points at an existing file
-- `CHANVOY_PGP_KEY_ID` set and present in the GPG keyring
-- `CHANVOY_GPG_HOMEDIR` set to the isolated release keyring
-  (GPG signature over `checksums.txt` is mandatory for v0.2.2 trust
-  posture — devrev PR #33 review)
-- `CHANVOY_RELEASE_TAG` and `RELEASE_TAG`, when set, are identical and
-  exactly match `v$(cat VERSION)`
-- Clean `main` is synchronized to `origin/main`; the desired local and
-  remote tag refs are absent
-- `docs/releases/vX.Y.Z.md` exists
-
-**This step does NOT inspect a draft release** — none exists yet.
-Post-GHA draft checks live in §8 `release-download` + `release-verify`.
-
-## 5. Create and push the signed tag
-
-Only proceed if §2 / §3 / §4 are all green.
-
-```bash
-export CHANVOY_RELEASE_TAG="v$(cat VERSION)"
-export RELEASE_TAG="$CHANVOY_RELEASE_TAG"
-export GNUPGHOME="$CHANVOY_GPG_HOMEDIR"
-
-# Creates and verifies the signed annotated tag locally. Does not push.
 make release-tag
-
-# Repeats the exact-tag, pinned-signer, clean-main, synced-commit, and
-# origin-absence guards, then pushes only this tag ref.
+# Inspect the exact local annotated object, target, body and pinned signature.
 make release-tag-push
 ```
 
-Both targets fail before signing or pushing if the tag overrides disagree or
-do not equal `v$(cat VERSION)`. `release-tag` requires an untagged clean `main`
-at the exact live `origin` `main` commit. `release-tag-push` requires the
-annotated tag to peel to that commit, the selected isolated-keyring primary to
-equal the GPG value in `keys/expected-fingerprints.txt`, and the tag signature
-to validate against that contracted fingerprint.
-Neither target force-updates a tag.
+`release-tag` creates and verifies the local tag only. Does not push.
+Neither target force-updates a tag. They require clean synchronized main,
+absent remote tag, approved tagger, reviewed external message and exact subkey.
+Read-only rules inspection is advisory: UNKNOWN or FOUND does not authorize
+signing or pushing. After an ambiguous push, inspect the remote ref and exact
+object before doing anything else; do not delete or replace it.
 
-## 6. GHA workflow (PER-031)
+## Read-only artifact CI and receipt-bound staging
 
-The `release` workflow fires on the tag push. It:
-- Validates the tag matches the `VERSION` file
-- Builds 3 binaries:
-  - `chanvoy-vX.Y.Z-linux-x86_64` (`ubuntu-22.04`)
-  - `chanvoy-vX.Y.Z-linux-aarch64` (`ubuntu-latest-arm64-s`, native)
-  - `chanvoy-vX.Y.Z-macos-aarch64` (`macos-14`)
-- Generates `checksums.txt` (SHA-256)
-- Creates a **draft** GitHub release with title `chanvoy vX.Y.Z`,
-  notes from `docs/releases/vX.Y.Z.md`, all binaries + checksums
-  attached
+Wait for the exact successful `release.yml` **push** run for the tag commit.
+CI restores the annotated ref, verifies its committed public pin in an isolated
+keyring plus GitHub Verified/valid, checks VERSION, and builds natively:
 
-Monitor the workflow run:
+| Platform | Asset | Runner |
+| --- | --- | --- |
+| Linux x86_64 | `chanvoy-vX.Y.Z-linux-x86_64` | `ubuntu-22.04` |
+| Linux aarch64 | `chanvoy-vX.Y.Z-linux-aarch64` | `ubuntu-latest-arm64-s` |
+| macOS aarch64 | `chanvoy-vX.Y.Z-macos-aarch64` | `macos-14` |
 
-```bash
-gh run watch --repo lanytehq/chanvoy
-```
-
-When the workflow completes, the draft URL is in the job summary.
-
-## 7. First-public visibility gate
-
-This section applies only while the repository is private. Keep the repository
-private through the signed tag-only push and the exact-tag workflow/draft proof
-in §6. Confirm the draft contains all three binaries plus `checksums.txt`, then
-perform the explicit principal visibility change:
+Confirm runner availability and hosted success on the actual cut. CI also creates
+a versioned CycloneDX SBOM and stages both licenses in one exact base inventory.
 
 ```bash
-gh repo view lanytehq/chanvoy --json visibility -q .visibility
-gh repo edit lanytehq/chanvoy --visibility public
-gh repo view lanytehq/chanvoy --json visibility -q .visibility
-```
-
-If the first command already reports `PUBLIC`, the edit is a no-op and must not
-be repeated. Stop if tag CI or draft verification is not green. The repository
-must be public before any crates.io publication or GitHub Release publication.
-
-v0.3.1 is GitHub-binary-only: do not run `cargo publish`. The root binary is
-not a valid standalone registry inventory because it depends on unpublished
-workspace crates and runtime git dependencies.
-
-## 8. Local signing flow
-
-All steps run locally. Idempotent: any step can be re-run safely.
-
-```bash
-# 8.1 — Download the draft release into a local working directory
-make release-download                # writes release/vX.Y.Z/
-
-# 8.2 — Regenerate checksums.txt locally (must byte-match what
-#        the GHA workflow produced)
+make release-fetch-ci-artifacts
+make release-stage-anchors
 make release-checksums
+make release-create-draft
+```
 
-# 8.3 — Export public signing keys into the release dir
-make release-export-keys
+Staging must start empty with no prior receipt. `RELEASE_DIR` defaults to
+`release/$CHANVOY_RELEASE_TAG`. Its sibling `.anchor` receipt binds repository
+(via fixed checks), tag object, peeled commit and exact successful run. The receipt
+is local evidence and is never uploaded. Trusted checkout helpers read tagged
+notes, pins, paired anchors and licenses as inert git blobs. Post-tag verification
+works after main changes VERSION, notes and anchors; it never executes tagged
+helpers or substitutes current-main metadata.
 
-# 8.4 — Sign: minisign per binary + GPG over checksums.txt
+The maintainer creates the draft from the exact receipt-bound checksummed set.
+There must be no existing release for this tag. CI never creates this draft.
+
+## Sign, upload, verify fresh bytes and promote
+
+```bash
 make release-sign
-
-# 8.5 — Verify signatures AND that exported public-key files
-#        match keys/expected-fingerprints.txt
+make release-export-keys
 make release-verify
-
-# 8.6 — Attach signed artifacts + public keys to the draft
-#        release (atomic — does NOT flip draft state)
 make release-upload
-
-# 8.7 — Execute the downloaded host binary and require VERSION, the tagged
-#        commit, and Dirty: false; release-undraft depends on this gate.
-make release-verify-identity
-
-# 8.8 — Re-run the executable identity gate, then flip the GitHub release
-#        from draft → published
-#        (atomic — does NOT touch assets)
+make release-verify-draft
+# Only after the separate publication approval:
+export CHANVOY_CONFIRM_PUBLISH="$CHANVOY_RELEASE_TAG"
 make release-undraft
-
-# Or, the composite for the end-to-end publish step:
-# make release-upload-all
 ```
 
-If any step fails, fix the underlying issue and re-run. Don't skip
-ahead with a half-signed release.
+One exact inventory covers the three binaries, versioned SBOM, two licenses,
+`release-notes-vX.Y.Z.md`, TXT/NDJSON anchors, `SHA256SUMS`, `SHA512SUMS`, both
+`.asc` and `.minisig` manifest signatures, and legacy `checksums.txt`,
+`checksums.txt.asc`, per-binary `.minisig`, `chanvoy.pub`, `chanvoy.gpg.asc`.
+Manifests cover payload and metadata only; they do not include themselves,
+signatures, exported keys or the local receipt. `checksums.txt` is byte-identical
+to `SHA256SUMS`, and its `.asc` is the same detached signature.
 
-## 9. Release announcement
+Upload enumerates only the missing provenance names from the exact expected draft
+state. It never clobbers. Fresh draft verification downloads every asset anew,
+checks exact inventory, tagged metadata, checksums, both signature formats and
+byte equality to the approved local signed cut. Only then does it execute the
+native host binary and require the tag version, tag commit and `Dirty: false`.
+Direct promotion repeats these gates, including host identity, before changing
+draft state. A Make dependency is not the sole enforcement boundary.
 
-Post the release-published notice through the project release channel. Include:
-- Release URL
-- SHA-256 checksums (top of `release/vX.Y.Z/checksums.txt`)
-- The verification commands from §11 below
-- Download URLs for each binary
+A partial or ambiguous create/upload/promotion must be inspected before retrying.
+Do not delete evidence, replace assets, assume publication succeeded, or blindly
+repeat a command. Published-release replacement is refused. Retain exact object,
+commit/run receipt and local signed bytes for review.
 
-## 10. Operational announcement
+## Compatibility and consumer verification
 
-Post the operational notification through the project's maintainer channel,
-following its current version-note pin convention.
+`release-download` now aliases exact CI-artifact staging, rather than draft
+download. `release-upload-all` remains an ordered upload/promotion alias but still
+requires the explicit promotion confirmation. `release-clean` refuses automatic
+cleanup. Equal `RELEASE_TAG` remains a compatibility input; prefer the explicit
+`CHANVOY_RELEASE_TAG`, and conflicting aliases fail closed.
 
----
+Legacy asset names and consumer commands remain available in v0.3.2. They are
+deprecated for future releases, with removal requiring a separate notice and cut.
+See [verification and rotation guidance](docs/security/release-verification.md).
+There is no crates.io publication in this binary release flow.
 
-## 11. Verification commands for external adopters
-
-These commands run **after** download from the published GitHub
-release. No chanvoy clone or org access required — keys + signatures
-are attached to the release.
-
-```bash
-# Verify a downloaded binary against its minisign signature
-minisign -Vm chanvoy-vX.Y.Z-linux-x86_64 -p chanvoy.pub
-
-# Verify the checksums manifest against the GPG signature
-gpg --verify checksums.txt.asc checksums.txt
-
-# Verify the downloaded binary matches the checksum in the manifest
-sha256sum -c checksums.txt --ignore-missing
-```
-
-### Stable key fingerprints
-
-External adopters should pin against these fingerprints. They change
-only through a documented public key-rotation announcement.
-
-| Algorithm | Fingerprint |
-|---|---|
-| minisign (`minisign-public-blob-sha256-v1`) | `36a80acfa44f5cf9ac402d3ce8e51fcc083e5a1dca22180d6a0ea85b7e5340ad` |
-| GPG (OpenPGP primary, `--gpg-role primary`) | `83FCC69CB060EDB8374EDE0547AAC7D6EB946A84` |
-
-The same values are checked into `keys/expected-fingerprints.txt` so
-`make release-verify-keys` asserts an exported `chanvoy.pub` /
-`chanvoy.gpg.asc` matches them.
-
----
-
-## Troubleshooting
-
-### `release-preflight` fails on "VERSION ($A) != Cargo.toml ($B)"
-Run `make version-sync` to bring `Cargo.toml` in line with `VERSION`,
-or `make version-set V=X.Y.Z` to set both atomically.
-
-### `release-preflight` fails on "CHANVOY_MINISIGN_KEY not set" or "CHANVOY_PGP_KEY_ID not set"
-Source the env file that exports your signing-key paths. Both are
-mandatory for v0.2.2 trust posture (devrev PR #33 review — silent
-skip of GPG would let a release ship without manifest-level
-authenticity):
-```bash
-export CHANVOY_MINISIGN_KEY=$HOME/.minisign/chanvoy-secret.key
-export CHANVOY_PGP_KEY_ID=ABC123...
-```
-
-### `release-verify-keys` fails on "TBD placeholder"
-`keys/expected-fingerprints.txt` still has placeholders. Fill both
-lines together with the inserter (decernor **0.1.4+**, explicit
-public files). Do not hand-type hex. A missing minisign `.pub` or
-GPG export leaves the dest unchanged.
-
-```bash
-make insert-expected-fingerprints MINISIGN_PUB=... GPG_ASC=...
-```
-
-### `insert-expected-fingerprints` / `verify-public-keys` fail on "decernor … too old"
-The host binary is older than 0.1.4. Install 0.1.4 or later and set
-`DECERNOR=` if PATH still points at an older copy. Do not verify
-against a pre-0.1.4 contract.
-
-### `release-checksums` fails on "no chanvoy-v*-* binaries found"
-You ran the target before `make release-download` populated the
-working dir, or `RELEASE_DIR` is pointing at a different path. Default:
-`release/v$(cat VERSION)/`.
-
-### `release-upload-all` partially failed
-The atomic split means you can re-run just the failing half:
-- `make release-upload` re-attaches assets (idempotent via `--clobber`)
-- `make release-undraft` re-flips draft state (idempotent — no-op if
-  already published)
+After publication, inspect the published release state and announce the exact
+release URL and verification guidance. Install the actual released CLI only
+under the separate installation cue, cycle the appropriate profile daemons, and
+prove CLI/daemon identity with `version --extended`.

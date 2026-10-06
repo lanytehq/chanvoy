@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.3leaps.dev/decernor/fingerprint-record.v0.schema.json",
+  "title": "Decernor Fingerprint Record v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "class",
+    "algorithm",
+    "fingerprint",
+    "fingerprint_scheme",
+    "confidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "v0"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "enum": [
+        "gpg",
+        "ssh",
+        "minisign"
+      ]
+    },
+    "class": {
+      "enum": [
+        "public",
+        "private",
+        "other"
+      ]
+    },
+    "algorithm": {
+      "enum": [
+        "openpgp-fingerprint",
+        "sha256",
+        "minisign-key-id"
+      ]
+    },
+    "fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "fingerprint_scheme": {
+      "enum": [
+        "openpgp-fingerprint-v1",
+        "ssh-rfc4253-public-blob-sha256-v1",
+        "minisign-key-id-v1",
+        "minisign-public-blob-sha256-v1"
+      ]
+    },
+    "key_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "key_role": {
+      "enum": [
+        "primary",
+        "subkey"
+      ]
+    },
+    "confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "reason": {
+      "enum": [
+        "encrypted-private-no-public-counterpart",
+        "helper-unavailable",
+        "parse-unsupported",
+        "too-large",
+        "unreadable",
+        "unsupported-kind",
+        "unsupported-version"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "gpg"
+          },
+          "fingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "fingerprint"
+        ]
+      },
+      "then": {
+        "required": [
+          "key_role",
+          "key_id"
+        ],
+        "properties": {
+          "algorithm": {
+            "const": "openpgp-fingerprint"
+          },
+          "fingerprint_scheme": {
+            "const": "openpgp-fingerprint-v1"
+          },
+          "key_role": {
+            "enum": [
+              "primary",
+              "subkey"
+            ]
+          },
+          "key_id": {
+            "type": "string",
+            "pattern": "^[0-9A-F]{16}$"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^[0-9A-F]{40}$"
+          }
+        }
+      },
+      "else": {
+        "not": {
+          "required": [
+            "key_role"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "fingerprint_scheme": {
+            "const": "openpgp-fingerprint-v1"
+          },
+          "fingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fingerprint_scheme",
+          "fingerprint"
+        ]
+      },
+      "then": {
+        "required": [
+          "key_role",
+          "key_id"
+        ],
+        "properties": {
+          "kind": {
+            "const": "gpg"
+          },
+          "algorithm": {
+            "const": "openpgp-fingerprint"
+          },
+          "key_role": {
+            "enum": [
+              "primary",
+              "subkey"
+            ]
+          },
+          "key_id": {
+            "type": "string",
+            "pattern": "^[0-9A-F]{16}$"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^[0-9A-F]{40}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "fingerprint_scheme": {
+            "const": "minisign-public-blob-sha256-v1"
+          },
+          "fingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fingerprint_scheme",
+          "fingerprint"
+        ]
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "minisign"
+          },
+          "algorithm": {
+            "const": "sha256"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "fingerprint_scheme": {
+            "const": "ssh-rfc4253-public-blob-sha256-v1"
+          },
+          "fingerprint": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fingerprint_scheme",
+          "fingerprint"
+        ]
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "ssh"
+          },
+          "algorithm": {
+            "const": "sha256"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^SHA256:[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]$"
+          }
+        }
+      }
+    }
+  ]
+}

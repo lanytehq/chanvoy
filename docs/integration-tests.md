@@ -264,6 +264,24 @@ settle.
   control: `daemon serve` must *not* become a session leader and must
   stay in the invoking process's session
 
+## Release provenance tooling gate
+
+`make release-tooling-test` runs disposable synthetic-key repositories and stub
+remotes. It requires Bash, Python 3, Git, GPG/gpgconf, minisign, jq, shasum and
+Decernor >=0.1.8. Set `CHANVOY_DECERNOR_BIN` to the trusted absolute regular
+executable when exercising ceremony helpers. The suite also runs in `pr-final`
+and the read-only `release_tooling` PR job; CI installs the checksum-pinned helper.
+Use the CI toolchain for the complete gate: `RUSTUP_TOOLCHAIN=1.89.0 make pr-final`.
+
+The corpus covers isolated pinned tags and exact signing subkeys, replaced or
+unsigned objects, inert tagged helpers, receipt/run binding, later-main metadata
+drift, complete inventories and legacy alias equality, explicit public rotation
+with rollback, single-platform consumer verification, mandatory signatures,
+missing-only upload and fresh-download promotion. Host execution follows
+authenticity checks and must prove version, commit and a clean build. Tests never
+use production signing keys or publish to a live remote. Live release smoke
+and final integrated dependency/advisory gates remain separate release steps.
+
 ## Held wait stream gate
 
 `tests/per_043_wait_follow.rs` exercises the process-held

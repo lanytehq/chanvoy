@@ -191,7 +191,7 @@ msrv: ensure-msrv
 	cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] MSRV $(MSRV) verified"
 
-pr-final: ensure-msrv version-check workflow-lint
+pr-final: ensure-msrv version-check workflow-lint release-tooling-test
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace --all-targets
@@ -254,7 +254,7 @@ license-check: ## Run goneat license compliance per .goneat/dependencies.yaml
 	fi
 	goneat dependencies --licenses --fail-on high
 
-release-prep: pr-final license-check security-scan sbom ## Full release-cycle gate (slower than pr-final; run before tagging)
+release-prep: pr-final release-tooling-test license-check security-scan sbom ## Full release-cycle gate (slower than pr-final; run before tagging)
 	@echo "[ok] release-prep gate passed"
 	@echo "     pr-final ✓"
 	@echo "     license-check ✓"
@@ -268,7 +268,7 @@ release-prep: pr-final license-check security-scan sbom ## Full release-cycle ga
 #   make release-prep      (commit-cycle gate — does NOT include this target)
 #   make release-smoke     (this target — live MM + ephemeral channel)
 #   make release-preflight (final pre-tag checks)
-#   git tag -a vX.Y.Z      (only if smoke passed)
+#   make release-tag      (only if smoke passed)
 #   git push origin vX.Y.Z (only if smoke passed)
 #
 # Smoke FAILS the release cycle BEFORE any tag exists, draft release
@@ -282,223 +282,103 @@ release-prep: pr-final license-check security-scan sbom ## Full release-cycle ga
 release-smoke: ## PER-032 Tier-B — live-MM URL-shape smoke against a disposable test channel
 	@bash scripts/release-smoke.sh
 
-# ---- PER-030 signing rails ----------------------------------------------
-# Manual-signing v0.2.2 baseline: CI (PER-031 release.yml) produces a
-# draft release with binaries + checksums.txt + release notes; Dave
-# runs the targets below locally to sign / verify / upload / undraft.
-# Signing keys are NEVER in CI.
-#
-# Canonical release sequence (RELEASE_CHECKLIST.md is the source of
-# truth for ordering):
-#   make release-prep        — commit-cycle gate (license + security + SBOM)
-#   make release-smoke       — PER-032 live-MM URL-shape gate
-#   make release-preflight   — pre-tag readiness (this section, AC #4)
-#   make release-tag        — create + verify the signed local tag
-#   make release-tag-push   — repeat guards + push only that tag
-#   (PER-031 GHA produces draft release)
-#   make release-download    — fetch draft artifacts
-#   make release-checksums   — regenerate checksums.txt locally
-#   make release-sign        — minisign per-binary + GPG over checksums.txt
-#   make release-verify      — verify signatures + key fingerprints
-#   make release-upload      — attach signed artifacts (atomic)
-#   make release-undraft     — flip draft → published (atomic)
-#   make release-upload-all  — composite of upload + undraft
-#
-# RELEASE_DIR is the local working directory for a given release
-# cycle. Derived from VERSION so the tag-mismatch foot-gun is
-# impossible: every target operates on the same directory.
-RELEASE_DIR ?= release/v$(shell cat $(VERSION_FILE))
-RELEASE_TAG ?= v$(shell cat $(VERSION_FILE))
-CHANVOY_RELEASE_TAG ?= v$(shell cat $(VERSION_FILE))
+# ---- Authenticated release provenance -------------------------------------
+# Post-tag operations require an explicit cut, even when main has advanced.
+RELEASE_TAG ?=
+CHANVOY_RELEASE_TAG ?= $(RELEASE_TAG)
+RELEASE_DIR ?= release/$(CHANVOY_RELEASE_TAG)
+RELEASE_ENV = CHANVOY_RELEASE_TAG="$(CHANVOY_RELEASE_TAG)"
 
-RELEASE_TAG_GUARD_ENV = CHANVOY_RELEASE_TAG="$(CHANVOY_RELEASE_TAG)" RELEASE_TAG="$(RELEASE_TAG)"
+.PHONY: release-tooling-test release-prepare-tag-message release-fetch-ci-artifacts
+.PHONY: release-create-draft release-stage-anchors release-verify-draft release-verify-published-tag
+.PHONY: release-export-pin release-insert-anchors release-validate-pin
 
-release-preflight: release-prep ## Pre-tag readiness gate — clean tree, version sync, no conflicting tag/release, tooling + signing keys present (AC #4)
-	@echo "[..] release-preflight: pre-tag readiness checks"
-	@if ! git diff --quiet HEAD; then \
-		echo "[!!] working tree has uncommitted changes"; \
-		git status --short; \
-		exit 1; \
-	fi
-	@if [ -n "$$(git status --porcelain)" ]; then \
-		echo "[!!] working tree has untracked files"; \
-		git status --short; \
-		exit 1; \
-	fi
-	@echo "[ok] working tree clean"
-	@file_version=$$(cat $(VERSION_FILE)); \
-	cargo_version=$$(awk -F'"' '/^version =/ {print $$2; exit}' Cargo.toml); \
-	if [ "$$file_version" != "$$cargo_version" ]; then \
-		echo "[!!] VERSION ($$file_version) != Cargo.toml ($$cargo_version)"; \
-		echo "     run 'make version-sync' to resolve"; \
-		exit 1; \
-	fi
-	@echo "[ok] VERSION + Cargo.toml in sync"
-	@$(RELEASE_TAG_GUARD_ENV) bash scripts/release-guard-tag-version.sh pre-create
-	@bash scripts/release-guard-github-release.sh "v$$(cat $(VERSION_FILE))"
-	@for tool in gh minisign gpg; do \
-		if ! command -v $$tool >/dev/null 2>&1; then \
-			echo "[!!] $$tool not on PATH"; \
-			exit 1; \
-		fi; \
-	done
-	@echo "[ok] release tooling (gh + minisign + gpg) on PATH"
-	@bash scripts/check-decernor.sh
-	@if [ -z "$${CHANVOY_MINISIGN_KEY:-}" ]; then \
-		echo "[!!] CHANVOY_MINISIGN_KEY not set"; \
-		echo "     export CHANVOY_MINISIGN_KEY=/path/to/minisign-secret-key"; \
-		exit 1; \
-	fi
-	@if [ ! -f "$$CHANVOY_MINISIGN_KEY" ]; then \
-		echo "[!!] CHANVOY_MINISIGN_KEY path not found: $$CHANVOY_MINISIGN_KEY"; \
-		exit 1; \
-	fi
-	@echo "[ok] minisign signing key present at $$CHANVOY_MINISIGN_KEY"
-	@if [ -z "$${CHANVOY_PGP_KEY_ID:-}" ]; then \
-		echo "[!!] CHANVOY_PGP_KEY_ID not set"; \
-		echo "     GPG signature over checksums.txt is mandatory for"; \
-		echo "     v0.2.2 trust posture (devrev PR #33 review)"; \
-		echo "     export CHANVOY_PGP_KEY_ID=<your-gpg-key-id>"; \
-		exit 1; \
-	fi
-	@if [ -z "$${CHANVOY_GPG_HOMEDIR:-}" ]; then \
-		echo "[!!] CHANVOY_GPG_HOMEDIR not set"; \
-		echo "     the release key intentionally lives outside the default keyring"; \
-		exit 1; \
-	fi
-	@if ! gpg --homedir "$$CHANVOY_GPG_HOMEDIR" --list-secret-keys "$$CHANVOY_PGP_KEY_ID" >/dev/null 2>&1; then \
-		echo "[!!] CHANVOY_PGP_KEY_ID not in gpg keyring: $$CHANVOY_PGP_KEY_ID"; \
-		echo "     inspect the isolated keyring at CHANVOY_GPG_HOMEDIR"; \
-		exit 1; \
-	fi
-	@echo "[ok] GPG signing key present in keyring ($$CHANVOY_PGP_KEY_ID)"
-	@notes="docs/releases/v$$(cat $(VERSION_FILE)).md"; \
-	if [ ! -f "$$notes" ]; then \
-		echo "[!!] release notes missing at $$notes"; \
-		echo "     create the file before pushing the tag"; \
-		exit 1; \
-	fi; \
-	if grep -Eiq '^\*\*Release Date\*\*:[[:space:]]*unreleased[[:space:]]*$$' "$$notes"; then \
-		echo "[!!] release notes still say unreleased: $$notes"; \
-		exit 1; \
-	fi
-	@echo "[ok] release notes present at docs/releases/v$$(cat $(VERSION_FILE)).md"
-	@version=$$(cat $(VERSION_FILE)); \
-	if grep -Eq "^## \\[$$version\\] - unreleased[[:space:]]*$$" CHANGELOG.md; then \
-		echo "[!!] CHANGELOG entry for $$version still says unreleased"; \
-		exit 1; \
-	fi
-	@echo "[ok] release notes + CHANGELOG carry a final release date"
-	@for license in LICENSE LICENSE-MIT LICENSE-APACHE; do \
-		if [ ! -f "$$license" ]; then \
-			echo "[!!] required public license file missing: $$license"; \
-			exit 1; \
-		fi; \
-	done
-	@echo "[ok] public license files present"
-	@if [ "$$(cat $(VERSION_FILE))" = "0.3.1" ]; then \
-		bash scripts/release-guard-github-release.sh v0.3.0; \
-	fi
-	@echo "[ok] first-public checkpoint release-object guard passed"
-	@echo "[ok] release-preflight passed — ready to tag v$$(cat $(VERSION_FILE))"
+release-tooling-test: ## Synthetic-key and stub-remote provenance regression corpus
+	@bash scripts/release-tooling-test.sh
 
-release-guard-tag-version: ## Validate the desired pre-create tag against VERSION and clean synced main
-	@$(RELEASE_TAG_GUARD_ENV) bash scripts/release-guard-tag-version.sh pre-create
+release-preflight: release-prep ## Fresh quality gates and maintainer tag preflight
+	@$(RELEASE_ENV) bash scripts/release-preflight.sh
 
-release-guard-release-target: ## Require later release targets to use the exact signed tag on synced main
-	@$(RELEASE_TAG_GUARD_ENV) bash scripts/release-guard-tag-version.sh post-create
+release-guard-tag-version: ## Check canonical version for tag creation
+	@$(RELEASE_ENV) bash scripts/release-guard-tag-version.sh
 
-release-tag: ## Create and verify a GPG-signed local release tag (does not push)
-	@$(RELEASE_TAG_GUARD_ENV) bash scripts/release-guard-tag-version.sh pre-create
-	@: "$${CHANVOY_PGP_KEY_ID:?CHANVOY_PGP_KEY_ID is required}"
-	@: "$${CHANVOY_GPG_HOMEDIR:?CHANVOY_GPG_HOMEDIR is required}"
-	@GNUPGHOME="$$CHANVOY_GPG_HOMEDIR" git tag -s -u "$$CHANVOY_PGP_KEY_ID" \
-		"$(CHANVOY_RELEASE_TAG)" -m "$(CHANVOY_RELEASE_TAG)"
-	@$(RELEASE_TAG_GUARD_ENV) bash scripts/release-guard-tag-version.sh post-create
-	@echo "[ok] signed local tag $(CHANVOY_RELEASE_TAG) created; not pushed"
+release-guard-release-target: ## Check receipt and published tag without requiring current main
+	@$(RELEASE_ENV) bash scripts/release-verify-staged.sh "$(RELEASE_DIR)"
 
-release-tag-push: ## Verify and push only the signed release tag
-	@$(RELEASE_TAG_GUARD_ENV) bash scripts/release-guard-tag-version.sh pre-push
-	@git push origin "refs/tags/$(CHANVOY_RELEASE_TAG):refs/tags/$(CHANVOY_RELEASE_TAG)"
-	@echo "[ok] pushed signed tag $(CHANVOY_RELEASE_TAG) only"
+release-prepare-tag-message: ## Prepare external public tag message for review
+	@$(RELEASE_ENV) bash scripts/release-tag-operator.sh prepare-message
 
-release-clean: ## Remove the local release working directory
-	@rm -rf release/
-	@echo "[ok] release working directory cleaned"
+release-tag: ## Create and verify the signed local tag only
+	@$(RELEASE_ENV) bash scripts/release-tag-operator.sh local-tag
 
-release-download: release-guard-release-target ## Download draft-release artifacts from GitHub into $(RELEASE_DIR)
-	@bash scripts/download-release-assets.sh $(RELEASE_TAG) $(RELEASE_DIR)
+release-tag-push: ## Separately verify and push the exact signed tag
+	@$(RELEASE_ENV) bash scripts/release-tag-operator.sh remote-push
 
-release-checksums: release-guard-release-target ## Regenerate checksums.txt locally over downloaded binaries
-	@bash scripts/generate-checksums.sh $(RELEASE_DIR)
+release-clean: ## Refuse automatic cleanup of potentially partial release evidence
+	@echo 'Inspect staging and its .anchor receipt before explicitly removing either.' >&2
+	@exit 1
 
-release-sign: release-guard-release-target ## Produce minisign per-binary + GPG over checksums.txt
-	@bash scripts/sign-release-assets.sh $(RELEASE_TAG) $(RELEASE_DIR)
+release-fetch-ci-artifacts: ## Stage exact verified CI artifacts with external receipt
+	@$(RELEASE_ENV) bash scripts/release-fetch-ci-artifacts.sh "$(CHANVOY_RELEASE_TAG)" "$(RELEASE_DIR)"
 
-release-export-keys: ## Export public signing keys into $(RELEASE_DIR)
-	@bash scripts/export-release-keys.sh $(RELEASE_DIR)
+release-download: release-fetch-ci-artifacts ## Compatibility alias: download CI artifacts, not a draft
 
-release-verify-signatures: release-guard-release-target ## Verify minisign + GPG signatures on signed artifacts
-	@bash scripts/verify-signatures.sh $(RELEASE_DIR)
+release-stage-anchors: ## Stage exact tagged notes and anchors as inert data
+	@$(RELEASE_ENV) bash scripts/stage-release-anchors.sh "$(RELEASE_DIR)"
 
-release-verify-keys: ## Verify public-key fingerprints match keys/expected-fingerprints.txt
-	@bash scripts/verify-public-keys.sh $(RELEASE_DIR)
+release-checksums: ## Generate two manifests and byte-identical legacy alias
+	@$(RELEASE_ENV) bash scripts/generate-checksums.sh "$(RELEASE_DIR)"
 
-# Explicit public files only. Requires decernor 0.1.4+. Both lines or neither.
-# Usage: make insert-expected-fingerprints MINISIGN_PUB=... GPG_ASC=...
-insert-expected-fingerprints: ## Write keys/expected-fingerprints.txt from decernor records
-ifndef MINISIGN_PUB
-	$(error MINISIGN_PUB is required)
-endif
-ifndef GPG_ASC
-	$(error GPG_ASC is required)
-endif
-	@bash scripts/insert-expected-fingerprints.sh --minisign "$(MINISIGN_PUB)" --gpg "$(GPG_ASC)"
+release-create-draft: ## Maintainer creates a draft from receipt-bound checksummed assets
+	@$(RELEASE_ENV) bash scripts/release-create-draft.sh "$(CHANVOY_RELEASE_TAG)" "$(RELEASE_DIR)"
 
-release-verify: release-verify-signatures release-verify-keys ## Composite — signatures + key fingerprints
-	@echo "[ok] release-verify passed (signatures + key fingerprints)"
+release-sign: ## Sign both manifests and the legacy per-binary surfaces
+	@$(RELEASE_ENV) bash scripts/sign-release-assets.sh "$(RELEASE_DIR)"
 
-release-verify-identity: release-guard-release-target ## Execute the downloaded host binary and verify version, tagged commit, and clean build identity
-	@bash scripts/verify-release-binary-identity.sh "$(RELEASE_TAG)" "$(RELEASE_DIR)"
+release-export-keys: ## Export and validate exact public verification keys
+	@$(RELEASE_ENV) bash scripts/export-release-keys.sh "$(RELEASE_DIR)"
 
-release-notes: ## Display the canonical release notes for the current VERSION
-	@notes="docs/releases/v$$(cat $(VERSION_FILE)).md"; \
-	if [ ! -f "$$notes" ]; then \
-		echo "[!!] release notes missing at $$notes"; \
-		exit 1; \
-	fi; \
-	cat "$$notes"
+release-verify-signatures: ## Verify all required signatures and metadata
+	@$(RELEASE_ENV) bash scripts/verify-signatures.sh "$(RELEASE_DIR)"
 
-release-upload: release-guard-release-target release-verify ## Attach signed artifacts + public keys to the draft release (gates on release-verify; does NOT flip draft state)
-	@bash scripts/upload-release-assets.sh $(RELEASE_TAG) $(RELEASE_DIR)
+release-verify-keys: ## Verify public keys against tagged paired anchors
+	@$(RELEASE_ENV) bash scripts/verify-public-keys.sh "$(RELEASE_DIR)"
 
-release-undraft: release-verify-identity ## Verify downloaded binary identity, then flip the GitHub release from draft → published
-	@if ! command -v gh >/dev/null 2>&1; then \
-		echo "[!!] gh CLI is required"; \
-		exit 1; \
-	fi
-	@# Explicit existence check first — without this, the previous
-	@# implementation swallowed gh's "release not found" error and
-	@# reported "already published" for a missing release. Per devrev
-	@# PR #33 review, idempotency must distinguish "exists + already
-	@# published" from "does not exist."
-	@if ! gh release view $(RELEASE_TAG) --repo lanytehq/chanvoy >/dev/null 2>&1; then \
-		echo "[!!] release $(RELEASE_TAG) not found on lanytehq/chanvoy"; \
-		echo "     check the tag was pushed and the GHA workflow created the draft"; \
-		exit 1; \
-	fi
-	@is_draft=$$(gh release view $(RELEASE_TAG) --repo lanytehq/chanvoy --json isDraft --jq .isDraft); \
-	if [ "$$is_draft" = "true" ]; then \
-		gh release edit $(RELEASE_TAG) --repo lanytehq/chanvoy --draft=false; \
-		echo "[ok] $(RELEASE_TAG) flipped draft → published"; \
-	elif [ "$$is_draft" = "false" ]; then \
-		echo "[ok] $(RELEASE_TAG) already published (no-op; idempotent)"; \
-	else \
-		echo "[!!] unexpected isDraft value for $(RELEASE_TAG): '$$is_draft'"; \
-		exit 1; \
-	fi
+release-verify: release-verify-signatures ## Complete local signed-cut verification
 
-release-upload-all: release-upload release-undraft ## Composite — verify + upload signed artifacts then flip to published (release-verify chains transitively via release-upload)
+release-verify-identity: release-guard-release-target ## Authenticate then execute the host binary
+	@$(RELEASE_ENV) bash scripts/verify-release-binary-identity.sh "$(CHANVOY_RELEASE_TAG)" "$(RELEASE_DIR)"
+
+release-verify-published-tag: ## Verify tag/object/commit using tagged public data after main advances
+	@$(RELEASE_ENV) bash scripts/release-verify-published-tag.sh
+
+release-upload: ## Upload only missing provenance names, never clobber
+	@$(RELEASE_ENV) bash scripts/upload-release-assets.sh "$(RELEASE_DIR)"
+
+release-verify-draft: ## Verify fresh remote bytes and authenticated host identity
+	@$(RELEASE_ENV) bash scripts/release-verify-draft.sh "$(RELEASE_DIR)"
+
+release-undraft: ## Separate guarded promotion; CHANVOY_CONFIRM_PUBLISH must equal tag
+	@$(RELEASE_ENV) bash scripts/release-publish.sh "$(RELEASE_DIR)"
+
+release-upload-all: ## Compatibility alias with ordered upload then separately cued promotion
+	@$(MAKE) release-upload
+	@$(MAKE) release-undraft
+
+release-export-pin: ## Export an approved existing public pin (replacement requires explicit script flag)
+	@bash scripts/release-export-pin.sh
+
+release-validate-pin: ## Independently validate approved primary and exact signing subkey
+	@bash scripts/release-validate-pin.sh
+
+release-insert-anchors: ## Derive paired anchors (rotation requires explicit script flag)
+	@bash scripts/release-insert-anchors.sh
+
+insert-expected-fingerprints: release-insert-anchors ## Compatibility alias for paired, guarded derivation
+
+release-notes: ## Display notes from the explicitly verified cut
+	@$(RELEASE_ENV) bash scripts/release-verify-published-tag.sh
+	@git cat-file blob "refs/tags/$(CHANVOY_RELEASE_TAG):docs/releases/$(CHANVOY_RELEASE_TAG).md"
 
 # ---- help -----------------------------------------------------------------
 # Auto-grouped from `##` annotations on target lines. Targets prefixed

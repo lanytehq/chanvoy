@@ -1,85 +1,27 @@
-# Shared helpers for the decernor 0.1.4 fingerprint contract.
+# Shared helpers for the decernor 0.1.8 fingerprint contract.
 # Sourced by insert-expected-fingerprints.sh and verify-public-keys.sh.
-# Requires bash, python3, and a decernor >= 0.1.4 on PATH (or $DECERNOR).
+# Requires bash, python3, and a decernor >= 0.1.8 on PATH (or $DECERNOR).
 
-CHANVOY_MIN_DECERNOR="${CHANVOY_MIN_DECERNOR:-0.1.4}"
+# The standalone legacy TXT parser/inserter shares the ceremony tool floor.
+# It is retained for explicit historical exports, not release staging.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/release-decernor.sh"
 
 chanvoy_refuse_private() {
-    local file="$1"
-    if grep -Eqi "PRIVATE|SECRET|BEGIN PGP PRIVATE KEY|minisign secret key" "$file"; then
-        echo "error: key file appears to contain private material: ${file}" >&2
+    if grep -Eqi 'PRIVATE|SECRET|BEGIN PGP PRIVATE KEY|minisign secret key' "$1"; then
+        echo 'error: key file appears to contain private material' >&2
         return 1
     fi
-}
-
-chanvoy_decernor_bin() {
-    if [ -n "${DECERNOR:-}" ]; then
-        if [ ! -x "$DECERNOR" ]; then
-            echo "error: DECERNOR is not executable: ${DECERNOR}" >&2
-            return 1
-        fi
-        printf '%s\n' "$DECERNOR"
-        return 0
-    fi
-    if command -v decernor >/dev/null 2>&1; then
-        command -v decernor
-        return 0
-    fi
-    echo "error: decernor not found on PATH (set DECERNOR= to an explicit binary)" >&2
-    return 1
-}
-
-# True if $1 and $2 are strict X.Y.Z and $1 >= $2.
-chanvoy_version_ge() {
-    python3 - "$1" "$2" <<'PY'
-import re, sys
-
-def parts(s):
-    s = s.strip()
-    if not re.fullmatch(r"\d+\.\d+\.\d+", s):
-        sys.exit(1)
-    return [int(p) for p in s.split(".")]
-
-have, need = parts(sys.argv[1]), parts(sys.argv[2])
-sys.exit(0 if have >= need else 1)
-PY
-}
-
-# Strict stable X.Y.Z only. Rejects 0.1.4-rc1 (must not become 0.1.41).
-chanvoy_decernor_version() {
-    local bin="$1"
-    local raw
-    raw="$("$bin" version 2>/dev/null || true)"
-    python3 - "$raw" <<'PY'
-import re, sys
-raw = sys.argv[1]
-matches = re.findall(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.\-A-Za-z])", raw)
-if len(matches) != 1:
-    sys.exit(1)
-print(matches[0])
-PY
 }
 
 chanvoy_require_decernor() {
-    local bin ver
-    bin="$(chanvoy_decernor_bin)" || return 1
-    ver="$(chanvoy_decernor_version "$bin")" || {
-        echo "error: could not parse version from \`$bin version\`" >&2
-        return 1
-    }
-    if ! chanvoy_version_ge "$ver" "$CHANVOY_MIN_DECERNOR"; then
-        echo "error: decernor ${ver} is too old; need ${CHANVOY_MIN_DECERNOR} or later" >&2
-        echo "       this host must not insert or verify against a pre-0.1.4 contract" >&2
-        return 1
-    fi
-    printf '%s\n' "$bin"
+    resolve_release_decernor general || return 1
+    printf '%s\n' "$RELEASE_DECERNOR_BIN"
 }
 
 chanvoy_preflight_decernor() {
-    local bin ver
+    local bin
     bin="$(chanvoy_require_decernor)" || return 1
-    ver="$(chanvoy_decernor_version "$bin")" || return 1
-    echo "[ok] decernor ${ver} (>= ${CHANVOY_MIN_DECERNOR}) at ${bin}"
+    "$bin" version
 }
 
 # stdout: minisign<TAB>gpg

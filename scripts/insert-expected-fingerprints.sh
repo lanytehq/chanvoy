@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Write keys/expected-fingerprints.txt from decernor 0.1.4 records.
+# Write keys/expected-fingerprints.txt from decernor 0.1.8 records.
 # Explicit public files only. Both contract lines or neither.
 set -euo pipefail
 
@@ -12,7 +12,7 @@ Usage: insert-expected-fingerprints.sh --minisign <pub> --gpg <asc> [--output <p
   --output    Destination contract file (default: keys/expected-fingerprints.txt)
 
 Environment:
-  DECERNOR    Explicit decernor binary (must be 0.1.4 or later)
+  DECERNOR    Explicit decernor binary (must be 0.1.8 or later)
 
 Writes both lines atomically. On any failure the destination is left
 unchanged. Never hand-types hex. Never walks a keyring or vault.
@@ -50,6 +50,12 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+# Historical standalone TXT exports must not bypass reviewed paired rotation.
+if [[ "$output" == "$repo_root/keys/expected-fingerprints.txt" ]]; then
+    echo 'error: repository anchors require release-insert-anchors.sh and explicit reviewed rotation' >&2
+    exit 1
+fi
 
 if [ -z "$minisign_pub" ] || [ -z "$gpg_asc" ]; then
     echo "error: --minisign and --gpg are both required" >&2
@@ -92,7 +98,7 @@ cat >"$tmp" <<EOF
 #
 # Load-bearing trust contract: release-verification asserts against
 # these values, not "some key file exists." Fill only via
-# scripts/insert-expected-fingerprints.sh (decernor 0.1.4+ records).
+# scripts/insert-expected-fingerprints.sh (decernor 0.1.8+ records).
 # Do not hand-type hex.
 #
 # Format: one \`<algo> <fingerprint>\` line per key.

@@ -5,7 +5,15 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.2] - 2026-09-12
+## [0.3.2] - unreleased
+
+### Release provenance
+
+- Read-only native artifact CI and maintainer-created, receipt-bound drafts.
+- Dual checksum manifests, paired public anchors and guarded fresh-download promotion.
+- Existing checksum, per-binary signature and public-key asset names remain available;
+  legacy names are deprecated for a future cut, with removal subject to notice.
+
 
 ### Added
 
@@ -42,8 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Distribution
 
-- v0.3.2 is distributed as signed GitHub Release binaries. It is not
-  published to crates.io.
+- v0.3.2 is planned for signed GitHub Release binary distribution, without
+  crates.io publication.
 
 ## [0.3.1] - 2026-08-27
 
