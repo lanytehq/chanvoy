@@ -641,3 +641,160 @@ async fn doctor_refreshes_refusal_after_an_inconclusive_generation_rpc() {
         task.await.unwrap();
     }
 }
+
+/// Parent and daemon credentials are separate evidence axes. A refused parent
+/// can coexist with a verified daemon using its own cached credential.
+#[tokio::test]
+async fn doctor_retains_parent_refusal_through_inconclusive_followup() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    for (
+        case,
+        (first_status, wrong_user, later_status, timeout, daemon_refused, team_refused, refused),
+    ) in [
+        (401, false, 503, false, false, false, true),
+        (403, false, 503, false, false, false, true),
+        (401, false, 200, true, false, false, true),
+        (403, false, 200, true, false, false, true),
+        (200, true, 503, false, false, false, true),
+        (200, true, 200, true, false, false, true),
+        (401, false, 200, false, false, false, false),
+        (200, true, 200, false, false, false, false),
+        (503, false, 503, false, false, false, false),
+        (200, false, 200, false, true, false, true),
+        (200, false, 503, false, true, false, true),
+        (200, false, 503, false, false, true, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let env = TestEnv::new(&format!("doc-parent-{case}")).await;
+        env.write_default_profile("agent-test", "org-lanytehq");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        Mock::given(method("GET")).and(path("/api/v4/users/me"))
+            .respond_with(move |_: &wiremock::Request| {
+                let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+                let mut response = ResponseTemplate::new(if first {first_status} else {later_status})
+                    .insert_header("Date", http_date_now_offset_secs(0))
+                    .set_body_json(serde_json::json!({"id":"synthetic-bot", "username":if first && wrong_user {"agent-other"} else {"agent-test"},"is_bot":true}));
+                if !first && timeout {response = response.set_delay(std::time::Duration::from_secs(5));}
+                response
+            }).mount(&env.mock).await;
+        if team_refused {
+            Mock::given(method("GET"))
+                .and(path("/api/v4/teams/name/org-lanytehq"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&env.mock)
+                .await;
+        } else {
+            mount_primary_team(&env).await;
+        }
+        std::fs::create_dir_all(env.chanvoy_runtime_dir()).unwrap();
+        let listener = UnixListener::bind(env.socket_path()).unwrap();
+        let profile = env.profile_name.clone();
+        let socket = env.socket_path();
+        let generation_reached_daemon = first_status == 200 && !wrong_user && !team_refused;
+        let task = tokio::spawn(async move {
+            for (index, method) in [
+                "daemon_observation",
+                "daemon_status",
+                if generation_reached_daemon {
+                    "daemon_status"
+                } else {
+                    "daemon_observation"
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: chanvoy_core::JsonRpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(&request.method, method);
+                let probe = if index == 1 {
+                    "verified"
+                } else if index == 2 && generation_reached_daemon {
+                    if daemon_refused {
+                        "rejected-credential"
+                    } else {
+                        "verified"
+                    }
+                } else {
+                    "unknown"
+                };
+                let response = chanvoy_core::rpc_result(
+                    request.id,
+                    serde_json::json!({"profile_name":profile,"socket_path":socket,
+                    "mattermost_username":"agent-test","mattermost_ok":probe=="verified","remote_probe":probe,
+                    "identity_refused":index==2 && daemon_refused,"mattermost_identity_drift":false,
+                    "ws_observation_admission_closed":false,"ws_connection_state":"healthy","ws_reconnect_count":0}),
+                );
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let before = read_attention_state_bytes(&env);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            run_chanvoy(&env, &["--json", "doctor"]),
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "case{case}: {report}");
+        assert_eq!(
+            output.status.code(),
+            Some(if refused { 2 } else { 0 }),
+            "case{case}: {report}"
+        );
+        assert_eq!(
+            report["daemon_disposition"],
+            if refused {
+                "identity-refused"
+            } else {
+                "degraded-remote"
+            },
+            "case{case}: {report}"
+        );
+        assert_eq!(
+            report["generation"]["generation_scored"], false,
+            "case{case}: {report}"
+        );
+        assert_eq!(report["generation"]["ownership"]["ownable"], false);
+        assert!(report["generation"]["generation_match"].is_null());
+        assert_eq!(report["observation_ready"], true);
+        let parent_refused = refused && !daemon_refused;
+        assert_eq!(
+            report["identity"]["check"],
+            if parent_refused {
+                "fail"
+            } else if timeout || later_status != 200 {
+                "warn"
+            } else {
+                "pass"
+            },
+            "case{case}: {report}"
+        );
+        assert_eq!(
+            report["clock"]["check"],
+            if timeout || later_status != 200 {
+                "unavailable"
+            } else {
+                "pass"
+            }
+        );
+        assert_eq!(read_attention_state_bytes(&env), before);
+        task.await.unwrap();
+    }
+}

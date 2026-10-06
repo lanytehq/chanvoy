@@ -845,6 +845,46 @@ struct RestartOwnership {
     reason: String,
 }
 
+/// Evidence from the parent identity endpoint, distinct from daemon evidence
+/// and team-access errors. No printable ownership reason is classification input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentIdentityEvidence {
+    VerifiedExpected,
+    RejectedCredential(u16),
+    WrongUsername,
+    Unknown,
+}
+
+impl ParentIdentityEvidence {
+    fn from_preflight_error(error: &CliError) -> Self {
+        match error {
+            CliError::IdentityRejected { status } => Self::RejectedCredential(*status),
+            CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch { .. }) => {
+                Self::WrongUsername
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ParentIdentityAssessment {
+    refusal: Option<ParentIdentityEvidence>,
+}
+
+impl ParentIdentityAssessment {
+    fn absorb(&mut self, evidence: ParentIdentityEvidence) {
+        match evidence {
+            ParentIdentityEvidence::VerifiedExpected => self.refusal = None,
+            ParentIdentityEvidence::RejectedCredential(_)
+            | ParentIdentityEvidence::WrongUsername => {
+                self.refusal = Some(evidence);
+            }
+            ParentIdentityEvidence::Unknown => {}
+        }
+    }
+}
+
 /// Operator-facing summary of an identity-preflight failure.
 ///
 /// `CoreError::Api` carries the provider's response body verbatim. For a
@@ -955,7 +995,11 @@ fn ownership_from_status(
 async fn probe_restart_ownership_with_status(
     profile: &Profile,
     deadline: tokio::time::Instant,
-) -> (RestartOwnership, Option<DaemonStatus>) {
+) -> (
+    RestartOwnership,
+    Option<DaemonStatus>,
+    ParentIdentityEvidence,
+) {
     let identity =
         match within_health_budget(deadline, validate_persisted_profile_identity(profile)).await {
             Ok(identity) => identity,
@@ -972,6 +1016,7 @@ async fn probe_restart_ownership_with_status(
                         ),
                     },
                     None,
+                    ParentIdentityEvidence::from_preflight_error(&error),
                 )
             }
         };
@@ -984,6 +1029,7 @@ async fn probe_restart_ownership_with_status(
             return (
                 ownership_from_status(profile, &identity, &status),
                 Some(status),
+                ParentIdentityEvidence::VerifiedExpected,
             );
         }
     }
@@ -996,6 +1042,7 @@ async fn probe_restart_ownership_with_status(
             reason: "daemon identity probe unavailable within the remaining budget".into(),
         },
         None,
+        ParentIdentityEvidence::VerifiedExpected,
     )
 }
 
@@ -3968,7 +4015,6 @@ async fn validate_persisted_profile_identity(profile: &Profile) -> Result<Identi
     let token = load_token(profile)?;
     let client = MattermostClient::new(profile, token)?;
     let identity = parent_identity(&client).await?;
-    validate_parent_team(&client).await?;
     if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
         return Err(chanvoy_core::CoreError::ProfileIdentityMismatch {
             expected: profile.bot_username.clone(),
@@ -3976,6 +4022,7 @@ async fn validate_persisted_profile_identity(profile: &Profile) -> Result<Identi
         }
         .into());
     }
+    validate_parent_team(&client).await?;
     Ok(identity)
 }
 
@@ -5160,6 +5207,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
 
     // --- daemon reachability + status (best-effort) ---
     let mut assessment = daemon_assessment::assess_until(&profile, deadline).await;
+    let mut parent_assessment = ParentIdentityAssessment::default();
     let cli_info = resolve_host_build_info();
     let mut ownership = RestartOwnership {
         ownable: false,
@@ -5172,8 +5220,9 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         && deadline.saturating_duration_since(tokio::time::Instant::now())
             >= daemon_assessment::REMOTE_BUDGET
     {
-        let (probed_ownership, later) =
+        let (probed_ownership, later, parent_evidence) =
             probe_restart_ownership_with_status(&profile, deadline).await;
+        parent_assessment.absorb(parent_evidence);
         ownership = probed_ownership;
         let next = if let Some(status) = later {
             daemon_assessment::Assessment::from_status(status, &profile.bot_username)
@@ -5323,7 +5372,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         }
     }
 
-    let (identity_check, identity_block, clock_block, client) = match load_token(&profile) {
+    let (mut identity_check, mut identity_block, clock_block, client) = match load_token(&profile) {
         Err(e) => {
             hard_failure = true;
             let (status_class, reason) = doctor_provider_error_summary(&e);
@@ -5387,6 +5436,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                             let username_ok =
                                 profile_bot.is_empty() || identity.username.as_str() == profile_bot;
                             let (id_check, id_block) = if username_ok {
+                                parent_assessment.absorb(ParentIdentityEvidence::VerifiedExpected);
                                 (
                                     CheckVerdict::Pass,
                                     DoctorIdentityBlock {
@@ -5398,6 +5448,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                                     },
                                 )
                             } else {
+                                parent_assessment.absorb(ParentIdentityEvidence::WrongUsername);
                                 hard_failure = true;
                                 daemon_disposition = DaemonDisposition::IdentityRefused;
                                 (
@@ -5424,6 +5475,11 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                                 == chanvoy_core::recovery::RemoteProbeOutcome::RejectedCredential;
                             hard_failure |= authoritative;
                             if authoritative {
+                                if let chanvoy_core::CoreError::Api { status, .. } = &e {
+                                    parent_assessment.absorb(
+                                        ParentIdentityEvidence::RejectedCredential(status.as_u16()),
+                                    );
+                                }
                                 daemon_disposition = DaemonDisposition::IdentityRefused;
                             } else if daemon_disposition == DaemonDisposition::Healthy {
                                 daemon_disposition = DaemonDisposition::DegradedRemote;
@@ -5542,6 +5598,30 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     } else {
         None
     };
+
+    // Parent refusal is operation-local and independent of the daemon latch.
+    // A later 5xx/timeout/local snapshot cannot clear it; only a successful
+    // expected parent identity can. Never let parent success clear daemon refusal.
+    if let Some(refusal) = parent_assessment.refusal {
+        daemon_disposition = DaemonDisposition::IdentityRefused;
+        // Preserve the current authoritative failure's actionable detail.
+        // Replace only a later inconclusive receipt that hid the earlier refusal.
+        if identity_check != CheckVerdict::Fail {
+            identity_block.status_class = Some(match refusal {
+                ParentIdentityEvidence::RejectedCredential(status) => {
+                    provider_status_class(status).into()
+                }
+                ParentIdentityEvidence::WrongUsername => "identity_mismatch".into(),
+                _ => unreachable!("parent assessment only retains refusals"),
+            });
+            identity_block.reason = Some(
+                "authoritative parent identity refusal remains unresolved during this diagnostic"
+                    .into(),
+            );
+        }
+        identity_check = CheckVerdict::Fail;
+        identity_block.ok = false;
+    }
 
     // Keep the final receipt aligned with all identity evidence discovered by
     // this operation, including the independent parent probe. A parent success
@@ -7996,6 +8076,37 @@ mod tests {
 
     const COMMIT_A: &str = "aaaaaaa1111111aaaaaaa1111111aaaaaaa11111";
     const COMMIT_B: &str = "bbbbbbb2222222bbbbbbb2222222bbbbbbb22222";
+
+    #[test]
+    fn parent_refusal_retains_unknown_and_only_expected_parent_success_clears_it() {
+        for refusal in [
+            ParentIdentityEvidence::RejectedCredential(401),
+            ParentIdentityEvidence::RejectedCredential(403),
+            ParentIdentityEvidence::WrongUsername,
+        ] {
+            let mut parent = ParentIdentityAssessment::default();
+            parent.absorb(refusal);
+            parent.absorb(ParentIdentityEvidence::Unknown);
+            assert_eq!(parent.refusal, Some(refusal));
+            parent.absorb(ParentIdentityEvidence::VerifiedExpected);
+            assert_eq!(parent.refusal, None);
+        }
+        // Team endpoint status and provider text are not identity evidence.
+        let team_error = CliError::Core(chanvoy_core::CoreError::Api {
+            status: chanvoy_core::StatusCode::UNAUTHORIZED,
+            message: "401 rejected".into(),
+        });
+        assert_eq!(
+            ParentIdentityEvidence::from_preflight_error(&team_error),
+            ParentIdentityEvidence::Unknown
+        );
+        assert_eq!(
+            ParentIdentityEvidence::from_preflight_error(&CliError::Bootstrap(
+                "401 rejected".into()
+            )),
+            ParentIdentityEvidence::Unknown
+        );
+    }
 
     #[test]
     fn generation_ownership_requires_observed_typed_identity() {

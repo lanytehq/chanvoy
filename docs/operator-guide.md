@@ -465,6 +465,12 @@ states stay distinct:
 | `clock` | Local wall clock vs HTTP `Date` on `GET /users/me` |
 | `channel` (optional) | Pure resolve / membership for a named channel |
 
+Within one diagnostic, parent credential evidence and daemon credential evidence
+remain separate. An identity-endpoint 401/403 or observed wrong username remains
+an identity refusal through later timeout, server failure or local-only snapshots.
+Only a successful expected identity on the same axis can clear it; parent success
+cannot clear daemon refusal. Unresolved refusal means exit 2 and unscored generation.
+
 Clock verdicts (residual after RTT/2):
 
 | Verdict | Residual band |
