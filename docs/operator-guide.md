@@ -176,10 +176,14 @@ provider calls. A missing, unreadable or mismatched reference skips discovery;
 failed inspection remains unconfirmed. Reports describe observed candidates,
 without claiming current liveness, ownership or observation readiness. Equality
 identifies the designated reference; it does not establish release qualification.
+The reference is comparison input only. Manual commands use the byte-verified
+installed executable, whose path matches the installed-path candidate; running
+a separate artifact or worktree copy does not satisfy that executable-path
+ownership guard. Revalidate the installed binary before manual action.
 `CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1` still skips this reporting step.
 
-For each candidate, source its owning identity and use the qualified binary
-with an explicit profile to observe status/doctor and resolve ownership and
+For each candidate, source its owning identity and use the qualified installed
+binary with an explicit profile to observe status/doctor and resolve ownership and
 liveness. Stop only the independently owned predecessor. Independently confirm
 that same candidate's whole-process death and guarded runtime cleanup before
 starting a successor; unknown identity, death or cleanup withholds startup.

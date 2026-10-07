@@ -100,6 +100,20 @@ has 'listener absence or refused connection are not death proof'
 has 'unknown ownership, death or cleanup withholds startup'
 has 'only after confirmation:'
 has 'verify dual pin:'
+printf -v report_test_escaped_bin '%q' "$report_test_bin"
+printf -v report_test_escaped_reference '%q' "$report_test_reference"
+for report_test_profile in synthetic-alpha synthetic-beta; do
+    has "observe: $report_test_escaped_bin --profile $report_test_profile daemon status"
+    has "diagnose: $report_test_escaped_bin --profile $report_test_profile doctor"
+    has "only for the independently owned predecessor: $report_test_escaped_bin --profile $report_test_profile daemon stop"
+    has "only after confirmation: $report_test_escaped_bin --profile $report_test_profile daemon start"
+    has "verify dual pin: $report_test_escaped_bin --profile $report_test_profile version --extended"
+    has "verify observation readiness: $report_test_escaped_bin --profile $report_test_profile doctor"
+done
+# A distinct byte-matched reference is verification data, not the executable
+# path owned by the installed-path candidate. None of its command prefixes may
+# appear; checking all six installed prefixes also covers their exact profiles.
+lacks "$report_test_escaped_reference --profile"
 
 reset_case old-no-runtime-stop-receipt
 printf '%s\n' "$report_test_bin --profile synthetic-installer daemon serve" > "$report_test_ps_input"
@@ -245,6 +259,18 @@ has 'unresolved=1'
 lacks 'no matching candidates'
 lacks 'synthetic!unconfirmed'
 
+reset_case ambiguous-whitespace-profiles
+for report_test_ambiguous in 'synthetic review' ' synthetic-review' $'synthetic\treview' ''; do
+    printf '%s\n' "$report_test_bin --profile $report_test_ambiguous daemon serve" > "$report_test_ps_input"
+    : > "$report_test_ps_calls"
+    run_report
+    one_inspection
+    has 'candidate formatting is unconfirmed'
+    has 'candidates=0 withheld=0 unresolved=1'
+    lacks 'no matching candidates'
+    lacks 'synthetic review'
+done
+
 reset_case unix-only-alias
 env -i PATH="$report_test_tools:$report_test_path" \
     REPORT_TEST_CLI_LOG="$report_test_calls" REPORT_TEST_CLI_EXIT=0 \
@@ -258,4 +284,4 @@ has 'reports installed-daemon candidates; no automatic restart'
 has 'process discovery is Unix-only'
 has 'unresolved=1'
 
-printf '%s\n' '[ok] installer reporting: 21 owned cases, zero CLI/lifecycle calls'
+printf '%s\n' '[ok] installer reporting: 22 owned cases, zero CLI/lifecycle calls'

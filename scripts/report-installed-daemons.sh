@@ -52,12 +52,13 @@ while IFS= read -r report_line; do
         *) continue ;;
     esac
     report_rest=${report_line#"$report_bin --profile "}
-    report_profile=${report_rest%% *}
-    report_tail=${report_rest#"$report_profile"}
-    case "$report_tail" in
-        ' daemon serve'|' daemon serve '*) ;;
+    case "$report_rest" in
+        *' daemon serve'|*' daemon serve '*) ;;
         *) continue ;;
     esac
+    # ps joins argv with spaces. Inspect the complete prefix before the verb,
+    # so an ambiguous multiword/empty profile cannot become a false absence.
+    report_profile=${report_rest%%" daemon serve"*}
     if [[ ! "$report_profile" =~ ^[A-Za-z0-9_.-]+$ ]]; then
         report_unconfirmed=$((report_unconfirmed + 1))
         continue
@@ -80,15 +81,15 @@ while IFS= read -r report_profile; do
     [[ -n "$report_profile" ]] || continue
     printf '     [!!] %s: daemon candidate observed; automatic restart withheld (candidate death is not established)\n' "$report_profile"
     printf '         source the owning identity for %s; resolve candidate ownership and liveness\n' "$report_profile"
-    printf '         observe: %q --profile %q daemon status\n' "$report_reference" "$report_profile"
-    printf '         diagnose: %q --profile %q doctor\n' "$report_reference" "$report_profile"
-    printf '         only for the independently owned predecessor: %q --profile %q daemon stop\n' "$report_reference" "$report_profile"
+    printf '         observe: %q --profile %q daemon status\n' "$report_bin" "$report_profile"
+    printf '         diagnose: %q --profile %q doctor\n' "$report_bin" "$report_profile"
+    printf '         only for the independently owned predecessor: %q --profile %q daemon stop\n' "$report_bin" "$report_profile"
     printf '%s\n' '         independently confirm the same candidate whole-process exit and guarded runtime cleanup'
     printf '%s\n' '         stop exit 0, missing PID/socket, listener absence or refused connection are not death proof'
     printf '%s\n' '         unknown ownership, death or cleanup withholds startup'
-    printf '         only after confirmation: %q --profile %q daemon start\n' "$report_reference" "$report_profile"
-    printf '         verify dual pin: %q --profile %q version --extended\n' "$report_reference" "$report_profile"
-    printf '         verify observation readiness: %q --profile %q doctor\n' "$report_reference" "$report_profile"
+    printf '         only after confirmation: %q --profile %q daemon start\n' "$report_bin" "$report_profile"
+    printf '         verify dual pin: %q --profile %q version --extended\n' "$report_bin" "$report_profile"
+    printf '         verify observation readiness: %q --profile %q doctor\n' "$report_bin" "$report_profile"
 done <<< "$report_profiles"
 if [[ "$report_unconfirmed" -gt 0 ]]; then
     printf '%s\n' '[!!] installed-path candidate formatting is unconfirmed; no cycle attempted'

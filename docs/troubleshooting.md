@@ -450,8 +450,13 @@ artifact via `CHANVOY_INSTALL_QUALIFIED_ARTIFACT`; missing, unreadable or
 mismatched bytes skip discovery. Failed inspection is unconfirmed, and a
 candidate snapshot is not current ownership, liveness or observation proof.
 
-Source the candidate's owning identity and use the qualified binary with an
-explicit profile to observe status/doctor. Resolve predecessor ownership before
+The independent artifact is verification input only; execute manual commands
+from the byte-verified installed path. A separate artifact or worktree path
+does not satisfy the candidate's executable-path ownership guard. Revalidate
+the installed binary before action.
+
+Source the candidate's owning identity and use the qualified installed binary
+with an explicit profile to observe status/doctor. Resolve predecessor ownership before
 stopping. Independently confirm that same candidate's whole-process death and
 guarded runtime cleanup before starting a successor. Stop exit 0, missing
 PID/socket, listener absence or refused connection are insufficient; unknown

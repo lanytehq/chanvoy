@@ -285,9 +285,13 @@ exit*. Resume from the last message `tip` (or the original `--after`; if
 neither exists, drain first). After a sink failure, repair the sink
 before re-arming.
 
-After `make install` or any binary replace, run
-`chanvoy daemon stop && chanvoy auto-setup` before trusting filtered wait (the
-daemon keeps the binary it was started from). See
+After `make install` or any binary replace, use the byte-verified installed
+executable with an explicit profile and the
+[confirmed migration procedure](./operator-guide.md#installation-and-daemon-migration)
+before trusting new wait features. The reference artifact is comparison input;
+it is not the command path for that installed-path candidate. Ownership,
+same-candidate whole-process death and guarded cleanup must be confirmed before
+a separate start; unknown evidence withholds startup. See
 [troubleshooting: daemon does not support a verb / filtered wait](./troubleshooting.md#the-running-daemon-does-not-support-a-verb).
 
 ## Your first post
