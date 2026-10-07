@@ -6,7 +6,9 @@ use std::os::unix::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
+use tokio::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileStamp {
@@ -78,6 +80,7 @@ struct NativeControl {
     captured: ProcessObservation,
     captured_birth: Option<u64>,
     exit_watch: Option<ExitWatch>,
+    death_seen: Mutex<Option<Instant>>,
 }
 
 /// Kernel exit evidence stays usable when an unreaped process no longer exposes
@@ -261,6 +264,7 @@ impl NativeControl {
             captured,
             captured_birth,
             exit_watch,
+            death_seen: Mutex::new(None),
         };
         if !control.runtime_matches(false) {
             return Err("runtime changed around exit monitor; state retained".into());
@@ -513,20 +517,40 @@ fn death_or_unknown(pid: u32) -> ProcessObservation {
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum SocketOwner {
-    Live(u32),
-    Absent,
-    Unknown,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketUnknown {
+    Connect(std::io::ErrorKind),
+    Credentials(std::io::ErrorKind),
+    ConnectTimeout,
+    ProbeTimeout,
+    CredentialSizeInvalid,
+    CredentialPidInvalid,
+    #[cfg(target_os = "linux")]
+    CredentialOwnerMismatch,
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Unsupported,
 }
 
-async fn peer_owner(socket: &Path) -> SocketOwner {
-    let stream = match tokio::time::timeout(
-        Duration::from_millis(750),
-        tokio::net::UnixStream::connect(socket),
-    )
-    .await
-    {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketOwner {
+    // This is returned peer credential metadata, not fresh liveness proof.
+    Live(u32),
+    Absent,
+    Unknown(SocketUnknown),
+}
+
+impl SocketOwner {
+    fn receipt(self) -> String {
+        match self {
+            Self::Live(pid) => format!("Live({pid})"),
+            Self::Absent => "Absent".into(),
+            Self::Unknown(reason) => format!("Unknown({reason:?})"),
+        }
+    }
+}
+
+async fn peer_owner(socket: &Path, budget: Duration) -> SocketOwner {
+    let stream = match tokio::time::timeout(budget, tokio::net::UnixStream::connect(socket)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error))
             if matches!(
@@ -539,15 +563,15 @@ async fn peer_owner(socket: &Path) -> SocketOwner {
         }
         Ok(Err(error)) => {
             tracing::debug!(stage = "socket-connect", outcome = ?error.kind());
-            return SocketOwner::Unknown;
+            return SocketOwner::Unknown(SocketUnknown::Connect(error.kind()));
         }
         Err(_) => {
             tracing::debug!(stage = "socket-connect", outcome = "connect-timeout");
-            return SocketOwner::Unknown;
+            return SocketOwner::Unknown(SocketUnknown::ConnectTimeout);
         }
     };
     #[cfg(target_os = "macos")]
-    {
+    let owner = {
         let mut pid: libc::pid_t = 0;
         let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
         let result = unsafe {
@@ -561,24 +585,17 @@ async fn peer_owner(socket: &Path) -> SocketOwner {
         };
         if result != 0 {
             let error = std::io::Error::last_os_error();
-            tracing::debug!(stage = "socket-credential-query", outcome = ?error.kind());
+            SocketOwner::Unknown(SocketUnknown::Credentials(error.kind()))
         } else if size as usize != std::mem::size_of_val(&pid) {
-            tracing::debug!(
-                stage = "socket-credential-query",
-                outcome = "credential-size-invalid"
-            );
+            SocketOwner::Unknown(SocketUnknown::CredentialSizeInvalid)
         } else if pid <= 0 {
-            tracing::debug!(
-                stage = "socket-credential-query",
-                outcome = "credential-pid-invalid"
-            );
+            SocketOwner::Unknown(SocketUnknown::CredentialPidInvalid)
         } else {
-            tracing::debug!(stage = "socket-peer", pid, outcome = "peer-pid-returned");
-            return SocketOwner::Live(pid as u32);
+            SocketOwner::Live(pid as u32)
         }
-    }
+    };
     #[cfg(target_os = "linux")]
-    {
+    let owner = {
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of_val(&cred) as libc::socklen_t;
         let result = unsafe {
@@ -592,36 +609,25 @@ async fn peer_owner(socket: &Path) -> SocketOwner {
         };
         if result != 0 {
             let error = std::io::Error::last_os_error();
-            tracing::debug!(stage = "socket-credential-query", outcome = ?error.kind());
+            SocketOwner::Unknown(SocketUnknown::Credentials(error.kind()))
         } else if size as usize != std::mem::size_of_val(&cred) {
-            tracing::debug!(
-                stage = "socket-credential-query",
-                outcome = "credential-size-invalid"
-            );
+            SocketOwner::Unknown(SocketUnknown::CredentialSizeInvalid)
         } else if cred.pid <= 0 {
-            tracing::debug!(
-                stage = "socket-credential-query",
-                outcome = "credential-pid-invalid"
-            );
+            SocketOwner::Unknown(SocketUnknown::CredentialPidInvalid)
         } else if cred.uid != unsafe { libc::geteuid() } {
-            tracing::debug!(
-                stage = "socket-credential-query",
-                outcome = "credential-owner-mismatch"
-            );
+            SocketOwner::Unknown(SocketUnknown::CredentialOwnerMismatch)
         } else {
-            tracing::debug!(
-                stage = "socket-peer",
-                pid = cred.pid,
-                outcome = "peer-pid-returned"
-            );
-            return SocketOwner::Live(cred.pid as u32);
+            SocketOwner::Live(cred.pid as u32)
         }
-    }
-    SocketOwner::Unknown
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let owner = SocketOwner::Unknown(SocketUnknown::Unsupported);
+    tracing::debug!(stage = "socket-credential-query", outcome = %owner.receipt());
+    owner
 }
 
-impl ProcessControl for NativeControl {
-    fn observe(&self) -> ProcessObservation {
+impl NativeControl {
+    fn observe_process(&self) -> ProcessObservation {
         if native_birth(self.pid).is_some_and(|birth| Some(birth) != self.captured_birth) {
             return ProcessObservation::Unknown;
         }
@@ -663,6 +669,19 @@ impl ProcessControl for NativeControl {
         }
         current
     }
+}
+
+impl ProcessControl for NativeControl {
+    fn observe(&self) -> ProcessObservation {
+        let observation = self.observe_process();
+        if observation == ProcessObservation::Dead {
+            let Ok(mut seen) = self.death_seen.lock() else {
+                return ProcessObservation::Unknown;
+            };
+            seen.get_or_insert_with(Instant::now);
+        }
+        observation
+    }
     fn runtime_matches(&self, allow_absent: bool) -> bool {
         let matches = |path: &Path, expected: Option<&FileStamp>| match stamp(path) {
             Ok(actual) => actual.as_ref() == expected || (allow_absent && actual.is_none()),
@@ -680,10 +699,37 @@ impl ProcessControl for NativeControl {
             }
     }
     async fn peer_matches(&self) -> bool {
-        peer_owner(&self.socket_path).await == SocketOwner::Live(self.pid)
+        peer_owner(&self.socket_path, Duration::from_millis(750)).await
+            == SocketOwner::Live(self.pid)
     }
-    async fn peer_absent(&self) -> bool {
-        peer_owner(&self.socket_path).await == SocketOwner::Absent
+    async fn socket_owner(&self, budget: Duration) -> SocketOwner {
+        peer_owner(&self.socket_path, budget).await
+    }
+    fn leftover_deadline(&self, pid: u32, window: Duration) -> Option<Instant> {
+        #[cfg(target_os = "linux")]
+        {
+            let ProcessObservation::Alive(identity) = &self.captured else {
+                return None;
+            };
+            if pid != self.pid
+                || self.captured_birth != Some(identity.birth)
+                || !self.owned_identity(identity)
+                || !matches!(self.exit_watch.as_ref()?.exited(), Ok(true))
+            {
+                return None;
+            }
+            match native_birth(self.pid) {
+                Some(birth) if birth == identity.birth => {}
+                None if death_or_unknown(self.pid) == ProcessObservation::Dead => {}
+                _ => return None,
+            }
+            (*self.death_seen.lock().ok()?).map(|seen| seen + window)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (pid, window);
+            None
+        }
     }
     async fn shutdown(&self) -> Result<(), String> {
         chanvoy_daemon::stop(&self.profile)
@@ -770,7 +816,8 @@ trait ProcessControl {
     fn observe(&self) -> ProcessObservation;
     fn runtime_matches(&self, allow_absent: bool) -> bool;
     async fn peer_matches(&self) -> bool;
-    async fn peer_absent(&self) -> bool;
+    async fn socket_owner(&self, budget: Duration) -> SocketOwner;
+    fn leftover_deadline(&self, pid: u32, window: Duration) -> Option<Instant>;
     async fn shutdown(&self) -> Result<(), String>;
     fn force_signal(&self) -> Result<(), String>;
     fn cleanup(&self) -> Result<(), String>;
@@ -803,14 +850,74 @@ fn revalidate(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SocketPollBudget {
+    total: Duration,
+    interval: Duration,
+    attempts: usize,
+}
+
 async fn cleanup_dead(control: &impl ProcessControl) -> Result<(), String> {
-    if !control.runtime_matches(true) {
-        return Err("runtime identity changed before cleanup; state retained".into());
+    cleanup_dead_with(
+        control,
+        SocketPollBudget {
+            total: Duration::from_millis(750),
+            interval: Duration::from_millis(50),
+            attempts: 5,
+        },
+    )
+    .await
+}
+
+fn revalidate_dead(control: &impl ProcessControl) -> Result<(), String> {
+    if !control.runtime_matches(true) || control.observe() != ProcessObservation::Dead {
+        return Err(
+            "death or runtime identity changed before socket observation; state retained".into(),
+        );
     }
-    if !control.peer_absent().await {
-        return Err("socket owner not confirmed absent; state retained".into());
+    Ok(())
+}
+
+async fn cleanup_dead_with(
+    control: &impl ProcessControl,
+    budget: SocketPollBudget,
+) -> Result<(), String> {
+    let mut deadline = Instant::now() + budget.total;
+    let mut last = SocketOwner::Unknown(SocketUnknown::ProbeTimeout);
+    for attempt in 0..budget.attempts {
+        revalidate_dead(control)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        last = match tokio::time::timeout_at(deadline, control.socket_owner(remaining)).await {
+            Ok(owner) => owner,
+            Err(_) => SocketOwner::Unknown(SocketUnknown::ProbeTimeout),
+        };
+        if Instant::now() >= deadline {
+            last = SocketOwner::Unknown(SocketUnknown::ProbeTimeout);
+        }
+        tracing::debug!(stage = "post-death-socket-owner", outcome = %last.receipt());
+        revalidate_dead(control)?;
+        match last {
+            SocketOwner::Absent => return control.cleanup(),
+            SocketOwner::Unknown(_) => break,
+            SocketOwner::Live(pid) => {
+                let Some(eligible_until) = control.leftover_deadline(pid, budget.total) else {
+                    break;
+                };
+                deadline = deadline.min(eligible_until);
+                if attempt + 1 == budget.attempts || Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep_until((Instant::now() + budget.interval).min(deadline)).await;
+            }
+        }
     }
-    control.cleanup()
+    Err(format!(
+        "socket owner not confirmed absent ({}); state retained",
+        last.receipt()
+    ))
 }
 
 async fn death_within(
@@ -961,6 +1068,20 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(control.observe(), ProcessObservation::Dead);
+        let first_death = *control.death_seen.lock().unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(control.observe(), ProcessObservation::Dead);
+        assert_eq!(
+            *control.death_seen.lock().unwrap(),
+            first_death,
+            "re-observation must not renew the post-death retry window"
+        );
+        assert!(
+            control
+                .leftover_deadline(child.0.id(), Duration::from_millis(750))
+                .is_none(),
+            "a cold dead capture cannot claim a recent owned daemon leftover"
+        );
         cleanup_dead(&control).await.unwrap();
         assert!(!pid_file.exists());
         child.0.wait().unwrap();
@@ -1088,7 +1209,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(control.observe(), ProcessObservation::Dead);
-        assert!(cleanup_dead(&control).await.is_err());
+        assert!(control
+            .leftover_deadline(child_pid, Duration::from_millis(750))
+            .is_none());
+        let refusal = cleanup_dead(&control).await.unwrap_err();
+        assert!(refusal.contains(&format!("Live({})", std::process::id())));
         assert!(pid.exists() && socket.exists());
         drop(listener);
         assert!(cleanup_dead(&control).await.is_ok());
@@ -1131,6 +1256,14 @@ mod tests {
         shutdowns: Cell<usize>,
         signals: Cell<usize>,
         cleanups: Cell<usize>,
+        owners: RefCell<VecDeque<SocketOwner>>,
+        last_owner: Cell<SocketOwner>,
+        owner_calls: Cell<usize>,
+        leftover_birth: Option<u64>,
+        leftover_until: Instant,
+        change_on_peer: bool,
+        alive_on_peer: bool,
+        pending_peer: bool,
     }
     fn identity() -> ProcessIdentity {
         ProcessIdentity {
@@ -1165,6 +1298,127 @@ mod tests {
             ProcessObservation::Alive(identity()),
         ]);
         assert!(capture_monitor(|| observations.pop_front().unwrap(), || Ok(())).is_err());
+    }
+
+    fn socket_budget() -> SocketPollBudget {
+        SocketPollBudget {
+            total: Duration::from_secs(1),
+            interval: Duration::ZERO,
+            attempts: 3,
+        }
+    }
+    fn dead_with_owners(owners: Vec<SocketOwner>) -> Fake {
+        let mut f = fake(vec![ProcessObservation::Dead]);
+        f.owners = RefCell::new(owners.into());
+        f.leftover_birth = Some(identity().birth);
+        f
+    }
+    fn assert_retained(f: &Fake) {
+        assert_eq!(
+            (f.shutdowns.get(), f.signals.get(), f.cleanups.get()),
+            (0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_birth_leftover_needs_positive_absence_within_attempt_bound() {
+        let f = dead_with_owners(vec![SocketOwner::Live(identity().pid), SocketOwner::Absent]);
+        cleanup_dead_with(&f, socket_budget()).await.unwrap();
+        assert_eq!((f.owner_calls.get(), f.cleanups.get()), (2, 1));
+        assert_eq!((f.shutdowns.get(), f.signals.get()), (0, 0));
+        let f = dead_with_owners(vec![SocketOwner::Live(identity().pid)]);
+        let err = cleanup_dead_with(&f, socket_budget()).await.unwrap_err();
+        assert!(err.contains("Live(1234)"));
+        assert_eq!(f.owner_calls.get(), 3);
+        assert_retained(&f);
+    }
+
+    #[tokio::test]
+    async fn unknown_owner_is_classified_and_never_retried_as_leftover() {
+        for reason in [
+            SocketUnknown::Connect(std::io::ErrorKind::PermissionDenied),
+            SocketUnknown::Credentials(std::io::ErrorKind::InvalidInput),
+            SocketUnknown::ConnectTimeout,
+            SocketUnknown::CredentialSizeInvalid,
+            SocketUnknown::CredentialPidInvalid,
+        ] {
+            let f = dead_with_owners(vec![SocketOwner::Unknown(reason), SocketOwner::Absent]);
+            let err = cleanup_dead_with(&f, socket_budget()).await.unwrap_err();
+            assert!(err.contains(&SocketOwner::Unknown(reason).receipt()));
+            assert_eq!(f.owner_calls.get(), 1);
+            assert_retained(&f);
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_peer_birth_and_expired_window_retain_runtime() {
+        for (pid, birth, expired) in [
+            (4321, Some(identity().birth), false),
+            (1234, Some(identity().birth + 1), false),
+            (1234, None, false),
+            (1234, Some(identity().birth), true),
+        ] {
+            let mut f = dead_with_owners(vec![SocketOwner::Live(pid), SocketOwner::Absent]);
+            f.leftover_birth = birth;
+            if expired {
+                f.leftover_until = Instant::now() - Duration::from_millis(1);
+                f.owners = RefCell::new(VecDeque::from([
+                    SocketOwner::Live(pid),
+                    SocketOwner::Live(pid),
+                ]));
+            }
+            assert!(cleanup_dead_with(&f, socket_budget()).await.is_err());
+            assert_eq!(f.owner_calls.get(), 1);
+            assert_retained(&f);
+            if expired {
+                assert!(
+                    cleanup_dead_with(&f, socket_budget()).await.is_err(),
+                    "another cleanup call must not renew the post-death window"
+                );
+                assert_eq!(f.owner_calls.get(), 2);
+                assert_retained(&f);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_probe_revalidates_death_and_runtime_before_cleanup_and_retry() {
+        for owner in [SocketOwner::Absent, SocketOwner::Live(identity().pid)] {
+            for change_runtime in [true, false] {
+                let mut f = dead_with_owners(vec![owner]);
+                f.change_on_peer = change_runtime;
+                f.alive_on_peer = !change_runtime;
+                assert!(cleanup_dead_with(&f, socket_budget()).await.is_err());
+                assert_eq!(f.owner_calls.get(), 1);
+                assert_retained(&f);
+            }
+        }
+        let mut reused = identity();
+        reused.birth += 1;
+        let mut f = dead_with_owners(vec![SocketOwner::Live(identity().pid), SocketOwner::Absent]);
+        f.observations = RefCell::new(VecDeque::from([
+            ProcessObservation::Dead,
+            ProcessObservation::Dead,
+            ProcessObservation::Alive(reused),
+        ]));
+        assert!(cleanup_dead_with(&f, socket_budget()).await.is_err());
+        assert_eq!(f.owner_calls.get(), 1);
+        assert_retained(&f);
+    }
+
+    #[tokio::test]
+    async fn socket_connect_cannot_outlive_shared_deadline() {
+        let mut f = dead_with_owners(vec![SocketOwner::Absent]);
+        f.pending_peer = true;
+        let budget = SocketPollBudget {
+            total: Duration::from_millis(10),
+            interval: Duration::ZERO,
+            attempts: 3,
+        };
+        let err = cleanup_dead_with(&f, budget).await.unwrap_err();
+        assert!(err.contains("Unknown(ProbeTimeout)"));
+        assert_eq!(f.owner_calls.get(), 1);
+        assert_retained(&f);
     }
 
     #[test]
@@ -1205,6 +1459,14 @@ mod tests {
             shutdowns: Cell::new(0),
             signals: Cell::new(0),
             cleanups: Cell::new(0),
+            owners: RefCell::new(VecDeque::new()),
+            last_owner: Cell::new(SocketOwner::Absent),
+            owner_calls: Cell::new(0),
+            leftover_birth: None,
+            leftover_until: Instant::now() + Duration::from_secs(1),
+            change_on_peer: false,
+            alive_on_peer: false,
+            pending_peer: false,
         }
     }
     fn budget() -> StopBudget {
@@ -1227,8 +1489,25 @@ mod tests {
         async fn peer_matches(&self) -> bool {
             true
         }
-        async fn peer_absent(&self) -> bool {
-            true
+        async fn socket_owner(&self, _: Duration) -> SocketOwner {
+            self.owner_calls.set(self.owner_calls.get() + 1);
+            if self.pending_peer {
+                std::future::pending::<()>().await;
+            }
+            if self.change_on_peer {
+                self.runtime.set(false);
+            }
+            if self.alive_on_peer {
+                *self.last.borrow_mut() = ProcessObservation::Alive(identity());
+            }
+            if let Some(owner) = self.owners.borrow_mut().pop_front() {
+                self.last_owner.set(owner);
+            }
+            self.last_owner.get()
+        }
+        fn leftover_deadline(&self, pid: u32, _: Duration) -> Option<Instant> {
+            (pid == identity().pid && self.leftover_birth == Some(identity().birth))
+                .then_some(self.leftover_until)
         }
         async fn shutdown(&self) -> Result<(), String> {
             self.shutdowns.set(self.shutdowns.get() + 1);

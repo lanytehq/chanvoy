@@ -272,6 +272,14 @@ Socket absence and unchanged runtime identity remain separate cleanup requiremen
 stage, PID and outcome only. Connect and credential-query errors are classified
 at the failing call; invalid credential shape or ownership has its own outcome.
 These diagnostics do not contain credentials, provider bodies or runtime file contents.
+A refused cleanup names `Live(pid)` or a classified `Unknown(reason)` owner.
+On Linux, only the captured daemon PID with matched birth and registered exit
+proof can receive bounded leftover-listener observation: at most five attempts
+within one 750 ms deadline, 50 ms apart. The retry window starts at the first
+confirmed death observation and cannot be renewed. Unknown or a different PID
+or birth retains runtime files. Every attempt rechecks death and runtime
+identity; cleanup still requires a fresh positive socket-absence result.
+
 
 The drift gate is intentionally one-way: the daemon doesn't try to
 "recover" by silently re-binding to a different identity. That would

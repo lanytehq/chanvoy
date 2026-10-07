@@ -685,6 +685,10 @@ async fn auto_setup_stops_zombie_and_respawns() {
         proof.contains("ConnectionRefused") || proof.contains("NotFound"),
         "recovery must record positive socket-absence proof: {proof}"
     );
+    assert!(
+        proof.contains("post-death-socket-owner") && proof.contains("Absent"),
+        "recovery must name its positive owner class: {proof}"
+    );
     eprintln!("owned recovery proof: {proof}");
 
     let pid_after = read_daemon_pid(&env).expect("daemon pid after zombie recovery");
