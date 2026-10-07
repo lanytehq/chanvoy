@@ -21,7 +21,7 @@ endif
 # `make version-sync` (which uses cargo-set-version under the hood).
 VERSION_FILE := VERSION
 
-.PHONY: all clean check fmt quality test test-integration build build-release install install-restart-daemons ensure-msrv msrv precommit prepush pr-final
+.PHONY: all clean check fmt quality test test-integration build build-release install install-restart-daemons installer-reporting-test ensure-msrv msrv precommit prepush pr-final
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
 .PHONY: sbom security-scan license-check release-prep release-smoke workflow-lint
 .PHONY: release-preflight release-guard-tag-version release-guard-release-target release-tag release-tag-push release-clean release-download release-checksums release-sign
@@ -84,101 +84,31 @@ build-release:
 # daemons keep their own open inode until they exit on their own
 # lifecycle, while new execs resolve to the fresh file.
 #
-# After the binary lands, `install-restart-daemons` cycles **ownable** live
-# daemons whose argv binary is exactly $(LOCAL_BIN)/chanvoy so the installer
-# seat picks up the new control plane without a manual stop/auto-setup.
-# Worktree/debug daemons (other binary paths) and **foreign** profiles are
-# left alone (PER-038A: stale-but-observing beats dark-and-unaware).
+# Installing updates the CLI only. Running daemon candidates are reported,
+# never automatically stopped or started. Manual migration requires independent
+# ownership, same-candidate death and guarded runtime-cleanup confirmation.
+# The legacy target name is retained as a reporting-only compatibility alias.
+# Standalone reporting requires an explicitly designated independent artifact:
+# CHANVOY_INSTALL_QUALIFIED_ARTIFACT=/path/to/qualified/chanvoy make install-restart-daemons
 # Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1 make install
-# Re-run cycle alone: make install-restart-daemons
 install: build-release
-	@mkdir -p $(LOCAL_BIN)
-	@rm -f $(LOCAL_BIN)/chanvoy$(EXT)
-	@cp target/release/chanvoy$(EXT) $(LOCAL_BIN)/chanvoy$(EXT)
+	@mkdir -p "$(LOCAL_BIN)"
+	@rm -f "$(LOCAL_BIN)/chanvoy$(EXT)"
+	@cp "target/release/chanvoy$(EXT)" "$(LOCAL_BIN)/chanvoy$(EXT)"
 	@echo "[ok] installed chanvoy to $(LOCAL_BIN)/chanvoy$(EXT)"
-	@$(MAKE) --no-print-directory install-restart-daemons
+	@CHANVOY_INSTALL_QUALIFIED_ARTIFACT="$(CURDIR)/target/release/chanvoy$(EXT)" $(MAKE) --no-print-directory install-restart-daemons
 
-# Cycle daemons started from the userspace install path onto the binary
-# currently at that path. Shared-host rules (PER-038A):
-#   - only processes whose argv binary is exactly $(LOCAL_BIN)/chanvoy
-#   - stop/start is always --profile-explicit (never wildcard kill)
-#   - **ownable only**: `chanvoy daemon ownable` (start-preflight whoami
-#     matches live daemon status.mattermost_username). Never env-vs-TOML
-#     bot string equality (FIX-2: org-spanning naming conventions diverge).
-#   - **foreign**: do **not** stop — leave running on the old inode and
-#     print a self-cycle hint (stale-but-observing > dark-and-unaware)
-#   - process probe is fail-soft under sandboxes that deny `ps`
-#   - per-profile outcomes reported; install does not hard-fail
-# Opt out: CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1
 install-restart-daemons:
 ifeq ($(OS),Windows_NT)
-	@echo "[!!] install-restart-daemons is Unix-only; cycle daemons manually:"
-	@echo "     chanvoy daemon stop --profile <name> && chanvoy daemon start --profile <name>"
+	@echo "[..] install-restart-daemons reports installed-daemon candidates; no automatic restart in this release."
+	@echo "[!!] process discovery is Unix-only; use the reviewed manual ownership/death/cleanup procedure."
+	@echo "[!!] daemon report: candidates=0 withheld=0 unresolved=1"
 else
-	@set -uo pipefail; \
-	BIN="$(LOCAL_BIN)/chanvoy$(EXT)"; \
-	if [ "$${CHANVOY_INSTALL_SKIP_DAEMON_RESTART:-}" = "1" ]; then \
-		echo "[ok] skipped daemon restart (CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1)"; \
-		echo "[!!] NEXT: cycle daemons or filtered wait / new verbs may use the old binary:"; \
-		echo "     make install-restart-daemons"; \
-		echo "     # or: chanvoy daemon stop --profile <name> && chanvoy daemon start --profile <name>"; \
-		exit 0; \
-	fi; \
-	if [ ! -x "$$BIN" ]; then \
-		echo "[!!] $$BIN not executable; nothing to cycle"; \
-		exit 0; \
-	fi; \
-	profiles=$$(ps -axo args= 2>/dev/null \
-		| sed -n "s|^$${BIN} --profile \\([^ ]*\\) daemon serve.*|\\1|p" \
-		| sort -u || true); \
-	if [ -z "$$profiles" ]; then \
-		echo "[ok] no live daemons on $$BIN — nothing to cycle"; \
-		exit 0; \
-	fi; \
-	count=$$(printf '%s\n' "$$profiles" | grep -c . || true); \
-	echo "[..] scanning $$count daemon(s) on $$BIN (ownable only; foreign left running)"; \
-	restarted=0; left_foreign=0; fail=0; proved=""; \
-	while IFS= read -r profile; do \
-		[ -n "$$profile" ] || continue; \
-		own_err=$$("$$BIN" --profile "$$profile" daemon ownable 2>&1); \
-		own_ec=$$?; \
-		if [ "$$own_ec" -ne 0 ]; then \
-			echo "     [..] left running $$profile (foreign / not restart-ownable — self-cycle under that seat):"; \
-			echo "         $$own_err" | sed 's/^/         /'; \
-			echo "         source identity for $$profile && $$BIN daemon stop --profile $$profile && $$BIN auto-setup"; \
-			left_foreign=$$((left_foreign + 1)); \
-			continue; \
-		fi; \
-		"$$BIN" daemon stop --profile "$$profile" >/dev/null 2>&1 || true; \
-		start_err=$$("$$BIN" daemon start --profile "$$profile" 2>&1); \
-		start_ec=$$?; \
-		if [ "$$start_ec" -eq 0 ]; then \
-			echo "     [ok] restarted $$profile"; \
-			restarted=$$((restarted + 1)); \
-			[ -n "$$proved" ] || proved="$$profile"; \
-		else \
-			echo "     [!!] $$profile — start failed after stop:"; \
-			echo "         $$start_err" | sed 's/^/         /'; \
-			echo "         this profile is DOWN until a start succeeds (the stop did land)"; \
-			echo "         retry: $$BIN daemon stop --profile $$profile; $$BIN daemon start --profile $$profile"; \
-			fail=$$((fail + 1)); \
-		fi; \
-	done <<< "$$profiles"; \
-	echo "[ok] daemon cycle done: $$restarted restarted, $$left_foreign left-running (foreign/self-cycle), $$fail failed"; \
-	if [ "$$left_foreign" -gt 0 ]; then \
-		echo "[!!] foreign seats still on previous binary — each must self-cycle under its own identity"; \
-	fi; \
-	if [ "$$fail" -gt 0 ]; then \
-		echo "[!!] $$fail profile(s) stopped but did not restart — they are DOWN, not stale"; \
-	fi; \
-	if [ -n "$$proved" ]; then \
-		echo "     prove dual pin: $$BIN --profile $$proved version --extended"; \
-	else \
-		echo "     prove dual pin: $$BIN --profile <your-profile> version --extended"; \
-	fi; \
-	echo "     (bare \`version --extended\` may probe another seat's active profile,"; \
-	echo "      which reports \`Generation: not scored\` and proves nothing about yours)"
+	@bash scripts/report-installed-daemons.sh "$(LOCAL_BIN)/chanvoy$(EXT)"
 endif
+
+installer-reporting-test:
+	@bash scripts/report-installed-daemons.test.sh
 
 ensure-msrv:
 	@echo "Checking MSRV $(MSRV)..."
@@ -293,7 +223,7 @@ RELEASE_ENV = CHANVOY_RELEASE_TAG="$(CHANVOY_RELEASE_TAG)"
 .PHONY: release-create-draft release-stage-anchors release-verify-draft release-verify-published-tag
 .PHONY: release-export-pin release-insert-anchors release-validate-pin
 
-release-tooling-test: ## Synthetic-key and stub-remote provenance regression corpus
+release-tooling-test: installer-reporting-test ## Synthetic-key and stub-remote provenance regression corpus
 	@bash scripts/release-tooling-test.sh
 
 release-preflight: release-prep ## Fresh quality gates and maintainer tag preflight

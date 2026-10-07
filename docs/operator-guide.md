@@ -159,6 +159,35 @@ identity checks harden accidental races within the existing Unix-account
 boundary. They do not make PID-based signal delivery atomic or add isolation
 between processes belonging to the same account.
 
+## Installation and daemon migration
+
+`make install` updates the installed CLI and reports daemon candidates; it
+performs no automatic stop or start. Running processes keep their existing
+executable until an independently confirmed manual migration. The legacy
+`make install-restart-daemons` target is a reporting-only alias. Standalone
+reporting requires an explicit independent artifact:
+
+```bash
+CHANVOY_INSTALL_QUALIFIED_ARTIFACT=/path/to/qualified/chanvoy make install-restart-daemons
+```
+
+The helper compares local bytes before process discovery and makes no CLI or
+provider calls. A missing, unreadable or mismatched reference skips discovery;
+failed inspection remains unconfirmed. Reports describe observed candidates,
+without claiming current liveness, ownership or observation readiness. Equality
+identifies the designated reference; it does not establish release qualification.
+`CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1` still skips this reporting step.
+
+For each candidate, source its owning identity and use the qualified binary
+with an explicit profile to observe status/doctor and resolve ownership and
+liveness. Stop only the independently owned predecessor. Independently confirm
+that same candidate's whole-process death and guarded runtime cleanup before
+starting a successor; unknown identity, death or cleanup withholds startup.
+Stop exit 0, missing PID/socket, listener absence or a refused connection are
+insufficient proof. After a separately confirmed start, verify the explicit-profile
+CLI/daemon dual pin and observation readiness. A start command's exit 0 alone
+does not attest replacement or an observation-ready wait.
+
 ## Profile and Team Naming Convention
 
 Chanvoy profile names and Mattermost team names follow a portable convention that lets `auto-setup` and the resolver work without operator intervention:
@@ -328,7 +357,9 @@ Filtered flags (`--contains` / `--pattern` / `--after`) require a daemon that
 knows `wait_channel_v2`. If the CLI refuses with “does not support filtered
 wait”, cycle the daemon (`chanvoy daemon stop` then `chanvoy auto-setup`) —
 see [troubleshooting](./troubleshooting.md#the-running-daemon-does-not-support-a-verb).
-After `make install`, always cycle before trusting new wait features. Prefer
+After `make install`, use the
+[confirmed migration procedure](#installation-and-daemon-migration) before
+trusting new wait features. Prefer
 unique dogfood markers (`PANEL-VERIFY-<seat>-<shortid>`) over bare vocabulary
 words on busy channels.
 

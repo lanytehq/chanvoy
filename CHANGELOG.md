@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Installation preserves running daemons.** `make install` updates the CLI
+  and reports installed-path daemon candidates without automatically stopping
+  or starting them. The legacy `install-restart-daemons` target reports only;
+  manual migration requires ownership, same-candidate death and guarded cleanup
+  confirmation before starting a successor.
 - **Held follow stdout is JSONL-only.** `--follow-stdout` emits one
   record per line. With `--coalesce`, that line may contain 1–32
   matching messages.
@@ -62,7 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration now runs as bounded best-effort maintenance after local state
   recovery, so slow or unavailable Mattermost REST cannot make a healthy
   daemon miss its startup budget. Startup failures now include an explicit
-  foreground logging command.
+  foreground logging command after child death and cleanup are confirmed;
+  uncertain termination requires observation and ownership resolution first.
 
 ### Distribution
 

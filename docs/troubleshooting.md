@@ -441,49 +441,32 @@ A `Generation: MISMATCH` line (or JSON `"generation_match": false` with
 `"generation_scored": true`) means the CLI on PATH and the process on the
 socket are different binaries for a daemon you own.
 
-**Fix**
+**Manual migration after installation**
 
-```bash
-chanvoy daemon stop --profile <name>   # explicit profile on shared hosts
-chanvoy auto-setup
-chanvoy version --extended             # Generation: match
-```
+`make install` updates the CLI and no longer restarts running daemons. Its
+legacy `install-restart-daemons` target reports installed-path candidates and
+performs no restart. Standalone reporting needs an independent designated
+artifact via `CHANVOY_INSTALL_QUALIFIED_ARTIFACT`; missing, unreadable or
+mismatched bytes skip discovery. Failed inspection is unconfirmed, and a
+candidate snapshot is not current ownership, liveness or observation proof.
 
-After `make install`, ownable daemons are restarted automatically. A
-daemon is ownable when the profile's own start-preflight `whoami` matches
-the identity the live daemon reports — not when two configured bot-name
-strings happen to look alike. **Foreign** profiles are **left running** on
-the previous binary (stale-but-observing) and printed as self-cycle
-targets — install does not stop a seat it cannot restart. Each foreign
-seat must cycle under its own identity.
+Source the candidate's owning identity and use the qualified binary with an
+explicit profile to observe status/doctor. Resolve predecessor ownership before
+stopping. Independently confirm that same candidate's whole-process death and
+guarded runtime cleanup before starting a successor. Stop exit 0, missing
+PID/socket, listener absence or refused connection are insufficient; unknown
+evidence withholds startup. Do not use an unconditional stop-then-start line.
 
-**Prove your own seat, not whichever profile is active**
+After a separately confirmed start, prove your own profile's CLI/daemon dual pin:
 
 ```bash
 chanvoy --profile <your-profile> version --extended
 ```
 
-A bare `version --extended` probes the `active_profile` marker, which on a
-shared host may name another seat. That path deliberately reports
-`Generation: not scored` and tells you nothing about your daemon. The
-restart step prints the `--profile` form for a profile it just cycled.
-
-**Restart is stop-then-start, so a failed start leaves the profile down**
-
-Cycling an ownable daemon stops it before starting the replacement. If the
-start then fails — bad credential, revoked token, no runtime dir — that
-profile is **down**, not merely stale, until a start succeeds. The restart
-step says so per profile and repeats it in the summary; the recovery is
-the printed retry:
-
-```bash
-chanvoy daemon stop --profile <name>   # no-op if already stopped
-chanvoy daemon start --profile <name>
-```
-
-The window is bounded by that one start attempt and never spans profiles:
-each is stopped and started before the next is touched, so a failure
-cannot darken a seat the installer never intended to cycle.
+Check observation readiness separately. A start exit 0 does not prove
+replacement or an observation-ready wait. A bare `version --extended` may
+probe another seat's active profile and leave generation unscored. See
+[the installation procedure](./operator-guide.md#installation-and-daemon-migration).
 
 **Note**
 

@@ -10,12 +10,13 @@ teams, and pick up where you left off across sessions.
 >
 > ```bash
 > chanvoy auto-setup                  # one-time per shell session
-> # After make install / binary replace: ownable daemons cycle automatically;
-> # foreign seats stay up on the old binary until that seat self-cycles.
+> # make install updates the CLI and reports candidates; it never cycles them.
+> # Manual migration needs owning identity, same-candidate death and guarded cleanup.
 > # Prove dual pin (CLI + daemon generation_match):
 > chanvoy version --extended          # Generation: match  (or MISMATCH + recovery)
-> # If MISMATCH for your profile:
-> #   chanvoy daemon stop --profile <name> && chanvoy auto-setup
+> # If MISMATCH: observe status/doctor under the owning identity.
+> # Resolve ownership, confirm predecessor death and cleanup before any new start.
+> # Stop exit 0, missing runtime or listener absence are insufficient.
 > chanvoy read <ops-channel> --since 1d
 > chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
 > # For channel WIP: use wait — do not sleep-poll or hand-roll a poller.
