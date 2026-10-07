@@ -650,7 +650,9 @@ async fn auto_setup_stops_zombie_and_respawns() {
     // process), and spawn a fresh daemon.
     let out2_result = tokio::time::timeout(
         Duration::from_secs(30),
-        auto_setup_command(&env, "lanytehq", "bravo-devlead").output(),
+        auto_setup_command(&env, "lanytehq", "bravo-devlead")
+            .env("RUST_LOG", "chanvoy_cli::lifecycle=debug")
+            .output(),
     )
     .await;
     // Always resume daemon1 so teardown can reap it cleanly. On the happy
@@ -673,6 +675,17 @@ async fn auto_setup_stops_zombie_and_respawns() {
         String::from_utf8_lossy(&out2.stdout),
         String::from_utf8_lossy(&out2.stderr)
     );
+
+    let proof = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        proof.contains("whole-process-exit-confirmed"),
+        "recovery must record kernel process-exit proof: {proof}"
+    );
+    assert!(
+        proof.contains("ConnectionRefused") || proof.contains("NotFound"),
+        "recovery must record positive socket-absence proof: {proof}"
+    );
+    eprintln!("owned recovery proof: {proof}");
 
     let pid_after = read_daemon_pid(&env).expect("daemon pid after zombie recovery");
     assert_ne!(

@@ -95,12 +95,22 @@ impl ExitWatch {
         }
         #[cfg(target_os = "macos")]
         {
+            // Registering NOTE_EXIT for an already-exited unreaped process
+            // can fail. Fresh BSD zombie proof needs no new monitor; capture
+            // still revalidates death and birth around this decision.
+            if native_terminated(pid) {
+                return Ok(None);
+            }
             let fd = unsafe { libc::kqueue() };
             if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                tracing::debug!(stage = "exit-observer-create", pid, outcome = ?error.kind());
                 return Err("kernel exit monitor unavailable".into());
             }
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                let error = std::io::Error::last_os_error();
+                tracing::debug!(stage = "exit-observer-descriptor", pid, outcome = ?error.kind());
                 return Err("kernel exit monitor descriptor setup failed".into());
             }
             let event = libc::kevent {
@@ -122,6 +132,13 @@ impl ExitWatch {
                 )
             } < 0
             {
+                let error = std::io::Error::last_os_error();
+                tracing::debug!(stage = "exit-observer-registration", pid, outcome = ?error.kind());
+                if native_terminated(pid)
+                    || matches!(death_or_unknown(pid), ProcessObservation::Dead)
+                {
+                    return Ok(None);
+                }
                 return Err("kernel exit monitor registration failed".into());
             }
             Ok(Some(Self {
@@ -133,6 +150,8 @@ impl ExitWatch {
         {
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
             if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                tracing::debug!(stage = "exit-observer-create", pid, outcome = ?error.kind());
                 return Err("kernel exit monitor unavailable".into());
             }
             Ok(Some(Self {
@@ -335,9 +354,46 @@ fn native_birth(pid: u32) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn native_terminated(pid: u32) -> bool {
-    native_bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SZOMB)
+    let confirmed = native_bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SZOMB);
+    if confirmed {
+        tracing::debug!(
+            stage = "process-exit",
+            pid,
+            outcome = "macos-zombie-exit-confirmed"
+        );
+    }
+    confirmed
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn native_terminated(pid: u32) -> bool {
+    // A leader can be a zombie while another thread still owns descriptors.
+    // A process pidfd (flags 0) becomes ready only after the final thread exits.
+    // Fresh proof also supports a fully exited, unreaped predecessor captured
+    // without an earlier monitor. Recheck birth around observer registration.
+    let Some(birth) = native_birth(pid) else {
+        return false;
+    };
+    let Ok(Some(watch)) = ExitWatch::new(pid) else {
+        tracing::debug!(
+            stage = "process-exit",
+            pid,
+            outcome = "whole-process-observer-unavailable"
+        );
+        return false;
+    };
+    let confirmed = matches!(watch.exited(), Ok(true)) && native_birth(pid) == Some(birth);
+    tracing::debug!(
+        stage = "process-exit",
+        pid,
+        outcome = if confirmed {
+            "whole-process-exit-confirmed"
+        } else {
+            "whole-process-exit-unconfirmed"
+        }
+    );
+    confirmed
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn native_terminated(_: u32) -> bool {
     false
 }
@@ -391,9 +447,12 @@ fn observe_pid(pid: u32) -> ProcessObservation {
         return ProcessObservation::Unknown;
     }
     if unsafe { libc::kill(pid as i32, 0) } != 0 {
-        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            tracing::debug!(stage = "process-liveness", pid, outcome = "pid-absent");
             ProcessObservation::Dead
         } else {
+            tracing::debug!(stage = "pid-probe", pid, outcome = ?error.kind());
             ProcessObservation::Unknown
         };
     }
@@ -403,8 +462,8 @@ fn observe_pid(pid: u32) -> ProcessObservation {
     let Some(uid) = native_owner(pid).filter(|uid| *uid == unsafe { libc::geteuid() }) else {
         return ProcessObservation::Unknown;
     };
-    // macOS can no longer supply executable/task details for an unreaped
-    // foreground child. The kernel's zombie state still proves termination.
+    // Termination needs platform-specific proof before executable metadata
+    // disappears: macOS zombie state or Linux whole-process pidfd readiness.
     if native_terminated(pid) {
         return ProcessObservation::Dead;
     }
@@ -415,6 +474,16 @@ fn observe_pid(pid: u32) -> ProcessObservation {
         return death_or_unknown(pid);
     }
     if info.state == sysprims_proc::ProcessState::Zombie {
+        #[cfg(target_os = "linux")]
+        {
+            tracing::debug!(
+                stage = "process-liveness",
+                pid,
+                outcome = "leader-zombie-unconfirmed"
+            );
+            return ProcessObservation::Unknown;
+        }
+        #[cfg(not(target_os = "linux"))]
         return ProcessObservation::Dead;
     }
     match (info.start_time_unix_ms, info.exe_path) {
@@ -465,9 +534,17 @@ async fn peer_owner(socket: &Path) -> SocketOwner {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            return SocketOwner::Absent
+            tracing::debug!(stage = "socket-connect", outcome = ?error.kind());
+            return SocketOwner::Absent;
         }
-        _ => return SocketOwner::Unknown,
+        Ok(Err(error)) => {
+            tracing::debug!(stage = "socket-connect", outcome = ?error.kind());
+            return SocketOwner::Unknown;
+        }
+        Err(_) => {
+            tracing::debug!(stage = "socket-connect", outcome = "connect-timeout");
+            return SocketOwner::Unknown;
+        }
     };
     #[cfg(target_os = "macos")]
     {
@@ -482,7 +559,21 @@ async fn peer_owner(socket: &Path) -> SocketOwner {
                 &mut size,
             )
         };
-        if result == 0 && size as usize == std::mem::size_of_val(&pid) && pid > 0 {
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            tracing::debug!(stage = "socket-credential-query", outcome = ?error.kind());
+        } else if size as usize != std::mem::size_of_val(&pid) {
+            tracing::debug!(
+                stage = "socket-credential-query",
+                outcome = "credential-size-invalid"
+            );
+        } else if pid <= 0 {
+            tracing::debug!(
+                stage = "socket-credential-query",
+                outcome = "credential-pid-invalid"
+            );
+        } else {
+            tracing::debug!(stage = "socket-peer", pid, outcome = "peer-pid-returned");
             return SocketOwner::Live(pid as u32);
         }
     }
@@ -499,11 +590,30 @@ async fn peer_owner(socket: &Path) -> SocketOwner {
                 &mut size,
             )
         };
-        if result == 0
-            && size as usize == std::mem::size_of_val(&cred)
-            && cred.pid > 0
-            && cred.uid == unsafe { libc::geteuid() }
-        {
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            tracing::debug!(stage = "socket-credential-query", outcome = ?error.kind());
+        } else if size as usize != std::mem::size_of_val(&cred) {
+            tracing::debug!(
+                stage = "socket-credential-query",
+                outcome = "credential-size-invalid"
+            );
+        } else if cred.pid <= 0 {
+            tracing::debug!(
+                stage = "socket-credential-query",
+                outcome = "credential-pid-invalid"
+            );
+        } else if cred.uid != unsafe { libc::geteuid() } {
+            tracing::debug!(
+                stage = "socket-credential-query",
+                outcome = "credential-owner-mismatch"
+            );
+        } else {
+            tracing::debug!(
+                stage = "socket-peer",
+                pid = cred.pid,
+                outcome = "peer-pid-returned"
+            );
             return SocketOwner::Live(cred.pid as u32);
         }
     }
@@ -530,6 +640,11 @@ impl ProcessControl for NativeControl {
         if let Some(watch) = &self.exit_watch {
             match watch.exited() {
                 Ok(true) => {
+                    tracing::debug!(
+                        stage = "registered-exit-observer",
+                        pid = self.pid,
+                        outcome = "whole-process-exit-confirmed"
+                    );
                     if current == ProcessObservation::Dead {
                         return current;
                     }
@@ -798,6 +913,12 @@ mod tests {
         }
     }
     fn child() -> OwnedChild {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("chanvoy_cli::lifecycle=debug")
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::io::stderr)
+            .try_init();
         OwnedChild(
             std::process::Command::new("sleep")
                 .arg("30")
@@ -826,6 +947,109 @@ mod tests {
             watch.exited().unwrap(),
             "exit evidence remains latched after consumption"
         );
+        assert_eq!(observe_pid(child.0.id()), ProcessObservation::Dead);
+        // A fresh capture of an unreaped fully exited process must still allow
+        // stale PID cleanup, with independent positive socket absence proof.
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("unreaped.pid");
+        std::fs::write(&pid_file, child.0.id().to_string()).unwrap();
+        let control = NativeControl::capture(
+            "unreaped",
+            pid_file.clone(),
+            root.path().join("absent.sock"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(control.observe(), ProcessObservation::Dead);
+        cleanup_dead(&control).await.unwrap();
+        assert!(!pid_file.exists());
+        child.0.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exited_leader_with_live_worker_is_not_process_death() {
+        use std::io::{BufRead, BufReader, Write};
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("owned-leader");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/leader_exit.c");
+        assert!(std::process::Command::new("cc")
+            .arg("-pthread")
+            .arg(fixture)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("owned Linux fixture compiler")
+            .success());
+        let socket = root.path().join("owned.sock");
+        let pid_file = root.path().join("owned.pid");
+        let mut child = OwnedChild(
+            std::process::Command::new(executable)
+                .arg(&socket)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        std::fs::write(&pid_file, child.0.id().to_string()).unwrap();
+        let control = NativeControl::capture("owned", pid_file.clone(), socket.clone())
+            .unwrap()
+            .unwrap();
+        let ProcessObservation::Alive(identity) = control.observe() else {
+            panic!("owned Linux process inspection blocked or incomplete");
+        };
+        let watch = control
+            .exit_watch
+            .as_ref()
+            .expect("registered process pidfd");
+        child.0.stdin.take().unwrap().write_all(b"x").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.0.id())).unwrap();
+            if stat.rsplit_once(") ").unwrap().1.starts_with("Z ") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader exit transition"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!watch.exited().unwrap(), "worker still holds listener");
+        assert!(control.peer_matches().await, "kernel peer remains present");
+        assert_eq!(
+            control.observe(),
+            ProcessObservation::Unknown,
+            "a leader Zombie must not override a not-ready whole-process pidfd"
+        );
+        assert!(stop_confirmed(&control, &identity, budget()).await.is_err());
+        assert!(pid_file.exists() && socket.exists());
+        assert!(
+            !watch.exited().unwrap(),
+            "uncertainty must not signal the worker"
+        );
+        child.0.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !watch.exited().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "whole-process exit transition"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            control.observe(),
+            ProcessObservation::Dead,
+            "kernel exit proves an unreaped whole process dead"
+        );
+        cleanup_dead(&control).await.unwrap();
+        assert!(!pid_file.exists() && !socket.exists());
         child.0.wait().unwrap();
     }
 

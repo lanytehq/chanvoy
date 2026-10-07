@@ -263,6 +263,16 @@ Three restart shapes, all handled idempotently:
 | Wedged daemon (alive but unresponsive) | Local UDS probe times out | After fresh parent validation, revalidate process/runtime ownership around shutdown and any force signal; cleanup and successor require confirmed termination |
 | Identity drift (token now authenticates as a different bot) | Periodic `whoami()` re-check returns a different bot id | Daemon stays bound on the socket but refuses network-backed RPCs (`post`, `read`, `check`, `notifications`, `search`, `react`, etc.) with a clear diagnostic. `daemon status` remains queryable. Recovery: re-run `auto-setup` to re-validate end-to-end. |
 
+On Linux, a zombie thread-group leader can coexist with live worker threads.
+Termination therefore requires process-wide pidfd exit readiness or confirmed
+PID absence, with birth identity rechecked; leader state alone is inconclusive.
+Socket absence and unchanged runtime identity remain separate cleanup requirements.
+
+`RUST_LOG=chanvoy_cli::lifecycle=debug` exposes classified lifecycle proof using
+stage, PID and outcome only. Connect and credential-query errors are classified
+at the failing call; invalid credential shape or ownership has its own outcome.
+These diagnostics do not contain credentials, provider bodies or runtime file contents.
+
 The drift gate is intentionally one-way: the daemon doesn't try to
 "recover" by silently re-binding to a different identity. That would
 mis-attribute posts and corrupt cursors. Refuse loudly, escalate to
