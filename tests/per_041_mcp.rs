@@ -266,6 +266,7 @@ async fn mcp_stdio_client_eof_closes_uds_and_admits_later_wait() {
     env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
     let socket_path = env.socket_path();
     let listener = UnixListener::bind(&socket_path).expect("bind");
+    let (wait_inflight_tx, wait_inflight_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("first accept");
         let (reader, _writer) = stream.into_split();
@@ -274,6 +275,7 @@ async fn mcp_stdio_client_eof_closes_uds_and_admits_later_wait() {
         reader.read_line(&mut line).await.expect("first request");
         let first: JsonRpcRequest = serde_json::from_str(line.trim_end()).expect("decode");
         assert_eq!(first.method, WAIT_CHANNEL_V3_METHOD);
+        let _ = wait_inflight_tx.send(());
         // Peer-close: MCP must drop the UDS when stdin EOFs.
         let n = tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut String::new()))
             .await
@@ -315,6 +317,12 @@ async fn mcp_stdio_client_eof_closes_uds_and_admits_later_wait() {
             )
             .await
             .expect("write wait");
+        // Establish the in-flight wait before testing cancellation by EOF.
+        // Without this barrier, EOF may cancel the UDS before its first RPC.
+        tokio::time::timeout(Duration::from_secs(5), wait_inflight_rx)
+            .await
+            .expect("first wait RPC must arrive before stdin EOF")
+            .expect("fake daemon confirms first wait RPC");
         drop(stdin);
     }
     let first_out = tokio::time::timeout(Duration::from_secs(5), first.wait_with_output())
