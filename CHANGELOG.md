@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirms termination before cleanup, and retains state when termination or
   ownership is unknown. Automatic replacement cannot proceed after an
   unconfirmed stop.
+- Startup identity, existing-socket and failed-child finalization phases have
+  separate deadlines and opt-in privacy-safe stderr diagnostics. Unsuccessful
+  foreground socket probes retain predecessor state.
+- Bootstrap writers and consumers preserve foreign or unconfirmed handoffs.
+  Orphaned handoffs now require operator ownership/liveness inspection before
+  manual removal; startup and doctor name the retained path without its contents.
 
 ### Release provenance
 

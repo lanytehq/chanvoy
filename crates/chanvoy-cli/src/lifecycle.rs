@@ -83,6 +83,95 @@ struct NativeControl {
     death_seen: Mutex<Option<Instant>>,
 }
 
+/// The parent's Child handle supplies death proof; these stamps separately
+/// govern its failed-start runtime cleanup. Capture before finalization.
+pub(super) struct FailedChildRuntime {
+    profile: String,
+    pid_path: PathBuf,
+    socket_path: PathBuf,
+    pid_stamp: Option<FileStamp>,
+    socket_stamp: Option<FileStamp>,
+    pid: u32,
+}
+
+impl FailedChildRuntime {
+    pub(super) fn capture(profile: &str, pid: u32) -> Result<Self, String> {
+        let pid_path = chanvoy_core::pid_path_for_profile(profile);
+        let socket_path = chanvoy_core::socket_path_for_profile(profile);
+        let pid_stamp = stamp(&pid_path)?;
+        let socket_stamp = stamp(&socket_path)?;
+        if pid_stamp.is_some() && read_pid(&pid_path)? != Some(pid) {
+            return Err("failed-child pid identity unconfirmed".into());
+        }
+        if socket_stamp.is_some() && pid_stamp.is_none() {
+            return Err("failed-child socket identity unconfirmed".into());
+        }
+        if socket_stamp.is_some()
+            && !std::fs::symlink_metadata(&socket_path)
+                .map_err(|_| "failed-child socket metadata unconfirmed")?
+                .file_type()
+                .is_socket()
+        {
+            return Err("failed-child socket path is not a socket".into());
+        }
+        Ok(Self {
+            profile: profile.to_string(),
+            pid_path,
+            socket_path,
+            pid_stamp,
+            socket_stamp,
+            pid,
+        })
+    }
+
+    fn matches(&self) -> Result<bool, String> {
+        Ok(stamp(&self.pid_path)? == self.pid_stamp
+            && stamp(&self.socket_path)? == self.socket_stamp
+            && (self.pid_stamp.is_none() || read_pid(&self.pid_path)? == Some(self.pid)))
+    }
+
+    /// Called only after the owned Child has supplied confirmed termination.
+    pub(super) async fn cleanup_after_exit(&self) -> Result<(), String> {
+        if !self.matches()? {
+            return Err("failed-child runtime changed".into());
+        }
+        let absence = chanvoy_core::startup::bounded(
+            chanvoy_core::startup::Phase::ChildSocketAbsence,
+            &self.profile,
+            chanvoy_core::startup::LOCAL_PING_BUDGET,
+            async {
+                match peer_owner(&self.socket_path, Duration::from_millis(750)).await {
+                    SocketOwner::Absent => Ok(()),
+                    _ => Err(()),
+                }
+            },
+            |_| chanvoy_core::startup::Outcome::LocalUnconfirmed,
+        )
+        .await;
+        if !self.matches()? || absence.is_err() {
+            return Err("failed-child socket absence unconfirmed".into());
+        }
+        if self.socket_stamp.is_some() {
+            if !self.matches()? {
+                return Err("failed-child runtime changed".into());
+            }
+            std::fs::remove_file(&self.socket_path)
+                .map_err(|_| "failed-child socket cleanup unconfirmed")?;
+        }
+        if self.pid_stamp.is_some() {
+            if stamp(&self.socket_path)?.is_some()
+                || stamp(&self.pid_path)? != self.pid_stamp
+                || read_pid(&self.pid_path)? != Some(self.pid)
+            {
+                return Err("failed-child runtime changed".into());
+            }
+            std::fs::remove_file(&self.pid_path)
+                .map_err(|_| "failed-child pid cleanup unconfirmed")?;
+        }
+        Ok(())
+    }
+}
+
 /// Kernel exit evidence stays usable when an unreaped process no longer exposes
 /// executable metadata. It observes termination; signal ownership still needs
 /// the separately revalidated process and socket identity.
@@ -989,6 +1078,63 @@ async fn stop_confirmed(
 
 #[cfg(test)]
 mod tests {
+    fn failed_child_fixture(dir: &std::path::Path, pid: u32) -> super::FailedChildRuntime {
+        let pid_path = dir.join("synthetic.pid");
+        let socket_path = dir.join("synthetic.sock");
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+        std::fs::set_permissions(
+            &pid_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        super::FailedChildRuntime {
+            profile: "synthetic".into(),
+            pid_stamp: super::stamp(&pid_path).unwrap(),
+            socket_stamp: super::stamp(&socket_path).unwrap(),
+            pid_path,
+            socket_path,
+            pid,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_child_cleanup_retains_a_live_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("synthetic.sock")).unwrap();
+        let runtime = failed_child_fixture(dir.path(), 4242);
+        assert!(runtime.cleanup_after_exit().await.is_err());
+        assert!(runtime.pid_path.exists() && runtime.socket_path.exists());
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn failed_child_cleanup_rejects_replaced_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("synthetic.sock")).unwrap();
+        drop(listener);
+        let runtime = failed_child_fixture(dir.path(), 4242);
+        std::fs::write(&runtime.pid_path, "42424242").unwrap();
+        assert!(runtime.cleanup_after_exit().await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&runtime.pid_path).unwrap(),
+            "42424242"
+        );
+        assert!(runtime.socket_path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_child_cleanup_requires_positive_socket_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join("synthetic.sock")).unwrap();
+        drop(listener);
+        let runtime = failed_child_fixture(dir.path(), 4242);
+        runtime.cleanup_after_exit().await.unwrap();
+        assert!(!runtime.pid_path.exists() && !runtime.socket_path.exists());
+    }
+
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;

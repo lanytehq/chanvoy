@@ -1167,6 +1167,50 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
 
 Observed lifecycle behavior:
 
+With `RUST_LOG=info`, startup prints phase begin/completion events on stderr
+before waiting on local or remote dependencies. These events contain only
+stage, budget, elapsed, classified outcome, profile and PID. JSON stdout keeps
+the command's existing receipt shape. Provider bodies, credentials and observed
+identity strings are excluded from startup errors and phase events.
+
+| Startup phase | Budget and attempt count |
+| --- | --- |
+| Foreground existing-socket probe | 750 ms, one attempt; success ends this attempt as already-running, any unsuccessful result retains the socket/PID and refuses to bind |
+| Parent identity and team access | Separate 2-second phases, one attempt each |
+| Reduce-family and manual foreground identity | Separate 2-second phases, one attempt each, before listener/PID creation |
+| Detached-child readiness | Nominal 10-second polling window, at most 40 iterations; each local probe has 750 ms and each interval is 250 ms, followed by one final 750 ms probe |
+| Failed-child termination | One 5-second kill-and-reap deadline; expiry retains state and reports termination-unconfirmed |
+| Confirmed-dead failed-child socket absence | One 750 ms probe, followed by runtime identity checks before removal |
+
+These are separate phases, not an end-to-end startup bound. A final readiness
+iteration can extend beyond the nominal window by its probe and sleep; the final
+probe, termination, cleanup and synchronous filesystem work are additional.
+An ordinary manual identity request has a 2-second budget; a reduction-enabled
+manual start can use two identity phases. An existing-socket probe always ends
+that attempt. Validated ordinary bootstrap makes no startup identity request.
+The long-lived service and ordinary waits/streams have no new global timeout.
+
+Foreground `serve` retains an existing socket even on connection refusal;
+missing responsiveness does not prove predecessor death. Use the reviewed,
+explicit-profile CLI recovery path to establish termination and socket absence.
+A failed startup may confirm child death while cleanup remains unconfirmed:
+changed runtime files or a foreign/unreadable bootstrap handoff are retained,
+and the receipt does not claim all residue was cleared. Each bootstrap consumer
+removes only its matching nonce, including its own invalid single-use handoff;
+a stale child cannot consume another spawn's handoff.
+
+The bootstrap writer also refuses any observed existing handoff or non-NotFound
+metadata error before writing or spawning. This is a compatibility tightening:
+an orphaned handoff after a crash or hard kill can block the next `auto-setup`
+or `daemon start`. The refusal and `doctor` name the runtime path without
+printing its contents. Doctor only observes it. Resolve possible in-flight
+predecessor ownership and liveness before manually removing retained state;
+missing PID/socket, parent death or file age alone is insufficient. Automatic
+removal remains limited to the child's own matching-nonce consumption and the
+parent's matching-nonce finalizer after confirmed child death. A clean NotFound
+permits a write attempt, not proof that all detached predecessors are dead.
+The check and rename do not exclude all concurrent same-account writers.
+
 - `auto-setup` and `daemon start` share one durable-spawn primitive, so a daemon started either way has the same lifetime: it is its own session leader and outlives the shell or agent tool invocation that started it
 - stale socket + recorded dead PID cleanup is guarded by unchanged runtime identity and absence of a live socket owner
 - a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; its diagnostic provides the `RUST_LOG=info ... daemon serve` foreground recipe

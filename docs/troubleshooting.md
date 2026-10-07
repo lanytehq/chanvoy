@@ -368,13 +368,23 @@ because the file path is taken even though no process holds it.
 chanvoy --profile <name> daemon start   # or: chanvoy auto-setup
 ```
 
-Either background start detects the stale-socket condition (bind fails
-+ no listener answers), sweeps the orphaned socket and pid file, and
-binds a fresh daemon. **Do not move or delete runtime files by hand.**
+Either background start requires confirmed predecessor death, unchanged
+runtime identity and positive socket absence before sweeping the socket/PID
+and starting a successor. Foreground `daemon serve` retains an existing socket
+on an unsuccessful probe. **Do not move or delete PID/socket files by hand.**
 Recovering from a crashed predecessor is the lifecycle verb's job; if
 you find yourself relocating `<profile>.sock` or `<profile>.pid` to
 make a start succeed, that is a bug worth reporting, not a workaround
 to keep using.
+
+If startup instead reports `bootstrap handoff local-unconfirmed`, a retained
+handoff blocks new writes and spawning. `chanvoy --profile <name> doctor` names
+that path without reading or removing it. This compatibility tightening can
+require manual operator recovery after a crash/hard kill. Resolve possible
+in-flight predecessor ownership and liveness before removing the handoff;
+missing PID/socket, parent death or age alone does not authorize removal.
+The ordinary matching-nonce child consumption and confirmed-dead parent
+finalizer remain the only automatic handoff removal paths.
 
 Pick `daemon start` when the profile already exists and you only want
 its daemon back; pick `auto-setup` when you also want the profile

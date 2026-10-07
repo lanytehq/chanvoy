@@ -127,6 +127,13 @@ One command does everything:
 chanvoy auto-setup
 ```
 
+Startup reports bounded phase failures while preserving uncertain predecessor
+state. If it reports a retained bootstrap handoff, `chanvoy --profile <name>
+doctor` names the path without reading its contents. An orphaned handoff may
+require operator intervention after a crash: establish possible predecessor
+ownership and liveness before manual removal. Missing PID/socket or file age
+alone is insufficient. See [startup lifecycle guidance](./operator-guide.md#daemon-lifecycle).
+
 This:
 
 - Synthesizes a canonical profile named `<role>-<scope>` (e.g.,

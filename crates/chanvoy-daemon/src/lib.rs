@@ -46,6 +46,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::Instant as WaitStarted;
 
+use chanvoy_core::startup::{self, Outcome as StartupOutcome, Phase as StartupPhase};
 use tracing::{info, warn};
 
 /// Best-effort legacy cursor repair must never become a daemon-readiness
@@ -76,6 +77,18 @@ pub enum DaemonError {
     },
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("startup {stage}: {outcome}; daemon not started")]
+    Startup {
+        stage: &'static str,
+        outcome: &'static str,
+    },
+}
+
+fn startup_failure<E>(failure: startup::Failure<E>) -> DaemonError {
+    DaemonError::Startup {
+        stage: failure.phase.name(),
+        outcome: failure.outcome.name(),
+    }
 }
 
 #[derive(Clone)]
@@ -278,15 +291,25 @@ async fn build_reduce_writer(
     };
     let token = load_token(&family)?;
     let client = MattermostClient::new(&family, token)?;
-    let identity = client.whoami().await?;
-    if !family.bot_username.is_empty() && identity.username != family.bot_username {
-        return Err(CoreError::ReduceIdentityMismatch {
-            profile: family.name.clone(),
-            expected: family.bot_username.clone(),
-            actual: identity.username,
-        }
-        .into());
-    }
+    let identity = startup::bounded(
+        StartupPhase::FamilyIdentity,
+        &family.name,
+        startup::IDENTITY_BUDGET,
+        async {
+            let identity = client.whoami().await?;
+            if !family.bot_username.is_empty() && identity.username != family.bot_username {
+                return Err(CoreError::ReduceIdentityMismatch {
+                    profile: family.name.clone(),
+                    expected: family.bot_username.clone(),
+                    actual: identity.username,
+                });
+            }
+            Ok(identity)
+        },
+        startup::classify_core_error,
+    )
+    .await
+    .map_err(startup_failure)?;
     Ok(ReduceWriter {
         profile_name: family.name.clone(),
         // Authoritative, whoami-verified identity — never the
@@ -309,17 +332,34 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let socket_path = socket_path_for_profile(profile_name);
     let pid_path = pid_path_for_profile(profile_name);
 
-    if socket_path.exists() && ping(profile_name).await.is_ok() {
-        return Err(DaemonError::AlreadyRunning(
-            socket_path.display().to_string(),
-        ));
+    // Every observed existing socket ends this attempt. Unknown cannot become
+    // permission to unlink a predecessor; the CLI confirmed-stop path owns that.
+    match fs::symlink_metadata(&socket_path) {
+        Ok(_) => {
+            startup::bounded(
+                StartupPhase::ExistingSocket,
+                profile_name,
+                startup::LOCAL_PING_BUDGET,
+                ping(profile_name),
+                |_| StartupOutcome::LocalUnconfirmed,
+            )
+            .await
+            .map_err(startup_failure)?;
+            return Err(DaemonError::AlreadyRunning(
+                socket_path.display().to_string(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(DaemonError::Startup {
+                stage: StartupPhase::ExistingSocket.name(),
+                outcome: StartupOutcome::LocalUnconfirmed.name(),
+            })
+        }
     }
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)?;
     }
     // Loaded exactly once and reused for every surface this daemon
     // brings up. Reading it a second time later would let a rotation
@@ -337,9 +377,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         Some(policy) => {
             let writer = build_reduce_writer(&profile, policy).await?;
             info!(
-                profile = profile_name,
-                reduce_to = %writer.profile_name,
-                reduce_identity = %writer.bot_username,
+                profile = %writer.profile_name,
                 "PER-035 reduction policy active: outside-team writes reduce to family identity"
             );
             Some(writer)
@@ -368,7 +406,11 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     //    is the right thing for developer-mode invocations.
     let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
     let resolution =
-        chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())?;
+        chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())
+            .map_err(|_| DaemonError::Startup {
+                stage: "bootstrap-identity",
+                outcome: StartupOutcome::InvalidInput.name(),
+            })?;
     let my_user_id = match resolution {
         chanvoy_core::BootstrapResolution::Validated { user_id } => {
             info!(
@@ -380,14 +422,25 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         chanvoy_core::BootstrapResolution::Legacy => {
             // Manual `chanvoy daemon serve` (not via auto-setup): no
             // handoff in flight. Network whoami() runs as before.
-            let identity = client.whoami().await?;
-            if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
-                return Err(CoreError::ProfileIdentityMismatch {
-                    expected: profile.bot_username.clone(),
-                    actual: identity.username,
-                }
-                .into());
-            }
+            let identity = startup::bounded(
+                StartupPhase::ForegroundIdentity,
+                profile_name,
+                startup::IDENTITY_BUDGET,
+                async {
+                    let identity = client.whoami().await?;
+                    if !profile.bot_username.is_empty() && identity.username != profile.bot_username
+                    {
+                        return Err(CoreError::ProfileIdentityMismatch {
+                            expected: profile.bot_username.clone(),
+                            actual: identity.username,
+                        });
+                    }
+                    Ok(identity)
+                },
+                startup::classify_core_error,
+            )
+            .await
+            .map_err(startup_failure)?;
             identity.id
         }
     };

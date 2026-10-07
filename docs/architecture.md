@@ -136,6 +136,26 @@ on the same machine run multiple daemons in parallel.
 
 ### Bootstrap: `chanvoy auto-setup`
 
+Startup-only phase deadlines and closed diagnostics live in the nonserialized
+`chanvoy-core::startup` helper. CLI/daemon call sites retain typed identity
+evidence and lifecycle authority. The helper scopes one future directly and
+drops it on timeout; it does not establish that remote work stopped, change
+request defaults, or time out the daemon service. Parent identity/team and
+child family/manual identity phases are separate from local readiness and
+confirmed failed-child finalization. See the operator guide for per-phase
+budgets, attempt limits and the readiness window's additional probe margins.
+
+Both bootstrap consumers revalidate nonce and file identity before removal.
+A mismatched/unreadable handoff stays in place; matching single-use poison is
+consumed under the existing validation rules. Parent child-death proof and
+runtime cleanup proof remain independent. The core writer refuses observed
+pre-existing or uninspectable handoff paths before temporary-file/write effects;
+the CLI maps that typed refusal to local-unconfirmed without spawning. It uses
+non-following metadata, including dangling symlinks. Orphaned residue may need
+operator intervention; doctor only reports its path. These guards harden same-account
+races without claiming atomic exclusion of concurrent writers or introducing
+new bootstrap fields, RPC methods or routed schemas.
+
 The canonical bootstrap is one command:
 
 ```bash
