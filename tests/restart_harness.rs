@@ -1243,8 +1243,8 @@ async fn daemon_start_classifies_child_startup_failure() {
          stderr={stderr}"
     );
     assert!(
-        stderr.contains("before consuming the bootstrap handoff"),
-        "classification must name the startup stage the child died in; stderr={stderr}"
+        stderr.contains("bootstrap handoff path was present at finalization"),
+        "classification must report observed handoff state without inferring identity; stderr={stderr}"
     );
     assert!(
         stderr.contains("daemon serve"),
@@ -1628,7 +1628,7 @@ async fn daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon()
     assert!(
         stderr.contains("daemon startup failed")
             && stderr.contains("exited on its own")
-            && stderr.contains("before consuming the bootstrap handoff"),
+            && stderr.contains("bootstrap handoff path was present at finalization"),
         "bounded family failure must retain its parent startup classification; stderr={stderr}"
     );
 

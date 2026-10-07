@@ -1199,6 +1199,17 @@ and the receipt does not claim all residue was cleared. Each bootstrap consumer
 removes only its matching nonce, including its own invalid single-use handoff;
 a stale child cannot consume another spawn's handoff.
 
+Bootstrap unreadability, foreign nonce, unconfirmed cleanup and an advertised
+but missing handoff report `local-unconfirmed`; known own validation poison
+remains `invalid-input` and single-use. A parent's handoff-path observation
+does not prove identity validation: rejected own poison can leave the path
+absent. After unconfirmed termination or cleanup, the receipt directs status
+or doctor observation and ownership/liveness resolution first. It offers a
+foreground startup recipe only after owned-child death and cleanup are confirmed.
+Non-following handoff presence/nonce inspection occurs before both family and
+manual provider requests. It does not consume matching own state or admit its
+identity; normal resolution revalidates and consumes at the existing point.
+
 The bootstrap writer also refuses any observed existing handoff or non-NotFound
 metadata error before writing or spawning. This is a compatibility tightening:
 an orphaned handoff after a crash or hard kill can block the next `auto-setup`
@@ -1213,7 +1224,7 @@ The check and rename do not exclude all concurrent same-account writers.
 
 - `auto-setup` and `daemon start` share one durable-spawn primitive, so a daemon started either way has the same lifetime: it is its own session leader and outlives the shell or agent tool invocation that started it
 - stale socket + recorded dead PID cleanup is guarded by unchanged runtime identity and absence of a live socket owner
-- a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; its diagnostic provides the `RUST_LOG=info ... daemon serve` foreground recipe
+- a background daemon that dies during startup reports a startup failure and observed handoff state, not a bare `NotRunning` or an inferred identity stage; confirmed terminal cleanup permits the foreground diagnostic recipe
 - legacy attention-key migration is bounded, best-effort maintenance after local state recovery; slow or unavailable Mattermost REST does not delay local socket readiness
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior
 

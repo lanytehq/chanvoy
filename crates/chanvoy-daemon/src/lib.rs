@@ -91,6 +91,29 @@ fn startup_failure<E>(failure: startup::Failure<E>) -> DaemonError {
     }
 }
 
+fn bootstrap_startup_failure(error: CoreError) -> DaemonError {
+    let outcome = match &error {
+        CoreError::Io(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<chanvoy_core::BootstrapError>())
+        {
+            // The resolver establishes its own nonce before producing these
+            // validation failures; own poison remains consumed and invalid.
+            Some(chanvoy_core::BootstrapError::Stale { .. })
+            | Some(chanvoy_core::BootstrapError::FingerprintMismatch { .. })
+            | Some(chanvoy_core::BootstrapError::UsernameMismatch { .. }) => {
+                StartupOutcome::InvalidInput
+            }
+            _ => StartupOutcome::LocalUnconfirmed,
+        },
+        _ => StartupOutcome::LocalUnconfirmed,
+    };
+    DaemonError::Startup {
+        stage: "bootstrap-identity",
+        outcome: outcome.name(),
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     profile: Profile,
@@ -361,6 +384,11 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
+    // Inspect without consumption before a reduction-enabled startup can
+    // contact its family provider. The resolver revalidates/consumes later.
+    let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
+    chanvoy_core::bootstrap::inspect_bootstrap_ownership(profile_name, env_nonce.as_deref())
+        .map_err(bootstrap_startup_failure)?;
     // Loaded exactly once and reused for every surface this daemon
     // brings up. Reading it a second time later would let a rotation
     // between the two reads pair a request-response client
@@ -404,13 +432,9 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     //    path. Manual `chanvoy daemon serve`. Fall through to the
     //    original network whoami() — works in unsandboxed shells and
     //    is the right thing for developer-mode invocations.
-    let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
     let resolution =
         chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())
-            .map_err(|_| DaemonError::Startup {
-                stage: "bootstrap-identity",
-                outcome: StartupOutcome::InvalidInput.name(),
-            })?;
+            .map_err(bootstrap_startup_failure)?;
     let my_user_id = match resolution {
         chanvoy_core::BootstrapResolution::Validated { user_id } => {
             info!(
@@ -4427,6 +4451,57 @@ mod compat_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_receipts_classify_typed_uncertainty_and_own_poison() {
+        use chanvoy_core::BootstrapError;
+        for error in [
+            BootstrapError::CleanupUnconfirmed.into(),
+            BootstrapError::NonceMismatch.into(),
+            BootstrapError::Io(io::Error::other("synthetic-secret invalid-input")).into(),
+            CoreError::Io(io::Error::other("synthetic-secret invalid-input")),
+            CoreError::BootstrapHandoffFailed {
+                profile: "synthetic-secret-profile".into(),
+                nonce_env: "SYNTHETIC_SECRET_NONCE",
+                path: "synthetic-secret-path".into(),
+            },
+        ] {
+            let receipt = bootstrap_startup_failure(error);
+            assert!(matches!(
+                receipt,
+                DaemonError::Startup {
+                    outcome: "local-unconfirmed",
+                    ..
+                }
+            ));
+            assert!(!format!("{receipt} {receipt:?}").contains("synthetic-secret"));
+        }
+        for error in [
+            BootstrapError::Stale {
+                issued_at: 0,
+                age: 100,
+                max: 60,
+            },
+            BootstrapError::FingerprintMismatch {
+                file: "synthetic-secret-body".into(),
+                computed: "synthetic-secret-profile".into(),
+            },
+            BootstrapError::UsernameMismatch {
+                file: "synthetic-secret-whoami".into(),
+                profile: "synthetic-secret-profile".into(),
+            },
+        ] {
+            let receipt = bootstrap_startup_failure(error.into());
+            assert!(matches!(
+                receipt,
+                DaemonError::Startup {
+                    outcome: "invalid-input",
+                    ..
+                }
+            ));
+            assert!(!format!("{receipt} {receipt:?}").contains("synthetic-secret"));
+        }
+    }
 
     #[test]
     fn observation_is_allowed_without_opening_network_methods_under_refusal() {

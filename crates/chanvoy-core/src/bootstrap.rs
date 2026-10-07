@@ -57,6 +57,10 @@ pub struct BootstrapState {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
+    #[error("bootstrap read local-unconfirmed; state retained")]
+    ReadUnconfirmed,
+    #[error("bootstrap cleanup local-unconfirmed; state retained")]
+    CleanupUnconfirmed,
     #[error("bootstrap handoff local-unconfirmed at {path}; retained state requires operator ownership/liveness inspection before removal; no successor spawned")]
     HandoffUnconfirmed { path: PathBuf },
     #[error("bootstrap-state file missing for profile {0}")]
@@ -83,7 +87,7 @@ pub enum BootstrapError {
 
 impl From<BootstrapError> for CoreError {
     fn from(err: BootstrapError) -> Self {
-        CoreError::Io(io::Error::other(err.to_string()))
+        CoreError::Io(io::Error::other(err))
     }
 }
 
@@ -168,10 +172,15 @@ pub fn write_bootstrap_state(state: &BootstrapState) -> Result<PathBuf, Bootstra
 }
 
 /// Read the bootstrap-state file for the given profile. Returns `Ok(None)`
-/// when the file does not exist (legacy / non-auto-setup spawn path); errors
-/// only on actual io / deserialize failures.
+/// only on clean non-following pathname NotFound. Observed nonregular or
+/// uninspectable state is unconfirmed; it cannot authorize the Legacy path.
 pub fn read_bootstrap_state(profile: &str) -> Result<Option<BootstrapState>, BootstrapError> {
     let path = bootstrap_path_for_profile(profile);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        _ => return Err(BootstrapError::ReadUnconfirmed),
+    }
     // PER-036A / ADR-0016: the bootstrap-state handoff seeds the daemon's
     // pre-validated identity (consumed once at startup), so it is
     // agent-critical. It lives in the chanvoy-created 0700 runtime dir →
@@ -184,7 +193,9 @@ pub fn read_bootstrap_state(profile: &str) -> Result<Option<BootstrapState>, Boo
             let state: BootstrapState = serde_json::from_str(&contents)?;
             Ok(Some(state))
         }
-        Err(err) if err.is_not_found() => Ok(None),
+        // A path observed present that disappears during the read is a
+        // changed handoff, not permission to begin a manual identity probe.
+        Err(err) if err.is_not_found() => Err(BootstrapError::ReadUnconfirmed),
         Err(err) => Err(err.into()),
     }
 }
@@ -344,17 +355,19 @@ pub fn resolve_startup_identity(
     let bootstrap = read_bootstrap_state(profile_name).map_err(CoreError::from)?;
     match (bootstrap, env_nonce) {
         (Some(state), nonce) => {
+            // Ownership precedes validation classification: an expired or
+            // malformed foreign envelope is still another spawn's state.
+            if nonce != Some(state.nonce.as_str()) {
+                return Err(BootstrapError::NonceMismatch.into());
+            }
             let validation = validate_bootstrap_state(&state, profile, nonce);
             // Only this child's matching handoff can be consumed, including
             // its own poisoned state. A different nonce belongs to another
             // spawn and must survive this stale child's refusal.
-            if nonce == Some(state.nonce.as_str())
-                && consume_bootstrap_state_if_owned(profile_name, &state.nonce)
-                    == BootstrapCleanup::Unconfirmed
+            if consume_bootstrap_state_if_owned(profile_name, &state.nonce)
+                == BootstrapCleanup::Unconfirmed
             {
-                return Err(CoreError::Io(io::Error::other(
-                    "bootstrap cleanup local-unconfirmed; state retained",
-                )));
+                return Err(BootstrapError::CleanupUnconfirmed.into());
             }
             validation.map_err(CoreError::from)?;
             Ok(BootstrapResolution::Validated {
@@ -367,6 +380,29 @@ pub fn resolve_startup_identity(
             path: bootstrap_path_for_profile(profile_name),
         }),
         (None, None) => Ok(BootstrapResolution::Legacy),
+    }
+}
+
+/// Refuse observed unconfirmed handoff state before ANY provider phase.
+/// This is a read-only envelope/nonce inspection, not identity admission or
+/// predecessor-death proof. Matching own state stays unconsumed for the later
+/// resolver, preserving the family-failure finalization/retry contract.
+pub fn inspect_bootstrap_ownership(
+    profile_name: &str,
+    env_nonce: Option<&str>,
+) -> Result<(), CoreError> {
+    match (
+        read_bootstrap_state(profile_name).map_err(CoreError::from)?,
+        env_nonce,
+    ) {
+        (Some(state), nonce) if nonce == Some(state.nonce.as_str()) => Ok(()),
+        (Some(_), _) => Err(BootstrapError::NonceMismatch.into()),
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(CoreError::BootstrapHandoffFailed {
+            profile: profile_name.into(),
+            nonce_env: BOOTSTRAP_NONCE_ENV,
+            path: bootstrap_path_for_profile(profile_name),
+        }),
     }
 }
 
@@ -700,6 +736,90 @@ mod tests {
                 !path.exists(),
                 "own poisoned handoff must remain single-use"
             );
+        });
+    }
+
+    #[test]
+    fn foreign_poison_is_retained_as_typed_ownership_uncertainty() {
+        with_isolated_runtime(|profile_name| {
+            let mut profile = sample_profile();
+            profile.name = profile_name.into();
+            let mut state =
+                build_bootstrap_state(&profile, "synthetic-id", "foreign-nonce", 12345).unwrap();
+            state.issued_at = 0;
+            state.profile_fingerprint = "synthetic-secret-body".into();
+            let path = write_bootstrap_state(&state).unwrap();
+            let body = fs::read(&path).unwrap();
+            let inode = fs::symlink_metadata(&path).unwrap().ino();
+            for nonce in [Some("own-nonce"), None] {
+                let error = resolve_startup_identity(profile_name, &profile, nonce).unwrap_err();
+                let CoreError::Io(error) = error else {
+                    panic!("expected typed local error");
+                };
+                assert!(matches!(
+                    error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<BootstrapError>()),
+                    Some(BootstrapError::NonceMismatch)
+                ));
+                assert_eq!(fs::read(&path).unwrap(), body);
+                assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+            }
+        });
+    }
+
+    #[test]
+    fn retained_nonregular_handoff_never_admits_legacy() {
+        with_isolated_runtime(|profile_name| {
+            let mut profile = sample_profile();
+            profile.name = profile_name.into();
+            let path = bootstrap_path_for_profile(profile_name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("synthetic-absent-target", &path).unwrap();
+            let inode = fs::symlink_metadata(&path).unwrap().ino();
+            assert!(matches!(
+                read_bootstrap_state(profile_name),
+                Err(BootstrapError::ReadUnconfirmed)
+            ));
+            assert!(resolve_startup_identity(profile_name, &profile, None).is_err());
+            assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+            assert_eq!(
+                fs::read_link(&path).unwrap(),
+                PathBuf::from("synthetic-absent-target")
+            );
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(resolve_startup_identity(profile_name, &profile, None).is_err());
+            assert!(path.is_dir());
+            fs::remove_dir(&path).unwrap();
+            assert_eq!(
+                resolve_startup_identity(profile_name, &profile, None).unwrap(),
+                BootstrapResolution::Legacy
+            );
+        });
+    }
+
+    #[test]
+    fn early_ownership_inspection_does_not_consume_or_admit_identity() {
+        with_isolated_runtime(|profile_name| {
+            let mut profile = sample_profile();
+            profile.name = profile_name.into();
+            let mut state =
+                build_bootstrap_state(&profile, "synthetic-id", "own-nonce", 12345).unwrap();
+            state.profile_fingerprint = "synthetic-invalid-poison".into();
+            let path = write_bootstrap_state(&state).unwrap();
+            let before = fs::read(&path).unwrap();
+            let inode = fs::symlink_metadata(&path).unwrap().ino();
+            assert!(inspect_bootstrap_ownership(profile_name, Some("own-nonce")).is_ok());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+            assert!(inspect_bootstrap_ownership(profile_name, Some("foreign-nonce")).is_err());
+            assert!(inspect_bootstrap_ownership(profile_name, None).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            // Inspection accepted the envelope's nonce, not the poisoned
+            // identity. Normal resolution still rejects and consumes it.
+            assert!(resolve_startup_identity(profile_name, &profile, Some("own-nonce")).is_err());
+            assert!(!path.exists());
         });
     }
 

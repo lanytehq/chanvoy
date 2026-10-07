@@ -62,6 +62,158 @@ fn serve_command(env: &TestEnv, trace: bool) -> tokio::process::Command {
     command
 }
 
+fn write_reduced_startup_profiles(env: &mut TestEnv) {
+    env.set_extra_env("SYNTHETIC_FAMILY_TOKEN", "synthetic-secret-family-token");
+    env.write_named_profile(
+        &env.profile_name,
+        "agent-synthetic",
+        "org-synthetic",
+        &env.token_env_name,
+        Some("synthetic-family"),
+    );
+    env.write_named_profile(
+        "synthetic-family",
+        "agent-synthetic-family",
+        "org-synthetic",
+        "SYNTHETIC_FAMILY_TOKEN",
+        None,
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_uncertainty_and_owned_poison_have_distinct_safe_receipts() {
+    for (case, reduced) in [
+        ("unreadable", false),
+        ("foreign-poison", false),
+        ("missing-advertised", false),
+        ("own-poison", false),
+        ("unreadable", true),
+        ("foreign-poison", true),
+        ("missing-advertised", true),
+    ] {
+        let mut env = TestEnv::new("synthetic-bootstrap-receipt").await;
+        if reduced {
+            write_reduced_startup_profiles(&mut env);
+        } else {
+            env.write_default_profile("agent-synthetic", "org-synthetic");
+        }
+        let profile: chanvoy_core::Profile =
+            toml::from_str(&std::fs::read_to_string(env.profile_path()).unwrap()).unwrap();
+        let path = env
+            .chanvoy_runtime_dir()
+            .join(format!("{}.bootstrap.json", env.profile_name));
+        let nonce = "synthetic-secret-own-nonce";
+        if case != "missing-advertised" {
+            let body = if case == "unreadable" {
+                b"synthetic-secret-invalid-json".to_vec()
+            } else {
+                let mut state = chanvoy_core::build_bootstrap_state(
+                    &profile,
+                    "synthetic-secret-id",
+                    nonce,
+                    std::process::id(),
+                )
+                .unwrap();
+                state.profile_fingerprint = "synthetic-secret-invalid-fingerprint".into();
+                state.issued_at = 0;
+                if case == "foreign-poison" {
+                    state.nonce = "synthetic-secret-foreign-nonce".into();
+                }
+                serde_json::to_vec(&state).unwrap()
+            };
+            std::fs::write(&path, body).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before = std::fs::read(&path).ok();
+        let inode = std::fs::symlink_metadata(&path).ok().map(|m| m.ino());
+        let output = serve_command(&env, true)
+            .env(chanvoy_core::BOOTSTRAP_NONCE_ENV, nonce)
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = plain_stderr(&output.stderr);
+        assert!(stderr.contains("bootstrap-identity"));
+        assert!(
+            stderr.contains(if case == "own-poison" {
+                "invalid-input"
+            } else {
+                "local-unconfirmed"
+            }),
+            "{case}: {stderr}"
+        );
+        assert!(!stderr.contains("synthetic-secret"), "{case}: {stderr}");
+        assert!(output.stdout.is_empty());
+        assert!(!env.socket_path().exists());
+        assert!(!env
+            .chanvoy_runtime_dir()
+            .join(format!("{}.pid", env.profile_name))
+            .exists());
+        if case == "own-poison" {
+            assert!(!path.exists(), "own poison stays single-use");
+        } else {
+            assert_eq!(std::fs::read(&path).ok(), before);
+            assert_eq!(
+                std::fs::symlink_metadata(&path).ok().map(|m| m.ino()),
+                inode
+            );
+        }
+        assert!(
+            env.mock.received_requests().await.unwrap().is_empty(),
+            "bootstrap failure must precede manual whoami/bind"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dangling_or_nonregular_handoff_refuses_foreground_before_whoami() {
+    for (kind, reduced) in [
+        ("dangling", false),
+        ("directory", false),
+        ("dangling", true),
+        ("directory", true),
+    ] {
+        let mut env = TestEnv::new("synthetic-nonregular-handoff").await;
+        if reduced {
+            write_reduced_startup_profiles(&mut env);
+        } else {
+            env.write_default_profile("agent-synthetic", "org-synthetic");
+        }
+        let path = env
+            .chanvoy_runtime_dir()
+            .join(format!("{}.bootstrap.json", env.profile_name));
+        if kind == "dangling" {
+            std::os::unix::fs::symlink("synthetic-absent-target", &path).unwrap();
+        } else {
+            std::fs::create_dir(&path).unwrap();
+        }
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let output = serve_command(&env, true).output().await.unwrap();
+        assert!(
+            env.mock.received_requests().await.unwrap().is_empty(),
+            "retained path must not authorize whoami"
+        );
+        let stderr = plain_stderr(&output.stderr);
+        assert!(!output.status.success(), "{kind}: {stderr}");
+        assert!(
+            stderr.contains("bootstrap-identity") && stderr.contains("local-unconfirmed"),
+            "{kind}: {stderr}"
+        );
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        assert!(!env.socket_path().exists());
+        assert!(!env
+            .chanvoy_runtime_dir()
+            .join(format!("{}.pid", env.profile_name))
+            .exists());
+        assert!(
+            env.mock.received_requests().await.unwrap().is_empty(),
+            "retained path must not authorize whoami"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
 #[tokio::test]
 async fn retained_foreign_handoff_blocks_spawn_and_doctor_names_path() {
     let env = TestEnv::new("synthetic-retained-handoff").await;

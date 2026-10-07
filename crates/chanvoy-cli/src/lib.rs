@@ -4545,7 +4545,7 @@ async fn finalize_failed_spawn_with(
     budget: std::time::Duration,
     finalize: impl std::future::Future<Output = Result<SpawnFailure, ()>>,
 ) -> CliError {
-    let handoff_pending = chanvoy_core::bootstrap_path_for_profile(profile_name).exists();
+    let handoff_observation = observe_bootstrap_handoff(profile_name);
     let runtime = child_pid
         .ok_or_else(|| "child pid unavailable".to_string())
         .and_then(|pid| lifecycle::FailedChildRuntime::capture(profile_name, pid));
@@ -4583,7 +4583,26 @@ async fn finalize_failed_spawn_with(
             failure = SpawnFailure::CleanupUnconfirmed { pid: child_pid };
         }
     }
-    daemon_child_startup_error(profile_name, failure, handoff_pending)
+    daemon_child_startup_error(profile_name, failure, handoff_observation)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffObservation {
+    Present,
+    Absent,
+    Unconfirmed,
+}
+
+fn observe_bootstrap_handoff(profile: &str) -> HandoffObservation {
+    observe_handoff_path(&chanvoy_core::bootstrap_path_for_profile(profile))
+}
+
+fn observe_handoff_path(path: &Path) -> HandoffObservation {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => HandoffObservation::Present,
+        Err(error) if error.kind() == ErrorKind::NotFound => HandoffObservation::Absent,
+        Err(_) => HandoffObservation::Unconfirmed,
+    }
 }
 
 /// Classify a background daemon that never reached readiness.
@@ -4594,34 +4613,38 @@ async fn finalize_failed_spawn_with(
 /// is null (a pipe would deadlock a long-lived daemon once its buffer filled,
 /// and closing our end would SIGPIPE it), so the classification is built from
 /// what the parent can observe without one: whether the child exited, with
-/// what status, and whether it lived long enough to consume the bootstrap
-/// handoff.
+/// what status, and the observed bootstrap path state. Path state cannot
+/// establish successful consumption or identity validation.
 ///
 /// Pure: `finalize_failed_spawn` owns the killing and sweeping, and passes
-/// `handoff_pending` in because the sweep destroys that evidence.
+/// the handoff observation in because cleanup changes that evidence.
 fn daemon_child_startup_error(
     profile_name: &str,
     failure: SpawnFailure,
-    handoff_pending: bool,
+    handoff: HandoffObservation,
 ) -> CliError {
-    let stage = if handoff_pending {
-        "before consuming the bootstrap handoff (profile/token load, reduce-policy setup, \
-         or local runtime preparation)"
-    } else {
-        "after consuming the bootstrap handoff, so it failed past identity resolution \
-         (socket bind, socket/pid permissions, local attention-state load, or pending local \
-         transaction recovery)"
+    let observation = match handoff {
+        HandoffObservation::Present => "bootstrap handoff path was present at finalization",
+        HandoffObservation::Absent => "bootstrap handoff path was absent at finalization",
+        HandoffObservation::Unconfirmed => {
+            "bootstrap handoff path state was unconfirmed at finalization"
+        }
     };
+    let cleared = matches!(
+        &failure,
+        SpawnFailure::ChildExited(_) | SpawnFailure::WedgedAndTerminated
+    );
     let detail = match failure {
         SpawnFailure::ChildExited(status) => format!(
             "background daemon exited on its own ({status}) before its socket answered, \
-             {stage}; it has been reaped and its startup residue cleared"
+             it has been reaped and its startup residue cleared"
         ),
-        SpawnFailure::WedgedAndTerminated => format!(
-            "background daemon was still not answering its socket at the end of the startup \
-             budget, {stage}; it was wedged during mandatory local startup, \
-             so it has been terminated and reaped rather than left running unowned"
-        ),
+        SpawnFailure::WedgedAndTerminated => {
+            ("background daemon was still not answering its socket at the end of the startup \
+             budget; it was wedged during mandatory local startup, \
+             so it has been terminated and reaped rather than left running unowned")
+                .to_string()
+        }
         SpawnFailure::CleanupUnconfirmed { pid } => format!(
             "background child death confirmed ({pid:?}); cleanup local-unconfirmed; \
              remaining runtime state retained, with no successor started"
@@ -4634,17 +4657,28 @@ fn daemon_child_startup_error(
             format!(
                 "background daemon was wedged during startup and could not be confirmed \
                  terminated ({detail}); {which} may still be running, so its socket and pid \
-                 file were left in place rather than deleted under a live process. Check it \
-                 with `ps` and stop it before starting again"
+                 file were left in place rather than deleted under a live process"
             )
         }
+    };
+    let guidance = if cleared {
+        format!(
+            "Run `RUST_LOG=info chanvoy --profile {profile_name} daemon serve` in a \
+             foreground shell to see startup stages; use `RUST_LOG=debug` for more detail, \
+             unset `RUST_LOG` to restore normal logging, and stop the foreground daemon with Ctrl-C"
+        )
+    } else {
+        format!(
+            "Observe retained state with `chanvoy --profile {profile_name} daemon status` \
+             or `chanvoy --profile {profile_name} doctor`. Resolve possible predecessor \
+             ownership/liveness and runtime uncertainty first; this receipt does not authorize \
+             another startup"
+        )
     };
     CliError::DaemonStartup {
         profile: profile_name.to_string(),
         detail: format!(
-            "{detail}. Run `RUST_LOG=info chanvoy --profile {profile_name} daemon serve` in a \
-             foreground shell to see startup stages; use `RUST_LOG=debug` for more detail, \
-             unset `RUST_LOG` to restore normal logging, and stop the foreground daemon with Ctrl-C"
+            "{detail}. {observation}; child identity resolution cannot be inferred from path state. {guidance}"
         ),
     }
 }
@@ -7844,7 +7878,7 @@ mod tests {
                 detail: "operation not permitted; child still running after the kill attempt"
                     .to_string(),
             },
-            false,
+            HandoffObservation::Absent,
         );
         let CliError::DaemonStartup { profile, detail } = err else {
             panic!("expected DaemonStartup");
@@ -7862,6 +7896,8 @@ mod tests {
             "has been reaped",
             "residue cleared",
             "terminated and reaped",
+            "daemon serve",
+            "daemon start",
         ] {
             assert!(
                 !detail.contains(lie),
@@ -7874,8 +7910,11 @@ mod tests {
     /// split is that each outcome says only what is true of it.
     #[test]
     fn confirmed_termination_paths_state_the_cleanup_they_performed() {
-        let wedged =
-            daemon_child_startup_error("unit-profile", SpawnFailure::WedgedAndTerminated, true);
+        let wedged = daemon_child_startup_error(
+            "unit-profile",
+            SpawnFailure::WedgedAndTerminated,
+            HandoffObservation::Present,
+        );
         let CliError::DaemonStartup { detail, .. } = wedged else {
             panic!("expected DaemonStartup");
         };
@@ -7884,8 +7923,8 @@ mod tests {
             "wedged-and-killed must not read as a self-inflicted crash: {detail}"
         );
         assert!(
-            detail.contains("before consuming the bootstrap handoff"),
-            "handoff-pending stage must be reported: {detail}"
+            detail.contains("bootstrap handoff path was present at finalization"),
+            "only observed handoff state may be reported: {detail}"
         );
         assert!(
             detail.contains("RUST_LOG=info chanvoy --profile unit-profile daemon serve")
@@ -7896,6 +7935,75 @@ mod tests {
         assert!(
             !detail.contains("WebSocket"),
             "post-readiness websocket setup must not be named as a local startup blocker: {detail}"
+        );
+    }
+
+    #[test]
+    fn startup_uncertainty_has_no_retry_recipe_or_identity_inference() {
+        for handoff in [
+            HandoffObservation::Present,
+            HandoffObservation::Absent,
+            HandoffObservation::Unconfirmed,
+        ] {
+            let error = daemon_child_startup_error(
+                "synthetic-profile",
+                SpawnFailure::CleanupUnconfirmed { pid: Some(4242) },
+                handoff,
+            );
+            let detail = error.to_string();
+            assert!(
+                detail.contains("child death confirmed")
+                    && detail.contains("cleanup local-unconfirmed")
+            );
+            assert!(
+                detail.contains("ownership/liveness")
+                    && detail.contains("does not authorize another startup")
+            );
+            assert!(detail.contains("child identity resolution cannot be inferred"));
+            for lie in [
+                "daemon serve",
+                "daemon start`",
+                "failed past identity",
+                "after consuming",
+                "before consuming",
+                "startup residue cleared",
+            ] {
+                assert!(
+                    !detail.contains(lie),
+                    "uncertain receipt must not claim {lie}: {detail}"
+                );
+            }
+        }
+        let detail = daemon_child_startup_error(
+            "synthetic-profile",
+            SpawnFailure::WedgedAndTerminated,
+            HandoffObservation::Absent,
+        )
+        .to_string();
+        assert!(detail.contains("path was absent") && detail.contains("cannot be inferred"));
+        assert!(!detail.contains("past identity resolution"));
+        assert!(!detail.contains("after consuming"));
+    }
+
+    #[test]
+    fn handoff_observation_is_nonfollowing_and_unknown_is_not_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("handoff.json");
+        assert_eq!(observe_handoff_path(&path), HandoffObservation::Absent);
+        std::os::unix::fs::symlink("synthetic-missing-target", &path).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert_eq!(observe_handoff_path(&path), HandoffObservation::Present);
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "synthetic-secret-body").unwrap();
+        assert_eq!(observe_handoff_path(&path), HandoffObservation::Present);
+        assert_eq!(
+            observe_handoff_path(&path.join("child")),
+            HandoffObservation::Unconfirmed
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "synthetic-secret-body"
         );
     }
 
