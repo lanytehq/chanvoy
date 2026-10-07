@@ -256,6 +256,7 @@ dependencies = [
  "chanvoy-core",
  "chanvoy-mcp",
  "chrono",
+ "futures-util",
  "libc",
  "rsfulmen 0.2.0",
  "serde_json",
@@ -263,6 +264,7 @@ dependencies = [
  "sysprims-signal",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "wiremock",
 ]
@@ -280,9 +282,12 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sysprims-proc",
+ "sysprims-signal",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

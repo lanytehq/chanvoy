@@ -106,6 +106,23 @@ This single command:
 - Starts the daemon if it isn't already running
 - Seeds channel cursors so subsequent `chanvoy check <channel>` calls return useful state without a fresh time-window probe
 
+Start, auto-setup and doctor report `daemon_disposition` and a separate
+`observation_ready` field (`true`, `false` or unknown/null):
+
+| Disposition | Meaning | Lifecycle exit |
+| --- | --- | --- |
+| `healthy` | Expected remote identity verified and admission open | 0 |
+| `degraded-remote` | Local RPC answers; remote identity or observation readiness is inconclusive/degraded | 0 |
+| `identity-refused` | Authoritative identity rejection or username mismatch | Nonzero |
+| `unresponsive-local` | Local RPC did not answer within its budget | Nonzero |
+
+A timeout, connection failure or server error preserves a responsive daemon.
+Closed/recovering WebSocket admission also preserves it. A successful lifecycle
+receipt does not mean a wait can observe messages. Old daemons with missing typed
+fields report unknown evidence, rather than inferred token failure. Setup skips
+cursor seeding while degraded and keeps existing waits intact. Explicit profile
+refresh still requires fresh parent validation and an owned predecessor stop.
+
 Subsequent `chanvoy ...` commands work without `--profile` — the resolver picks the canonical profile from your sourced env automatically. Required env: `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN` (or the env name configured by `CHANVOY_TOKEN_ENV_NAME`).
 
 ### Manual path (debugging or custom scenarios)
@@ -118,6 +135,29 @@ chanvoy daemon start
 ```
 
 Use this path only when you have a specific reason to deviate from the canonical flow.
+
+### Confirmed daemon shutdown
+
+`chanvoy --profile <name> daemon stop` reports success only after the predecessor
+has terminated. The CLI checks its executable path, explicit daemon/profile
+arguments, native process birth identity, runtime file identity and the Unix
+socket's kernel peer PID before requesting shutdown or sending a force signal.
+An older process image at the same executable path remains eligible; a different
+path, a Linux deleted executable, missing identity evidence or changed runtime
+files prevents automatic stop.
+
+Unknown liveness, denied process inspection, failed signaling and a survivor
+after the grace window return nonzero with the PID and attempted operation.
+Runtime files remain in place, and an automatic replacement is blocked. An
+orphan socket without a readable predecessor PID is also retained. A confirmed
+dead predecessor's unchanged files can be removed only when the socket has no
+live owner.
+
+The exit observer uses macOS kernel process notifications or Linux pidfds
+(kernel 5.3 or newer); unavailable observation fails conservatively. Process
+identity checks harden accidental races within the existing Unix-account
+boundary. They do not make PID-based signal delivery atomic or add isolation
+between processes belonging to the same account.
 
 ## Profile and Team Naming Convention
 
@@ -425,6 +465,12 @@ states stay distinct:
 | `clock` | Local wall clock vs HTTP `Date` on `GET /users/me` |
 | `channel` (optional) | Pure resolve / membership for a named channel |
 
+Within one diagnostic, parent credential evidence and daemon credential evidence
+remain separate. An identity-endpoint 401/403 or observed wrong username remains
+an identity refusal through later timeout, server failure or local-only snapshots.
+Only a successful expected identity on the same axis can clear it; parent success
+cannot clear daemon refusal. Unresolved refusal means exit 2 and unscored generation.
+
 Clock verdicts (residual after RTT/2):
 
 | Verdict | Residual band |
@@ -442,9 +488,10 @@ sync when skew is real. A post at or after the emitted `--since` boundary
 that is still missing is a request/provider question, not NTP (see
 [troubleshooting](./troubleshooting.md#check-reports-new-posts-but-a---since-read-returns-nothing)).
 
-Exit codes: **0** all checks pass · **1** any soft finding (clock
+Exit codes: **0** all scored checks pass, including uncertainty-only
+`degraded-remote` · **1** an independent soft finding (clock
 `elevated_*` / `suspected_*` / unavailable, generation mismatch or not
-scored, channel throttle warn, daemon mattermost_ok false) · **2** hard
+scored outside remote degradation, channel throttle warn) · **2** hard
 failure (auth / identity mismatch, channel hard fail, daemon unreachable
 or identity drift).
 
@@ -1099,9 +1146,10 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
 ## Daemon Lifecycle
 
 - `chanvoy --profile <name> daemon start` — **durable background start**
-  - validates the token, bot identity, and team access **in this process**, then spawns a detached daemon that survives the invocation
-  - reports `already running` if an existing daemon is healthy (network-aware check: a daemon holding a revoked or drifted credential is replaced, not reused)
-  - reconciles a stale socket and a dead pid file automatically — no manual file movement
+  - preserves a locally responsive healthy or degraded daemon; remote uncertainty or closed observation admission does not trigger replacement
+  - before starting or replacing a daemon, validates the current parent credential, bot identity and team access; the new daemon is detached and survives the invocation
+  - replaces an authoritatively refused predecessor only after independent process/runtime ownership and confirmed termination; unresolved identity retains state
+  - cleans stale runtime files only for a confirmed-dead recorded predecessor with no live socket owner
   - refuses when the live credential authenticates as a different bot than the profile records
   - requires an explicit profile (`--profile`, `CHANVOY_PROFILE`, or a sourced agent identity)
   - never creates or refreshes a profile, moves the `active_profile` marker, seeds cursors, or rewrites `bot_username` — use `auto-setup` for those
@@ -1113,14 +1161,14 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
 - `chanvoy daemon status`
   - reports socket path, profile, and Mattermost health
 - `chanvoy --profile <name> daemon stop`
-  - stops a running daemon
-  - returns `NotRunning` if the daemon is already absent
+  - confirms termination of an independently owned predecessor before reporting success
+  - succeeds when both runtime files are absent; uncertain residue or liveness returns nonzero with state retained
   - requires an explicit profile
 
 Observed lifecycle behavior:
 
 - `auto-setup` and `daemon start` share one durable-spawn primitive, so a daemon started either way has the same lifetime: it is its own session leader and outlives the shell or agent tool invocation that started it
-- stale socket + dead pid cleanup works on the next `daemon start` or `auto-setup`
+- stale socket + recorded dead PID cleanup is guarded by unchanged runtime identity and absence of a live socket owner
 - a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; its diagnostic provides the `RUST_LOG=info ... daemon serve` foreground recipe
 - legacy attention-key migration is bounded, best-effort maintenance after local state recovery; slow or unavailable Mattermost REST does not delay local socket readiness
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior

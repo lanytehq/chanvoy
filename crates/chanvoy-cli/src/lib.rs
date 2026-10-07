@@ -1,4 +1,7 @@
 use std::io::{ErrorKind, IsTerminal, Read, Write};
+mod daemon_assessment;
+mod lifecycle;
+use chanvoy_core::recovery::DaemonDisposition;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -30,7 +33,7 @@ use chanvoy_core::{
     RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP,
     WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_INBOX_HELP,
 };
-use chanvoy_daemon::{daemon_client, ping, ping_full, start, status, stop, DaemonError};
+use chanvoy_daemon::{daemon_client, ping, start, status, DaemonError};
 use chrono::{TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -49,6 +52,13 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("bootstrap error: {0}")]
     Bootstrap(String),
+    #[error("identity probe rejected credential (HTTP {status})")]
+    IdentityRejected { status: u16 },
+    #[error("{disposition:?}: {detail}")]
+    DaemonAssessment {
+        disposition: DaemonDisposition,
+        detail: String,
+    },
     /// CHAN-TASK-001: a background daemon spawn that never reached
     /// readiness. Distinct from `Daemon(NotRunning)` — that means "no daemon
     /// is listening", this means "we started one and it died during startup",
@@ -835,6 +845,46 @@ struct RestartOwnership {
     reason: String,
 }
 
+/// Evidence from the parent identity endpoint, distinct from daemon evidence
+/// and team-access errors. No printable ownership reason is classification input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentIdentityEvidence {
+    VerifiedExpected,
+    RejectedCredential(u16),
+    WrongUsername,
+    Unknown,
+}
+
+impl ParentIdentityEvidence {
+    fn from_preflight_error(error: &CliError) -> Self {
+        match error {
+            CliError::IdentityRejected { status } => Self::RejectedCredential(*status),
+            CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch { .. }) => {
+                Self::WrongUsername
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ParentIdentityAssessment {
+    refusal: Option<ParentIdentityEvidence>,
+}
+
+impl ParentIdentityAssessment {
+    fn absorb(&mut self, evidence: ParentIdentityEvidence) {
+        match evidence {
+            ParentIdentityEvidence::VerifiedExpected => self.refusal = None,
+            ParentIdentityEvidence::RejectedCredential(_)
+            | ParentIdentityEvidence::WrongUsername => {
+                self.refusal = Some(evidence);
+            }
+            ParentIdentityEvidence::Unknown => {}
+        }
+    }
+}
+
 /// Operator-facing summary of an identity-preflight failure.
 ///
 /// `CoreError::Api` carries the provider's response body verbatim. For a
@@ -849,6 +899,9 @@ struct RestartOwnership {
 /// the profile: `chanvoy --profile <name> whoami`.
 fn preflight_failure_summary(err: &CliError) -> String {
     match err {
+        CliError::IdentityRejected { status } => {
+            format!("server rejected this environment's credential (HTTP {status})")
+        }
         // `CoreError::Api` is every non-success response, not only a refusal
         // of this credential. Reading them all as "your credential was
         // rejected" would send an operator to re-source an identity that is
@@ -901,58 +954,96 @@ fn score_generation(
 
 async fn probe_restart_ownership(profile_name: &str) -> RestartOwnership {
     let profile = match load_profile(profile_name) {
-        Ok(p) => p,
-        Err(e) => {
+        Ok(profile) => profile,
+        Err(error) => {
             return RestartOwnership {
                 ownable: false,
-                profile: profile_name.to_string(),
+                profile: profile_name.into(),
                 cli_username: None,
                 daemon_username: None,
-                reason: format!("profile load failed: {e}"),
-            };
-        }
-    };
-    let identity = match validate_persisted_profile_identity(&profile).await {
-        Ok(id) => id,
-        Err(e) => {
-            return RestartOwnership {
-                ownable: false,
-                profile: profile_name.to_string(),
-                cli_username: None,
-                daemon_username: None,
-                reason: format!("start preflight failed: {}", preflight_failure_summary(&e)),
-            };
-        }
-    };
-    match status(profile_name).await {
-        Ok(st) => {
-            let daemon_user = st.mattermost_username.clone();
-            if identity.username == daemon_user {
-                RestartOwnership {
-                    ownable: true,
-                    profile: profile_name.to_string(),
-                    cli_username: Some(identity.username),
-                    daemon_username: Some(daemon_user),
-                    reason: "cli whoami matches daemon-reported identity".into(),
-                }
-            } else {
-                RestartOwnership {
-                    ownable: false,
-                    profile: profile_name.to_string(),
-                    cli_username: Some(identity.username),
-                    daemon_username: Some(daemon_user),
-                    reason: "cli whoami does not match daemon-reported identity".into(),
-                }
+                reason: format!("profile load failed: {error}"),
             }
         }
-        Err(e) => RestartOwnership {
+    };
+    probe_restart_ownership_with_status(&profile, daemon_assessment::deadline())
+        .await
+        .0
+}
+
+fn ownership_from_status(
+    profile: &Profile,
+    identity: &Identity,
+    status: &DaemonStatus,
+) -> RestartOwnership {
+    let ownable = daemon_assessment::verified_expected_identity(status, &identity.username);
+    RestartOwnership {
+        ownable,
+        profile: profile.name.clone(),
+        cli_username: Some(identity.username.clone()),
+        daemon_username: daemon_assessment::observed_username(status).map(str::to_owned),
+        reason: if ownable {
+            "cli whoami matches a verified daemon identity"
+        } else {
+            "daemon identity is refused or unverified; configured fallback cannot prove ownership"
+        }
+        .into(),
+    }
+}
+
+/// Return the actual daemon evidence as well as the ownership verdict, so a
+/// diagnostic cannot discard a refusal discovered by its generation probe.
+async fn probe_restart_ownership_with_status(
+    profile: &Profile,
+    deadline: tokio::time::Instant,
+) -> (
+    RestartOwnership,
+    Option<DaemonStatus>,
+    ParentIdentityEvidence,
+) {
+    let identity =
+        match within_health_budget(deadline, validate_persisted_profile_identity(profile)).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                return (
+                    RestartOwnership {
+                        ownable: false,
+                        profile: profile.name.clone(),
+                        cli_username: None,
+                        daemon_username: None,
+                        reason: format!(
+                            "start preflight failed: {}",
+                            preflight_failure_summary(&error)
+                        ),
+                    },
+                    None,
+                    ParentIdentityEvidence::from_preflight_error(&error),
+                )
+            }
+        };
+    if deadline.saturating_duration_since(tokio::time::Instant::now())
+        >= daemon_assessment::REMOTE_BUDGET
+    {
+        if let Ok(Ok(status)) =
+            tokio::time::timeout(daemon_assessment::REMOTE_BUDGET, status(&profile.name)).await
+        {
+            return (
+                ownership_from_status(profile, &identity, &status),
+                Some(status),
+                ParentIdentityEvidence::VerifiedExpected,
+            );
+        }
+    }
+    (
+        RestartOwnership {
             ownable: false,
-            profile: profile_name.to_string(),
+            profile: profile.name.clone(),
             cli_username: Some(identity.username),
             daemon_username: None,
-            reason: format!("daemon unreachable for ownership probe: {e}"),
+            reason: "daemon identity probe unavailable within the remaining budget".into(),
         },
-    }
+        None,
+        ParentIdentityEvidence::VerifiedExpected,
+    )
 }
 
 async fn handle_version(
@@ -3320,68 +3411,48 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
             // and never rewrites `bot_username`. It starts a daemon for a
             // profile that already exists, or it fails.
             let profile_config = load_profile(profile)?;
-
-            // Reuse a running daemon only when it is actually healthy. The
-            // network-aware `ping_full` (not the local-only `ping`) is what
-            // distinguishes a working daemon from one holding a revoked or
-            // drifted credential — the latter answers local RPCs fine and
-            // then fails every real operation, which is exactly the "start
-            // said OK, nothing works" shape this task is closing. Same
-            // health predicate as `ensure_daemon_running`.
-            let healthy = match tokio::time::timeout(PING_TIMEOUT, ping_full(profile)).await {
-                Ok(Ok(status)) => {
-                    status.mattermost_ok && !status.mattermost_identity_drift.unwrap_or(false)
-                }
-                _ => false,
-            };
-            if healthy {
-                // Report the local `ProfileStatus` shape, unchanged from the
-                // pre-CHAN-TASK-001 receipt so `--json` consumers keep
-                // parsing the same object.
-                if let Ok(health) = ping(profile).await {
-                    return print_json_or_text(
-                        json,
-                        &health,
-                        &format!(
-                            "daemon already running for profile {} at {}",
-                            health.profile_name,
-                            health.socket_path.display()
-                        ),
-                    );
-                }
+            let deadline = daemon_assessment::deadline();
+            let existing = daemon_assessment::assess_until(&profile_config, deadline).await;
+            if existing.disposition.successful() {
+                return print_start_assessment(json, &profile_config, &existing, "already running");
             }
-
-            // Parent-side identity validation. This is the half of PER-014
-            // `daemon start` never adopted: the approved parent invocation
-            // holds the network authority, so it proves the token, the bot
-            // identity, and team access here and hands the result to the
-            // detached child, which then binds without repeating that call.
-            //
-            // Scope of the guarantee: the daemon's *primary* identity. A
-            // profile with a `[reduce]` policy still resolves its family
-            // identity inside the child (`build_reduce_writer` runs before the
-            // handoff is read), so reduce-configured profiles under a
-            // network-gated sandbox are not yet covered. Extending the handoff
-            // to carry the family identity is a follow-on, not this repair.
-            let identity = validate_persisted_profile_identity(&profile_config).await?;
-
-            // Absent / stale / wedged predecessor. Short-circuits when no
-            // socket exists (normal cold start); otherwise graceful shutdown
-            // RPC, then pid-file force-kill plus runtime-file sweep. This is
-            // what makes stale socket + dead pid recover without an operator
-            // moving files by hand.
-            stop_daemon_if_present(profile).await?;
-
-            let health = spawn_durable_daemon(&profile_config, &identity, profile).await?;
-            print_json_or_text(
-                json,
-                &health,
-                &format!(
-                    "daemon listening for profile {} at {}",
-                    health.profile_name,
-                    health.socket_path.display()
-                ),
+            let identity = match within_health_budget(
+                deadline,
+                validate_persisted_profile_identity(&profile_config),
             )
+            .await
+            {
+                Ok(identity) => identity,
+                Err(error) => {
+                    print_start_failure(
+                        json,
+                        &profile_config,
+                        failure_disposition(&error, existing.disposition),
+                        &error,
+                    )?;
+                    return Err(error);
+                }
+            };
+            let launched = match ensure_daemon_running_assessed(
+                &profile_config,
+                &identity,
+                existing,
+                deadline,
+            )
+            .await
+            {
+                Ok(launched) => launched,
+                Err(error) => {
+                    print_start_failure(
+                        json,
+                        &profile_config,
+                        failure_disposition(&error, DaemonDisposition::UnresponsiveLocal),
+                        &error,
+                    )?;
+                    return Err(error);
+                }
+            };
+            print_start_assessment(json, &profile_config, &launched.assessment, "started")
         }
         DaemonCommand::Serve => {
             let health = start(profile).await?;
@@ -3396,7 +3467,7 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
             )
         }
         DaemonCommand::Stop => {
-            stop(profile).await?;
+            stop_daemon_if_present(profile).await?;
             if json {
                 println!(
                     "{}",
@@ -3515,6 +3586,7 @@ async fn handle_auto_setup(
     profile_override: Option<&str>,
     args: AutoSetupArgs,
 ) -> Result<(), CliError> {
+    let deadline = daemon_assessment::deadline();
     let desired =
         match build_desired_profile_from_env(profile_override, args.reduce_profile.as_deref()) {
             Ok(profile) => profile,
@@ -3531,9 +3603,15 @@ async fn handle_auto_setup(
     };
 
     let action = decide_profile_action(&desired, existing.as_ref());
+    let mut existing_assessment = None;
     let (profile_state, persisted_profile, persisted_identity, refresh_diff) = match action {
         ProfileAction::Create => {
-            let (validated, identity) = match validate_and_finalize_profile(desired).await {
+            let (validated, identity) = match within_health_budget(
+                deadline,
+                validate_and_finalize_profile(desired),
+            )
+            .await
+            {
                 Ok(pair) => pair,
                 Err(err) => return exit_on_preflight(json, err),
             };
@@ -3543,10 +3621,11 @@ async fn handle_auto_setup(
         ProfileAction::Refresh(diff) => {
             let existing = existing.clone().expect("Refresh implies existing profile");
             let merged = merge_forward_for_refresh(desired, &existing);
-            let (validated, identity) = match validate_and_finalize_profile(merged).await {
-                Ok(pair) => pair,
-                Err(err) => return exit_on_preflight(json, err),
-            };
+            let (validated, identity) =
+                match within_health_budget(deadline, validate_and_finalize_profile(merged)).await {
+                    Ok(pair) => pair,
+                    Err(err) => return exit_on_preflight(json, err),
+                };
             store_profile(&validated)?;
             // A running daemon holds Profile + token in-memory from the last start
             // (`chanvoy-daemon::start`). Refresh writes to disk but the live daemon
@@ -3564,17 +3643,39 @@ async fn handle_auto_setup(
         }
         ProfileAction::Reuse => {
             let existing = existing.expect("Reuse implies existing profile");
-            // AC #3 (amended brief): team/token validation must happen against
-            // the *current* env credential before reporting success, on every
-            // path including Reuse. Without this, a token rotated in place
-            // under the same env var name would be unobserved and the report
-            // would claim success based purely on token-source presence from
-            // `check_token_available`, never proving the token actually works
-            // for the configured team.
-            let (validated, identity) = match validate_and_finalize_profile(existing.clone()).await
+            let assessment = daemon_assessment::assess_until(&existing, deadline).await;
+            if assessment.disposition == DaemonDisposition::DegradedRemote {
+                return print_preserved_setup(json, &existing, assessment, !args.no_activate);
+            }
+            existing_assessment = Some(assessment);
+            // A responsive but remotely inconclusive daemon was preserved
+            // above without claiming fresh parent identity. Any replacement
+            // still requires validation against the current parent credential.
+            let (validated, identity) = match within_health_budget(
+                deadline,
+                validate_and_finalize_profile(existing.clone()),
+            )
+            .await
             {
                 Ok(pair) => pair,
-                Err(err) => return exit_on_preflight(json, err),
+                Err(err) => {
+                    let authoritative = matches!(&err, CliError::IdentityRejected { .. });
+                    if !authoritative
+                        && existing_assessment
+                            .as_ref()
+                            .is_some_and(|a| a.disposition.successful())
+                    {
+                        let mut assessment = existing_assessment.take().unwrap();
+                        assessment.disposition = DaemonDisposition::DegradedRemote;
+                        return print_preserved_setup(
+                            json,
+                            &existing,
+                            assessment,
+                            !args.no_activate,
+                        );
+                    }
+                    return exit_on_preflight(json, err);
+                }
             };
             // If the env credential now authenticates as a different bot than
             // the persisted profile, the running daemon (if any) is holding a
@@ -3586,6 +3687,7 @@ async fn handle_auto_setup(
             // decide_profile_action phase; treating a post-whoami change as a
             // surfaced refresh is consistent with that rule.
             if validated.bot_username != existing.bot_username {
+                existing_assessment = None;
                 store_profile(&validated)?;
                 if let Err(err) = stop_daemon_if_present(&validated.name).await {
                     print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
@@ -3625,50 +3727,78 @@ async fn handle_auto_setup(
             .unwrap_or(false)
     };
 
-    let daemon_state = match ensure_daemon_running(&persisted_profile, &persisted_identity).await {
+    let launch_result = if let Some(assessment) = existing_assessment {
+        ensure_daemon_running_assessed(
+            &persisted_profile,
+            &persisted_identity,
+            assessment,
+            deadline,
+        )
+        .await
+    } else {
+        ensure_daemon_running(&persisted_profile, &persisted_identity, deadline).await
+    };
+    let launched = match launch_result {
         Ok(state) => state,
         Err(err) => {
-            print_auto_setup_error(json, "daemon_start", &err.to_string())?;
+            print_auto_setup_failure(
+                json,
+                "daemon_start",
+                &err.to_string(),
+                failure_disposition(&err, DaemonDisposition::UnresponsiveLocal),
+            )?;
             process::exit(EXIT_DAEMON_FAILED);
         }
     };
 
-    let seed_outcomes: Vec<SeedOutcome> = match daemon_client(&persisted_profile.name)
-        .seed_cursors()
-        .await
+    let seed_outcomes: Vec<SeedOutcome> = if launched.assessment.disposition
+        == DaemonDisposition::DegradedRemote
     {
-        Ok(SeedCursorsResult { outcomes }) => outcomes.into_iter().map(SeedOutcome::from).collect(),
-        Err(DaemonError::NotRunning(_)) => {
-            // Daemon died between the health check and the seed RPC. This is a
-            // daemon health failure (exit 4), not a per-channel seed problem
-            // (exit 1). auto-setup's contract requires a healthy daemon at the
-            // point of success — soft-degraded would mask the collapse.
-            print_auto_setup_error(
+        Vec::new()
+    } else {
+        match daemon_client(&persisted_profile.name).seed_cursors().await {
+            Ok(SeedCursorsResult { outcomes }) => {
+                outcomes.into_iter().map(SeedOutcome::from).collect()
+            }
+            Err(DaemonError::NotRunning(_)) => {
+                // Daemon died between the health check and the seed RPC. This is a
+                // daemon health failure (exit 4), not a per-channel seed problem
+                // (exit 1). auto-setup's contract requires a healthy daemon at the
+                // point of success — soft-degraded would mask the collapse.
+                print_auto_setup_error(
                 json,
                 "daemon_unreachable",
                 "daemon socket unavailable during seed_cursors RPC — daemon exited after the health check",
             )?;
-            process::exit(EXIT_DAEMON_FAILED);
-        }
-        Err(err) => {
-            // Other failures (upstream Mattermost errors during enumeration,
-            // serialization issues) surface as a single synthetic seed failure.
-            // Profile is still coherent; readiness flips to degraded (exit 1).
-            vec![SeedOutcome::Failed {
-                channel: "<membership-enumeration>".to_string(),
-                reason: err.to_string(),
-            }]
+                process::exit(EXIT_DAEMON_FAILED);
+            }
+            Err(err) => {
+                // Other failures (upstream Mattermost errors during enumeration,
+                // serialization issues) surface as a single synthetic seed failure.
+                // Profile is still coherent; readiness flips to degraded (exit 1).
+                vec![SeedOutcome::Failed {
+                    channel: "<membership-enumeration>".to_string(),
+                    reason: err.to_string(),
+                }]
+            }
         }
     };
-    let degraded = seed_outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, SeedOutcome::Failed { .. }));
+    let degraded = launched.assessment.disposition == DaemonDisposition::DegradedRemote
+        || seed_outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, SeedOutcome::Failed { .. }));
 
     let report = AutoSetupReport {
         profile_name: persisted_profile.name.clone(),
         bot_username: persisted_profile.bot_username.clone(),
         profile_state,
-        daemon_state,
+        daemon_state: launched.state,
+        daemon_disposition: if degraded {
+            DaemonDisposition::DegradedRemote
+        } else {
+            launched.assessment.disposition
+        },
+        observation_ready: launched.assessment.observation_ready,
         is_active: is_active_now,
         refresh_diff,
         seed_outcomes,
@@ -3676,13 +3806,9 @@ async fn handle_auto_setup(
     };
 
     print_auto_setup_report(json, &report)?;
-    if degraded {
-        process::exit(EXIT_SOFT_DEGRADED);
-    }
     Ok(())
 }
 
-const EXIT_SOFT_DEGRADED: i32 = 1;
 const EXIT_ENV_INPUT: i32 = 2;
 const EXIT_PREFLIGHT_FAILED: i32 = 3;
 const EXIT_DAEMON_FAILED: i32 = 4;
@@ -3690,19 +3816,37 @@ const EXIT_IDENTITY_DRIFT: i32 = 5;
 
 fn exit_on_preflight(json: bool, err: CliError) -> Result<(), CliError> {
     let (code, message) = classify_preflight_error(&err);
-    print_auto_setup_error(json, code, &message)?;
+    print_auto_setup_failure(
+        json,
+        code,
+        &message,
+        failure_disposition(&err, DaemonDisposition::UnresponsiveLocal),
+    )?;
     process::exit(EXIT_PREFLIGHT_FAILED);
 }
 
 fn classify_preflight_error(err: &CliError) -> (&'static str, String) {
-    if let CliError::Core(chanvoy_core::CoreError::Api { status, message }) = err {
+    if let CliError::IdentityRejected { status } = err {
+        return (
+            "token_invalid",
+            format!("identity probe rejected credential (HTTP {status})"),
+        );
+    }
+    if let CliError::Core(chanvoy_core::CoreError::Api { status, .. }) = err {
         let code = match status.as_u16() {
             401 => "token_invalid",
             403 => "bot_not_in_team",
             404 => "team_missing",
             _ => "preflight_failed",
         };
-        return (code, format!("{status}: {message}"));
+        return (
+            code,
+            doctor_provider_error_summary(match err {
+                CliError::Core(core) => core,
+                _ => unreachable!(),
+            })
+            .1,
+        );
     }
     ("preflight_failed", err.to_string())
 }
@@ -3728,16 +3872,27 @@ fn merge_forward_for_refresh(mut desired: Profile, existing: &Profile) -> Profil
 }
 
 fn print_auto_setup_error(json: bool, code: &str, message: &str) -> Result<(), CliError> {
+    print_auto_setup_failure(json, code, message, DaemonDisposition::UnresponsiveLocal)
+}
+
+fn print_auto_setup_failure(
+    json: bool,
+    code: &str,
+    message: &str,
+    disposition: DaemonDisposition,
+) -> Result<(), CliError> {
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "error_code": code,
                 "message": message,
+                "daemon_disposition": disposition,
+                "observation_ready": null,
             }))?
         );
     } else {
-        eprintln!("{code}: {message}");
+        eprintln!("{}: {code}: {message}", disposition.label());
     }
     Ok(())
 }
@@ -3748,6 +3903,8 @@ fn print_identity_drift_error(json: bool, diff: &[ProfileFieldDiff]) -> Result<(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "error_code": "identity_drift",
+                "daemon_disposition": "identity-refused",
+                "observation_ready": null,
                 "message": "persisted profile identity does not match env-derived identity; refusing silent refresh",
                 "drift": diff,
                 "recovery": "resolve the mismatch (correct the env, or rename/remove the persisted profile), then re-run auto-setup",
@@ -3834,8 +3991,8 @@ async fn validate_and_finalize_profile(
 ) -> Result<(Profile, Identity), CliError> {
     let token = load_token(&profile)?;
     let client = MattermostClient::new(&profile, token)?;
-    let identity = client.whoami().await?;
-    client.validate_team_access().await?;
+    let identity = parent_identity(&client).await?;
+    validate_parent_team(&client).await?;
     profile.bot_username = identity.username.clone();
     Ok((profile, identity))
 }
@@ -3857,8 +4014,7 @@ async fn validate_and_finalize_profile(
 async fn validate_persisted_profile_identity(profile: &Profile) -> Result<Identity, CliError> {
     let token = load_token(profile)?;
     let client = MattermostClient::new(profile, token)?;
-    let identity = client.whoami().await?;
-    client.validate_team_access().await?;
+    let identity = parent_identity(&client).await?;
     if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
         return Err(chanvoy_core::CoreError::ProfileIdentityMismatch {
             expected: profile.bot_username.clone(),
@@ -3866,33 +4022,145 @@ async fn validate_persisted_profile_identity(profile: &Profile) -> Result<Identi
         }
         .into());
     }
+    validate_parent_team(&client).await?;
     Ok(identity)
+}
+
+async fn parent_identity(client: &MattermostClient) -> Result<Identity, CliError> {
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(chanvoy_core::STATUS_PROBE_TIMEOUT_MS),
+        client.whoami(),
+    )
+    .await
+    {
+        Ok(Ok(identity)) => Ok(identity),
+        Ok(Err(chanvoy_core::CoreError::Api { status, .. }))
+            if matches!(status.as_u16(), 401 | 403) =>
+        {
+            Err(CliError::IdentityRejected {
+                status: status.as_u16(),
+            })
+        }
+        Ok(Err(error)) => Err(CliError::Bootstrap(doctor_provider_error_summary(&error).1)),
+        Err(_) => Err(CliError::Bootstrap(
+            "parent identity probe timed out; credential refusal unproven".into(),
+        )),
+    }
+}
+
+async fn validate_parent_team(client: &MattermostClient) -> Result<(), CliError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.validate_team_access(),
+    )
+    .await
+    .map_err(|_| CliError::Bootstrap("parent team-access probe timed out".into()))??;
+    Ok(())
+}
+
+async fn within_health_budget<T>(
+    deadline: tokio::time::Instant,
+    future: impl std::future::Future<Output = Result<T, CliError>>,
+) -> Result<T, CliError> {
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| {
+            CliError::Bootstrap(
+                "health assessment budget exhausted; credential refusal unproven".into(),
+            )
+        })?
+}
+
+fn failure_disposition(error: &CliError, fallback: DaemonDisposition) -> DaemonDisposition {
+    match error {
+        CliError::IdentityRejected { .. }
+        | CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch { .. }) => {
+            DaemonDisposition::IdentityRefused
+        }
+        CliError::DaemonAssessment { disposition, .. } => *disposition,
+        _ => fallback,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DaemonReuseDecision {
     Reuse,
+    PreserveDegraded,
     RestartOwnable,
     RefuseForeign,
 }
 
-/// Decide whether this invocation may reuse or replace a reachable daemon.
-///
-/// This stays pure so the generation-matched field case can be pinned without
-/// process orchestration: a current websocket observation failure defeats
-/// reuse even when REST identity and binary generation are otherwise healthy.
-/// Replacement remains identity-owned; a foreign daemon is never stopped.
 fn daemon_reuse_decision(status: &DaemonStatus, cli_username: &str) -> DaemonReuseDecision {
-    let drifted = status.mattermost_identity_drift.unwrap_or(false);
-    let ws_degraded = daemon_ws_degraded(status);
-    if status.mattermost_ok && !drifted && !ws_degraded {
-        return DaemonReuseDecision::Reuse;
+    match daemon_assessment::status_disposition(status, cli_username) {
+        DaemonDisposition::Healthy => DaemonReuseDecision::Reuse,
+        DaemonDisposition::DegradedRemote => DaemonReuseDecision::PreserveDegraded,
+        DaemonDisposition::IdentityRefused
+            if status.remote_probe
+                == Some(chanvoy_core::recovery::RemoteProbeOutcome::Verified)
+                && status.mattermost_username != cli_username
+                && !status.mattermost_identity_drift.unwrap_or(false) =>
+        {
+            DaemonReuseDecision::RefuseForeign
+        }
+        _ => DaemonReuseDecision::RestartOwnable,
     }
-    if status.mattermost_username == cli_username {
-        DaemonReuseDecision::RestartOwnable
+}
+
+struct DaemonLaunch {
+    state: DaemonState,
+    assessment: daemon_assessment::Assessment,
+}
+
+fn print_start_assessment(
+    json: bool,
+    profile: &Profile,
+    assessment: &daemon_assessment::Assessment,
+    action: &str,
+) -> Result<(), CliError> {
+    let mut receipt = serde_json::to_value(ProfileStatus {
+        profile_name: profile.name.clone(),
+        role: profile.role.clone(),
+        scope: profile.scope.clone(),
+        provider: profile.provider.clone(),
+        bot_username: profile.bot_username.clone(),
+        server_url: profile.server_url.clone(),
+        socket_path: socket_path_for_profile(&profile.name),
+    })?;
+    receipt["daemon_disposition"] = serde_json::to_value(assessment.disposition)?;
+    receipt["observation_ready"] = serde_json::to_value(assessment.observation_ready)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
     } else {
-        DaemonReuseDecision::RefuseForeign
+        println!(
+            "daemon {action} for profile {}: {}; observation_ready={}",
+            profile.name,
+            assessment.disposition.label(),
+            assessment
+                .observation_ready
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
     }
+    Ok(())
+}
+
+fn print_start_failure(
+    json: bool,
+    profile: &Profile,
+    disposition: DaemonDisposition,
+    error: &CliError,
+) -> Result<(), CliError> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "profile_name":profile.name,"daemon_disposition":disposition,"observation_ready":null,"error":match error { CliError::Core(core) => doctor_provider_error_summary(core).1, _ => error.to_string() }
+            }))?
+        );
+    } else {
+        eprintln!("daemon disposition: {}", disposition.label());
+    }
+    Ok(())
 }
 
 fn daemon_ws_degraded(status: &DaemonStatus) -> bool {
@@ -3910,104 +4178,60 @@ fn daemon_ws_degraded(status: &DaemonStatus) -> bool {
 async fn ensure_daemon_running(
     profile: &Profile,
     identity: &Identity,
-) -> Result<DaemonState, CliError> {
-    // Bound the pre-spawn health-check. Two distinct things can be wrong
-    // with an existing daemon:
-    //   (1) Wedged daemon (SIGSTOPed, deadlocked, I/O-stuck): socket open,
-    //       RPCs never respond. PING_TIMEOUT bounds us so auto-setup
-    //       routes through the zombie-stop path instead of hanging.
-    //   (2) Running daemon with a stale / revoked / drifted token: socket
-    //       open and local RPCs answer fine, but the cached Mattermost
-    //       credential won't survive seed/read calls. PER-014 entarch
-    //       residual finding (2026-04-28): use the network-aware
-    //       `ping_full` (= `daemon_status`, runs `probe_whoami`) at
-    //       the pre-spawn check to surface this case so the existing
-    //       daemon gets stopped and respawned with the freshly
-    //       validated parent credential. The local-only `ping()`
-    //       elsewhere does NOT make that distinction by design.
-    let profile_name = profile.name.as_str();
-    let ping_outcome = tokio::time::timeout(PING_TIMEOUT, ping_full(profile_name)).await;
-    let mut require_ws_recovery_proof = false;
-    if let Ok(Ok(status)) = &ping_outcome {
-        match daemon_reuse_decision(status, &identity.username) {
-            DaemonReuseDecision::Reuse => return Ok(DaemonState::AlreadyRunning),
-            DaemonReuseDecision::RestartOwnable => {
-                // Fall through to bounded stop + fresh start. In particular,
-                // a live ws_last_error must not be greenwashed by a successful
-                // REST whoami probe or a nominally Healthy derived state.
-                require_ws_recovery_proof = daemon_ws_degraded(status);
-            }
-            DaemonReuseDecision::RefuseForeign => {
-                return Err(CliError::Bootstrap(format!(
-                    "daemon for profile {profile_name} is unhealthy but is not restart-ownable \
-                     by this environment (cli identity {}, daemon identity {}); target the \
-                     owning profile, then run `chanvoy daemon stop --profile {profile_name}` \
-                     followed by `chanvoy auto-setup`",
-                    identity.username, status.mattermost_username
-                )));
-            }
-        }
-    }
-    // ping_full failing/timing out OR returning unhealthy/drifted does
-    // not mean the daemon is absent — a wedged daemon hangs ping; a
-    // stale-token daemon answers but flunks `mattermost_ok`. Blindly
-    // spawning in either case would leave a zombie alongside the fresh
-    // daemon (two-daemons-one-profile condition secrev F5 / devrev F6
-    // flagged). Call stop_daemon_if_present before spawning; it
-    // short-circuits when no socket exists (normal cold-start), uses
-    // the local `shutdown` RPC when a daemon is responsive, and falls
-    // back to pid-file-driven SIGKILL when shutdown can't be served.
-    stop_daemon_if_present(profile_name).await?;
-
-    spawn_durable_daemon(profile, identity, profile_name).await?;
-    if require_ws_recovery_proof {
-        if let Err(err) = await_replacement_ws_ready(profile_name, &identity.username).await {
-            // A replacement that cannot restore observation is not a
-            // successful repair. Tear it down so the next auto-setup does not
-            // inherit another known-degraded daemon from this attempt.
-            let cleanup = stop_daemon_if_present(profile_name).await;
-            return Err(ws_repair_failure_with_cleanup(err, cleanup));
-        }
-    }
-    Ok(DaemonState::Started)
+    deadline: tokio::time::Instant,
+) -> Result<DaemonLaunch, CliError> {
+    let assessment = daemon_assessment::assess_until(profile, deadline).await;
+    ensure_daemon_running_assessed(profile, identity, assessment, deadline).await
 }
 
-fn ws_repair_failure_with_cleanup(
-    recovery_error: CliError,
-    cleanup: Result<(), CliError>,
-) -> CliError {
-    match cleanup {
-        Ok(()) => recovery_error,
-        Err(cleanup_error) => CliError::Bootstrap(format!(
-            "websocket recovery failed: {recovery_error}; replacement cleanup also failed: \
-             {cleanup_error}; replacement termination is unconfirmed and its runtime state \
-             was preserved for diagnosis"
-        )),
-    }
-}
-
-async fn await_replacement_ws_ready(
-    profile_name: &str,
-    cli_username: &str,
-) -> Result<(), CliError> {
-    let deadline = std::time::Instant::now() + SPAWN_READY_DEADLINE;
-    while std::time::Instant::now() < deadline {
-        if let Ok(Ok(status)) =
-            tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping_full(profile_name)).await
-        {
-            if daemon_reuse_decision(&status, cli_username) == DaemonReuseDecision::Reuse
-                && status.ws_connection_state == Some(WsConnectionState::Healthy)
-            {
-                return Ok(());
-            }
+async fn ensure_daemon_running_assessed(
+    profile: &Profile,
+    identity: &Identity,
+    assessment: daemon_assessment::Assessment,
+    deadline: tokio::time::Instant,
+) -> Result<DaemonLaunch, CliError> {
+    if let Some(status) = &assessment.status {
+        if daemon_reuse_decision(status, &identity.username) == DaemonReuseDecision::RefuseForeign {
+            return Err(CliError::DaemonAssessment {
+                disposition: DaemonDisposition::IdentityRefused,
+                detail: "daemon's observed identity belongs to another profile; state retained"
+                    .into(),
+            });
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    Err(CliError::Bootstrap(format!(
-        "replacement daemon for profile {profile_name} did not restore healthy websocket \
-         observation within {} seconds",
-        SPAWN_READY_DEADLINE.as_secs()
-    )))
+    if assessment.disposition.successful() {
+        return Ok(DaemonLaunch {
+            state: DaemonState::AlreadyRunning,
+            assessment,
+        });
+    }
+    // Only validated caller identity plus independent process/runtime proof
+    // permits replacement. Remote uncertainty never reaches this transition.
+    if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
+        return Err(CliError::DaemonAssessment {
+            disposition: DaemonDisposition::IdentityRefused,
+            detail: "parent identity does not match the persisted profile".into(),
+        });
+    }
+    if let Err(error) = stop_daemon_if_present(&profile.name).await {
+        return Err(CliError::DaemonAssessment {
+            disposition: assessment.disposition,
+            detail: error.to_string(),
+        });
+    }
+    spawn_durable_daemon(profile, identity, &profile.name).await?;
+    let assessment = daemon_assessment::assess_until(profile, deadline).await;
+    if !assessment.disposition.successful() {
+        return Err(CliError::DaemonAssessment {
+            disposition: assessment.disposition,
+            detail: "newly started daemon did not establish usable local identity; state retained"
+                .into(),
+        });
+    }
+    Ok(DaemonLaunch {
+        state: DaemonState::Started,
+        assessment,
+    })
 }
 
 /// CHAN-TASK-001: the **single** durable background-start primitive.
@@ -4349,77 +4573,9 @@ fn detach_into_new_session(_cmd: &mut Command) {
     // detachment story is Unix-shaped (setsid / process groups).
 }
 
-/// Stop the daemon if it is present, and wait until its socket is actually gone
-/// so the caller's subsequent spawn lands on a clean slate.
-///
-/// **Daemon presence is detected via socket file existence, not via a probe RPC.**
-/// The pre-spawn health check in `ensure_daemon_running` uses `ping_full()`
-/// (network-aware `daemon_status`, runs `probe_whoami` against Mattermost); a
-/// daemon running with a revoked credential or drifted identity fails that
-/// probe while being very much alive. Falling back to socket existence ensures
-/// the stop path catches those zombies on both the Refresh path (explicit stop
-/// to force reload) and the Reuse path (invoked from `ensure_daemon_running`
-/// when the network-aware probe fails or returns degraded). The local-only
-/// `ping()` (= `profile_status`) is reserved for post-spawn readiness, not
-/// stale-daemon detection.
-///
-/// The daemon's `shutdown` RPC is handled locally (no Mattermost calls) so it
-/// works even when `whoami()` is failing. A stale socket (process already gone)
-/// surfaces as `DaemonError::NotRunning` from `stop()`; that is treated as
-/// no-op since the next `daemon::start()` cleans up the stale socket.
+/// Stop only a revalidated predecessor and retain state unless death is confirmed.
 async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
-    let socket = socket_path_for_profile(profile);
-    if !socket.exists() {
-        return Ok(());
-    }
-    // Try graceful shutdown with a bounded timeout. A wedged daemon
-    // (SIGSTOPed, deadlocked, or stuck on a blocking dependency) holds
-    // the socket but never accepts the shutdown RPC. If the RPC doesn't
-    // complete in SHUTDOWN_RPC_TIMEOUT, fall through to the pid-file
-    // force-kill fallback instead of blocking auto-setup indefinitely.
-    let stop_outcome = tokio::time::timeout(SHUTDOWN_RPC_TIMEOUT, stop(profile)).await;
-    match stop_outcome {
-        Ok(Ok(_)) => {}
-        Ok(Err(DaemonError::NotRunning(_))) => return Ok(()),
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => {
-            // RPC timed out — daemon is wedged. Fall through to force-kill.
-        }
-    }
-    for _ in 0..20 {
-        if !socket_path_for_profile(profile).exists() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    // Socket still present after the shutdown grace window. Force-kill
-    // the pid recorded in the runtime-dir pid file, then sweep the
-    // SIGKILL-orphaned runtime files (SIGKILL skips the daemon's own
-    // `cleanup_runtime_files`). Uses `kill` via std::process::Command
-    // instead of pulling sysprims into the prod graph — a single-purpose
-    // shell-out is cheaper than a new prod dependency for one fallback.
-    if let Some(pid) = read_daemon_pid_for_force_kill(profile) {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        // Wait for the process to be reaped so the next start() doesn't
-        // see an inconsistent pid/socket state.
-        for _ in 0..20 {
-            if !is_pid_alive(pid) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-        // Sweep SIGKILL-orphaned runtime files. Ignoring errors because
-        // either file may already be absent.
-        let _ = std::fs::remove_file(socket_path_for_profile(profile));
-        let _ = std::fs::remove_file(pid_path_for_profile(profile));
-        return Ok(());
-    }
-    Err(CliError::Bootstrap(format!(
-        "daemon for profile {profile} did not exit within the shutdown grace \
-         window and no pid file was readable for the force-kill fallback"
-    )))
+    lifecycle::stop(profile).await.map_err(CliError::Bootstrap)
 }
 
 /// Read the daemon's pid from the runtime-dir pid file. Returns None on any
@@ -4456,10 +4612,8 @@ fn is_pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const SHUTDOWN_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Per-iteration ping budget on the post-spawn readiness poll. Shorter than
-/// `PING_TIMEOUT` because a healthy fresh daemon should answer quickly; a
+/// remote status budget because a healthy fresh daemon should answer quickly; a
 /// slow ping during spawn polling signals "not ready yet, keep waiting"
 /// rather than a wedged-daemon classification (that's what the outer
 /// deadline handles).
@@ -4613,12 +4767,43 @@ struct AutoSetupReport {
     bot_username: String,
     profile_state: ProfileState,
     daemon_state: DaemonState,
+    daemon_disposition: DaemonDisposition,
+    observation_ready: Option<bool>,
     is_active: bool,
     degraded: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     refresh_diff: Vec<ProfileFieldDiff>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     seed_outcomes: Vec<SeedOutcome>,
+}
+
+fn print_preserved_setup(
+    json: bool,
+    profile: &Profile,
+    assessment: daemon_assessment::Assessment,
+    activate: bool,
+) -> Result<(), CliError> {
+    let is_active = if activate {
+        store_active_profile(&profile.name)?;
+        true
+    } else {
+        load_active_profile()?.as_deref() == Some(profile.name.as_str())
+    };
+    print_auto_setup_report(
+        json,
+        &AutoSetupReport {
+            profile_name: profile.name.clone(),
+            bot_username: profile.bot_username.clone(),
+            profile_state: ProfileState::Reused,
+            daemon_state: DaemonState::AlreadyRunning,
+            daemon_disposition: assessment.disposition,
+            observation_ready: assessment.observation_ready,
+            is_active,
+            degraded: true,
+            refresh_diff: Vec::new(),
+            seed_outcomes: Vec::new(),
+        },
+    )
 }
 
 fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), CliError> {
@@ -4637,13 +4822,20 @@ fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), C
         DaemonState::Started => "daemon started".to_string(),
     };
     println!("{profile_line}");
-    println!("{daemon_line}");
+    println!(
+        "{daemon_line}: {}; observation_ready={}",
+        report.daemon_disposition.label(),
+        report
+            .observation_ready
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    );
     println!("bot_username: {}", report.bot_username);
     if report.is_active {
         println!("active: {}", report.profile_name);
     }
     if report.degraded {
-        println!("status: degraded (see seed outcomes below)");
+        println!("status: degraded; responsive daemon retained; see disposition and observation readiness");
     }
     // Detail sections follow.
     for field in &report.refresh_diff {
@@ -5009,17 +5201,59 @@ fn store_profile_and_maybe_activate(
 /// mutates attention state.
 async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Result<(), CliError> {
     let profile = load_profile(profile_name)?;
+    let deadline = daemon_assessment::deadline();
     let mut checks: Vec<CheckVerdict> = Vec::new();
     let mut hard_failure = false;
 
     // --- daemon reachability + status (best-effort) ---
-    let (daemon_check, daemon_block, daemon_binary) = match status(profile_name).await {
-        Ok(st) => {
+    let mut assessment = daemon_assessment::assess_until(&profile, deadline).await;
+    let mut parent_assessment = ParentIdentityAssessment::default();
+    let cli_info = resolve_host_build_info();
+    let mut ownership = RestartOwnership {
+        ownable: false,
+        profile: profile_name.into(),
+        cli_username: None,
+        daemon_username: None,
+        reason: "generation not scored without bounded verified identity evidence".into(),
+    };
+    if assessment.disposition == DaemonDisposition::Healthy
+        && deadline.saturating_duration_since(tokio::time::Instant::now())
+            >= daemon_assessment::REMOTE_BUDGET
+    {
+        let (probed_ownership, later, parent_evidence) =
+            probe_restart_ownership_with_status(&profile, deadline).await;
+        parent_assessment.absorb(parent_evidence);
+        ownership = probed_ownership;
+        let next = if let Some(status) = later {
+            daemon_assessment::Assessment::from_status(status, &profile.bot_username)
+        } else if let Ok(Ok(local)) = tokio::time::timeout(
+            daemon_assessment::LOCAL_BUDGET,
+            daemon_client(profile_name).daemon_observation(),
+        )
+        .await
+        {
+            daemon_assessment::Assessment::from_status(local, &profile.bot_username)
+        } else {
+            daemon_assessment::Assessment {
+                disposition: DaemonDisposition::DegradedRemote,
+                status: None,
+                observation_ready: None,
+            }
+        };
+        assessment.absorb(next, &profile.bot_username);
+    }
+
+    let mut daemon_disposition = assessment.disposition;
+    let observation_ready = assessment.observation_ready;
+    let (_initial_daemon_check, mut daemon_block, daemon_binary) = match assessment.status {
+        Some(st) => {
             let drifted = st.mattermost_identity_drift.unwrap_or(false);
             let ws_degraded = daemon_ws_degraded(&st);
-            let (check, daemon_hard_failure) = doctor_daemon_assessment(&st);
+            let (check, daemon_hard_failure) = doctor_disposition_assessment(daemon_disposition);
             hard_failure |= daemon_hard_failure;
-            checks.push(check);
+            if check != CheckVerdict::Warn {
+                checks.push(check);
+            }
             let binary = st.binary.clone();
             (
                 check,
@@ -5038,14 +5272,16 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     ws_reconnect_count: st.ws_reconnect_count,
                     ws_catchup_in_flight: st.ws_catchup_in_flight,
                     ws_observation_admission_closed: st.ws_observation_admission_closed,
-                    reason: if drifted {
+                    reason: if daemon_disposition == DaemonDisposition::IdentityRefused {
+                        Some("daemon reports authoritative identity refusal; network RPCs are refused".into())
+                    } else if drifted {
                         Some(
                             "daemon reports identity drift; network RPCs through the daemon are refused"
                                 .into(),
                         )
                     } else if ws_degraded {
                         Some(
-                            "daemon reports a current websocket observation failure; run auto-setup to cycle the ownable daemon"
+                            "observation admission is closed; responsive daemon retained; lifecycle success does not make waits ready"
                                 .into(),
                         )
                     } else if !st.mattermost_ok {
@@ -5057,14 +5293,20 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                 binary,
             )
         }
-        Err(e) => {
-            let check = CheckVerdict::Fail;
-            hard_failure = true;
-            checks.push(check);
+        None => {
+            let check = if daemon_disposition.successful() {
+                CheckVerdict::Warn
+            } else {
+                CheckVerdict::Fail
+            };
+            hard_failure = !daemon_disposition.successful();
+            if check != CheckVerdict::Warn {
+                checks.push(check);
+            }
             (
                 check,
                 DoctorDaemonBlock {
-                    reachable: false,
+                    reachable: daemon_disposition.successful(),
                     mattermost_ok: false,
                     identity_drift: false,
                     mattermost_username: None,
@@ -5074,28 +5316,28 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     ws_reconnect_count: None,
                     ws_catchup_in_flight: None,
                     ws_observation_admission_closed: None,
-                    reason: Some(format!("daemon unreachable: {e}")),
+                    reason: Some(if daemon_disposition.successful() {
+                        "local daemon responsive; identity and observation status unknown".into()
+                    } else {
+                        "local daemon did not respond within its local budget".into()
+                    }),
                 },
                 None,
             )
         }
     };
 
-    // --- generation (reuse ownership gate; no bare active_profile greenwash) ---
-    let cli_info = resolve_host_build_info();
-    let ownership = probe_restart_ownership(profile_name).await;
     let daemon_info = daemon_binary;
     let (generation_scored, generation_match) =
         score_generation(Some(&ownership), &cli_info, daemon_info.as_ref());
-    let generation_check = if !generation_scored {
+    let mut generation_check = if !generation_scored {
         CheckVerdict::Unavailable
     } else if generation_match == Some(true) {
         CheckVerdict::Pass
     } else {
         CheckVerdict::Warn
     };
-    checks.push(generation_check);
-    let generation_block = DoctorGenerationBlock {
+    let mut generation_block = DoctorGenerationBlock {
         check: generation_check,
         generation_scored,
         generation_match,
@@ -5130,7 +5372,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         }
     }
 
-    let (identity_check, identity_block, clock_block, client) = match load_token(&profile) {
+    let (mut identity_check, mut identity_block, clock_block, client) = match load_token(&profile) {
         Err(e) => {
             hard_failure = true;
             let (status_class, reason) = doctor_provider_error_summary(&e);
@@ -5153,77 +5395,15 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                 None,
             )
         }
-        Ok(token) => match MattermostClient::new(&profile, token) {
-            Err(e) => {
-                hard_failure = true;
-                let (status_class, reason) = doctor_provider_error_summary(&e);
-                let id_check = CheckVerdict::Fail;
-                checks.push(id_check);
-                let clock = doctor_clock_unavailable(
-                    "server-time observation unavailable because the client could not be built",
-                );
-                checks.push(clock.check);
-                (
-                    id_check,
-                    DoctorIdentityBlock {
-                        ok: false,
-                        username: None,
-                        user_id: None,
-                        status_class,
-                        reason: Some(reason),
-                    },
-                    clock,
-                    None,
-                )
-            }
-            Ok(client) => match client.whoami_with_server_time().await {
-                Ok((identity, observation)) => {
-                    // Token whoami alone is not enough: a drifted credential can
-                    // authenticate as a different bot while still returning 200.
-                    // Match profile.bot_username so identity.ok never greenwashes a
-                    // mismatch that ownership already surfaces elsewhere.
-                    let profile_bot = profile.bot_username.trim();
-                    let username_ok =
-                        profile_bot.is_empty() || identity.username.as_str() == profile_bot;
-                    let (id_check, id_block) = if username_ok {
-                        (
-                            CheckVerdict::Pass,
-                            DoctorIdentityBlock {
-                                ok: true,
-                                username: Some(identity.username.clone()),
-                                user_id: Some(identity.id.clone()),
-                                status_class: None,
-                                reason: None,
-                            },
-                        )
-                    } else {
-                        hard_failure = true;
-                        (
-                            CheckVerdict::Fail,
-                            DoctorIdentityBlock {
-                                ok: false,
-                                username: Some(identity.username.clone()),
-                                user_id: Some(identity.id.clone()),
-                                status_class: Some("identity_mismatch".into()),
-                                reason: Some(format!(
-                                    "token authenticates as {}, profile expects {}",
-                                    identity.username, profile.bot_username
-                                )),
-                            },
-                        )
-                    };
-                    checks.push(id_check);
-                    let clock = clock_check_from_observation(&observation);
-                    checks.push(clock.check);
-                    (id_check, id_block, clock, Some(client))
-                }
+        Ok(token) => {
+            match MattermostClient::new(&profile, token) {
                 Err(e) => {
                     hard_failure = true;
                     let (status_class, reason) = doctor_provider_error_summary(&e);
                     let id_check = CheckVerdict::Fail;
                     checks.push(id_check);
                     let clock = doctor_clock_unavailable(
-                        "server-time observation unavailable because the identity probe failed",
+                        "server-time observation unavailable because the client could not be built",
                     );
                     checks.push(clock.check);
                     (
@@ -5236,11 +5416,114 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                             reason: Some(reason),
                         },
                         clock,
-                        Some(client),
+                        None,
                     )
                 }
-            },
-        },
+                Ok(client) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(chanvoy_core::STATUS_PROBE_TIMEOUT_MS)
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                        client.whoami_with_server_time(),
+                    )
+                    .await
+                    {
+                        Ok(Ok((identity, observation))) => {
+                            // Token whoami alone is not enough: a drifted credential can
+                            // authenticate as a different bot while still returning 200.
+                            // Match profile.bot_username so identity.ok never greenwashes a
+                            // mismatch that ownership already surfaces elsewhere.
+                            let profile_bot = profile.bot_username.trim();
+                            let username_ok =
+                                profile_bot.is_empty() || identity.username.as_str() == profile_bot;
+                            let (id_check, id_block) = if username_ok {
+                                parent_assessment.absorb(ParentIdentityEvidence::VerifiedExpected);
+                                (
+                                    CheckVerdict::Pass,
+                                    DoctorIdentityBlock {
+                                        ok: true,
+                                        username: Some(identity.username.clone()),
+                                        user_id: Some(identity.id.clone()),
+                                        status_class: None,
+                                        reason: None,
+                                    },
+                                )
+                            } else {
+                                parent_assessment.absorb(ParentIdentityEvidence::WrongUsername);
+                                hard_failure = true;
+                                daemon_disposition = DaemonDisposition::IdentityRefused;
+                                (
+                                    CheckVerdict::Fail,
+                                    DoctorIdentityBlock {
+                                        ok: false,
+                                        username: Some(identity.username.clone()),
+                                        user_id: Some(identity.id.clone()),
+                                        status_class: Some("identity_mismatch".into()),
+                                        reason: Some(format!(
+                                            "token authenticates as {}, profile expects {}",
+                                            identity.username, profile.bot_username
+                                        )),
+                                    },
+                                )
+                            };
+                            checks.push(id_check);
+                            let clock = clock_check_from_observation(&observation);
+                            checks.push(clock.check);
+                            (id_check, id_block, clock, Some(client))
+                        }
+                        Ok(Err(e)) => {
+                            let authoritative = chanvoy_core::recovery::identity_probe_error(&e)
+                                == chanvoy_core::recovery::RemoteProbeOutcome::RejectedCredential;
+                            hard_failure |= authoritative;
+                            if authoritative {
+                                if let chanvoy_core::CoreError::Api { status, .. } = &e {
+                                    parent_assessment.absorb(
+                                        ParentIdentityEvidence::RejectedCredential(status.as_u16()),
+                                    );
+                                }
+                                daemon_disposition = DaemonDisposition::IdentityRefused;
+                            } else if daemon_disposition == DaemonDisposition::Healthy {
+                                daemon_disposition = DaemonDisposition::DegradedRemote;
+                            }
+                            let (status_class, reason) = doctor_provider_error_summary(&e);
+                            let id_check = if authoritative {
+                                CheckVerdict::Fail
+                            } else {
+                                CheckVerdict::Warn
+                            };
+                            if authoritative {
+                                checks.push(id_check);
+                            }
+                            let clock = doctor_clock_unavailable(
+                        "server-time observation unavailable because the identity probe failed",
+                    );
+                            if authoritative {
+                                checks.push(clock.check);
+                            }
+                            (
+                                id_check,
+                                DoctorIdentityBlock {
+                                    ok: false,
+                                    username: None,
+                                    user_id: None,
+                                    status_class,
+                                    reason: Some(reason),
+                                },
+                                clock,
+                                Some(client),
+                            )
+                        }
+                        Err(_) => {
+                            if daemon_disposition == DaemonDisposition::Healthy {
+                                daemon_disposition = DaemonDisposition::DegradedRemote;
+                            }
+                            (CheckVerdict::Warn,DoctorIdentityBlock {ok:false,username:None,user_id:None,status_class:None,
+                        reason:Some("identity probe timed out; credential refusal unproven".into())},
+                        doctor_clock_unavailable("server-time observation unavailable after bounded identity probe"),Some(client))
+                        }
+                    }
+                }
+            }
+        }
     };
 
     // --- optional channel resolve (pure; no post read, no cursor) ---
@@ -5262,8 +5545,14 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                     ),
                 })
             }
-            Some(client) => match client.resolve_channel(channel, args.team.as_deref()).await {
-                Ok(resolved) => {
+            Some(client) => match tokio::time::timeout(
+                std::time::Duration::from_secs(2)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                client.resolve_channel(channel, args.team.as_deref()),
+            )
+            .await
+            {
+                Ok(Ok(resolved)) => {
                     let check = CheckVerdict::Pass;
                     checks.push(check);
                     Some(DoctorChannelBlock {
@@ -5276,7 +5565,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                         reason: None,
                     })
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let (status_class, reason, check) = doctor_channel_error_summary(&e);
                     if check == CheckVerdict::Fail {
                         hard_failure = true;
@@ -5292,15 +5581,78 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                         reason: Some(reason),
                     })
                 }
+                Err(_) => {
+                    checks.push(CheckVerdict::Warn);
+                    Some(DoctorChannelBlock {
+                        check: CheckVerdict::Warn,
+                        requested: channel.to_string(),
+                        team: args.team.clone(),
+                        resolved_name: None,
+                        resolved_team: None,
+                        status_class: None,
+                        reason: Some("channel probe timed out within the operation budget".into()),
+                    })
+                }
             },
         }
     } else {
         None
     };
 
+    // Parent refusal is operation-local and independent of the daemon latch.
+    // A later 5xx/timeout/local snapshot cannot clear it; only a successful
+    // expected parent identity can. Never let parent success clear daemon refusal.
+    if let Some(refusal) = parent_assessment.refusal {
+        daemon_disposition = DaemonDisposition::IdentityRefused;
+        // Preserve the current authoritative failure's actionable detail.
+        // Replace only a later inconclusive receipt that hid the earlier refusal.
+        if identity_check != CheckVerdict::Fail {
+            identity_block.status_class = Some(match refusal {
+                ParentIdentityEvidence::RejectedCredential(status) => {
+                    provider_status_class(status).into()
+                }
+                ParentIdentityEvidence::WrongUsername => "identity_mismatch".into(),
+                _ => unreachable!("parent assessment only retains refusals"),
+            });
+            identity_block.reason = Some(
+                "authoritative parent identity refusal remains unresolved during this diagnostic"
+                    .into(),
+            );
+        }
+        identity_check = CheckVerdict::Fail;
+        identity_block.ok = false;
+    }
+
+    // Keep the final receipt aligned with all identity evidence discovered by
+    // this operation, including the independent parent probe. A parent success
+    // cannot clear an authoritative daemon refusal observed above.
+    let (daemon_check, _) = doctor_disposition_assessment(daemon_disposition);
+    if daemon_disposition == DaemonDisposition::IdentityRefused {
+        hard_failure = true;
+        daemon_block.reason =
+            Some("authoritative identity refusal observed during this diagnostic".into());
+        generation_block.generation_scored = false;
+        generation_block.generation_match = None;
+        generation_block.ownership.ownable = false;
+        generation_block.ownership.reason =
+            "authoritative identity refusal prevents ownership scoring".into();
+        generation_block.reason =
+            Some("generation not scored after authoritative identity refusal".into());
+        generation_check = CheckVerdict::Unavailable;
+        generation_block.check = generation_check;
+    }
+    // Independent clock/channel findings still score. Unobserved metadata
+    // caused solely by an inconclusive identity probe is diagnostic only.
+    if generation_check != CheckVerdict::Unavailable
+        || daemon_disposition != DaemonDisposition::DegradedRemote
+    {
+        checks.push(generation_check);
+    }
     let exit = doctor_exit_code(&checks, hard_failure);
     let report = DoctorReport {
         profile: profile_name.to_string(),
+        daemon_disposition,
+        observation_ready,
         exit_code: exit,
         daemon: DoctorCheckWrap {
             check: daemon_check,
@@ -5331,19 +5683,24 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
     Ok(())
 }
 
-fn doctor_daemon_assessment(status: &DaemonStatus) -> (CheckVerdict, bool) {
-    if status.mattermost_identity_drift.unwrap_or(false) {
-        (CheckVerdict::Fail, true)
-    } else if daemon_ws_degraded(status) || !status.mattermost_ok {
-        (CheckVerdict::Warn, false)
-    } else {
-        (CheckVerdict::Pass, false)
+#[cfg(test)]
+fn doctor_daemon_assessment(status: &DaemonStatus, expected: &str) -> (CheckVerdict, bool) {
+    doctor_disposition_assessment(daemon_assessment::status_disposition(status, expected))
+}
+
+fn doctor_disposition_assessment(disposition: DaemonDisposition) -> (CheckVerdict, bool) {
+    match disposition {
+        DaemonDisposition::Healthy => (CheckVerdict::Pass, false),
+        DaemonDisposition::DegradedRemote => (CheckVerdict::Warn, false),
+        _ => (CheckVerdict::Fail, true),
     }
 }
 
 #[derive(Debug, serde::Serialize)]
 struct DoctorReport {
     profile: String,
+    daemon_disposition: DaemonDisposition,
+    observation_ready: Option<bool>,
     exit_code: i32,
     daemon: DoctorCheckWrap<DoctorDaemonBlock>,
     generation: DoctorGenerationBlock,
@@ -5529,6 +5886,14 @@ fn render_doctor_human(report: &DoctorReport) -> String {
     let mut lines = Vec::new();
     lines.push(format!("chanvoy doctor — profile {}", report.profile));
     lines.push(format!("exit_code: {}", report.exit_code));
+    lines.push(format!(
+        "daemon_disposition: {}; observation_ready={}",
+        report.daemon_disposition.label(),
+        report
+            .observation_ready
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    ));
     lines.push(String::new());
 
     let d = &report.daemon.detail;
@@ -7688,6 +8053,8 @@ mod tests {
             socket_path: PathBuf::from("/tmp/seat.sock"),
             mattermost_username: "agent-seat".into(),
             mattermost_ok: true,
+            remote_probe: Some(chanvoy_core::recovery::RemoteProbeOutcome::Verified),
+            identity_refused: Some(false),
             ws_connection_state: Some(connection),
             ws_last_event_at: None,
             ws_last_error: last_error.map(str::to_string),
@@ -7711,7 +8078,91 @@ mod tests {
     const COMMIT_B: &str = "bbbbbbb2222222bbbbbbb2222222bbbbbbb22222";
 
     #[test]
-    fn generation_matched_live_ws_error_cycles_an_ownable_daemon() {
+    fn parent_refusal_retains_unknown_and_only_expected_parent_success_clears_it() {
+        for refusal in [
+            ParentIdentityEvidence::RejectedCredential(401),
+            ParentIdentityEvidence::RejectedCredential(403),
+            ParentIdentityEvidence::WrongUsername,
+        ] {
+            let mut parent = ParentIdentityAssessment::default();
+            parent.absorb(refusal);
+            parent.absorb(ParentIdentityEvidence::Unknown);
+            assert_eq!(parent.refusal, Some(refusal));
+            parent.absorb(ParentIdentityEvidence::VerifiedExpected);
+            assert_eq!(parent.refusal, None);
+        }
+        // Team endpoint status and provider text are not identity evidence.
+        let team_error = CliError::Core(chanvoy_core::CoreError::Api {
+            status: chanvoy_core::StatusCode::UNAUTHORIZED,
+            message: "401 rejected".into(),
+        });
+        assert_eq!(
+            ParentIdentityEvidence::from_preflight_error(&team_error),
+            ParentIdentityEvidence::Unknown
+        );
+        assert_eq!(
+            ParentIdentityEvidence::from_preflight_error(&CliError::Bootstrap(
+                "401 rejected".into()
+            )),
+            ParentIdentityEvidence::Unknown
+        );
+    }
+
+    #[test]
+    fn generation_ownership_requires_observed_typed_identity() {
+        let profile = sample_profile();
+        let identity: Identity = serde_json::from_value(
+            serde_json::json!({"id":"synthetic-bot","username":"agent-seat","is_bot":true}),
+        )
+        .unwrap();
+        let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        assert!(ownership_from_status(&profile, &identity, &status).ownable);
+        for outcome in [
+            chanvoy_core::recovery::RemoteProbeOutcome::Unknown,
+            chanvoy_core::recovery::RemoteProbeOutcome::Timeout,
+            chanvoy_core::recovery::RemoteProbeOutcome::Unavailable,
+            chanvoy_core::recovery::RemoteProbeOutcome::RejectedCredential,
+        ] {
+            status.remote_probe = Some(outcome);
+            status.mattermost_ok = false;
+            let ownership = ownership_from_status(&profile, &identity, &status);
+            assert!(!ownership.ownable);
+            assert!(ownership.daemon_username.is_none());
+        }
+        status.remote_probe = None;
+        status.identity_refused = None;
+        status.mattermost_ok = true;
+        assert!(!ownership_from_status(&profile, &identity, &status).ownable);
+        status.remote_probe = Some(chanvoy_core::recovery::RemoteProbeOutcome::Verified);
+        status.identity_refused = Some(true);
+        assert!(!ownership_from_status(&profile, &identity, &status).ownable);
+    }
+
+    #[test]
+    fn assessment_retains_refusal_through_unknown_and_clears_on_expected_success() {
+        let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        status.identity_refused = Some(true);
+        let mut assessment =
+            daemon_assessment::Assessment::from_status(status.clone(), "agent-seat");
+        status.remote_probe = Some(chanvoy_core::recovery::RemoteProbeOutcome::Unknown);
+        status.identity_refused = Some(false);
+        status.mattermost_ok = false;
+        assessment.absorb(
+            daemon_assessment::Assessment::from_status(status.clone(), "agent-seat"),
+            "agent-seat",
+        );
+        assert_eq!(assessment.disposition, DaemonDisposition::IdentityRefused);
+        status.remote_probe = Some(chanvoy_core::recovery::RemoteProbeOutcome::Verified);
+        status.mattermost_ok = true;
+        assessment.absorb(
+            daemon_assessment::Assessment::from_status(status, "agent-seat"),
+            "agent-seat",
+        );
+        assert_eq!(assessment.disposition, DaemonDisposition::Healthy);
+    }
+
+    #[test]
+    fn generation_matched_live_ws_error_preserves_a_degraded_daemon() {
         let status = daemon_status_with_ws(
             WsConnectionState::Healthy,
             Some("io error: operation timed out"),
@@ -7723,7 +8174,7 @@ mod tests {
         );
         assert_eq!(
             daemon_reuse_decision(&status, "agent-seat"),
-            DaemonReuseDecision::RestartOwnable
+            DaemonReuseDecision::PreserveDegraded
         );
     }
 
@@ -7737,17 +8188,76 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_recovery_does_not_reuse_until_catchup_completes() {
+    fn additive_status_wire_compatibility_remains_conservative() {
+        let status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        let mut json = serde_json::to_value(&status).unwrap();
+        #[derive(serde::Deserialize)]
+        struct OldReader {
+            mattermost_ok: bool,
+            mattermost_username: String,
+        }
+        let old: OldReader = serde_json::from_value(json.clone()).unwrap();
+        assert!(old.mattermost_ok && old.mattermost_username == "agent-seat");
+        for future in [
+            serde_json::Value::Null,
+            serde_json::json!("unsupported-future-result"),
+        ] {
+            json["remote_probe"] = future;
+            let decoded: DaemonStatus = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(
+                daemon_reuse_decision(&decoded, "agent-seat"),
+                DaemonReuseDecision::PreserveDegraded
+            );
+        }
+        json.as_object_mut().unwrap().remove("remote_probe");
+        json.as_object_mut().unwrap().remove("identity_refused");
+        let mut old: DaemonStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(old.identity_refused, None);
+        assert_eq!(
+            daemon_reuse_decision(&old, "agent-seat"),
+            DaemonReuseDecision::PreserveDegraded
+        );
+        old.mattermost_identity_drift = Some(true);
+        assert_eq!(
+            daemon_reuse_decision(&old, "agent-seat"),
+            DaemonReuseDecision::RestartOwnable,
+            "positive legacy drift remains affirmative refusal"
+        );
+    }
+
+    #[test]
+    fn positive_refusal_dominates_benign_probe_and_observation() {
+        let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
+        status.ws_observation_admission_closed = Some(false);
+        status.identity_refused = Some(true);
+        assert_eq!(
+            daemon_assessment::status_disposition(&status, "agent-seat"),
+            DaemonDisposition::IdentityRefused
+        );
+        status.identity_refused = None;
+        assert_eq!(
+            daemon_assessment::status_disposition(&status, "agent-seat"),
+            DaemonDisposition::DegradedRemote
+        );
+        status.identity_refused = Some(false);
+        assert_eq!(
+            daemon_assessment::status_disposition(&status, "agent-seat"),
+            DaemonDisposition::Healthy
+        );
+    }
+
+    #[test]
+    fn authenticated_recovery_stays_degraded_until_catchup_completes() {
         let mut status = daemon_status_with_ws(WsConnectionState::Healthy, None);
         status.ws_reconnect_count = Some(3);
         status.health = Some(DaemonHealthState::Recovering);
         status.ws_catchup_in_flight = Some(true);
         assert_eq!(
             daemon_reuse_decision(&status, "agent-seat"),
-            DaemonReuseDecision::RestartOwnable
+            DaemonReuseDecision::PreserveDegraded
         );
         assert_eq!(
-            doctor_daemon_assessment(&status),
+            doctor_daemon_assessment(&status, "agent-seat"),
             (CheckVerdict::Warn, false)
         );
 
@@ -7767,10 +8277,10 @@ mod tests {
         status.health = Some(DaemonHealthState::Connecting);
         assert_eq!(
             daemon_reuse_decision(&status, "agent-seat"),
-            DaemonReuseDecision::RestartOwnable
+            DaemonReuseDecision::PreserveDegraded
         );
         assert_eq!(
-            doctor_daemon_assessment(&status),
+            doctor_daemon_assessment(&status, "agent-seat"),
             (CheckVerdict::Warn, false)
         );
     }
@@ -7785,10 +8295,10 @@ mod tests {
         status.ws_observation_admission_closed = Some(true);
         assert_eq!(
             daemon_reuse_decision(&status, "agent-seat"),
-            DaemonReuseDecision::RestartOwnable
+            DaemonReuseDecision::PreserveDegraded
         );
         assert_eq!(
-            doctor_daemon_assessment(&status),
+            doctor_daemon_assessment(&status, "agent-seat"),
             (CheckVerdict::Warn, false)
         );
 
@@ -7798,7 +8308,7 @@ mod tests {
             DaemonReuseDecision::Reuse
         );
         assert_eq!(
-            doctor_daemon_assessment(&status),
+            doctor_daemon_assessment(&status, "agent-seat"),
             (CheckVerdict::Pass, false)
         );
     }
@@ -7828,7 +8338,7 @@ mod tests {
             WsConnectionState::Healthy,
             Some("io error: operation timed out"),
         );
-        let (check, hard) = doctor_daemon_assessment(&status);
+        let (check, hard) = doctor_daemon_assessment(&status, "agent-seat");
         assert_eq!(check, CheckVerdict::Warn);
         assert!(!hard);
         assert_eq!(doctor_exit_code(&[check], hard), 1);
@@ -7853,35 +8363,6 @@ mod tests {
         assert!(!json.contains("operation timed out"), "{json}");
     }
 
-    #[test]
-    fn failed_ws_repair_reports_cleanup_failure_without_claiming_termination() {
-        let err = ws_repair_failure_with_cleanup(
-            CliError::Bootstrap("replacement did not recover".into()),
-            Err(CliError::Bootstrap(
-                "shutdown RPC and pid fallback failed".into(),
-            )),
-        );
-        let rendered = err.to_string();
-        assert!(
-            rendered.contains("replacement did not recover"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("shutdown RPC and pid fallback failed"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("termination is unconfirmed"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("runtime state was preserved"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("replacement was removed"), "{rendered}");
-    }
-
-    /// An owned daemon on the same pin scores, and scores `match`.
     #[test]
     fn owned_daemon_on_the_same_pin_scores_a_match() {
         let (scored, verdict) = score_generation(

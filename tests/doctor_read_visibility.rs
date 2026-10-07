@@ -34,7 +34,7 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(0),
         "stdout={stdout} stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -46,8 +46,10 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
     );
 
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
-    assert_eq!(v["exit_code"], 1, "report={stdout}");
+    assert_eq!(v["exit_code"], 0, "report={stdout}");
     assert_eq!(v["daemon"]["check"], "warn");
+    assert_eq!(v["daemon_disposition"], "degraded-remote");
+    assert_eq!(v["observation_ready"], false);
     assert_eq!(v["daemon"]["health"], "degraded");
     assert!(v["daemon"]["ws_last_error"].as_str().is_some());
     assert!(v["daemon"]["ws_reconnect_count"].as_u64().is_some());
@@ -65,7 +67,7 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
 
     let human = run_chanvoy(&env, &["doctor", "ops-updates"]).await;
     let human_stdout = String::from_utf8_lossy(&human.stdout);
-    assert_eq!(human.status.code(), Some(1), "{human_stdout}");
+    assert_eq!(human.status.code(), Some(0), "{human_stdout}");
     assert!(
         human_stdout.contains("ws_connection_state:"),
         "{human_stdout}"
@@ -389,4 +391,410 @@ fn http_date_now_offset_secs(offset_secs: i64) -> String {
     let ts = now + offset_secs;
     let dt = chrono::DateTime::from_timestamp(ts, 0).expect("timestamp");
     dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+/// A later generation probe must be part of the final diagnostic evidence.
+/// All endpoints and runtime files here belong to this synthetic harness.
+#[tokio::test]
+async fn doctor_incorporates_later_identity_evidence_without_fallback_ownership() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    for (case, (outcome, username, refused, drifted, admission_closed, disposition, exit)) in [
+        (
+            "rejected-credential",
+            "agent-test",
+            true,
+            false,
+            false,
+            "identity-refused",
+            2,
+        ),
+        (
+            "verified",
+            "agent-other",
+            true,
+            true,
+            false,
+            "identity-refused",
+            2,
+        ),
+        (
+            "verified",
+            "agent-test",
+            true,
+            false,
+            false,
+            "identity-refused",
+            2,
+        ),
+        (
+            "timeout",
+            "agent-test",
+            false,
+            false,
+            false,
+            "degraded-remote",
+            0,
+        ),
+        (
+            "unavailable",
+            "agent-test",
+            false,
+            false,
+            false,
+            "degraded-remote",
+            0,
+        ),
+        (
+            "unknown",
+            "agent-test",
+            false,
+            false,
+            false,
+            "degraded-remote",
+            0,
+        ),
+        (
+            "verified",
+            "agent-test",
+            false,
+            false,
+            true,
+            "degraded-remote",
+            0,
+        ),
+        ("verified", "agent-test", false, false, false, "healthy", 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let env = TestEnv::new(&format!("doc-order-{case}")).await;
+        // The isolated empty config ensures this pin query has no daemon target.
+        let pin = env
+            .chanvoy_command()
+            .args(["--json", "version", "--extended"])
+            .output()
+            .await
+            .unwrap();
+        assert!(pin.status.success());
+        let pin: serde_json::Value = serde_json::from_slice(&pin.stdout).unwrap();
+        let pin = pin["cli"].clone();
+        env.write_default_profile("agent-test", "org-lanytehq");
+        mount_whoami_with_date(&env, "synthetic-bot", "agent-test", 0).await;
+        mount_primary_team(&env).await;
+        std::fs::create_dir_all(env.chanvoy_runtime_dir()).unwrap();
+        let listener = UnixListener::bind(env.socket_path()).unwrap();
+        let profile = env.profile_name.clone();
+        let socket = env.socket_path();
+        let task = tokio::spawn(async move {
+            for (index, method) in ["daemon_observation", "daemon_status", "daemon_status"]
+                .iter()
+                .enumerate()
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: chanvoy_core::JsonRpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(&request.method, method);
+                let last = index == 2;
+                let probe = if index == 0 {
+                    "unknown"
+                } else if last {
+                    outcome
+                } else {
+                    "verified"
+                };
+                let status = serde_json::json!({"profile_name":profile,"socket_path":socket,
+                    "mattermost_username":if last {username} else {"agent-test"},"mattermost_ok":probe=="verified",
+                    "remote_probe":probe,"identity_refused":last && refused,"mattermost_identity_drift":last && drifted,
+                    "ws_observation_admission_closed":last && admission_closed,"ws_connection_state":"healthy",
+                    "ws_reconnect_count":0,"binary":pin});
+                let response = chanvoy_core::rpc_result(request.id, status);
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let before = read_attention_state_bytes(&env);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            run_chanvoy(&env, &["--json", "doctor"]),
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{report}");
+        assert_eq!(report["daemon_disposition"], disposition, "{report}");
+        assert_eq!(report["observation_ready"], !admission_closed);
+        assert_eq!(report["identity"]["check"], "pass");
+        assert_eq!(report["clock"]["check"], "pass");
+        let score = outcome == "verified" && !refused && username == "agent-test";
+        assert_eq!(report["generation"]["generation_scored"], score, "{report}");
+        assert_eq!(
+            report["generation"]["ownership"]["ownable"], score,
+            "{report}"
+        );
+        if outcome != "verified" {
+            assert!(
+                report["generation"]["ownership"]["daemon_username"].is_null(),
+                "fallback must not become observed ownership: {report}"
+            );
+        }
+        if refused {
+            assert_eq!(report["daemon"]["check"], "fail");
+            assert!(report["generation"]["generation_match"].is_null());
+        }
+        assert_eq!(read_attention_state_bytes(&env), before);
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn doctor_refreshes_refusal_after_an_inconclusive_generation_rpc() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    for refused in [false, true] {
+        let env = TestEnv::new(if refused {
+            "doc-fail-refused"
+        } else {
+            "doc-fail-unknown"
+        })
+        .await;
+        env.write_default_profile("agent-test", "org-lanytehq");
+        mount_whoami_with_date(&env, "synthetic-bot", "agent-test", 0).await;
+        mount_primary_team(&env).await;
+        std::fs::create_dir_all(env.chanvoy_runtime_dir()).unwrap();
+        let listener = UnixListener::bind(env.socket_path()).unwrap();
+        let profile = env.profile_name.clone();
+        let socket = env.socket_path();
+        let task = tokio::spawn(async move {
+            for (index, method) in [
+                "daemon_observation",
+                "daemon_status",
+                "daemon_status",
+                "daemon_observation",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: chanvoy_core::JsonRpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(&request.method, method);
+                let response = if index == 2 {
+                    // Text which resembles authentication failure is not authority.
+                    chanvoy_core::rpc_error(
+                        request.id,
+                        -32000,
+                        "synthetic inconclusive status: 401 rejected",
+                    )
+                } else {
+                    chanvoy_core::rpc_result(
+                        request.id,
+                        serde_json::json!({"profile_name":profile,"socket_path":socket,
+                        "mattermost_username":"agent-test","mattermost_ok":index==1,
+                        "remote_probe":if index==1 {"verified"} else {"unknown"},
+                        "identity_refused":index==3 && refused,"mattermost_identity_drift":false,
+                        "ws_observation_admission_closed":false,"ws_connection_state":"healthy","ws_reconnect_count":0}),
+                    )
+                };
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            run_chanvoy(&env, &["--json", "doctor"]),
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if refused { 2 } else { 0 }),
+            "{report}"
+        );
+        assert_eq!(
+            report["daemon_disposition"],
+            if refused {
+                "identity-refused"
+            } else {
+                "degraded-remote"
+            },
+            "{report}"
+        );
+        assert_eq!(report["generation"]["generation_scored"], false);
+        assert_eq!(report["generation"]["ownership"]["ownable"], false);
+        assert_eq!(report["identity"]["check"], "pass");
+        task.await.unwrap();
+    }
+}
+
+/// Parent and daemon credentials are separate evidence axes. A refused parent
+/// can coexist with a verified daemon using its own cached credential.
+#[tokio::test]
+async fn doctor_retains_parent_refusal_through_inconclusive_followup() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    for (
+        case,
+        (first_status, wrong_user, later_status, timeout, daemon_refused, team_refused, refused),
+    ) in [
+        (401, false, 503, false, false, false, true),
+        (403, false, 503, false, false, false, true),
+        (401, false, 200, true, false, false, true),
+        (403, false, 200, true, false, false, true),
+        (200, true, 503, false, false, false, true),
+        (200, true, 200, true, false, false, true),
+        (401, false, 200, false, false, false, false),
+        (200, true, 200, false, false, false, false),
+        (503, false, 503, false, false, false, false),
+        (200, false, 200, false, true, false, true),
+        (200, false, 503, false, true, false, true),
+        (200, false, 503, false, false, true, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let env = TestEnv::new(&format!("doc-parent-{case}")).await;
+        env.write_default_profile("agent-test", "org-lanytehq");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        Mock::given(method("GET")).and(path("/api/v4/users/me"))
+            .respond_with(move |_: &wiremock::Request| {
+                let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+                let mut response = ResponseTemplate::new(if first {first_status} else {later_status})
+                    .insert_header("Date", http_date_now_offset_secs(0))
+                    .set_body_json(serde_json::json!({"id":"synthetic-bot", "username":if first && wrong_user {"agent-other"} else {"agent-test"},"is_bot":true}));
+                if !first && timeout {response = response.set_delay(std::time::Duration::from_secs(5));}
+                response
+            }).mount(&env.mock).await;
+        if team_refused {
+            Mock::given(method("GET"))
+                .and(path("/api/v4/teams/name/org-lanytehq"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&env.mock)
+                .await;
+        } else {
+            mount_primary_team(&env).await;
+        }
+        std::fs::create_dir_all(env.chanvoy_runtime_dir()).unwrap();
+        let listener = UnixListener::bind(env.socket_path()).unwrap();
+        let profile = env.profile_name.clone();
+        let socket = env.socket_path();
+        let generation_reached_daemon = first_status == 200 && !wrong_user && !team_refused;
+        let task = tokio::spawn(async move {
+            for (index, method) in [
+                "daemon_observation",
+                "daemon_status",
+                if generation_reached_daemon {
+                    "daemon_status"
+                } else {
+                    "daemon_observation"
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let request: chanvoy_core::JsonRpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(&request.method, method);
+                let probe = if index == 1 {
+                    "verified"
+                } else if index == 2 && generation_reached_daemon {
+                    if daemon_refused {
+                        "rejected-credential"
+                    } else {
+                        "verified"
+                    }
+                } else {
+                    "unknown"
+                };
+                let response = chanvoy_core::rpc_result(
+                    request.id,
+                    serde_json::json!({"profile_name":profile,"socket_path":socket,
+                    "mattermost_username":"agent-test","mattermost_ok":probe=="verified","remote_probe":probe,
+                    "identity_refused":index==2 && daemon_refused,"mattermost_identity_drift":false,
+                    "ws_observation_admission_closed":false,"ws_connection_state":"healthy","ws_reconnect_count":0}),
+                );
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let before = read_attention_state_bytes(&env);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            run_chanvoy(&env, &["--json", "doctor"]),
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "case{case}: {report}");
+        assert_eq!(
+            output.status.code(),
+            Some(if refused { 2 } else { 0 }),
+            "case{case}: {report}"
+        );
+        assert_eq!(
+            report["daemon_disposition"],
+            if refused {
+                "identity-refused"
+            } else {
+                "degraded-remote"
+            },
+            "case{case}: {report}"
+        );
+        assert_eq!(
+            report["generation"]["generation_scored"], false,
+            "case{case}: {report}"
+        );
+        assert_eq!(report["generation"]["ownership"]["ownable"], false);
+        assert!(report["generation"]["generation_match"].is_null());
+        assert_eq!(report["observation_ready"], true);
+        let parent_refused = refused && !daemon_refused;
+        assert_eq!(
+            report["identity"]["check"],
+            if parent_refused {
+                "fail"
+            } else if timeout || later_status != 200 {
+                "warn"
+            } else {
+                "pass"
+            },
+            "case{case}: {report}"
+        );
+        assert_eq!(
+            report["clock"]["check"],
+            if timeout || later_status != 200 {
+                "unavailable"
+            } else {
+                "pass"
+            }
+        );
+        assert_eq!(read_attention_state_bytes(&env), before);
+        task.await.unwrap();
+    }
 }

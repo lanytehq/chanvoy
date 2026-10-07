@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod doctor;
 pub mod host_build_info;
+pub mod recovery;
 pub mod safe_read;
 pub mod wait_channels;
 pub mod wait_dm;
@@ -537,7 +538,46 @@ pub fn build_daemon_status(
         mattermost_identity_drift,
         // PER-038A: pin of *this* process (the daemon), not the calling CLI.
         binary: Some(host_build_info::resolve()),
+        remote_probe: None,
+        identity_refused: None,
     }
+}
+
+/// Construct additive status without converting human error text into identity evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn build_daemon_status_typed(
+    profile_name: String,
+    socket_path: PathBuf,
+    configured_bot_username: String,
+    probe: recovery::IdentityProbe,
+    ws: WsStatusSnapshot,
+    ipc: IpcStatusSnapshot,
+    now_millis: i64,
+    refused: bool,
+    drifted: bool,
+) -> DaemonStatus {
+    let outcome = probe.outcome;
+    let diagnostic = probe.diagnostic().unwrap_or_default().to_owned();
+    let result = match probe.observed_username {
+        Some(username) if outcome == recovery::RemoteProbeOutcome::Verified => Ok(username),
+        _ => Err(diagnostic),
+    };
+    let mut status = build_daemon_status(
+        profile_name,
+        socket_path,
+        configured_bot_username,
+        result,
+        ws,
+        ipc,
+        now_millis,
+    );
+    status.remote_probe = Some(outcome);
+    status.identity_refused = Some(refused);
+    status.mattermost_identity_drift = Some(drifted);
+    if outcome == recovery::RemoteProbeOutcome::Unknown {
+        status.mattermost_last_error = None;
+    }
+    status
 }
 
 pub fn derive_daemon_health(
@@ -1775,6 +1815,12 @@ pub struct DaemonStatus {
     pub socket_path: PathBuf,
     pub mattermost_username: String,
     pub mattermost_ok: bool,
+    /// Additive typed evidence; absent/null/future enum strings are unknown.
+    #[serde(default)]
+    pub remote_probe: Option<recovery::RemoteProbeOutcome>,
+    /// Process-memory refusal state; absent/null is unknown, not false.
+    #[serde(default)]
+    pub identity_refused: Option<bool>,
     #[serde(default)]
     pub ws_connection_state: Option<WsConnectionState>,
     #[serde(default)]
