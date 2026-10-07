@@ -265,13 +265,16 @@ path) when no bootstrap handoff is in flight. Use `auto-setup` or
 `daemon start` for the durable case, `daemon serve` for
 foreground-debug.
 
-If a background daemon exits during startup, the starting command fails
-with a startup-failure classification naming the stage it died in
-(before or after consuming the bootstrap handoff) rather than a bare
-"not running" — the two call for different operator actions. The diagnostic
-includes an explicit `RUST_LOG=info ... daemon serve` foreground command;
-`RUST_LOG=debug` provides more detail and `Ctrl-C` ends that owned foreground
-process.
+If a background daemon fails during startup, the starting command reports
+a classified outcome and the observed bootstrap handoff path state:
+present, absent, or unconfirmed. That path observation does not establish
+whether child identity validation succeeded. A foreground
+`RUST_LOG=info ... daemon serve` recipe is supplied only after child death
+and guarded runtime cleanup are confirmed. If termination or cleanup
+remains unconfirmed, use status/doctor to observe the retained state and
+resolve predecessor ownership, liveness, and runtime identity before any
+new startup. `RUST_LOG=debug` provides more detail for an authorized
+foreground diagnostic process; `Ctrl-C` ends that process.
 
 ### Restart and recovery
 
