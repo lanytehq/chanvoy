@@ -56,9 +56,9 @@ while IFS= read -r report_line; do
         *' daemon serve'|*' daemon serve '*) ;;
         *) continue ;;
     esac
-    # ps joins argv with spaces. Inspect the complete prefix before the verb,
-    # so an ambiguous multiword/empty profile cannot become a false absence.
-    report_profile=${report_rest%%" daemon serve"*}
+    # ps joins argv with spaces. Keep the entire prefix before the last verb;
+    # earlier delimiters make it ambiguous and fail the single-word guard.
+    report_profile=${report_rest%" daemon serve"*}
     if [[ ! "$report_profile" =~ ^[A-Za-z0-9_.-]+$ ]]; then
         report_unconfirmed=$((report_unconfirmed + 1))
         continue
