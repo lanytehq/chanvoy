@@ -65,7 +65,7 @@ class Synthetic:
         target, pin_platform = TARGETS[platform]
         self.state = dict(root=str(self.root), target=target, pin_platform=pin_platform,
                           platform=platform, head=HEAD, tree=TREE, dirty=False,
-                          cases=case_lists(), rust=RUST, pin_commit=HEAD)
+                          cases=case_lists(), rust=RUST, pin_commit=HEAD, evidence=str(self.out))
         self.state.update(changes)
         self.state_path.write_text(json.dumps(self.state))
         (self.root / "Cargo.toml").write_text('[package]\nname="chanvoy"\nversion="0.3.2"\n')
@@ -100,6 +100,16 @@ else:raise SystemExit(8)
 """)
         executable(self.tools / "rustc", prefix + """
 print(state['rust']+'\\nhost: '+state['target']+'\\nrelease: 1.89.0')
+""")
+        for name in ("readelf", "otool"):
+            executable(self.tools / name, prefix + """
+if state.get('fail_native'):raise SystemExit(7)
+if '--version' in sys.argv:print('synthetic native metadata tool version 1')
+elif '-L' in sys.argv:
+ print(sys.argv[-1]+':\\n\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)')
+elif '-d' in sys.argv:print('Dynamic section: (NEEDED) Shared library: [libc.so.6]')
+elif '-l' in sys.argv:print('Program Headers: [Requesting program interpreter: /lib64/synthetic-loader]')
+else:raise SystemExit(8)
 """)
         cargo_body = prefix + """
 root=pathlib.Path(state['root']); target=root/'target'; package='path+file:///synthetic#chanvoy@0.3.2'
@@ -144,6 +154,8 @@ else:
   with (pathlib.Path(state['root'])/'target/debug/chanvoy').open('a') as f:f.write('changed')
  if state.get('dirty_after')==suite:
   state['dirty']=True;pathlib.Path(CONTROL).write_text(json.dumps(state))
+ if state.get('tamper_native')==suite:
+  with (pathlib.Path(state['evidence'])/'normal-build-inputs.json').open('a') as f:f.write('changed')
  if state.get('fail_suite')==suite:
   if state.get('restore_failure'):
    cli=pathlib.Path(state['root'])/'target/debug/chanvoy';cli.unlink();cli.mkdir()
@@ -250,6 +262,11 @@ class QualificationTests(unittest.TestCase):
     def test_payload_mutation_and_source_mutation_are_refused(self):
         self.check("payload changed", tamper_cli="startup_diagnostics")
         self.check("dirty", dirty_after="startup_diagnostics")
+
+    def test_native_capture_is_required_and_its_receipt_cannot_change(self):
+        receipt = self.check("owned command failed: native-tool-version", fail_native=True)
+        self.assertEqual(receipt["suites"], [])
+        self.check("normal build input receipt changed", tamper_native="startup_diagnostics")
 
     def test_first_failure_is_retained_and_stops_later_suites(self):
         receipt = self.check("owned command failed", fail_suite="startup_diagnostics")
@@ -449,7 +466,7 @@ class QualificationTests(unittest.TestCase):
         qualifier = workflow.index("Qualify actual tag-run payload")
         upload = workflow.index("Upload exact binary artifact")
         self.assertLess(qualifier, upload)
-        block = workflow[upload:workflow.index("\n  sbom:", upload)]
+        block = workflow[upload:workflow.index("\n  sbom_tool_route:", upload)]
         self.assertIn("if: success()", block)
         self.assertNotIn("always()", block)
         self.assertIn("Preserve shipping qualification and first-failure evidence\n        if: always()", workflow)

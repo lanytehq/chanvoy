@@ -20,7 +20,8 @@ if not re.search(r'^permissions:\s*\n\s+contents:\s*read\b', text, re.MULTILINE)
     errors.append('workflow permissions must be contents: read')
 for construct in ('persist-credentials: false', 'release-restore-tag-ref.sh',
                   'verify-pinned-tag.sh', 'release-packages-', 'validate-release-assets.sh',
-                  'EXPECTED_TARGET', 'cyclonedx-json', 'needs.validate.outputs.commit'):
+                  'EXPECTED_TARGET', 'scripts/shipping_sbom.py',
+                  'needs: [validate, build, sbom_tool_route]', 'needs.validate.outputs.commit'):
     if construct not in text:
         errors.append(f'required release invariant absent: {construct}')
 if errors:

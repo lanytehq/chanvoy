@@ -107,3 +107,39 @@ jobs:
           path: ${{ runner.temp }}/qualification-linux-x86_64/
           if-no-files-found: warn
           retention-days: 7
+  sbom_tool_route:
+    name: Offline SBOM tool route
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Stage checksum-pinned validator
+        timeout-minutes: 3
+        run: python3 scripts/setup-sbom-validator.py --output "$RUNNER_TEMP/sbom-validator"
+      - name: Prove immutable closure and Linux network denial
+        timeout-minutes: 10
+        env:
+          EXPECTED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 scripts/sbom-tool-route.py --expected-commit "$EXPECTED_COMMIT" \
+            --tool-receipt "$RUNNER_TEMP/sbom-validator/setup-evidence.json" \
+            --output "$RUNNER_TEMP/sbom-tool-route"
+      - name: Preserve tool-route and setup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-tool-route-candidate-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sbom-tool-route/
+            ${{ runner.temp }}/sbom-validator/
+          if-no-files-found: error
+          retention-days: 7

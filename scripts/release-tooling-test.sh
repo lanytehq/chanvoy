@@ -7,6 +7,7 @@ for tool in bash python3 git gpg gpgconf minisign jq shasum; do
 done
 export CHANVOY_DECERNOR_BIN="${CHANVOY_DECERNOR_BIN:-$(command -v decernor)}"
 python3 -B "$root/scripts/qualify-production-binary.test.py"
+python3 -B "$root/scripts/shipping-sbom.test.py"
 for test in release-decernor-resolver release-workflow-permissions release-assets release-staging \
 	release-tag-controls verify-pinned-tag release-verify-published-tag release-negative-controls sign-release-assets; do
 	bash "$root/scripts/$test.test.sh"

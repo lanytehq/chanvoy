@@ -11,8 +11,13 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
+
+sys.dont_write_bytecode = True
+from bounded_evidence import EvidenceCommands, EvidenceError as QualificationError, json_write
+from production_build_inputs import capture as capture_build_inputs
 
 
 PLATFORMS = {
@@ -109,14 +114,6 @@ SUITES = {
 }
 
 
-class QualificationError(Exception):
-    pass
-
-
-CLEANUP_SECONDS = 10
-TERM_REAP_SECONDS = 5
-
-
 def regular(path):
     path = Path(path).absolute()
     if not stat.S_ISREG(path.lstat().st_mode):
@@ -126,13 +123,6 @@ def regular(path):
 
 def digest(path):
     return hashlib.sha256(regular(path).read_bytes()).hexdigest()
-
-
-def json_write(path, value):
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
 
 
 def messages(path):
@@ -165,7 +155,7 @@ def compiler_executable(events, package_id, name, kind, test):
     return candidates[0]
 
 
-class Driver:
+class Driver(EvidenceCommands):
     def __init__(self, args):
         self.args = args
         self.root = args.root.resolve()
@@ -179,6 +169,7 @@ class Driver:
         if self.out.is_symlink() or not self.out.is_dir():
             raise QualificationError("unsafe evidence directory")
         self.deadline = time.monotonic() + args.operation_seconds
+        self.receipt_path = self.out / "qualification.json"
         self.receipt = {
             "schema": "production-qualification-v1",
             "status": "incomplete",
@@ -198,93 +189,6 @@ class Driver:
             },
         }
         self.save()
-
-    def save(self):
-        json_write(self.out / "qualification.json", self.receipt)
-
-    def fail(self, cause):
-        self.receipt["status"] = "failed"
-        first = self.receipt.setdefault("failure", cause)
-        if cause != first:
-            self.receipt.setdefault("secondary_failures", []).append(cause)
-        self.save()
-
-    def expired_command(self, child, record, started):
-        cause = "owned command exceeded its process horizon"
-        cleanup_deadline = min(self.deadline, time.monotonic() + CLEANUP_SECONDS)
-        record.update(process_horizon_expired=True, owned_cleanup_confirmed=False,
-                      exit=None, child_collected=False, cleanup_deadline=cleanup_deadline,
-                      elapsed_seconds=time.monotonic() - started, teardown=[])
-        # Persist the first failure and unknown cleanup BEFORE any signal/reap.
-        self.fail(cause)
-        for stage, sig, cap in (("term", signal.SIGTERM, TERM_REAP_SECONDS),
-                                ("kill", signal.SIGKILL, CLEANUP_SECONDS)):
-            remaining = cleanup_deadline - time.monotonic()
-            if remaining <= 0:
-                record["cleanup_horizon_expired"] = True
-                break
-            step = {"stage": stage}
-            record["teardown"].append(step)
-            # Only the process group created by this Popen invocation is used.
-            # Even a collected child does not prove whole-group death.
-            try:
-                os.killpg(child.pid, sig)
-            except OSError as error:
-                step["signal_error_class"] = type(error).__name__
-                break
-            remaining = cleanup_deadline - time.monotonic()
-            if remaining <= 0:
-                record["cleanup_horizon_expired"] = True
-                break
-            step["reap_horizon_seconds"] = min(cap, remaining)
-            self.save()
-            try:
-                record["exit"] = child.wait(timeout=step["reap_horizon_seconds"])
-                record["child_collected"] = True
-                break
-            except subprocess.TimeoutExpired:
-                step["reap_horizon_expired"] = True
-                if stage == "kill":
-                    record["cleanup_horizon_expired"] = True
-            except OSError as error:
-                step["reap_error_class"] = type(error).__name__
-                break
-        record["elapsed_seconds"] = time.monotonic() - started
-        self.save()
-        raise QualificationError(cause)
-
-    def command(self, name, argv, horizon, env=None):
-        # Cleanup is reserved INSIDE the total operation deadline. A depleted
-        # execution budget starts no further command and never renews cleanup.
-        remaining = self.deadline - time.monotonic() - CLEANUP_SECONDS
-        if remaining <= 0:
-            cause = "qualification operation horizon expired"
-            self.fail(cause)
-            raise QualificationError(cause)
-        horizon = min(horizon, remaining)
-        log = self.out / (name + ".log")
-        stderr_log = self.out / (name + ".stderr.log")
-        record = {"stage": name, "argv": argv, "horizon_seconds": horizon,
-                  "stdout": log.name, "stderr": stderr_log.name}
-        self.receipt["commands"].append(record)
-        self.save()
-        started = time.monotonic()
-        with log.open("wb") as output, stderr_log.open("wb") as errors:
-            child = subprocess.Popen(
-                argv, cwd=self.root, env=env, stdout=output,
-                stderr=errors, start_new_session=True,
-            )
-            try:
-                code = child.wait(timeout=horizon)
-            except subprocess.TimeoutExpired:
-                self.expired_command(child, record, started)
-        record.update(exit=code, elapsed_seconds=time.monotonic() - started)
-        self.save()
-        if code:
-            cause = "owned command failed: " + name
-            self.fail(cause)
-            raise QualificationError(cause)
-        return log.read_text()
 
     def git(self, name, *args):
         return self.command(name, ["git", *args], 10).strip()
@@ -335,6 +239,7 @@ class Driver:
             "metadata", ["cargo", "metadata", "--locked", "--offline", "--format-version", "1",
                          "--filter-platform", target], 30,
         ))
+        self.receipt["metadata_messages_sha256"] = digest(self.out / "metadata.log")
         roots = [x for x in metadata["packages"]
                  if x["name"] == "chanvoy" and Path(x["manifest_path"]).resolve() == self.root / "Cargo.toml"]
         if len(roots) != 1:
@@ -401,6 +306,9 @@ class Driver:
         if pin.get("daemon") is not None or pin.get("generation_scored") is not False:
             raise QualificationError("isolated pin unexpectedly scored a daemon")
         json_write(self.out / "build-pin.json", pin)
+        inputs_path = capture_build_inputs(self, normal_events, metadata, preserved)
+        self.receipt.update(normal_build_inputs=inputs_path.name, normal_build_inputs_sha256=digest(inputs_path))
+        self.save()
         suites = ["startup_diagnostics", "per_043_wait_follow"]
         if self.args.platform.startswith("linux-"):
             suites.insert(1, "restart_harness")
@@ -485,6 +393,14 @@ class Driver:
             backup.unlink()
         if any(digest(path) != expected_hash for path in (preserved, original, supplied)):
             raise QualificationError("normal payload changed during qualification")
+        if digest(inputs_path) != self.receipt["normal_build_inputs_sha256"]:
+            raise QualificationError("normal build input receipt changed")
+        captured = json.loads(inputs_path.read_text())
+        inputs = {"normal-build.jsonl": captured["normal_build_messages_sha256"],
+                  "metadata.log": captured["metadata_sha256"], "normal-Cargo.lock": captured["lock_sha256"],
+                  **captured["native"]["logs_sha256"]}
+        if any(digest(self.out / name) != value for name, value in inputs.items()):
+            raise QualificationError("normal build evidence changed during qualification")
         self.boundary("after")
         self.receipt["status"] = "pass"
         self.save()
