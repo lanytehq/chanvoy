@@ -2757,8 +2757,8 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "waitprims-async"
-version = "0.2.1"
-source = "git+https://github.com/3leaps/waitprims?tag=v0.2.1#7dfb46f372a80a21b71ddd8be97c1a2fc25c6db5"
+version = "0.2.3"
+source = "git+https://github.com/3leaps/waitprims?tag=v0.2.3#65b597fdcdb82bf4a0c0d575ec859e15a323d3cb"
 dependencies = [
  "tokio",
  "waitprims-core",
@@ -2766,8 +2766,8 @@ dependencies = [
 
 [[package]]
 name = "waitprims-core"
-version = "0.2.1"
-source = "git+https://github.com/3leaps/waitprims?tag=v0.2.1#7dfb46f372a80a21b71ddd8be97c1a2fc25c6db5"
+version = "0.2.3"
+source = "git+https://github.com/3leaps/waitprims?tag=v0.2.3#65b597fdcdb82bf4a0c0d575ec859e15a323d3cb"
 dependencies = [
  "jsonschema 0.30.0",
  "ryu-js",
