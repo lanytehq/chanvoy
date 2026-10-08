@@ -220,20 +220,19 @@ else:
         (self.out / "normal-Cargo.lock").write_bytes((self.root / "Cargo.lock").read_bytes())
         self.normal.write_bytes((self.out / "normal-build.jsonl").read_bytes())
 
+    def owned_environment(self):
+        # The provider/roots/tools belong to this harness. Never borrow the
+        # launcher's Make/native/compiler selections or ambient credentials.
+        # Intentional negative controls are added below without normalization.
+        env = {"PATH": str(self.tools) + os.pathsep + os.environ["PATH"],
+               "CARGO_HOME": str(self.cargo_home)}
+        for name in ("GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"):
+            if name in os.environ:
+                env[name] = os.environ[name]
+        return env
+
     def run(self, **overrides):
-        env = os.environ.copy()
-        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
-                     "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
-                     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS"):
-            env.pop(name, None)
-        for name in list(env):
-            if (name.startswith(("CARGO_PROFILE_", "CARGO_HOST_", "CARGO_UNSTABLE_"))
-                    or name == "CARGO_TARGET_APPLIES_TO_HOST"
-                    or (name.startswith("CARGO_TARGET_")
-                        and name.endswith(("_RUSTFLAGS", "_LINKER", "_RUNNER", "_RUSTDOCFLAGS")))):
-                env.pop(name)
-        env["PATH"] = str(self.tools) + os.pathsep + env["PATH"]
-        env["CARGO_HOME"] = str(self.cargo_home)
+        env = self.owned_environment()
         env.update(overrides.get("env", {}))
         mode = overrides.get("mode", "candidate" if self.state["platform"] == "linux-x86_64" else "shipping")
         args = [sys.executable, str(DRIVER), "--root", str(self.root), "--binary", str(self.cli),
@@ -272,6 +271,31 @@ class QualificationTests(unittest.TestCase):
         for platform in TARGETS:
             with self.subTest(platform=platform):
                 self.check(platform=platform)
+
+    def test_owned_provider_environment_works_under_ambient_make_and_native_context(self):
+        with tempfile.TemporaryDirectory(prefix="cv-owned-launcher-") as directory:
+            fixture = Synthetic(Path(directory))
+            ambient = {"MAKEFLAGS": "--jobs=2 --no-print-directory", "CC": "owned-unsupported-caller-compiler",
+                       "CMAKE_TOOLCHAIN_FILE": "owned-unsupported-toolchain", "AWS_LC_SYS_USE_SYSTEM": "1",
+                       "CARGO_TARGET_DIR": "owned-unsupported-caller-output"}
+            with mock.patch.dict(os.environ, ambient):
+                before = dict(os.environ)
+                result, receipt = fixture.run()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(receipt["status"], "pass")
+                # Boolean assertion cannot disclose the ambient environment.
+                self.assertTrue(dict(os.environ) == before, "synthetic run changed the parent environment")
+
+    def test_explicit_empty_makeflags_and_native_negative_are_not_removed(self):
+        for override in ({"MAKEFLAGS": ""}, {"AWS_LC_SYS_USE_SYSTEM": "0"}):
+            with self.subTest(selector=next(iter(override))), tempfile.TemporaryDirectory(prefix="cv-owned-negative-") as directory:
+                fixture = Synthetic(Path(directory))
+                result, receipt = fixture.run(env=override)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt["status"], "failed")
+                self.assertIn(next(iter(override)), receipt["failure"])
+                self.assertEqual(receipt["commands"], [])
+                self.assertEqual(receipt["suites"], [])
 
     def test_fixture_control_follows_verified_policy_and_metadata_has_none(self):
         with tempfile.TemporaryDirectory(prefix="cv-fixture-control-") as directory:
@@ -518,7 +542,8 @@ class QualificationTests(unittest.TestCase):
                 args = SimpleNamespace(root=fixture.root, output=fixture.out, operation_seconds=20,
                                        mode="candidate", platform="linux-x86_64", expected_commit=HEAD,
                                        tag=None, tag_object=None)
-                with mock.patch.object(module.time, "monotonic", side_effect=lambda: clock[0]), \
+                with mock.patch.dict(module.os.environ, fixture.owned_environment(), clear=True), \
+                        mock.patch.object(module.time, "monotonic", side_effect=lambda: clock[0]), \
                         mock.patch.object(module.subprocess, "Popen", UncollectableChild), \
                         mock.patch.object(module.os, "killpg", side_effect=owned_signal):
                     driver = module.Driver(args)
