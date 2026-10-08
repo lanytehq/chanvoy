@@ -193,7 +193,9 @@ class Driver(EvidenceCommands):
         self.save()
 
     def command(self, name, argv, horizon, env=None, **kwargs):
-        if argv and argv[0] == "cargo":
+        if argv and argv[0] == "cargo" and argv[1] != "metadata":
+            if not getattr(self, "native_policy", None):
+                raise QualificationError("native fixture control requires verified producer association")
             env = policy.child_environment(os.environ, PLATFORMS[self.args.platform][0])
         return super().command(name, argv, horizon, env, **kwargs)
 

@@ -294,6 +294,14 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(EvidenceError, "normal executable"):
                 fixture.verify()
 
+    def test_correct_payload_hash_with_wrong_producer_size_refuses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = NativeFixture(Path(temporary))
+            fixture.receipt["normal_executable"]["bytes"] += 1
+            fixture.rewrite()
+            with self.assertRaisesRegex(EvidenceError, "normal executable"):
+                fixture.verify()
+
     def test_missing_wrong_size_and_source_target_mode_policy_refuse(self):
         for field, wrong in (("normal_executable", None), ("normal_executable", {"sha256": "1" * 64, "bytes": 3}),
                              ("commit", "f" * 40), ("target", "wrong"), ("mode", "candidate"),

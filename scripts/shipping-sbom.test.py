@@ -253,6 +253,20 @@ class ShippingTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceError, "producer normal executable association"):
             self.fixture.assemble()
 
+    def test_correct_shipping_payload_hash_with_wrong_producer_size_refuses(self):
+        folder = self.fixture.folders["linux-x86_64"]
+        producer = sbom.object_file(folder / "native-build-policy.json")
+        producer["normal_executable"]["bytes"] += 1
+        self.fixture.write_json(folder / "native-build-policy.json", producer)
+        for name in ("normal-build-inputs.json", "qualification.json"):
+            value = sbom.object_file(folder / name)
+            value["normal_executable"] = copy.deepcopy(producer["normal_executable"])
+            value["native_build_policy_sha256"] = schema.sha(schema.regular_bytes(folder / "native-build-policy.json"))
+            self.fixture.write_json(folder / name, value)
+        self.fixture.refresh(folder)
+        with self.assertRaisesRegex(EvidenceError, "producer normal executable association"):
+            self.fixture.assemble()
+
     def test_old_input_version_and_missing_producer_binding_cannot_upgrade(self):
         folder = self.fixture.folders["linux-x86_64"]
         original = schema.regular_bytes(folder / "normal-build-inputs.json")

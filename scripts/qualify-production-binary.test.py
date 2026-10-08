@@ -120,7 +120,10 @@ elif '-l' in sys.argv:print('Program Headers: [Requesting program interpreter: /
 else:raise SystemExit(8)
 """)
         cargo_body = prefix + """
+import os
 root=pathlib.Path(state['root']); target=root/'target'; package='path+file:///synthetic#chanvoy@0.3.2'
+with (root.parent/'qualifier-cargo-controls.jsonl').open('a') as controls:
+ controls.write(json.dumps(dict(operation=sys.argv[1],control={k:v for k,v in os.environ.items() if k.startswith(('AWS_LC_SYS_','HOST_AWS_LC_SYS_','TARGET_AWS_LC_SYS_'))}))+'\\n')
 def event(name,kind,path,test):
  return dict(reason='compiler-artifact',package_id=package,target=dict(name=name,kind=[kind]),
              profile=dict(test=test,opt_level='0',debug_assertions=True),
@@ -270,6 +273,24 @@ class QualificationTests(unittest.TestCase):
             with self.subTest(platform=platform):
                 self.check(platform=platform)
 
+    def test_fixture_control_follows_verified_policy_and_metadata_has_none(self):
+        with tempfile.TemporaryDirectory(prefix="cv-fixture-control-") as directory:
+            fixture = Synthetic(Path(directory))
+            result, receipt = fixture.run()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            controls = [json.loads(x) for x in (fixture.root.parent / "qualifier-cargo-controls.jsonl").read_text().splitlines()]
+            self.assertEqual(controls, [{"operation": "metadata", "control": {}},
+                                       {"operation": "test", "control": {"AWS_LC_SYS_USE_SYSTEM": "0"}}])
+            self.assertEqual(receipt["status"], "pass")
+        with tempfile.TemporaryDirectory(prefix="cv-fixture-control-refusal-") as directory:
+            fixture = Synthetic(Path(directory))
+            (fixture.out / "native-build-policy.json").unlink()
+            result, receipt = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            controls = [json.loads(x) for x in (fixture.root.parent / "qualifier-cargo-controls.jsonl").read_text().splitlines()]
+            self.assertEqual(controls, [{"operation": "metadata", "control": {}}])
+            self.assertEqual(receipt["suites"], [])
+
     def test_stale_checkout_and_dirty_source_refuse(self):
         self.check("declared commit", head="e" * 40)
         self.check("dirty", dirty=True)
@@ -338,6 +359,16 @@ class QualificationTests(unittest.TestCase):
             self.assertIn("producer normal executable association", receipt["failure"])
             self.assertEqual(receipt["suites"], [])
             self.assertNotIn("fixture-compile", [x["stage"] for x in receipt["commands"]])
+
+    def test_correct_normal_payload_hash_with_wrong_producer_size_refuses(self):
+        with tempfile.TemporaryDirectory(prefix="cv-producer-size-") as directory:
+            fixture = Synthetic(Path(directory))
+            fixture.producer["normal_executable"]["bytes"] += 1
+            native.json_file(fixture.out / "native-build-policy.json", fixture.producer)
+            result, receipt = fixture.run()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("producer normal executable association", receipt["failure"])
+            self.assertEqual(receipt["suites"], [])
 
     def test_missing_wrong_size_mode_and_policy_fields_refuse_before_fixtures(self):
         for field, wrong in (("normal_executable", None), ("normal_executable", {"sha256": "1" * 64, "bytes": 1}),
