@@ -113,6 +113,10 @@ class QualificationError(Exception):
     pass
 
 
+CLEANUP_SECONDS = 10
+TERM_REAP_SECONDS = 5
+
+
 def regular(path):
     path = Path(path).absolute()
     if not stat.S_ISREG(path.lstat().st_mode):
@@ -198,45 +202,88 @@ class Driver:
     def save(self):
         json_write(self.out / "qualification.json", self.receipt)
 
+    def fail(self, cause):
+        self.receipt["status"] = "failed"
+        first = self.receipt.setdefault("failure", cause)
+        if cause != first:
+            self.receipt.setdefault("secondary_failures", []).append(cause)
+        self.save()
+
+    def expired_command(self, child, record, started):
+        cause = "owned command exceeded its process horizon"
+        cleanup_deadline = min(self.deadline, time.monotonic() + CLEANUP_SECONDS)
+        record.update(process_horizon_expired=True, owned_cleanup_confirmed=False,
+                      exit=None, child_collected=False, cleanup_deadline=cleanup_deadline,
+                      elapsed_seconds=time.monotonic() - started, teardown=[])
+        # Persist the first failure and unknown cleanup BEFORE any signal/reap.
+        self.fail(cause)
+        for stage, sig, cap in (("term", signal.SIGTERM, TERM_REAP_SECONDS),
+                                ("kill", signal.SIGKILL, CLEANUP_SECONDS)):
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining <= 0:
+                record["cleanup_horizon_expired"] = True
+                break
+            step = {"stage": stage}
+            record["teardown"].append(step)
+            # Only the process group created by this Popen invocation is used.
+            # Even a collected child does not prove whole-group death.
+            try:
+                os.killpg(child.pid, sig)
+            except OSError as error:
+                step["signal_error_class"] = type(error).__name__
+                break
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining <= 0:
+                record["cleanup_horizon_expired"] = True
+                break
+            step["reap_horizon_seconds"] = min(cap, remaining)
+            self.save()
+            try:
+                record["exit"] = child.wait(timeout=step["reap_horizon_seconds"])
+                record["child_collected"] = True
+                break
+            except subprocess.TimeoutExpired:
+                step["reap_horizon_expired"] = True
+                if stage == "kill":
+                    record["cleanup_horizon_expired"] = True
+            except OSError as error:
+                step["reap_error_class"] = type(error).__name__
+                break
+        record["elapsed_seconds"] = time.monotonic() - started
+        self.save()
+        raise QualificationError(cause)
+
     def command(self, name, argv, horizon, env=None):
-        remaining = self.deadline - time.monotonic()
+        # Cleanup is reserved INSIDE the total operation deadline. A depleted
+        # execution budget starts no further command and never renews cleanup.
+        remaining = self.deadline - time.monotonic() - CLEANUP_SECONDS
         if remaining <= 0:
-            raise QualificationError("qualification operation horizon expired")
+            cause = "qualification operation horizon expired"
+            self.fail(cause)
+            raise QualificationError(cause)
         horizon = min(horizon, remaining)
         log = self.out / (name + ".log")
-        record = {"stage": name, "argv": argv, "horizon_seconds": horizon}
+        stderr_log = self.out / (name + ".stderr.log")
+        record = {"stage": name, "argv": argv, "horizon_seconds": horizon,
+                  "stdout": log.name, "stderr": stderr_log.name}
         self.receipt["commands"].append(record)
         self.save()
         started = time.monotonic()
-        with log.open("wb") as output:
+        with log.open("wb") as output, stderr_log.open("wb") as errors:
             child = subprocess.Popen(
                 argv, cwd=self.root, env=env, stdout=output,
-                stderr=subprocess.STDOUT, start_new_session=True,
+                stderr=errors, start_new_session=True,
             )
             try:
                 code = child.wait(timeout=horizon)
             except subprocess.TimeoutExpired:
-                record["process_horizon_expired"] = True
-                record["owned_cleanup_confirmed"] = False
-                # This process group was created by this invocation. No host
-                # daemon/profile/PID discovery or speculative signaling occurs.
-                try:
-                    os.killpg(child.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
-                record["exit"] = child.returncode
-                record["elapsed_seconds"] = time.monotonic() - started
-                self.save()
-                raise QualificationError("owned command exceeded its process horizon")
+                self.expired_command(child, record, started)
         record.update(exit=code, elapsed_seconds=time.monotonic() - started)
         self.save()
         if code:
-            raise QualificationError("owned command failed: " + name)
+            cause = "owned command failed: " + name
+            self.fail(cause)
+            raise QualificationError(cause)
         return log.read_text()
 
     def git(self, name, *args):
@@ -258,12 +305,26 @@ class Driver:
         self.save()
 
     def qualify(self):
-        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
-                     "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS"):
+        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
+                     "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
+                     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS"):
             if os.environ.get(name):
                 raise QualificationError("unsupported compiler override: " + name)
         if any(value for name, value in os.environ.items() if name.startswith("CARGO_PROFILE_")):
             raise QualificationError("unsupported Cargo profile override")
+        # No Cargo config is approved by this fixed build contract. Presence
+        # refusal covers hidden compiler/wrapper/flag selection without parsing
+        # or disclosing unknown configuration contents (including symlinks).
+        cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+        if not cargo_home.is_absolute():
+            cargo_home = self.root / cargo_home
+        config_dirs = [directory / ".cargo" for directory in (self.root, *self.root.parents)]
+        for directory in (*config_dirs, cargo_home):
+            for filename in ("config", "config.toml"):
+                path = directory / filename
+                if path.exists() or path.is_symlink():
+                    raise QualificationError("unsupported Cargo configuration")
+        self.receipt["cargo_configuration"] = "absent"
         self.boundary("before")
         target, pin_platform = PLATFORMS[self.args.platform]
         rust = self.command("rust", ["rustc", "-vV"], 10)
@@ -409,6 +470,11 @@ class Driver:
                     raise QualificationError("executed fixture or payload changed")
                 record["status"] = "pass"
                 self.save()
+        except (QualificationError, OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+            # Restoration may fail too; preserve the actual qualification
+            # failure before finally runs instead of replacing its cause.
+            self.fail(str(error))
+            raise
         finally:
             shutil.copy2(backup, fixture_cli)
             restored = digest(fixture_cli)
@@ -454,8 +520,7 @@ def main():
         driver.qualify()
     except (QualificationError, OSError, ValueError, KeyError, TypeError, StopIteration) as error:
         if driver:
-            driver.receipt.update(status="failed", failure=str(error))
-            driver.save()
+            driver.fail(str(error))
         print("production qualification failed: " + str(error))
         return 1
     print("production qualification passed for " + args.platform)

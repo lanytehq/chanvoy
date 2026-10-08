@@ -8,11 +8,13 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 
@@ -69,6 +71,12 @@ class Synthetic:
         (self.root / "Cargo.toml").write_text('[package]\nname="chanvoy"\nversion="0.3.2"\n')
         (self.root / "Cargo.lock").write_text("synthetic locked packages\n")
         (self.root / "VERSION").write_text("0.3.2\n")
+        self.cargo_home = directory / "owned-cargo-home"
+        for key, location in (("cargo_config", self.root / ".cargo"),
+                              ("cargo_parent_config", directory / ".cargo"), ("cargo_home_config", self.cargo_home)):
+            if changes.get(key):
+                location.mkdir(parents=True, exist_ok=True)
+                (location / changes[key]).write_text('[build]\nrustc="unsupported-owned-selector"\n')
         self.cli = self.root / "target/release/chanvoy"
         self.package_id = "path+file:///synthetic#chanvoy@0.3.2"
         prefix = "import json,pathlib,sys,time\nstate=json.loads(pathlib.Path(%r).read_text())\n" % str(self.state_path)
@@ -76,6 +84,8 @@ class Synthetic:
 pin={'commit':state['pin_commit'],'dirty':False,'platform':state['pin_platform'],
      'rustc':state['rust'],'version':'0.3.2'}
 print(json.dumps(dict(pin,cli=pin,daemon=None,generation_scored=False)))
+if state.get('human_stderr'):print('synthetic pin warning',file=sys.stderr)
+if state.get('malformed_stdout')=='build-pin':print('invalid machine output')
 """)
         self.normal_bytes = self.cli.read_bytes()
         self.hash = hashlib.sha256(self.normal_bytes).hexdigest()
@@ -100,7 +110,11 @@ def event(name,kind,path,test):
 if sys.argv[1]=='metadata':
  print(json.dumps(dict(packages=[dict(name='chanvoy',id=package,manifest_path=str(root/'Cargo.toml'))],
                        target_directory=str(target))))
+ if state.get('human_stderr'):print('warning: synthetic metadata diagnostic',file=sys.stderr)
+ if state.get('malformed_stdout')=='metadata':print('invalid machine output')
 elif sys.argv[1]=='test':
+ if state.get('human_stderr'):print('   Compiling synthetic fixture; warning: owned diagnostic',file=sys.stderr)
+ if state.get('malformed_stdout')=='fixture-compile':print('invalid machine output')
  time.sleep(state.get('compile_sleep',0))
  cli=target/'debug/chanvoy';cli.parent.mkdir(parents=True,exist_ok=True)
  cli.write_text('original synthetic debug CLI');cli.chmod(0o755)
@@ -113,6 +127,7 @@ elif sys.argv[1]=='test':
   exe.write_text('#!/usr/bin/env python3\\n'+body);exe.chmod(0o755)
   print(json.dumps(event(suite,'test',exe,True)))
  print(json.dumps(dict(reason='build-finished',success=True)))
+ if state.get('human_stderr'):print('    Finished synthetic test profile',file=sys.stderr)
 else:raise SystemExit(9)
 """
         fixture = """
@@ -129,7 +144,10 @@ else:
   with (pathlib.Path(state['root'])/'target/debug/chanvoy').open('a') as f:f.write('changed')
  if state.get('dirty_after')==suite:
   state['dirty']=True;pathlib.Path(CONTROL).write_text(json.dumps(state))
- if state.get('fail_suite')==suite:raise SystemExit(7)
+ if state.get('fail_suite')==suite:
+  if state.get('restore_failure'):
+   cli=pathlib.Path(state['root'])/'target/debug/chanvoy';cli.unlink();cli.mkdir()
+  raise SystemExit(7)
 """
         cargo_body = cargo_body.replace("FIXTURE", repr(textwrap.dedent(fixture).replace("CONTROL", repr(str(self.state_path)))))
         cargo_body = cargo_body.replace("CONTROL", repr(str(self.state_path)))
@@ -160,9 +178,12 @@ else:
 
     def run(self, **overrides):
         env = os.environ.copy()
-        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"):
+        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
+                     "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
+                     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS"):
             env.pop(name, None)
         env["PATH"] = str(self.tools) + os.pathsep + env["PATH"]
+        env["CARGO_HOME"] = str(self.cargo_home)
         env.update(overrides.get("env", {}))
         mode = overrides.get("mode", "candidate" if self.state["platform"] == "linux-x86_64" else "shipping")
         args = [sys.executable, str(DRIVER), "--root", str(self.root), "--binary", str(self.cli),
@@ -236,6 +257,13 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(receipt["suites"][0]["status"], "incomplete")
         self.assertEqual(receipt["restored_fixture_cli_sha256"], receipt["original_fixture_cli_sha256"])
 
+    def test_restoration_failure_keeps_the_first_command_failure(self):
+        receipt = self.check("owned command failed: startup_diagnostics",
+                             fail_suite="startup_diagnostics", restore_failure=True)
+        self.assertEqual([x["name"] for x in receipt["suites"]], ["startup_diagnostics"])
+        self.assertEqual(receipt["suites"][0]["status"], "incomplete")
+        self.assertTrue(any("regular file" in x for x in receipt["secondary_failures"]))
+
     def test_wrong_hash_and_compiler_override_are_refused(self):
         with tempfile.TemporaryDirectory(prefix="cv-qualify-negative-") as directory:
             fixture = Synthetic(Path(directory))
@@ -265,6 +293,152 @@ class QualificationTests(unittest.TestCase):
             self.assertTrue(receipt["commands"][0]["process_horizon_expired"])
             self.assertFalse(receipt["commands"][0]["owned_cleanup_confirmed"])
             self.assertEqual(receipt["suites"], [])
+
+    def test_json_stdout_and_human_stderr_are_separate_retained_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="cv-qualify-streams-") as directory:
+            fixture = Synthetic(Path(directory), human_stderr=True)
+            result, receipt = fixture.run()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(receipt["status"], "pass")
+            for stage in ("metadata", "build-pin", "fixture-compile"):
+                record = next(x for x in receipt["commands"] if x["stage"] == stage)
+                stdout = (fixture.out / record["stdout"]).read_text()
+                stderr = (fixture.out / record["stderr"]).read_text()
+                self.assertIn("synthetic", stderr)
+                for line in stdout.splitlines():
+                    self.assertIsInstance(json.loads(line), dict)
+            self.assertIn("Compiling", (fixture.out / "fixture-compile.stderr.log").read_text())
+            self.assertIn("Finished", (fixture.out / "fixture-compile.stderr.log").read_text())
+
+    def test_malformed_machine_stdout_is_not_filtered_into_success(self):
+        for stage in ("metadata", "build-pin", "fixture-compile"):
+            with self.subTest(stage=stage):
+                cause = "Expecting value" if stage == "fixture-compile" else "Extra data"
+                receipt = self.check(cause, human_stderr=True, malformed_stdout=stage)
+                self.assertEqual(receipt["suites"], [])
+
+    def test_compiler_selectors_and_config_wrapper_equivalents_refuse(self):
+        for name in ("RUSTC", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
+                     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"):
+            with self.subTest(variable=name), tempfile.TemporaryDirectory(prefix="cv-qualify-selector-") as directory:
+                fixture = Synthetic(Path(directory))
+                result, receipt = fixture.run(env={name: "unsupported-owned-selector"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt["failure"], "unsupported compiler override: " + name)
+                self.assertEqual(receipt["commands"], [])
+                self.assertEqual(receipt["suites"], [])
+
+    def test_unapproved_cargo_config_cannot_select_a_hidden_compiler(self):
+        for location in ("cargo_config", "cargo_parent_config", "cargo_home_config"):
+            for filename in ("config", "config.toml"):
+                with self.subTest(location=location, filename=filename):
+                    receipt = self.check("unsupported Cargo configuration", **{location: filename})
+                    self.assertEqual(receipt["commands"], [])
+                    self.assertEqual(receipt["suites"], [])
+        with tempfile.TemporaryDirectory(prefix="cv-qualify-config-link-") as directory:
+            fixture = Synthetic(Path(directory))
+            config_dir = fixture.root / ".cargo"
+            config_dir.mkdir()
+            (config_dir / "config.toml").symlink_to(config_dir / "owned-missing-config")
+            result, receipt = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(receipt["failure"], "unsupported Cargo configuration")
+            self.assertEqual(receipt["commands"], [])
+
+    def test_unreaped_denied_signal_and_reap_error_remain_bounded_unknown(self):
+        for failure_mode in ("never-reap", "denied-signal", "reap-error"):
+            with self.subTest(mode=failure_mode), tempfile.TemporaryDirectory(prefix="cv-qualify-reap-") as directory:
+                fixture = Synthetic(Path(directory))
+                spec = importlib.util.spec_from_file_location("qualification_driver", DRIVER)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                clock = [100.0]
+                waits, signals, children = [], [], []
+                outer = self
+
+                class UncollectableChild:
+                    pid = 424242  # Simulated only; killpg is replaced below.
+
+                    def __init__(self, argv, **kwargs):
+                        children.append(argv)
+                        outer.assertTrue(kwargs["start_new_session"])
+                        outer.assertNotEqual(kwargs["stderr"], subprocess.STDOUT)
+
+                    def wait(self, *, timeout):
+                        outer.assertGreater(timeout, 0)
+                        waits.append((clock[0], timeout))
+                        if failure_mode == "reap-error" and len(waits) > 1:
+                            raise OSError("owned synthetic reap error")
+                        clock[0] += timeout
+                        raise subprocess.TimeoutExpired("owned synthetic child", timeout)
+
+                def owned_signal(pid, sig):
+                    outer.assertEqual(pid, UncollectableChild.pid)
+                    before = json.loads((fixture.out / "qualification.json").read_text())
+                    outer.assertEqual(before["status"], "failed")
+                    outer.assertIn("process horizon", before["failure"])
+                    outer.assertTrue(before["commands"][0]["process_horizon_expired"])
+                    outer.assertFalse(before["commands"][0]["owned_cleanup_confirmed"])
+                    outer.assertIsNone(before["commands"][0]["exit"])
+                    signals.append(sig)
+                    clock[0] += 1  # Signals consume the SAME absolute budget.
+                    if failure_mode == "denied-signal":
+                        raise PermissionError("owned synthetic signal denial")
+
+                args = SimpleNamespace(root=fixture.root, output=fixture.out, operation_seconds=20,
+                                       mode="candidate", platform="linux-x86_64", expected_commit=HEAD,
+                                       tag=None, tag_object=None)
+                with mock.patch.object(module.time, "monotonic", side_effect=lambda: clock[0]), \
+                        mock.patch.object(module.subprocess, "Popen", UncollectableChild), \
+                        mock.patch.object(module.os, "killpg", side_effect=owned_signal):
+                    driver = module.Driver(args)
+                    with self.assertRaisesRegex(module.QualificationError, "process horizon"):
+                        driver.qualify()
+                    driver.fail("owned synthetic restoration failure")
+                receipt = json.loads((fixture.out / "qualification.json").read_text())
+                record = receipt["commands"][0]
+                self.assertEqual(len(children), 1)
+                self.assertEqual(len(receipt["commands"]), 1)
+                self.assertEqual(receipt["suites"], [])
+                self.assertFalse((fixture.out / "payload").exists())
+                self.assertEqual(receipt["failure"], "owned command exceeded its process horizon")
+                self.assertEqual(receipt["secondary_failures"], ["owned synthetic restoration failure"])
+                self.assertIsNone(record["exit"])
+                self.assertFalse(record["child_collected"])
+                self.assertFalse(record["owned_cleanup_confirmed"])
+                self.assertLessEqual(clock[0], driver.deadline)
+                self.assertEqual(record["cleanup_deadline"], 120)
+                for began, timeout in waits[1:]:
+                    self.assertLessEqual(began + timeout, record["cleanup_deadline"])
+                if failure_mode == "never-reap":
+                    self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
+                    self.assertEqual([x[1] for x in waits], [10, 5, 3])
+                    self.assertTrue(all(x["reap_horizon_expired"] for x in record["teardown"]))
+                    self.assertTrue(record["cleanup_horizon_expired"])
+                elif failure_mode == "denied-signal":
+                    self.assertEqual(signals, [signal.SIGTERM])
+                    self.assertEqual(record["teardown"][0]["signal_error_class"], "PermissionError")
+                else:
+                    self.assertEqual(signals, [signal.SIGTERM])
+                    self.assertEqual(record["teardown"][0]["reap_error_class"], "OSError")
+
+    def test_cleanup_reserve_prevents_late_command_launch(self):
+        with tempfile.TemporaryDirectory(prefix="cv-qualify-reserve-") as directory:
+            fixture = Synthetic(Path(directory))
+            spec = importlib.util.spec_from_file_location("qualification_driver", DRIVER)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            args = SimpleNamespace(root=fixture.root, output=fixture.out, operation_seconds=10,
+                                   mode="candidate", platform="linux-x86_64", expected_commit=HEAD,
+                                   tag=None, tag_object=None)
+            with mock.patch.object(module.time, "monotonic", return_value=100), \
+                    mock.patch.object(module.subprocess, "Popen") as launch:
+                driver = module.Driver(args)
+                with self.assertRaisesRegex(module.QualificationError, "operation horizon"):
+                    driver.command("forbidden-late-child", ["owned-synthetic-command"], 1)
+                launch.assert_not_called()
+            self.assertEqual(driver.receipt["commands"], [])
+            self.assertEqual(driver.receipt["status"], "failed")
 
     def test_workflow_admission_and_failed_evidence_are_distinct(self):
         workflow = (REPO / ".github/workflows/release.yml").read_text()
