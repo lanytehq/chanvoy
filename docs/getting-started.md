@@ -10,12 +10,13 @@ teams, and pick up where you left off across sessions.
 >
 > ```bash
 > chanvoy auto-setup                  # one-time per shell session
-> # After make install / binary replace: ownable daemons cycle automatically;
-> # foreign seats stay up on the old binary until that seat self-cycles.
+> # make install updates the CLI and reports candidates; it never cycles them.
+> # Manual migration needs owning identity, same-candidate death and guarded cleanup.
 > # Prove dual pin (CLI + daemon generation_match):
 > chanvoy version --extended          # Generation: match  (or MISMATCH + recovery)
-> # If MISMATCH for your profile:
-> #   chanvoy daemon stop --profile <name> && chanvoy auto-setup
+> # If MISMATCH: observe status/doctor under the owning identity.
+> # Resolve ownership, confirm predecessor death and cleanup before any new start.
+> # Stop exit 0, missing runtime or listener absence are insufficient.
 > chanvoy read <ops-channel> --since 1d
 > chanvoy check <team>-team           # exit 0 = new posts, exit 1 = none
 > # For channel WIP: use wait — do not sleep-poll or hand-roll a poller.
@@ -126,6 +127,13 @@ One command does everything:
 ```bash
 chanvoy auto-setup
 ```
+
+Startup reports bounded phase failures while preserving uncertain predecessor
+state. If it reports a retained bootstrap handoff, `chanvoy --profile <name>
+doctor` names the path without reading its contents. An orphaned handoff may
+require operator intervention after a crash: establish possible predecessor
+ownership and liveness before manual removal. Missing PID/socket or file age
+alone is insufficient. See [startup lifecycle guidance](./operator-guide.md#daemon-lifecycle).
 
 This:
 
@@ -277,9 +285,13 @@ exit*. Resume from the last message `tip` (or the original `--after`; if
 neither exists, drain first). After a sink failure, repair the sink
 before re-arming.
 
-After `make install` or any binary replace, run
-`chanvoy daemon stop && chanvoy auto-setup` before trusting filtered wait (the
-daemon keeps the binary it was started from). See
+After `make install` or any binary replace, use the byte-verified installed
+executable with an explicit profile and the
+[confirmed migration procedure](./operator-guide.md#installation-and-daemon-migration)
+before trusting new wait features. The reference artifact is comparison input;
+it is not the command path for that installed-path candidate. Ownership,
+same-candidate whole-process death and guarded cleanup must be confirmed before
+a separate start; unknown evidence withholds startup. See
 [troubleshooting: daemon does not support a verb / filtered wait](./troubleshooting.md#the-running-daemon-does-not-support-a-verb).
 
 ## Your first post

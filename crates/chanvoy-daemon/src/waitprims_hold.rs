@@ -132,6 +132,7 @@ pub(crate) async fn run_single_channel_first_match(
         release: Arc::clone(&release),
         inner_cancel: inner_cancel.clone(),
         follow: false,
+        delivery: None,
         follow_rx: Mutex::new(None),
         bind_ready: Mutex::new(None),
         observed: AtomicBool::new(false),
@@ -170,6 +171,7 @@ pub(crate) async fn run_single_channel_follow(
     stream: crate::wait::FollowStreamSender,
     coalesce_ms: Option<u64>,
     client_gone: CancellationToken,
+    delivery: Option<crate::follow_delivery::ChannelDelivery>,
 ) -> Result<WaitFollowResult, CoreError> {
     let release = Arc::new(LeaseRelease::new(wait.guard));
     let sidecar = MessageSidecar::new();
@@ -178,18 +180,32 @@ pub(crate) async fn run_single_channel_follow(
     // Subscribe before the remaining bind work so monitored delivery
     // cannot fall into a baseline-to-subscribe seam.
     let follow_rx = wait.monitored.then(|| state.event_bus.subscribe());
-    let (resolved_start, rest_baseline) = match wait.prebound_after {
-        Some(bound) => bound,
-        None => resolve_bind_cursor(
-            state,
-            wait.session,
-            wait.channel,
-            wait.predicate.channel_id(),
-            wait.after,
-            wait.deadline,
-        )
-        .await
-        .map_err(classify_bind_core_error)?,
+    let bind_cursor = async {
+        Ok::<_, CoreError>(match wait.prebound_after {
+            Some(bound) => bound,
+            None => resolve_bind_cursor(
+                state,
+                wait.session,
+                wait.channel,
+                wait.predicate.channel_id(),
+                wait.after,
+                wait.deadline,
+            )
+            .await
+            .map_err(classify_bind_core_error)?,
+        })
+    };
+    let (resolved_start, rest_baseline) = if let Some(delivery) = delivery.as_ref() {
+        tokio::select! {
+            biased;
+            result = bind_cursor => result?,
+            _ = delivery.stopped() => return Err(CoreError::WaitProviderDegraded {
+                channel: wait.channel.to_string(),
+                message: "held wait ended before observer bind".into(),
+            }),
+        }
+    } else {
+        bind_cursor.await?
     };
 
     let tip_state = Arc::new(Mutex::new(None));
@@ -212,16 +228,238 @@ pub(crate) async fn run_single_channel_follow(
         release: Arc::clone(&release),
         inner_cancel: inner_cancel.clone(),
         follow: true,
+        delivery: delivery.clone(),
         follow_rx: Mutex::new(follow_rx),
         bind_ready: Mutex::new(Some(bind_ready_tx)),
         observed: AtomicBool::new(false),
         restored: Mutex::new(HashMap::new()),
     };
 
+    drive_follow(
+        &observer,
+        FollowWait {
+            channel: wait.channel,
+            channel_id: wait.channel_id,
+            after: wait.after,
+            deadline: wait.deadline,
+            session: wait.session,
+            my_user_id: &state.my_user_id,
+        },
+        FollowRun {
+            release,
+            sidecar,
+            last_error,
+            inner_cancel,
+            tip_state,
+            bind_ready_rx,
+            stream,
+            coalesce_ms,
+            client_gone,
+            delivery,
+        },
+    )
+    .await
+}
+
+struct FollowWait<'a> {
+    channel: &'a str,
+    channel_id: &'a str,
+    after: Option<&'a str>,
+    deadline: Instant,
+    session: &'a WaitSession,
+    my_user_id: &'a str,
+}
+
+struct FollowRun {
+    release: Arc<LeaseRelease>,
+    sidecar: MessageSidecar,
+    last_error: Arc<Mutex<Option<CoreError>>>,
+    inner_cancel: CancellationToken,
+    tip_state: Arc<Mutex<Option<String>>>,
+    bind_ready_rx: tokio::sync::oneshot::Receiver<()>,
+    stream: crate::wait::FollowStreamSender,
+    coalesce_ms: Option<u64>,
+    client_gone: CancellationToken,
+    delivery: Option<crate::follow_delivery::ChannelDelivery>,
+}
+
+struct FollowCleanup {
+    release: Arc<LeaseRelease>,
+    inner_cancel: CancellationToken,
+    delivery: Option<crate::follow_delivery::ChannelDelivery>,
+}
+
+impl Drop for FollowCleanup {
+    fn drop(&mut self) {
+        self.inner_cancel.cancel();
+        self.release.release();
+        if let Some(delivery) = self.delivery.as_ref() {
+            delivery.close_gate();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FollowSink {
+    stream: crate::wait::FollowStreamSender,
+    sidecar: MessageSidecar,
+    last_error: Arc<Mutex<Option<CoreError>>>,
+    tip_state: Arc<Mutex<Option<String>>>,
+    channel: String,
+    wait_id: String,
+    coalesce: Option<Arc<Mutex<CoalesceBuffer<Message>>>>,
+    deadline_tx: tokio::sync::watch::Sender<Option<Instant>>,
+    sink_failed: Arc<AtomicBool>,
+    delivery: Option<crate::follow_delivery::ChannelDelivery>,
+}
+impl FollowSink {
+    async fn consume(
+        self,
+        burst: waitprims_async::FollowBurst,
+    ) -> Result<(), waitprims_async::Error> {
+        let Self {
+            stream,
+            sidecar,
+            last_error,
+            tip_state,
+            channel,
+            wait_id,
+            coalesce,
+            deadline_tx,
+            sink_failed,
+            delivery,
+        } = self;
+        let event_count = burst.events.len();
+        for (index, event) in burst.events.into_iter().enumerate() {
+            if let Some(delivery) = delivery.as_ref() {
+                delivery.admit().await.map_err(|_| {
+                    waitprims_core::ValidationError::new("/follow_sink", "channel_admission_closed")
+                })?;
+            }
+            let key = event.payload.payload_ref.as_str();
+            let Some(entry) = sidecar.take_entry(key) else {
+                let err = CoreError::WaitProviderDegraded {
+                    channel: channel.clone(),
+                    message: "held wait event missing sidecar message".into(),
+                };
+                if let Ok(mut slot) = last_error.lock() {
+                    *slot = Some(err);
+                }
+                return Err(waitprims_core::ValidationError::new(
+                    "/follow_sink",
+                    "sidecar_missing",
+                )
+                .into());
+            };
+            if let Err(err) = authenticate_sidecar_message(
+                &channel,
+                &entry.message,
+                &event.payload.content_digest,
+            ) {
+                if let Ok(mut slot) = last_error.lock() {
+                    *slot = Some(err);
+                }
+                return Err(
+                    waitprims_core::ValidationError::new("/follow_sink", "sidecar_digest").into(),
+                );
+            }
+            let proposed_tip = event.proposed_next_anchor.value.as_str();
+            if proposed_tip != entry.message.id {
+                if let Ok(mut slot) = last_error.lock() {
+                    *slot = Some(CoreError::WaitProviderDegraded {
+                        channel: channel.clone(),
+                        message: "held wait tip does not equal its sole message id".into(),
+                    });
+                }
+                return Err(waitprims_core::ValidationError::new(
+                    "/follow_sink",
+                    "tip_message_mismatch",
+                )
+                .into());
+            }
+            let mode = match entry.phase {
+                FollowObservationPhase::Backlog => WaitFollowMode::Backlog,
+                FollowObservationPhase::Live => WaitFollowMode::Live,
+            };
+            if let Some(buffer) = coalesce.as_ref() {
+                let flushes = {
+                    let mut guard = buffer.lock().map_err(|_| {
+                        waitprims_core::ValidationError::new("/follow_sink", "lock")
+                    })?;
+                    let flushed = guard.push(mode, entry.message);
+                    let _ = deadline_tx.send(guard.deadline());
+                    flushed
+                };
+                for flush in flushes {
+                    emit_coalesced_burst(
+                        &stream,
+                        &wait_id,
+                        flush,
+                        &tip_state,
+                        &last_error,
+                        &sink_failed,
+                    )
+                    .await?;
+                }
+            } else {
+                let record = WaitFollowEvent::message(
+                    wait_id.clone(),
+                    mode,
+                    entry.message,
+                    mode == WaitFollowMode::Backlog && index + 1 < event_count,
+                )
+                .map_err(|_| {
+                    waitprims_core::ValidationError::new("/follow_sink", "invalid_event_document")
+                })?;
+                emit_follow_v1(&stream, record).await.map_err(|err| {
+                    if let Ok(mut slot) = last_error.lock() {
+                        *slot = Some(err);
+                    }
+                    waitprims_async::Error::from(waitprims_core::ValidationError::new(
+                        "/follow_sink",
+                        "stream_write_failed",
+                    ))
+                })?;
+                if let Ok(mut current) = tip_state.lock() {
+                    *current = Some(proposed_tip.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Both the provider adapter and deterministic observer fixtures drive this
+/// exact pinned runner and production sink callback.
+async fn drive_follow<O: Observer>(
+    observer: &O,
+    wait: FollowWait<'_>,
+    run: FollowRun,
+) -> Result<WaitFollowResult, CoreError>
+where
+    O::Bind: 'static,
+{
+    let FollowRun {
+        release,
+        sidecar,
+        last_error,
+        inner_cancel,
+        tip_state,
+        bind_ready_rx,
+        stream,
+        coalesce_ms,
+        client_gone,
+        delivery,
+    } = run;
+    let _cleanup = FollowCleanup {
+        release: Arc::clone(&release),
+        inner_cancel: inner_cancel.clone(),
+        delivery: delivery.clone(),
+    };
     let clock = WallClock::new();
     let (set, request) = build_live_documents(
         wait.session,
-        &state.my_user_id,
+        wait.my_user_id,
         wait.channel_id,
         wait.after,
         clock.project_deadline(wait.deadline),
@@ -239,131 +477,28 @@ pub(crate) async fn run_single_channel_follow(
         coalesce_ms.map(|ms| Arc::new(Mutex::new(CoalesceBuffer::<Message>::new(ms))));
     let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(None::<Instant>);
 
-    let sink_stream = stream.clone();
-    let sink_sidecar = sidecar.clone();
-    let sink_error = Arc::clone(&last_error);
-    let sink_tip = Arc::clone(&tip_state);
-    let sink_channel = wait.channel.to_string();
-    let sink_wait_id = wait.session.wait_id.clone();
-    let sink_coalesce = coalesce_buf.clone();
-    let sink_deadline = deadline_tx.clone();
     let sink_failed = Arc::new(AtomicBool::new(false));
-    let sink_failed_cb = Arc::clone(&sink_failed);
+    let sink = FollowSink {
+        stream: stream.clone(),
+        sidecar: sidecar.clone(),
+        last_error: Arc::clone(&last_error),
+        tip_state: Arc::clone(&tip_state),
+        channel: wait.channel.to_string(),
+        wait_id: wait.session.wait_id.clone(),
+        coalesce: coalesce_buf.clone(),
+        deadline_tx: deadline_tx.clone(),
+        sink_failed: Arc::clone(&sink_failed),
+        delivery: delivery.clone(),
+    };
     let follow = run_follow(
-        &observer,
+        observer,
         &clock,
         &wp_cancel,
         &docs.set,
         &docs.request,
         move |burst| {
-            let stream = sink_stream.clone();
-            let sidecar = sink_sidecar.clone();
-            let last_error = Arc::clone(&sink_error);
-            let tip_state = Arc::clone(&sink_tip);
-            let channel = sink_channel.clone();
-            let wait_id = sink_wait_id.clone();
-            let coalesce = sink_coalesce.clone();
-            let deadline_tx = sink_deadline.clone();
-            let sink_failed = Arc::clone(&sink_failed_cb);
-            async move {
-                let event_count = burst.events.len();
-                for (index, event) in burst.events.into_iter().enumerate() {
-                    let key = event.payload.payload_ref.as_str();
-                    let Some(entry) = sidecar.take_entry(key) else {
-                        let err = CoreError::WaitProviderDegraded {
-                            channel: channel.clone(),
-                            message: "held wait event missing sidecar message".into(),
-                        };
-                        if let Ok(mut slot) = last_error.lock() {
-                            *slot = Some(err);
-                        }
-                        return Err(waitprims_core::ValidationError::new(
-                            "/follow_sink",
-                            "sidecar_missing",
-                        )
-                        .into());
-                    };
-                    if let Err(err) = authenticate_sidecar_message(
-                        &channel,
-                        &entry.message,
-                        &event.payload.content_digest,
-                    ) {
-                        if let Ok(mut slot) = last_error.lock() {
-                            *slot = Some(err);
-                        }
-                        return Err(waitprims_core::ValidationError::new(
-                            "/follow_sink",
-                            "sidecar_digest",
-                        )
-                        .into());
-                    }
-                    let proposed_tip = event.proposed_next_anchor.value.as_str();
-                    if proposed_tip != entry.message.id {
-                        if let Ok(mut slot) = last_error.lock() {
-                            *slot = Some(CoreError::WaitProviderDegraded {
-                                channel: channel.clone(),
-                                message: "held wait tip does not equal its sole message id".into(),
-                            });
-                        }
-                        return Err(waitprims_core::ValidationError::new(
-                            "/follow_sink",
-                            "tip_message_mismatch",
-                        )
-                        .into());
-                    }
-                    let mode = match entry.phase {
-                        FollowObservationPhase::Backlog => WaitFollowMode::Backlog,
-                        FollowObservationPhase::Live => WaitFollowMode::Live,
-                    };
-                    if let Some(buffer) = coalesce.as_ref() {
-                        let flushes = {
-                            let mut guard = buffer.lock().map_err(|_| {
-                                waitprims_core::ValidationError::new("/follow_sink", "lock")
-                            })?;
-                            let flushed = guard.push(mode, entry.message);
-                            let _ = deadline_tx.send(guard.deadline());
-                            flushed
-                        };
-                        for flush in flushes {
-                            emit_coalesced_burst(
-                                &stream,
-                                &wait_id,
-                                flush,
-                                &tip_state,
-                                &last_error,
-                                &sink_failed,
-                            )
-                            .await?;
-                        }
-                    } else {
-                        let record = WaitFollowEvent::message(
-                            wait_id.clone(),
-                            mode,
-                            entry.message,
-                            mode == WaitFollowMode::Backlog && index + 1 < event_count,
-                        )
-                        .map_err(|_| {
-                            waitprims_core::ValidationError::new(
-                                "/follow_sink",
-                                "invalid_event_document",
-                            )
-                        })?;
-                        emit_follow_v1(&stream, record).await.map_err(|err| {
-                            if let Ok(mut slot) = last_error.lock() {
-                                *slot = Some(err);
-                            }
-                            waitprims_async::Error::from(waitprims_core::ValidationError::new(
-                                "/follow_sink",
-                                "stream_write_failed",
-                            ))
-                        })?;
-                        if let Ok(mut current) = tip_state.lock() {
-                            *current = Some(proposed_tip.to_string());
-                        }
-                    }
-                }
-                Ok(())
-            }
+            let sink = sink.clone();
+            async move { sink.consume(burst).await }
         },
     );
     tokio::pin!(follow);
@@ -390,13 +525,21 @@ pub(crate) async fn run_single_channel_follow(
         });
     }
 
-    emit_armed(
+    #[cfg(test)]
+    if let Some(delivery) = delivery.as_ref() {
+        delivery.pause_before_armed().await;
+    }
+    emit_armed_with_admission(
         &stream,
         use_v2,
         wait.session.wait_id.clone(),
         wait.session.replaced_wait_id.clone(),
+        delivery.as_ref(),
     )
     .await?;
+    if let Some(delivery) = delivery.as_ref() {
+        delivery.open_gate();
+    }
 
     let end = if let Some(buffer) = coalesce_buf.clone() {
         await_follow_with_coalesce(
@@ -412,6 +555,41 @@ pub(crate) async fn run_single_channel_follow(
         .await
     } else {
         follow.await
+    };
+    let end = if let Some(delivery) = delivery.as_ref() {
+        if delivery.cause() == Some(crate::follow_delivery::StopCause::Transport) {
+            inner_cancel.cancel();
+            release.release();
+            return Err(CoreError::WaitProviderDegraded {
+                channel: wait.channel.to_string(),
+                message: "held wait transport failed".into(),
+            });
+        }
+        let admission_stop = delivery.admission_stopped()
+            && !sink_failed.load(Ordering::SeqCst)
+            && last_error
+                .lock()
+                .map(|slot| slot.is_none())
+                .unwrap_or(false);
+        // Preserve a real provider/sink failure. A latched operation cause
+        // only translates normal completion or our own admission-stop error.
+        if delivery.armed_committed()
+            && (matches!(&end, Ok(FollowEnd::Deadline | FollowEnd::Cancel))
+                || (end.is_err() && admission_stop))
+        {
+            match delivery.cause() {
+                Some(crate::follow_delivery::StopCause::Deadline) => Ok(FollowEnd::Deadline),
+                Some(
+                    crate::follow_delivery::StopCause::Canceled
+                    | crate::follow_delivery::StopCause::Replaced,
+                ) => Ok(FollowEnd::Cancel),
+                _ => end,
+            }
+        } else {
+            end
+        }
+    } else {
+        end
     };
     let end = match end {
         Ok(end) => end,
@@ -464,7 +642,13 @@ pub(crate) async fn run_single_channel_follow(
             WaitFollowResultKind::Deadman { tip },
         ),
         FollowEnd::Cancel => {
-            let replaced_by_wait_id = wait.session.replaced_by_id();
+            let replaced_by_wait_id = if delivery.as_ref().is_some_and(|delivery| {
+                delivery.cause() == Some(crate::follow_delivery::StopCause::Canceled)
+            }) {
+                String::new()
+            } else {
+                wait.session.replaced_by_id()
+            };
             if replaced_by_wait_id.is_empty() {
                 emit_canceled(&stream, use_v2, wait.session.wait_id.clone()).await?;
                 inner_cancel.cancel();
@@ -519,6 +703,14 @@ async fn emit_follow_v1(
     stream: &crate::wait::FollowStreamSender,
     event: WaitFollowEvent,
 ) -> Result<(), CoreError> {
+    emit_follow_v1_with_admission(stream, event, None).await
+}
+
+async fn emit_follow_v1_with_admission(
+    stream: &crate::wait::FollowStreamSender,
+    event: WaitFollowEvent,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
+) -> Result<(), CoreError> {
     event
         .validate()
         .map_err(|message| CoreError::WaitProviderDegraded {
@@ -529,13 +721,21 @@ async fn emit_follow_v1(
         channel: "follow".into(),
         message: err.to_string(),
     })?;
-    emit_follow_event(stream, WAIT_FOLLOW_V1_EVENT_METHOD, value).await
+    emit_follow_event(stream, WAIT_FOLLOW_V1_EVENT_METHOD, value, armed_admission).await
 }
 
 async fn emit_follow_v2(
     stream: &crate::wait::FollowStreamSender,
     event: WaitFollowV2Event,
 ) -> Result<(), CoreError> {
+    emit_follow_v2_with_admission(stream, event, None).await
+}
+
+async fn emit_follow_v2_with_admission(
+    stream: &crate::wait::FollowStreamSender,
+    event: WaitFollowV2Event,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
+) -> Result<(), CoreError> {
     event
         .validate()
         .map_err(|message| CoreError::WaitProviderDegraded {
@@ -546,26 +746,48 @@ async fn emit_follow_v2(
         channel: "follow".into(),
         message: err.to_string(),
     })?;
-    emit_follow_event(stream, WAIT_FOLLOW_V2_EVENT_METHOD, value).await
+    emit_follow_event(stream, WAIT_FOLLOW_V2_EVENT_METHOD, value, armed_admission).await
 }
 
 async fn emit_follow_event(
     stream: &crate::wait::FollowStreamSender,
     method: &'static str,
     event: serde_json::Value,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
 ) -> Result<(), CoreError> {
     let (written, receipt) = tokio::sync::oneshot::channel();
-    stream
-        .send(crate::wait::FollowStreamRecord {
-            method,
-            event,
-            written,
-        })
-        .await
-        .map_err(|_| CoreError::WaitProviderDegraded {
-            channel: "follow".into(),
-            message: "held wait stream closed".into(),
-        })?;
+    let record = crate::wait::FollowStreamRecord {
+        method,
+        event,
+        written,
+    };
+    if let Some(delivery) = armed_admission {
+        #[cfg(test)]
+        delivery.note_armed_reservation();
+        let permit = tokio::select! {
+            biased;
+            permit = stream.reserve() => permit.map_err(|_| CoreError::WaitProviderDegraded {
+                channel: "follow".into(), message: "held wait stream closed".into(),
+            })?,
+            cause = delivery.stopped() => return Err(delivery.prearmed_error(cause)),
+        };
+        #[cfg(test)]
+        delivery.pause_after_armed_reservation().await;
+        // Actual Armed admission frontier: capacity is reserved, then the
+        // original cause is revalidated. No await occurs before permit.send.
+        if let Some(cause) = delivery.cause() {
+            return Err(delivery.prearmed_error(cause));
+        }
+        permit.send(record);
+    } else {
+        stream
+            .send(record)
+            .await
+            .map_err(|_| CoreError::WaitProviderDegraded {
+                channel: "follow".into(),
+                message: "held wait stream closed".into(),
+            })?;
+    }
     receipt
         .await
         .map_err(|_| CoreError::WaitProviderDegraded {
@@ -578,16 +800,37 @@ async fn emit_follow_event(
         })
 }
 
+#[cfg(test)]
 async fn emit_armed(
     stream: &crate::wait::FollowStreamSender,
     use_v2: bool,
     wait_id: String,
     replaced_wait_id: Option<String>,
 ) -> Result<(), CoreError> {
+    emit_armed_with_admission(stream, use_v2, wait_id, replaced_wait_id, None).await
+}
+
+async fn emit_armed_with_admission(
+    stream: &crate::wait::FollowStreamSender,
+    use_v2: bool,
+    wait_id: String,
+    replaced_wait_id: Option<String>,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
+) -> Result<(), CoreError> {
     if use_v2 {
-        emit_follow_v2(stream, WaitFollowV2Event::armed(wait_id, replaced_wait_id)).await
+        emit_follow_v2_with_admission(
+            stream,
+            WaitFollowV2Event::armed(wait_id, replaced_wait_id),
+            armed_admission,
+        )
+        .await
     } else {
-        emit_follow_v1(stream, WaitFollowEvent::armed(wait_id, replaced_wait_id)).await
+        emit_follow_v1_with_admission(
+            stream,
+            WaitFollowEvent::armed(wait_id, replaced_wait_id),
+            armed_admission,
+        )
+        .await
     }
 }
 
@@ -1392,6 +1635,7 @@ struct ChanvoyWaitObserver {
     release: Arc<LeaseRelease>,
     inner_cancel: CancellationToken,
     follow: bool,
+    delivery: Option<crate::follow_delivery::ChannelDelivery>,
     follow_rx: Mutex<Option<tokio::sync::broadcast::Receiver<Arc<chanvoy_core::DaemonEvent>>>>,
     bind_ready: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     observed: AtomicBool,
@@ -1626,6 +1870,13 @@ impl Observer for ChanvoyWaitObserver {
     }
 
     async fn next(&self, bind: &Self::Bind) -> waitprims_core::Result<Observation> {
+        if self
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.cause().is_some())
+        {
+            return Ok(Observation::Idle);
+        }
         if let Some(obs) = self.take_restored(bind) {
             return Ok(obs);
         }
@@ -2549,3 +2800,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "waitprims_follow_tests.rs"]
+mod follow_delivery_tests;

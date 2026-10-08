@@ -159,6 +159,39 @@ identity checks harden accidental races within the existing Unix-account
 boundary. They do not make PID-based signal delivery atomic or add isolation
 between processes belonging to the same account.
 
+## Installation and daemon migration
+
+`make install` updates the installed CLI and reports daemon candidates; it
+performs no automatic stop or start. Running processes keep their existing
+executable until an independently confirmed manual migration. The legacy
+`make install-restart-daemons` target is a reporting-only alias. Standalone
+reporting requires an explicit independent artifact:
+
+```bash
+CHANVOY_INSTALL_QUALIFIED_ARTIFACT=/path/to/qualified/chanvoy make install-restart-daemons
+```
+
+The helper compares local bytes before process discovery and makes no CLI or
+provider calls. A missing, unreadable or mismatched reference skips discovery;
+failed inspection remains unconfirmed. Reports describe observed candidates,
+without claiming current liveness, ownership or observation readiness. Equality
+identifies the designated reference; it does not establish release qualification.
+The reference is comparison input only. Manual commands use the byte-verified
+installed executable, whose path matches the installed-path candidate; running
+a separate artifact or worktree copy does not satisfy that executable-path
+ownership guard. Revalidate the installed binary before manual action.
+`CHANVOY_INSTALL_SKIP_DAEMON_RESTART=1` still skips this reporting step.
+
+For each candidate, source its owning identity and use the qualified installed
+binary with an explicit profile to observe status/doctor and resolve ownership and
+liveness. Stop only the independently owned predecessor. Independently confirm
+that same candidate's whole-process death and guarded runtime cleanup before
+starting a successor; unknown identity, death or cleanup withholds startup.
+Stop exit 0, missing PID/socket, listener absence or a refused connection are
+insufficient proof. After a separately confirmed start, verify the explicit-profile
+CLI/daemon dual pin and observation readiness. A start command's exit 0 alone
+does not attest replacement or an observation-ready wait.
+
 ## Profile and Team Naming Convention
 
 Chanvoy profile names and Mattermost team names follow a portable convention that lets `auto-setup` and the resolver work without operator intervention:
@@ -328,7 +361,9 @@ Filtered flags (`--contains` / `--pattern` / `--after`) require a daemon that
 knows `wait_channel_v2`. If the CLI refuses with “does not support filtered
 wait”, cycle the daemon (`chanvoy daemon stop` then `chanvoy auto-setup`) —
 see [troubleshooting](./troubleshooting.md#the-running-daemon-does-not-support-a-verb).
-After `make install`, always cycle before trusting new wait features. Prefer
+After `make install`, use the
+[confirmed migration procedure](#installation-and-daemon-migration) before
+trusting new wait features. Prefer
 unique dogfood markers (`PANEL-VERIFY-<seat>-<shortid>`) over bare vocabulary
 words on busy channels.
 
@@ -1167,9 +1202,64 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
 
 Observed lifecycle behavior:
 
+With `RUST_LOG=info`, startup prints phase begin/completion events on stderr
+before waiting on local or remote dependencies. These events contain only
+stage, budget, elapsed, classified outcome, profile and PID. JSON stdout keeps
+the command's existing receipt shape. Provider bodies, credentials and observed
+identity strings are excluded from startup errors and phase events.
+
+| Startup phase | Budget and attempt count |
+| --- | --- |
+| Foreground existing-socket probe | 750 ms, one attempt; success ends this attempt as already-running, any unsuccessful result retains the socket/PID and refuses to bind |
+| Parent identity and team access | Separate 2-second phases, one attempt each |
+| Reduce-family and manual foreground identity | Separate 2-second phases, one attempt each, before listener/PID creation |
+| Detached-child readiness | Nominal 10-second polling window, at most 40 iterations; each local probe has 750 ms and each interval is 250 ms, followed by one final 750 ms probe |
+| Failed-child termination | One 5-second kill-and-reap deadline; expiry retains state and reports termination-unconfirmed |
+| Confirmed-dead failed-child socket absence | One 750 ms probe, followed by runtime identity checks before removal |
+
+These are separate phases, not an end-to-end startup bound. A final readiness
+iteration can extend beyond the nominal window by its probe and sleep; the final
+probe, termination, cleanup and synchronous filesystem work are additional.
+An ordinary manual identity request has a 2-second budget; a reduction-enabled
+manual start can use two identity phases. An existing-socket probe always ends
+that attempt. Validated ordinary bootstrap makes no startup identity request.
+The long-lived service and ordinary waits/streams have no new global timeout.
+
+Foreground `serve` retains an existing socket even on connection refusal;
+missing responsiveness does not prove predecessor death. Use the reviewed,
+explicit-profile CLI recovery path to establish termination and socket absence.
+A failed startup may confirm child death while cleanup remains unconfirmed:
+changed runtime files or a foreign/unreadable bootstrap handoff are retained,
+and the receipt does not claim all residue was cleared. Each bootstrap consumer
+removes only its matching nonce, including its own invalid single-use handoff;
+a stale child cannot consume another spawn's handoff.
+
+Bootstrap unreadability, foreign nonce, unconfirmed cleanup and an advertised
+but missing handoff report `local-unconfirmed`; known own validation poison
+remains `invalid-input` and single-use. A parent's handoff-path observation
+does not prove identity validation: rejected own poison can leave the path
+absent. After unconfirmed termination or cleanup, the receipt directs status
+or doctor observation and ownership/liveness resolution first. It offers a
+foreground startup recipe only after owned-child death and cleanup are confirmed.
+Non-following handoff presence/nonce inspection occurs before both family and
+manual provider requests. It does not consume matching own state or admit its
+identity; normal resolution revalidates and consumes at the existing point.
+
+The bootstrap writer also refuses any observed existing handoff or non-NotFound
+metadata error before writing or spawning. This is a compatibility tightening:
+an orphaned handoff after a crash or hard kill can block the next `auto-setup`
+or `daemon start`. The refusal and `doctor` name the runtime path without
+printing its contents. Doctor only observes it. Resolve possible in-flight
+predecessor ownership and liveness before manually removing retained state;
+missing PID/socket, parent death or file age alone is insufficient. Automatic
+removal remains limited to the child's own matching-nonce consumption and the
+parent's matching-nonce finalizer after confirmed child death. A clean NotFound
+permits a write attempt, not proof that all detached predecessors are dead.
+The check and rename do not exclude all concurrent same-account writers.
+
 - `auto-setup` and `daemon start` share one durable-spawn primitive, so a daemon started either way has the same lifetime: it is its own session leader and outlives the shell or agent tool invocation that started it
 - stale socket + recorded dead PID cleanup is guarded by unchanged runtime identity and absence of a live socket owner
-- a background daemon that dies during startup produces a startup-failure error naming the stage it failed in, not a bare `NotRunning`; its diagnostic provides the `RUST_LOG=info ... daemon serve` foreground recipe
+- a background daemon that dies during startup reports a startup failure and observed handoff state, not a bare `NotRunning` or an inferred identity stage; confirmed terminal cleanup permits the foreground diagnostic recipe
 - legacy attention-key migration is bounded, best-effort maintenance after local state recovery; slow or unavailable Mattermost REST does not delay local socket readiness
 - rebuilding the binary requires daemon restart to pick up new RPC surface/output behavior
 

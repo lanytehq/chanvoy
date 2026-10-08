@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, io};
 
+mod follow_delivery;
 mod wait;
 mod wait_channels;
 mod wait_coalesce;
@@ -46,6 +47,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::Instant as WaitStarted;
 
+use chanvoy_core::startup::{self, Outcome as StartupOutcome, Phase as StartupPhase};
 use tracing::{info, warn};
 
 /// Best-effort legacy cursor repair must never become a daemon-readiness
@@ -76,6 +78,41 @@ pub enum DaemonError {
     },
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("startup {stage}: {outcome}; daemon not started")]
+    Startup {
+        stage: &'static str,
+        outcome: &'static str,
+    },
+}
+
+fn startup_failure<E>(failure: startup::Failure<E>) -> DaemonError {
+    DaemonError::Startup {
+        stage: failure.phase.name(),
+        outcome: failure.outcome.name(),
+    }
+}
+
+fn bootstrap_startup_failure(error: CoreError) -> DaemonError {
+    let outcome = match &error {
+        CoreError::Io(error) => match error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<chanvoy_core::BootstrapError>())
+        {
+            // The resolver establishes its own nonce before producing these
+            // validation failures; own poison remains consumed and invalid.
+            Some(chanvoy_core::BootstrapError::Stale { .. })
+            | Some(chanvoy_core::BootstrapError::FingerprintMismatch { .. })
+            | Some(chanvoy_core::BootstrapError::UsernameMismatch { .. }) => {
+                StartupOutcome::InvalidInput
+            }
+            _ => StartupOutcome::LocalUnconfirmed,
+        },
+        _ => StartupOutcome::LocalUnconfirmed,
+    };
+    DaemonError::Startup {
+        stage: "bootstrap-identity",
+        outcome: outcome.name(),
+    }
 }
 
 #[derive(Clone)]
@@ -278,15 +315,25 @@ async fn build_reduce_writer(
     };
     let token = load_token(&family)?;
     let client = MattermostClient::new(&family, token)?;
-    let identity = client.whoami().await?;
-    if !family.bot_username.is_empty() && identity.username != family.bot_username {
-        return Err(CoreError::ReduceIdentityMismatch {
-            profile: family.name.clone(),
-            expected: family.bot_username.clone(),
-            actual: identity.username,
-        }
-        .into());
-    }
+    let identity = startup::bounded(
+        StartupPhase::FamilyIdentity,
+        &family.name,
+        startup::IDENTITY_BUDGET,
+        async {
+            let identity = client.whoami().await?;
+            if !family.bot_username.is_empty() && identity.username != family.bot_username {
+                return Err(CoreError::ReduceIdentityMismatch {
+                    profile: family.name.clone(),
+                    expected: family.bot_username.clone(),
+                    actual: identity.username,
+                });
+            }
+            Ok(identity)
+        },
+        startup::classify_core_error,
+    )
+    .await
+    .map_err(startup_failure)?;
     Ok(ReduceWriter {
         profile_name: family.name.clone(),
         // Authoritative, whoami-verified identity — never the
@@ -309,18 +356,40 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let socket_path = socket_path_for_profile(profile_name);
     let pid_path = pid_path_for_profile(profile_name);
 
-    if socket_path.exists() && ping(profile_name).await.is_ok() {
-        return Err(DaemonError::AlreadyRunning(
-            socket_path.display().to_string(),
-        ));
+    // Every observed existing socket ends this attempt. Unknown cannot become
+    // permission to unlink a predecessor; the CLI confirmed-stop path owns that.
+    match fs::symlink_metadata(&socket_path) {
+        Ok(_) => {
+            startup::bounded(
+                StartupPhase::ExistingSocket,
+                profile_name,
+                startup::LOCAL_PING_BUDGET,
+                ping(profile_name),
+                |_| StartupOutcome::LocalUnconfirmed,
+            )
+            .await
+            .map_err(startup_failure)?;
+            return Err(DaemonError::AlreadyRunning(
+                socket_path.display().to_string(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(DaemonError::Startup {
+                stage: StartupPhase::ExistingSocket.name(),
+                outcome: StartupOutcome::LocalUnconfirmed.name(),
+            })
+        }
     }
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    if socket_path.exists() {
-        fs::remove_file(&socket_path)?;
-    }
+    // Inspect without consumption before a reduction-enabled startup can
+    // contact its family provider. The resolver revalidates/consumes later.
+    let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
+    chanvoy_core::bootstrap::inspect_bootstrap_ownership(profile_name, env_nonce.as_deref())
+        .map_err(bootstrap_startup_failure)?;
     // Loaded exactly once and reused for every surface this daemon
     // brings up. Reading it a second time later would let a rotation
     // between the two reads pair a request-response client
@@ -337,9 +406,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         Some(policy) => {
             let writer = build_reduce_writer(&profile, policy).await?;
             info!(
-                profile = profile_name,
-                reduce_to = %writer.profile_name,
-                reduce_identity = %writer.bot_username,
+                profile = %writer.profile_name,
                 "PER-035 reduction policy active: outside-team writes reduce to family identity"
             );
             Some(writer)
@@ -366,9 +433,9 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     //    path. Manual `chanvoy daemon serve`. Fall through to the
     //    original network whoami() — works in unsandboxed shells and
     //    is the right thing for developer-mode invocations.
-    let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
     let resolution =
-        chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())?;
+        chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())
+            .map_err(bootstrap_startup_failure)?;
     let my_user_id = match resolution {
         chanvoy_core::BootstrapResolution::Validated { user_id } => {
             info!(
@@ -380,14 +447,25 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         chanvoy_core::BootstrapResolution::Legacy => {
             // Manual `chanvoy daemon serve` (not via auto-setup): no
             // handoff in flight. Network whoami() runs as before.
-            let identity = client.whoami().await?;
-            if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
-                return Err(CoreError::ProfileIdentityMismatch {
-                    expected: profile.bot_username.clone(),
-                    actual: identity.username,
-                }
-                .into());
-            }
+            let identity = startup::bounded(
+                StartupPhase::ForegroundIdentity,
+                profile_name,
+                startup::IDENTITY_BUDGET,
+                async {
+                    let identity = client.whoami().await?;
+                    if !profile.bot_username.is_empty() && identity.username != profile.bot_username
+                    {
+                        return Err(CoreError::ProfileIdentityMismatch {
+                            expected: profile.bot_username.clone(),
+                            actual: identity.username,
+                        });
+                    }
+                    Ok(identity)
+                },
+                startup::classify_core_error,
+            )
+            .await
+            .map_err(startup_failure)?;
             identity.id
         }
     };
@@ -796,8 +874,9 @@ async fn handle_client(
                             }
                         }
                     };
-                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
+                    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
+                    let delivery = follow_delivery::ChannelDelivery::new(client_gone.clone());
                     let follow = wait::wait_with_params_follow(
                         &state,
                         wait::WaitRequest {
@@ -813,74 +892,10 @@ async fn handle_client(
                         },
                         stream_tx,
                         coalesce_ms,
-                        client_gone.clone(),
+                        client_gone,
+                        delivery.clone(),
                     );
-                    tokio::pin!(follow);
-                    let mut eof_buf = String::new();
-                    let mut client_eof = false;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            Some(record) = stream_rx.recv() => {
-                                let notification = JsonRpcNotification {
-                                    jsonrpc: "2.0".to_string(),
-                                    method: record.method.to_string(),
-                                    params: record.event,
-                                };
-                                let write_result = async {
-                                    writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
-                                    writer.flush().await
-                                }.await;
-                                let ack = write_result
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(ToString::to_string);
-                                let _ = record.written.send(ack);
-                                write_result?;
-                            }
-                            result = &mut follow => {
-                                while let Ok(record) = stream_rx.try_recv() {
-                                    let notification = JsonRpcNotification {
-                                        jsonrpc: "2.0".to_string(),
-                                        method: record.method.to_string(),
-                                        params: record.event,
-                                    };
-                                    let write_result = async {
-                                        writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
-                                        writer.write_all(b"\n").await?;
-                                        writer.flush().await
-                                    }.await;
-                                    let ack = write_result
-                                        .as_ref()
-                                        .map(|_| ())
-                                        .map_err(ToString::to_string);
-                                    let _ = record.written.send(ack);
-                                    write_result?;
-                                }
-                                let response = match result {
-                                    Ok(result) => rpc_result(request.id, to_value(result)),
-                                    Err(error) => {
-                                        let error = DaemonError::from(error);
-                                        let (code, message, data) = error_payload(&error);
-                                        rpc_error_with_data(request.id, code, message, data)
-                                    }
-                                };
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
-                                break;
-                            }
-                            peek = reader.read_line(&mut eof_buf), if !client_eof => {
-                                if coalesce_ms.is_some() {
-                                    client_gone.cancel();
-                                    client_eof = true;
-                                } else {
-                                    let _ = peek?;
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    delivery.serve(&mut writer, &mut reader, request.id, stream_rx, follow).await?;
                     line.clear();
                     continue;
                 }
@@ -4374,6 +4389,57 @@ mod compat_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_receipts_classify_typed_uncertainty_and_own_poison() {
+        use chanvoy_core::BootstrapError;
+        for error in [
+            BootstrapError::CleanupUnconfirmed.into(),
+            BootstrapError::NonceMismatch.into(),
+            BootstrapError::Io(io::Error::other("synthetic-secret invalid-input")).into(),
+            CoreError::Io(io::Error::other("synthetic-secret invalid-input")),
+            CoreError::BootstrapHandoffFailed {
+                profile: "synthetic-secret-profile".into(),
+                nonce_env: "SYNTHETIC_SECRET_NONCE",
+                path: "synthetic-secret-path".into(),
+            },
+        ] {
+            let receipt = bootstrap_startup_failure(error);
+            assert!(matches!(
+                receipt,
+                DaemonError::Startup {
+                    outcome: "local-unconfirmed",
+                    ..
+                }
+            ));
+            assert!(!format!("{receipt} {receipt:?}").contains("synthetic-secret"));
+        }
+        for error in [
+            BootstrapError::Stale {
+                issued_at: 0,
+                age: 100,
+                max: 60,
+            },
+            BootstrapError::FingerprintMismatch {
+                file: "synthetic-secret-body".into(),
+                computed: "synthetic-secret-profile".into(),
+            },
+            BootstrapError::UsernameMismatch {
+                file: "synthetic-secret-whoami".into(),
+                profile: "synthetic-secret-profile".into(),
+            },
+        ] {
+            let receipt = bootstrap_startup_failure(error.into());
+            assert!(matches!(
+                receipt,
+                DaemonError::Startup {
+                    outcome: "invalid-input",
+                    ..
+                }
+            ));
+            assert!(!format!("{receipt} {receipt:?}").contains("synthetic-secret"));
+        }
+    }
 
     #[test]
     fn observation_is_allowed_without_opening_network_methods_under_refusal() {

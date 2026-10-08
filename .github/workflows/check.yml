@@ -55,3 +55,90 @@ jobs:
         with:
           toolchain: "1.89.0"
       - run: make test-integration
+
+  shipping_x86_qualification:
+    name: Optimized native x86 qualification
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RUSTUP_TOOLCHAIN: 1.89.0
+      QUALIFICATION_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install Rust 1.89.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.89.0
+      - name: Build normal standalone binary with compiler receipts
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          qual_dir="$RUNNER_TEMP/qualification-linux-x86_64"
+          mkdir -m700 "$qual_dir"
+          python3 scripts/build-production-binary.py --root "$PWD" --platform linux-x86_64 \
+            --expected-commit "$QUALIFICATION_COMMIT" --mode candidate --output "$qual_dir" \
+            >"$qual_dir/producer.log" 2>&1
+      - name: Qualify preserved candidate bytes
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          qual_dir="$RUNNER_TEMP/qualification-linux-x86_64"
+          payload_hash="$(python3 -c 'import hashlib,pathlib; print(hashlib.sha256(pathlib.Path("target/release/chanvoy").read_bytes()).hexdigest())')"
+          python3 scripts/qualify-production-binary.py --root "$PWD" \
+            --binary "$PWD/target/release/chanvoy" --normal-build "$qual_dir/normal-build.jsonl" \
+            --expected-commit "$QUALIFICATION_COMMIT" --expected-sha256 "$payload_hash" \
+            --platform linux-x86_64 --mode candidate --output "$qual_dir" \
+            >"$qual_dir/driver.log" 2>&1
+      - name: Preserve candidate qualification and first-failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualification-candidate-linux-x86_64-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification-linux-x86_64/
+          if-no-files-found: warn
+          retention-days: 7
+  sbom_tool_route:
+    name: Offline SBOM tool route
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Stage checksum-pinned validator
+        timeout-minutes: 3
+        run: python3 scripts/setup-sbom-validator.py --output "$RUNNER_TEMP/sbom-validator"
+      - name: Prove immutable closure and Linux network denial
+        timeout-minutes: 10
+        env:
+          EXPECTED_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 scripts/sbom-tool-route.py --expected-commit "$EXPECTED_COMMIT" \
+            --tool-receipt "$RUNNER_TEMP/sbom-validator/setup-evidence.json" \
+            --output "$RUNNER_TEMP/sbom-tool-route"
+      - name: Preserve tool-route and setup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-tool-route-candidate-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sbom-tool-route/
+            ${{ runner.temp }}/sbom-validator/
+          if-no-files-found: error
+          retention-days: 7

@@ -52,6 +52,9 @@ jobs:
   build:
     name: Binary (${{ matrix.platform }})
     needs: validate
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: 1.89.0
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -85,8 +88,21 @@ jobs:
         env:
           EXPECTED_TARGET: ${{ matrix.target }}
         run: test "$(rustc -vV | awk '/^host:/{print $2}')" = "$EXPECTED_TARGET"
-      - name: Build standalone binary
-        run: make build-release
+      - name: Build normal standalone binary with compiler receipts
+        timeout-minutes: 12
+        env:
+          QUALIFICATION_PLATFORM: ${{ matrix.platform }}
+          QUALIFICATION_COMMIT: ${{ needs.validate.outputs.commit }}
+          QUALIFICATION_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+          QUALIFICATION_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          qual_dir="$RUNNER_TEMP/qualification-$QUALIFICATION_PLATFORM"
+          mkdir -m700 "$qual_dir"
+          python3 scripts/build-production-binary.py --root "$PWD" --platform "$QUALIFICATION_PLATFORM" \
+            --expected-commit "$QUALIFICATION_COMMIT" --mode shipping --tag "$QUALIFICATION_TAG" \
+            --tag-object "$QUALIFICATION_TAG_OBJECT" --output "$qual_dir" \
+            >"$qual_dir/producer.log" 2>&1
       - name: Stage exact binary
         id: binary
         env:
@@ -95,19 +111,84 @@ jobs:
         run: |
           set -euo pipefail
           asset="chanvoy-v${RELEASE_VERSION}-${RELEASE_PLATFORM}"
-          cp target/release/chanvoy "$asset"
+          # The driver creates this preserved payload outside the source checkout.
+          asset="$RUNNER_TEMP/qualification-$RELEASE_PLATFORM/payload/$asset"
           printf 'asset=%s\n' "$asset" >>"$GITHUB_OUTPUT"
+      - name: Qualify actual tag-run payload before inventory admission
+        timeout-minutes: 15
+        env:
+          QUALIFICATION_PLATFORM: ${{ matrix.platform }}
+          QUALIFICATION_COMMIT: ${{ needs.validate.outputs.commit }}
+          QUALIFICATION_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+          QUALIFICATION_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          qual_dir="$RUNNER_TEMP/qualification-$QUALIFICATION_PLATFORM"
+          payload_hash="$(python3 -c 'import hashlib,pathlib; print(hashlib.sha256(pathlib.Path("target/release/chanvoy").read_bytes()).hexdigest())')"
+          python3 scripts/qualify-production-binary.py --root "$PWD" \
+            --binary "$PWD/target/release/chanvoy" --normal-build "$qual_dir/normal-build.jsonl" \
+            --expected-commit "$QUALIFICATION_COMMIT" --expected-sha256 "$payload_hash" \
+            --platform "$QUALIFICATION_PLATFORM" --mode shipping --tag "$QUALIFICATION_TAG" \
+            --tag-object "$QUALIFICATION_TAG_OBJECT" --output "$qual_dir" \
+            >"$qual_dir/driver.log" 2>&1
+      - name: Preserve shipping qualification and first-failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualification-shipping-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification-${{ matrix.platform }}/
+          if-no-files-found: warn
+          retention-days: 7
       - name: Upload exact binary artifact
+        if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: binary-${{ matrix.platform }}
           path: ${{ steps.binary.outputs.asset }}
           if-no-files-found: error
           retention-days: 7
+  sbom_tool_route:
+    name: Offline SBOM tool route
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Stage checksum-pinned validator
+        timeout-minutes: 3
+        run: python3 scripts/setup-sbom-validator.py --output "$RUNNER_TEMP/sbom-validator"
+      - name: Prove immutable closure and Linux network denial
+        timeout-minutes: 10
+        env:
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          python3 scripts/sbom-tool-route.py --expected-commit "$EXPECTED_COMMIT" \
+            --tool-receipt "$RUNNER_TEMP/sbom-validator/setup-evidence.json" \
+            --output "$RUNNER_TEMP/sbom-tool-route"
+      - name: Preserve tool-route and setup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-tool-route-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sbom-tool-route/
+            ${{ runner.temp }}/sbom-validator/
+          if-no-files-found: error
+          retention-days: 7
   sbom:
     name: Versioned CycloneDX SBOM
-    needs: validate
-    runs-on: ubuntu-latest
+    needs: [validate, build, sbom_tool_route]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     permissions:
       contents: read
     defaults:
@@ -119,20 +200,67 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
-      - name: Generate SBOM with pinned Syft
+      - name: Download exact qualified binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: binary-*
+          path: ${{ runner.temp }}/sbom-binaries
+          merge-multiple: true
+      - name: Download x86 shipping evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qualification-shipping-linux-x86_64-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sbom-inputs/linux-x86_64
+      - name: Download ARM shipping evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qualification-shipping-linux-aarch64-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sbom-inputs/linux-aarch64
+      - name: Download Mac shipping evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qualification-shipping-macos-aarch64-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sbom-inputs/macos-aarch64
+      - name: Download this attempt's tool-route proof
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sbom-tool-route-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sbom-route-proof
+      - name: Stage checksum-pinned validator
+        timeout-minutes: 3
+        run: python3 scripts/setup-sbom-validator.py --output "$RUNNER_TEMP/sbom-release-validator"
+      - name: Generate artifact-associated SBOM
+        timeout-minutes: 13
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          docker run --rm --volume "$PWD:/src:ro" --workdir /src \
-            anchore/syft@sha256:f94e5d9fce1f2278491a8e3a63bd5f6ddb81fdfdbb8bf7a1637565c1d5344357 \
-            dir:. --output cyclonedx-json >"sbom-${RELEASE_VERSION}.cdx.json"
-          test -s "sbom-${RELEASE_VERSION}.cdx.json"
+          python3 scripts/shipping_sbom.py --binaries "$RUNNER_TEMP/sbom-binaries" \
+            --evidence "$RUNNER_TEMP/sbom-inputs" \
+            --tool-route "$RUNNER_TEMP/sbom-route-proof/sbom-tool-route/evidence.json" \
+            --tool-receipt "$RUNNER_TEMP/sbom-release-validator/setup-evidence.json" \
+            --expected-commit "$RELEASE_COMMIT" --tag-object "$RELEASE_TAG_OBJECT" \
+            --tag "$RELEASE_TAG" --version "$RELEASE_VERSION" \
+            --output "$RUNNER_TEMP/shipping-sbom"
+      - name: Preserve generation and validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: shipping-sbom-evidence-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/shipping-sbom/
+            ${{ runner.temp }}/sbom-release-validator/
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload exact SBOM artifact
+        if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sbom
-          path: sbom-${{ needs.validate.outputs.version }}.cdx.json
+          path: ${{ runner.temp }}/shipping-sbom/sbom-${{ needs.validate.outputs.version }}.cdx.json
           if-no-files-found: error
           retention-days: 7
   packages:

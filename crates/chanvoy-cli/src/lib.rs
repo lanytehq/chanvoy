@@ -2,6 +2,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 mod daemon_assessment;
 mod lifecycle;
 use chanvoy_core::recovery::DaemonDisposition;
+use chanvoy_core::startup::{self, Outcome as StartupOutcome, Phase as StartupPhase};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -54,6 +55,8 @@ pub enum CliError {
     Bootstrap(String),
     #[error("identity probe rejected credential (HTTP {status})")]
     IdentityRejected { status: u16 },
+    #[error("parent identity mismatch; configured profile identity refused")]
+    ParentIdentityMismatch,
     #[error("{disposition:?}: {detail}")]
     DaemonAssessment {
         disposition: DaemonDisposition,
@@ -859,7 +862,8 @@ impl ParentIdentityEvidence {
     fn from_preflight_error(error: &CliError) -> Self {
         match error {
             CliError::IdentityRejected { status } => Self::RejectedCredential(*status),
-            CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch { .. }) => {
+            CliError::ParentIdentityMismatch
+            | CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch { .. }) => {
                 Self::WrongUsername
             }
             _ => Self::Unknown,
@@ -3991,8 +3995,8 @@ async fn validate_and_finalize_profile(
 ) -> Result<(Profile, Identity), CliError> {
     let token = load_token(&profile)?;
     let client = MattermostClient::new(&profile, token)?;
-    let identity = parent_identity(&client).await?;
-    validate_parent_team(&client).await?;
+    let identity = parent_identity(&client, &profile.name).await?;
+    validate_parent_team(&client, &profile.name).await?;
     profile.bot_username = identity.username.clone();
     Ok((profile, identity))
 }
@@ -4014,48 +4018,67 @@ async fn validate_and_finalize_profile(
 async fn validate_persisted_profile_identity(profile: &Profile) -> Result<Identity, CliError> {
     let token = load_token(profile)?;
     let client = MattermostClient::new(profile, token)?;
-    let identity = parent_identity(&client).await?;
+    let identity = parent_identity(&client, &profile.name).await?;
     if !profile.bot_username.is_empty() && identity.username != profile.bot_username {
-        return Err(chanvoy_core::CoreError::ProfileIdentityMismatch {
-            expected: profile.bot_username.clone(),
-            actual: identity.username,
-        }
-        .into());
+        return Err(CliError::ParentIdentityMismatch);
     }
-    validate_parent_team(&client).await?;
+    validate_parent_team(&client, &profile.name).await?;
     Ok(identity)
 }
 
-async fn parent_identity(client: &MattermostClient) -> Result<Identity, CliError> {
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(chanvoy_core::STATUS_PROBE_TIMEOUT_MS),
+async fn parent_identity(client: &MattermostClient, profile: &str) -> Result<Identity, CliError> {
+    match startup::bounded(
+        StartupPhase::ParentIdentity,
+        profile,
+        startup::IDENTITY_BUDGET,
         client.whoami(),
+        startup::classify_core_error,
     )
     .await
     {
-        Ok(Ok(identity)) => Ok(identity),
-        Ok(Err(chanvoy_core::CoreError::Api { status, .. }))
-            if matches!(status.as_u16(), 401 | 403) =>
-        {
-            Err(CliError::IdentityRejected {
-                status: status.as_u16(),
-            })
-        }
-        Ok(Err(error)) => Err(CliError::Bootstrap(doctor_provider_error_summary(&error).1)),
-        Err(_) => Err(CliError::Bootstrap(
-            "parent identity probe timed out; credential refusal unproven".into(),
-        )),
+        Ok(identity) => Ok(identity),
+        Err(failure) => match failure.into_cause() {
+            Some(chanvoy_core::CoreError::Api { status, .. })
+                if matches!(status.as_u16(), 401 | 403) =>
+            {
+                Err(CliError::IdentityRejected {
+                    status: status.as_u16(),
+                })
+            }
+            Some(error) => Err(CliError::Bootstrap(doctor_provider_error_summary(&error).1)),
+            None => Err(CliError::Bootstrap(
+                "parent identity probe timed out; credential refusal unproven".into(),
+            )),
+        },
     }
 }
 
-async fn validate_parent_team(client: &MattermostClient) -> Result<(), CliError> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+async fn validate_parent_team(client: &MattermostClient, profile: &str) -> Result<(), CliError> {
+    match startup::bounded(
+        StartupPhase::ParentTeam,
+        profile,
+        startup::TEAM_BUDGET,
         client.validate_team_access(),
+        startup::classify_core_error,
     )
     .await
-    .map_err(|_| CliError::Bootstrap("parent team-access probe timed out".into()))??;
-    Ok(())
+    {
+        Ok(()) => Ok(()),
+        Err(failure) => match failure.into_cause() {
+            // Preserve endpoint status provenance while removing the provider body.
+            Some(chanvoy_core::CoreError::Api { status, .. }) => {
+                Err(chanvoy_core::CoreError::Api {
+                    status,
+                    message: "startup team-access probe failed".into(),
+                }
+                .into())
+            }
+            Some(error) => Err(CliError::Bootstrap(doctor_provider_error_summary(&error).1)),
+            None => Err(CliError::Bootstrap(
+                "parent team-access probe timed out".into(),
+            )),
+        },
+    }
 }
 
 async fn within_health_budget<T>(
@@ -4074,6 +4097,7 @@ async fn within_health_budget<T>(
 fn failure_disposition(error: &CliError, fallback: DaemonDisposition) -> DaemonDisposition {
     match error {
         CliError::IdentityRejected { .. }
+        | CliError::ParentIdentityMismatch
         | CliError::Core(chanvoy_core::CoreError::ProfileIdentityMismatch { .. }) => {
             DaemonDisposition::IdentityRefused
         }
@@ -4273,6 +4297,15 @@ async fn spawn_durable_daemon(
     identity: &Identity,
     profile_name: &str,
 ) -> Result<ProfileStatus, CliError> {
+    spawn_durable_daemon_with(profile, identity, profile_name, |cmd| cmd.spawn()).await
+}
+
+async fn spawn_durable_daemon_with(
+    profile: &Profile,
+    identity: &Identity,
+    profile_name: &str,
+    spawn: impl FnOnce(&mut Command) -> std::io::Result<tokio::process::Child>,
+) -> Result<ProfileStatus, CliError> {
     // PER-014: write the bootstrap-state file co-located with the spawn.
     // Site discipline by structural placement — only this helper emits a
     // bootstrap file, so non-daemon-spawn paths (`profile create`) cannot
@@ -4289,8 +4322,13 @@ async fn spawn_durable_daemon(
         std::process::id(),
     )
     .map_err(|err| CliError::Bootstrap(format!("build bootstrap state: {err}")))?;
-    chanvoy_core::write_bootstrap_state(&bootstrap)
-        .map_err(|err| CliError::Bootstrap(format!("write bootstrap state: {err}")))?;
+    chanvoy_core::write_bootstrap_state(&bootstrap).map_err(|err| match err {
+        chanvoy_core::BootstrapError::HandoffUnconfirmed { .. } => CliError::DaemonAssessment {
+            disposition: DaemonDisposition::UnresponsiveLocal,
+            detail: err.to_string(),
+        },
+        _ => CliError::Bootstrap("write bootstrap state failed; runtime state retained".into()),
+    })?;
 
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -4308,7 +4346,7 @@ async fn spawn_durable_daemon(
     // this CLI exits, so `try_wait()` is a reliable "did startup fail?"
     // signal for the whole poll. Dropping the handle afterwards does not
     // signal the child (`kill_on_drop` is off by default).
-    let mut child = cmd.spawn()?;
+    let mut child = spawn(&mut cmd)?;
     // Capture the pid *now*. Tokio's `Child::id()` returns `None` once the
     // child has been polled to completion, so reading it after `try_wait()`
     // observes an exit yields `None` in exactly the case where residue cleanup
@@ -4316,36 +4354,102 @@ async fn spawn_durable_daemon(
     // several fallible startup steps (attention-state load, token/WS setup), so
     // an exit there leaves owned pid + socket files on disk. devrev P1 on rev 2.
     let child_pid = child.id();
+    await_spawn_readiness(profile_name, &mut child, child_pid, &nonce).await
+}
+
+/// Kept separate so a harness-owned child can exercise genuine readiness expiry
+/// independently of the daemon's earlier identity-phase deadline.
+async fn await_spawn_readiness(
+    profile_name: &str,
+    child: &mut tokio::process::Child,
+    child_pid: Option<u32>,
+    nonce: &str,
+) -> Result<ProfileStatus, CliError> {
+    await_spawn_readiness_with(
+        profile_name,
+        child,
+        child_pid,
+        nonce,
+        ReadinessBudget::normal(),
+        || {},
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct ReadinessBudget {
+    window: std::time::Duration,
+    probe: std::time::Duration,
+    interval: std::time::Duration,
+    attempts: usize,
+}
+
+impl ReadinessBudget {
+    fn normal() -> Self {
+        Self {
+            window: SPAWN_READY_DEADLINE,
+            probe: POST_SPAWN_PING_TIMEOUT,
+            interval: std::time::Duration::from_millis(250),
+            attempts: 40,
+        }
+    }
+}
+
+async fn await_spawn_readiness_with(
+    profile_name: &str,
+    child: &mut tokio::process::Child,
+    child_pid: Option<u32>,
+    nonce: &str,
+    budget: ReadinessBudget,
+    mut observe_attempt: impl FnMut(),
+) -> Result<ProfileStatus, CliError> {
     // Each per-iteration `ping()` is bounded the same way as the
     // pre-spawn health check, for the same reason: a freshly spawned
     // daemon could wedge during startup (deadlocked WebSocket init,
     // stuck dependency probe) and leave us polling a ping that never
-    // returns. The outer deadline bounds total wait to a fixed budget
-    // independent of per-iteration timeout.
-    let spawn_ready_deadline = std::time::Instant::now() + SPAWN_READY_DEADLINE;
-    while std::time::Instant::now() < spawn_ready_deadline {
-        let ping_outcome = tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping(profile_name)).await;
+    // returns. The nominal window and attempt count are independent bounds; the
+    // last iteration and final probe retain their documented margins.
+    let spawn_ready_deadline = std::time::Instant::now() + budget.window;
+    let mut diagnostic =
+        startup::Diagnostic::begin(StartupPhase::ChildReadiness, profile_name, budget.window);
+    for _ in 0..budget.attempts {
+        if std::time::Instant::now() >= spawn_ready_deadline {
+            break;
+        }
+        observe_attempt();
+        let ping_outcome = tokio::time::timeout(budget.probe, ping(profile_name)).await;
         if let Ok(Ok(health)) = ping_outcome {
+            diagnostic.finish(StartupOutcome::Success);
             return Ok(health);
         }
         // Ping order matters: a child that became ready and then exited
         // still counts as "started" above. Only an exit observed while the
         // socket is unreachable is a startup failure.
         if let Some(exit) = child.try_wait()? {
+            diagnostic.finish(StartupOutcome::OtherError);
             return Err(
-                finalize_failed_spawn(profile_name, &mut child, child_pid, Some(exit)).await,
+                finalize_failed_spawn(profile_name, child, child_pid, Some(exit), nonce).await,
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(budget.interval).await;
     }
     // Deadline expired. One last probe closes the race where the daemon became
     // ready between the final poll and the deadline check; anything else is a
     // failed spawn, and a failed spawn must be terminal.
-    if let Ok(Ok(health)) = tokio::time::timeout(POST_SPAWN_PING_TIMEOUT, ping(profile_name)).await
+    diagnostic.finish(StartupOutcome::Timeout);
+    observe_attempt();
+    if let Ok(health) = startup::bounded(
+        StartupPhase::FinalReadinessProbe,
+        profile_name,
+        budget.probe,
+        ping(profile_name),
+        |_| StartupOutcome::LocalUnconfirmed,
+    )
+    .await
     {
         return Ok(health);
     }
-    Err(finalize_failed_spawn(profile_name, &mut child, child_pid, None).await)
+    Err(finalize_failed_spawn(profile_name, child, child_pid, None, nonce).await)
 }
 
 /// Make a failed spawn terminal, then classify it.
@@ -4366,7 +4470,9 @@ async fn spawn_durable_daemon(
 ///
 /// **The guarantee, stated precisely**: when termination is *confirmed* —
 /// either the child exited on its own or `kill()` reaped it — this function
-/// performs terminal cleanup and nothing from the spawn is left alive. When
+/// the owned child is no longer alive. Cleanup additionally requires matching
+/// handoff/runtime identity and positive socket absence; an unconfirmed cleanup
+/// is reported separately with remaining state retained. When
 /// termination cannot be confirmed, it does **not** silently pretend
 /// otherwise: it returns `TerminationUnconfirmed`, preserves the runtime state
 /// for the operator, and says so in the diagnostic. A child may still be alive
@@ -4392,7 +4498,13 @@ enum SpawnFailure {
     /// invariant this code exists to establish is precisely the thing that
     /// failed. Residue is deliberately left in place: a process that may still
     /// be running owns its socket and pid file.
-    TerminationUnconfirmed { pid: Option<u32>, detail: String },
+    TerminationUnconfirmed {
+        pid: Option<u32>,
+        detail: String,
+    },
+    CleanupUnconfirmed {
+        pid: Option<u32>,
+    },
 }
 
 async fn finalize_failed_spawn(
@@ -4400,73 +4512,97 @@ async fn finalize_failed_spawn(
     child: &mut tokio::process::Child,
     child_pid: Option<u32>,
     already_exited: Option<std::process::ExitStatus>,
+    nonce: &str,
 ) -> CliError {
-    // Read the handoff state *before* any cleanup: whether the child got far
-    // enough to consume it is the signal that distinguishes a pre-identity
-    // failure from a post-identity one, and the sweep below destroys it.
-    let handoff_pending = chanvoy_core::bootstrap_path_for_profile(profile_name).exists();
-    let failure = match already_exited {
-        Some(status) => SpawnFailure::ChildExited(status),
-        None => {
-            // SIGKILL rather than a graceful signal: this child is by
-            // definition not answering its socket, and the states that hang
-            // here (blocked dependency probe, wedged WebSocket init) are the
-            // least likely to service a shutdown request. We sweep the residue
-            // ourselves precisely because SIGKILL skips the daemon's own
-            // cleanup.
-            //
-            // `kill()` is signal-then-wait, so `Ok` means the child is really
-            // gone. An `Err` must not be swallowed: it is either the benign
-            // race (the child exited between our last poll and the signal, so
-            // there is nothing left to kill) or a genuine failure to terminate.
-            //
-            // The owned `Child` handle is the authority for telling those
-            // apart — devrev round 3. A `kill -0` probe is not: nonzero is not
-            // uniquely `ESRCH` (`EPERM` means the process very much exists),
-            // and a probe that fails to launch is *unknown*, not dead. Both
-            // would be silently promoted to "confirmed terminated" in exactly
-            // the restricted-process-control conditions where `kill()` itself
-            // just failed — printing the false guarantee this branch exists to
-            // avoid. `try_wait` on the handle we already hold has none of that
-            // ambiguity and needs no shell-out.
+    finalize_failed_spawn_with(
+        profile_name,
+        child_pid,
+        nonce,
+        startup::FINALIZATION_BUDGET,
+        async {
+            if let Some(status) = already_exited {
+                return match child.try_wait() {
+                    Ok(Some(_)) => Ok(SpawnFailure::ChildExited(status)),
+                    _ => Err(()),
+                };
+            }
             match child.kill().await {
-                Ok(()) => SpawnFailure::WedgedAndTerminated,
-                Err(kill_err) => match child.try_wait() {
-                    // Reaped: the child was already gone when we signalled, so
-                    // the terminal-cleanup invariant does hold.
-                    Ok(Some(_status)) => SpawnFailure::WedgedAndTerminated,
-                    // Still running after a failed kill — the honest case.
-                    Ok(None) => SpawnFailure::TerminationUnconfirmed {
-                        pid: child_pid,
-                        detail: format!("{kill_err}; child still running after the kill attempt"),
-                    },
-                    // Cannot even read the child's status: unknown, not dead.
-                    Err(wait_err) => SpawnFailure::TerminationUnconfirmed {
-                        pid: child_pid,
-                        detail: format!("{kill_err}; exit status unreadable: {wait_err}"),
-                    },
+                Ok(()) => Ok(SpawnFailure::WedgedAndTerminated),
+                Err(_) => match child.try_wait() {
+                    Ok(Some(_)) => Ok(SpawnFailure::WedgedAndTerminated),
+                    _ => Err(()),
                 },
             }
-        }
+        },
+    )
+    .await
+}
+
+async fn finalize_failed_spawn_with(
+    profile_name: &str,
+    child_pid: Option<u32>,
+    nonce: &str,
+    budget: std::time::Duration,
+    finalize: impl std::future::Future<Output = Result<SpawnFailure, ()>>,
+) -> CliError {
+    let handoff_observation = observe_bootstrap_handoff(profile_name);
+    let runtime = child_pid
+        .ok_or_else(|| "child pid unavailable".to_string())
+        .and_then(|pid| lifecycle::FailedChildRuntime::capture(profile_name, pid));
+    // The owned handle, not an external PID probe, establishes termination.
+    // A deadline may expire after a signal was sent: no second signal, no sweep.
+    let finalized = startup::bounded(
+        StartupPhase::ChildFinalization,
+        profile_name,
+        budget,
+        finalize,
+        |_| StartupOutcome::LocalUnconfirmed,
+    )
+    .await;
+    let mut failure = match finalized {
+        Ok(failure) => failure,
+        Err(error) => SpawnFailure::TerminationUnconfirmed {
+            pid: child_pid,
+            detail: error.to_string(),
+        },
     };
-    // Only sweep when the child is confirmed gone. A process we could not
-    // confirm dead still owns its socket and pid file, and deleting them under
-    // a live daemon would strand it — unreachable but running, which is worse
-    // than the state we are reporting. Same reasoning for the handoff: a live
-    // child may still be about to read it.
     if !matches!(failure, SpawnFailure::TerminationUnconfirmed { .. }) {
-        // Any surviving handoff is orphaned now. Consume it so it cannot shadow
-        // the next spawn (it would fail the nonce check anyway, but clearing
-        // poisoned residue at the source is cheaper than diagnosing it).
-        let _ = chanvoy_core::consume_bootstrap_state(profile_name);
-        if let Some(pid) = child_pid {
-            if read_daemon_pid_for_force_kill(profile_name) == Some(pid) {
-                let _ = std::fs::remove_file(pid_path_for_profile(profile_name));
-                let _ = std::fs::remove_file(socket_path_for_profile(profile_name));
+        // Each consumer proves its own nonce. Another parent's replacement
+        // handoff is retained, even though our child is independently dead.
+        let handoff =
+            chanvoy_core::bootstrap::consume_bootstrap_state_if_owned(profile_name, nonce);
+        let cleanup = if handoff == chanvoy_core::bootstrap::BootstrapCleanup::Unconfirmed {
+            Err("handoff cleanup unconfirmed".to_string())
+        } else {
+            match runtime {
+                Ok(runtime) => runtime.cleanup_after_exit().await,
+                Err(error) => Err(error),
             }
+        };
+        if cleanup.is_err() {
+            failure = SpawnFailure::CleanupUnconfirmed { pid: child_pid };
         }
     }
-    daemon_child_startup_error(profile_name, failure, handoff_pending)
+    daemon_child_startup_error(profile_name, failure, handoff_observation)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffObservation {
+    Present,
+    Absent,
+    Unconfirmed,
+}
+
+fn observe_bootstrap_handoff(profile: &str) -> HandoffObservation {
+    observe_handoff_path(&chanvoy_core::bootstrap_path_for_profile(profile))
+}
+
+fn observe_handoff_path(path: &Path) -> HandoffObservation {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => HandoffObservation::Present,
+        Err(error) if error.kind() == ErrorKind::NotFound => HandoffObservation::Absent,
+        Err(_) => HandoffObservation::Unconfirmed,
+    }
 }
 
 /// Classify a background daemon that never reached readiness.
@@ -4477,33 +4613,41 @@ async fn finalize_failed_spawn(
 /// is null (a pipe would deadlock a long-lived daemon once its buffer filled,
 /// and closing our end would SIGPIPE it), so the classification is built from
 /// what the parent can observe without one: whether the child exited, with
-/// what status, and whether it lived long enough to consume the bootstrap
-/// handoff.
+/// what status, and the observed bootstrap path state. Path state cannot
+/// establish successful consumption or identity validation.
 ///
 /// Pure: `finalize_failed_spawn` owns the killing and sweeping, and passes
-/// `handoff_pending` in because the sweep destroys that evidence.
+/// the handoff observation in because cleanup changes that evidence.
 fn daemon_child_startup_error(
     profile_name: &str,
     failure: SpawnFailure,
-    handoff_pending: bool,
+    handoff: HandoffObservation,
 ) -> CliError {
-    let stage = if handoff_pending {
-        "before consuming the bootstrap handoff (profile/token load, reduce-policy setup, \
-         or local runtime preparation)"
-    } else {
-        "after consuming the bootstrap handoff, so it failed past identity resolution \
-         (socket bind, socket/pid permissions, local attention-state load, or pending local \
-         transaction recovery)"
+    let observation = match handoff {
+        HandoffObservation::Present => "bootstrap handoff path was present at finalization",
+        HandoffObservation::Absent => "bootstrap handoff path was absent at finalization",
+        HandoffObservation::Unconfirmed => {
+            "bootstrap handoff path state was unconfirmed at finalization"
+        }
     };
+    let cleared = matches!(
+        &failure,
+        SpawnFailure::ChildExited(_) | SpawnFailure::WedgedAndTerminated
+    );
     let detail = match failure {
         SpawnFailure::ChildExited(status) => format!(
             "background daemon exited on its own ({status}) before its socket answered, \
-             {stage}; it has been reaped and its startup residue cleared"
+             it has been reaped and its startup residue cleared"
         ),
-        SpawnFailure::WedgedAndTerminated => format!(
-            "background daemon was still not answering its socket at the end of the startup \
-             budget, {stage}; it was wedged during mandatory local startup, \
-             so it has been terminated and reaped rather than left running unowned"
+        SpawnFailure::WedgedAndTerminated => {
+            ("background daemon was still not answering its socket at the end of the startup \
+             budget; it was wedged during mandatory local startup, \
+             so it has been terminated and reaped rather than left running unowned")
+                .to_string()
+        }
+        SpawnFailure::CleanupUnconfirmed { pid } => format!(
+            "background child death confirmed ({pid:?}); cleanup local-unconfirmed; \
+             remaining runtime state retained, with no successor started"
         ),
         SpawnFailure::TerminationUnconfirmed { pid, detail } => {
             let which = match pid {
@@ -4513,17 +4657,28 @@ fn daemon_child_startup_error(
             format!(
                 "background daemon was wedged during startup and could not be confirmed \
                  terminated ({detail}); {which} may still be running, so its socket and pid \
-                 file were left in place rather than deleted under a live process. Check it \
-                 with `ps` and stop it before starting again"
+                 file were left in place rather than deleted under a live process"
             )
         }
+    };
+    let guidance = if cleared {
+        format!(
+            "Run `RUST_LOG=info chanvoy --profile {profile_name} daemon serve` in a \
+             foreground shell to see startup stages; use `RUST_LOG=debug` for more detail, \
+             unset `RUST_LOG` to restore normal logging, and stop the foreground daemon with Ctrl-C"
+        )
+    } else {
+        format!(
+            "Observe retained state with `chanvoy --profile {profile_name} daemon status` \
+             or `chanvoy --profile {profile_name} doctor`. Resolve possible predecessor \
+             ownership/liveness and runtime uncertainty first; this receipt does not authorize \
+             another startup"
+        )
     };
     CliError::DaemonStartup {
         profile: profile_name.to_string(),
         detail: format!(
-            "{detail}. Run `RUST_LOG=info chanvoy --profile {profile_name} daemon serve` in a \
-             foreground shell to see startup stages; use `RUST_LOG=debug` for more detail, \
-             unset `RUST_LOG` to restore normal logging, and stop the foreground daemon with Ctrl-C"
+            "{detail}. {observation}; child identity resolution cannot be inferred from path state. {guidance}"
         ),
     }
 }
@@ -5649,6 +5804,19 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         checks.push(generation_check);
     }
     let exit = doctor_exit_code(&checks, hard_failure);
+    let mut notes = vec![
+        "doctor is cursor-neutral: it does not post, ack, advance, or call check".into(),
+        "daemon reachability is not a substitute for provider read visibility".into(),
+        "a post at/after an emitted --since boundary that is still missing is a request/provider question, not clock".into(),
+    ];
+    let handoff_path = chanvoy_core::bootstrap_path_for_profile(profile_name);
+    if !matches!(std::fs::symlink_metadata(&handoff_path), Err(error) if error.kind() == ErrorKind::NotFound)
+    {
+        notes.push(format!(
+            "bootstrap handoff local-unconfirmed at {}; startup retains this path. Resolve possible in-flight predecessor ownership/liveness before manual removal; missing PID/socket, parent death or age alone is insufficient. Doctor only observes this state",
+            handoff_path.display()
+        ));
+    }
     let report = DoctorReport {
         profile: profile_name.to_string(),
         daemon_disposition,
@@ -5665,11 +5833,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         },
         clock: clock_block,
         channel: channel_block,
-        notes: vec![
-            "doctor is cursor-neutral: it does not post, ack, advance, or call check".into(),
-            "daemon reachability is not a substitute for provider read visibility".into(),
-            "a post at/after an emitted --since boundary that is still missing is a request/provider question, not clock".into(),
-        ],
+        notes,
     };
 
     if json {
@@ -7714,7 +7878,7 @@ mod tests {
                 detail: "operation not permitted; child still running after the kill attempt"
                     .to_string(),
             },
-            false,
+            HandoffObservation::Absent,
         );
         let CliError::DaemonStartup { profile, detail } = err else {
             panic!("expected DaemonStartup");
@@ -7732,6 +7896,8 @@ mod tests {
             "has been reaped",
             "residue cleared",
             "terminated and reaped",
+            "daemon serve",
+            "daemon start",
         ] {
             assert!(
                 !detail.contains(lie),
@@ -7744,8 +7910,11 @@ mod tests {
     /// split is that each outcome says only what is true of it.
     #[test]
     fn confirmed_termination_paths_state_the_cleanup_they_performed() {
-        let wedged =
-            daemon_child_startup_error("unit-profile", SpawnFailure::WedgedAndTerminated, true);
+        let wedged = daemon_child_startup_error(
+            "unit-profile",
+            SpawnFailure::WedgedAndTerminated,
+            HandoffObservation::Present,
+        );
         let CliError::DaemonStartup { detail, .. } = wedged else {
             panic!("expected DaemonStartup");
         };
@@ -7754,8 +7923,8 @@ mod tests {
             "wedged-and-killed must not read as a self-inflicted crash: {detail}"
         );
         assert!(
-            detail.contains("before consuming the bootstrap handoff"),
-            "handoff-pending stage must be reported: {detail}"
+            detail.contains("bootstrap handoff path was present at finalization"),
+            "only observed handoff state may be reported: {detail}"
         );
         assert!(
             detail.contains("RUST_LOG=info chanvoy --profile unit-profile daemon serve")
@@ -7766,6 +7935,75 @@ mod tests {
         assert!(
             !detail.contains("WebSocket"),
             "post-readiness websocket setup must not be named as a local startup blocker: {detail}"
+        );
+    }
+
+    #[test]
+    fn startup_uncertainty_has_no_retry_recipe_or_identity_inference() {
+        for handoff in [
+            HandoffObservation::Present,
+            HandoffObservation::Absent,
+            HandoffObservation::Unconfirmed,
+        ] {
+            let error = daemon_child_startup_error(
+                "synthetic-profile",
+                SpawnFailure::CleanupUnconfirmed { pid: Some(4242) },
+                handoff,
+            );
+            let detail = error.to_string();
+            assert!(
+                detail.contains("child death confirmed")
+                    && detail.contains("cleanup local-unconfirmed")
+            );
+            assert!(
+                detail.contains("ownership/liveness")
+                    && detail.contains("does not authorize another startup")
+            );
+            assert!(detail.contains("child identity resolution cannot be inferred"));
+            for lie in [
+                "daemon serve",
+                "daemon start`",
+                "failed past identity",
+                "after consuming",
+                "before consuming",
+                "startup residue cleared",
+            ] {
+                assert!(
+                    !detail.contains(lie),
+                    "uncertain receipt must not claim {lie}: {detail}"
+                );
+            }
+        }
+        let detail = daemon_child_startup_error(
+            "synthetic-profile",
+            SpawnFailure::WedgedAndTerminated,
+            HandoffObservation::Absent,
+        )
+        .to_string();
+        assert!(detail.contains("path was absent") && detail.contains("cannot be inferred"));
+        assert!(!detail.contains("past identity resolution"));
+        assert!(!detail.contains("after consuming"));
+    }
+
+    #[test]
+    fn handoff_observation_is_nonfollowing_and_unknown_is_not_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("handoff.json");
+        assert_eq!(observe_handoff_path(&path), HandoffObservation::Absent);
+        std::os::unix::fs::symlink("synthetic-missing-target", &path).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert_eq!(observe_handoff_path(&path), HandoffObservation::Present);
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "synthetic-secret-body").unwrap();
+        assert_eq!(observe_handoff_path(&path), HandoffObservation::Present);
+        assert_eq!(
+            observe_handoff_path(&path.join("child")),
+            HandoffObservation::Unconfirmed
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "synthetic-secret-body"
         );
     }
 
@@ -8551,5 +8789,267 @@ mod tests {
         let summary = preflight_failure_summary(&err);
         assert!(summary.contains("agent-seat"), "{summary}");
         assert!(summary.contains("agent-other"), "{summary}");
+    }
+    /// Run the real parent readiness loop in a child test process with private
+    /// roots. Its owned sleeper cannot bind; no identity-phase timer is involved.
+    #[tokio::test]
+    async fn real_parent_readiness_expiry_is_terminal() {
+        const FLAG: &str = "CHANVOY_F5_READINESS_FIXTURE";
+        if env::var_os(FLAG).is_none() {
+            let runtime = tempfile::tempdir().unwrap();
+            let config = tempfile::tempdir().unwrap();
+            let child = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::real_parent_readiness_expiry_is_terminal",
+                    "--nocapture",
+                ])
+                .env(FLAG, "1")
+                .env("CHANVOY_RUNTIME_DIR", runtime.path())
+                .env("CHANVOY_CONFIG_DIR", config.path())
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(25), child.wait_with_output())
+                    .await
+                    .expect("readiness fixture bound")
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let profile = "synthetic-parent-readiness";
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        let mut attempts = 0usize;
+        let error = await_spawn_readiness_with(
+            profile,
+            &mut child,
+            pid,
+            "synthetic-nonce",
+            ReadinessBudget::normal(),
+            || attempts += 1,
+        )
+        .await
+        .expect_err("owned child cannot become ready");
+        eprintln!(
+            "readiness attempts={attempts}; elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        assert!(attempts <= 41);
+        assert!(
+            started.elapsed() >= SPAWN_READY_DEADLINE,
+            "must reach actual readiness expiry"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(18));
+        assert!(error.to_string().contains("startup budget"));
+        assert!(error.to_string().contains("terminated and reaped"));
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "failed readiness leaves no owned survivor"
+        );
+        assert!(!pid_path_for_profile(profile).exists());
+        assert!(!socket_path_for_profile(profile).exists());
+        assert!(!chanvoy_core::bootstrap_path_for_profile(profile).exists());
+        // Count is an independent bound, even when the elapsed window is long
+        // and the synthetic local failures return without consuming a budget.
+        let mut retry = Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let retry_pid = retry.id();
+        let mut count = 0usize;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            await_spawn_readiness_with(
+                "synthetic-attempt-bound",
+                &mut retry,
+                retry_pid,
+                "synthetic-nonce",
+                ReadinessBudget {
+                    window: std::time::Duration::from_secs(3),
+                    probe: std::time::Duration::from_millis(25),
+                    interval: std::time::Duration::ZERO,
+                    attempts: 3,
+                },
+                || count += 1,
+            ),
+        )
+        .await
+        .expect("count bound independent of time");
+        assert!(result.is_err());
+        assert_eq!(
+            count, 4,
+            "three iterations plus one final race-closing probe"
+        );
+        assert!(retry.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn owned_startup_effect_guards_preserve_unconfirmed_state() {
+        const FLAG: &str = "CHANVOY_F5_EFFECT_FIXTURE";
+        if env::var_os(FLAG).is_none() {
+            let runtime = tempfile::tempdir().unwrap();
+            let config = tempfile::tempdir().unwrap();
+            let child = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::owned_startup_effect_guards_preserve_unconfirmed_state",
+                    "--nocapture",
+                ])
+                .env(FLAG, "1")
+                .env("CHANVOY_RUNTIME_DIR", runtime.path())
+                .env("CHANVOY_CONFIG_DIR", config.path())
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(8), child.wait_with_output())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut profile = sample_profile();
+        profile.name = "synthetic-owned-effects".into();
+        let identity = Identity {
+            id: "synthetic-id".into(),
+            username: profile.bot_username.clone(),
+            is_bot: true,
+            nickname: None,
+            email: None,
+        };
+        let path = chanvoy_core::bootstrap_path_for_profile(&profile.name);
+        std::fs::write(&path, "synthetic-secret-foreign-handoff").unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let mut spawns = 0usize;
+        let error = spawn_durable_daemon_with(&profile, &identity, &profile.name, |_| {
+            spawns += 1;
+            Err(std::io::Error::other(
+                "synthetic spawn must never be reached",
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(spawns, 0, "retained handoff refuses before spawn");
+        assert_eq!(
+            failure_disposition(&error, DaemonDisposition::Healthy),
+            DaemonDisposition::UnresponsiveLocal
+        );
+        assert!(error.to_string().contains("local-unconfirmed"));
+        assert!(!error.to_string().contains("synthetic-secret"));
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "synthetic-secret-foreign-handoff"
+        );
+        std::fs::remove_file(&path).unwrap();
+        let nonce = "synthetic-own-nonce";
+        let state =
+            chanvoy_core::build_bootstrap_state(&profile, &identity.id, nonce, std::process::id())
+                .unwrap();
+        chanvoy_core::write_bootstrap_state(&state).unwrap();
+        let body = std::fs::read(&path).unwrap();
+        let handoff_inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let pid_path = pid_path_for_profile(&profile.name);
+        std::fs::write(&pid_path, pid.to_string()).unwrap();
+        let socket_path = socket_path_for_profile(&profile.name);
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let pid_inode = std::fs::symlink_metadata(&pid_path).unwrap().ino();
+        let socket_inode = std::fs::symlink_metadata(&socket_path).unwrap().ino();
+        let mut signals = 0usize;
+        let error = finalize_failed_spawn_with(
+            &profile.name,
+            Some(pid),
+            nonce,
+            std::time::Duration::from_millis(30),
+            async {
+                signals += 1;
+                child.start_kill().unwrap();
+                std::future::pending::<Result<SpawnFailure, ()>>().await
+            },
+        )
+        .await;
+        assert_eq!(signals, 1, "deadline must not issue a follow-up signal");
+        assert!(error
+            .to_string()
+            .contains("could not be confirmed terminated"));
+        assert!(!error.to_string().contains("terminated and reaped"));
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().ino(),
+            handoff_inode
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&pid_path).unwrap().ino(),
+            pid_inode
+        );
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), pid.to_string());
+        assert_eq!(
+            std::fs::symlink_metadata(&socket_path).unwrap().ino(),
+            socket_inode
+        );
+        // Any death/reap here is the harness's later observation, never the
+        // expired operation's success evidence.
+        tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let error = finalize_failed_spawn_with(
+            &profile.name,
+            Some(pid),
+            "stale-parent-nonce",
+            std::time::Duration::from_secs(1),
+            async {
+                assert!(child.try_wait().unwrap().is_some());
+                Ok(SpawnFailure::WedgedAndTerminated)
+            },
+        )
+        .await;
+        assert!(error.to_string().contains("child death confirmed"));
+        assert!(error.to_string().contains("cleanup local-unconfirmed"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            body,
+            "stale parent cannot consume another handoff"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().ino(),
+            handoff_inode
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&pid_path).unwrap().ino(),
+            pid_inode
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&socket_path).unwrap().ino(),
+            socket_inode
+        );
+        drop(listener);
     }
 }

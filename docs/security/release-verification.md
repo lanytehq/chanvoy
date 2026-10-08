@@ -11,11 +11,11 @@ ceremony additionally verifies the pinned tag and exact CI run before signing.
 Download the chosen binary, its `.minisig`, `chanvoy.pub`, `chanvoy.gpg.asc`,
 `checksums.txt` and `checksums.txt.asc`. Authenticate the public keys against your
 independently pinned fingerprints, import the approved public GPG key into an
-isolated keyring, then run:
+`verification-home` isolated keyring, then run:
 
 ```bash
 minisign -Vm chanvoy-vX.Y.Z-linux-x86_64 -p chanvoy.pub
-gpg --verify checksums.txt.asc checksums.txt
+gpg --homedir verification-home --verify checksums.txt.asc checksums.txt
 sha256sum -c checksums.txt --ignore-missing
 ```
 
@@ -41,6 +41,46 @@ The rotation notice must name the effective version, old and re-derived new
 fingerprints, exact signing subkey and verification commands. Tooling adoption
 alone does not rotate keys or authorize donor fingerprints. Keep historical
 verification guidance and anchors available for prior releases.
+
+## v0.3.2 identity
+
+Starting with v0.3.2, authenticate release keys using the tagged TXT/NDJSON
+anchor pair and the [selected public GPG export](release-signing-keys.asc).
+The identity changes from the v0.3.1 fingerprints below to:
+
+| Key | v0.3.2 fingerprint |
+|---|---|
+| OpenPGP primary | `0CACA49B3119B6BC12B2CA11B9B485F294B9FE07` |
+| Minisign decoded public blob SHA-256 | `c6c2a0d6e08842889ba07cf1ad28fcd9275336d86a0e868ed6070fdfbe818928` |
+
+The exact OpenPGP signing subkey is
+`DAB70DD758911B26BB45A08C3B75AC591449DEBE`. Manifest signatures must use this
+subkey. The selected public export contains the primary and this signing
+subkey. The maintainer selects it with the full fingerprint followed by `!`.
+
+Using independently obtained anchors and Decernor >=0.1.8, verify the downloaded
+public files before the signature and checksum commands above:
+
+```bash
+mkdir -m 700 verification-home
+decernor fingerprint verify --anchors expected-fingerprints.txt \
+  --anchors-ndjson expected-fingerprints.ndjson \
+  --gpg chanvoy.gpg.asc --minisign chanvoy.pub
+gpg --homedir verification-home --show-keys --with-subkey-fingerprint chanvoy.gpg.asc
+```
+
+Confirm the primary and signing-subkey fingerprints shown match this identity,
+then import the verified public key into that isolated keyring:
+
+```bash
+gpg --homedir verification-home --import chanvoy.gpg.asc
+gpg --homedir verification-home --status-fd 1 --verify checksums.txt.asc checksums.txt
+```
+
+Require a successful `VALIDSIG` for the exact signing subkey and primary above
+before using the checksum commands. The key import and verification use only
+this isolated keyring.
+Use the historical identity for v0.3.1 downloads.
 
 ## Historical v0.3.1
 

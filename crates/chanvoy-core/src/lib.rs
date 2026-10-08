@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod host_build_info;
 pub mod recovery;
 pub mod safe_read;
+pub mod startup;
 pub mod wait_channels;
 pub mod wait_dm;
 pub mod wait_follow;

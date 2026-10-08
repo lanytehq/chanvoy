@@ -39,8 +39,8 @@ use std::time::Duration;
 
 use chanvoy_core::{rpc_result, AttentionState, ChannelCursorState, JsonRpcRequest, Profile};
 use common::{
-    kill_daemon, read_attention_state, run_chanvoy, spawn_daemon, stop_daemon_cleanly,
-    wait_for_ws_failure, TestEnv,
+    daemon_serving, kill_daemon, read_attention_state, run_chanvoy, spawn_daemon,
+    stop_daemon_cleanly, wait_for_ws_failure, TestEnv,
 };
 use tokio::process::Command;
 use tokio::{
@@ -170,21 +170,27 @@ async fn post_cursor_survives_sigkill_restart() {
         Some("post-id-ac2-phase1"),
     );
 
-    // SIGKILL. `daemon::start` cleans up stale socket on next boot, so no
-    // pre-boot cleanup is needed here.
+    // SIGKILL. Foreground serve retains an unsuccessful existing-socket
+    // probe; CLI start owns confirmed-dead recovery before spawning again.
     kill_daemon(daemon).await;
 
     env.reset_mocks().await;
     env.mock_baseline("bot-id-ac2", "agent-bravo-devlead", "team-id-456")
         .await;
 
-    let daemon2 = spawn_daemon(&env).await;
+    let recovery = run_chanvoy(&env, &["daemon", "start"]).await;
+    assert!(
+        recovery.status.success(),
+        "confirmed-dead restart: {}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    assert!(daemon_serving(&env).await);
     let state_after = read_attention_state(&env).expect("state file survives sigkill");
     assert_eq!(
         state_after, state_before,
         "attention state must survive SIGKILL — writes are synchronous fs::write"
     );
-    let _ = stop_daemon_cleanly(&env, daemon2).await;
+    teardown_auto_setup_daemon(&env).await;
 }
 
 /// AC #3: notifications_cursor persists across clean restart. Exercises the
@@ -1157,8 +1163,12 @@ async fn daemon_start_refuses_on_bot_identity_mismatch() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("agent-bravo-devlead") && stderr.contains("agent-impostor"),
-        "refusal must name both the expected and actual identity; stderr={stderr}"
+        stderr.contains("identity-refused") && stderr.contains("parent identity mismatch"),
+        "refusal must retain the structural identity classification; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("agent-impostor"),
+        "raw whoami must not escape: {stderr}"
     );
 
     // Nothing was spawned: no daemon, and no handoff left on disk.
@@ -1233,8 +1243,8 @@ async fn daemon_start_classifies_child_startup_failure() {
          stderr={stderr}"
     );
     assert!(
-        stderr.contains("before consuming the bootstrap handoff"),
-        "classification must name the startup stage the child died in; stderr={stderr}"
+        stderr.contains("bootstrap handoff path was present at finalization"),
+        "classification must report observed handoff state without inferring identity; stderr={stderr}"
     );
     assert!(
         stderr.contains("daemon serve"),
@@ -1574,9 +1584,9 @@ fn write_reduce_pair(env: &TestEnv, family_name: &str, family_server_url: &str) 
 /// two-daemons-one-profile, the condition the lifecycle code exists to
 /// prevent. A failed start must be terminal.
 ///
-/// The hang is deterministic, not timing-luck: the stream profile carries a
+/// The phase failure is deterministic: the stream profile carries a
 /// reduce policy whose family profile lives on a second mock server that
-/// delays `whoami` well past the startup budget. The daemon child blocks in
+/// delays `whoami` past the two-second family phase. The daemon child fails in
 /// `build_reduce_writer` — before bind, before consuming the handoff — while
 /// the parent's own stream-identity validation against the primary mock
 /// succeeds normally.
@@ -1616,8 +1626,10 @@ async fn daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon()
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("daemon startup failed") && stderr.contains("startup budget"),
-        "timeout must be classified as a startup failure; stderr={stderr}"
+        stderr.contains("daemon startup failed")
+            && stderr.contains("exited on its own")
+            && stderr.contains("bootstrap handoff path was present at finalization"),
+        "bounded family failure must retain its parent startup classification; stderr={stderr}"
     );
 
     // TERMINAL-FAILURE PROOF: nothing from that spawn survives.

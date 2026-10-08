@@ -463,12 +463,13 @@ pub async fn wait_with_params_v3(
 }
 
 /// Held single-channel wait through waitprims `run_follow`.
-pub async fn wait_with_params_follow(
+pub(crate) async fn wait_with_params_follow(
     state: &AppState,
     req: WaitRequest<'_>,
     stream: FollowStreamSender,
     coalesce_ms: Option<u64>,
     client_gone: tokio_util::sync::CancellationToken,
+    delivery: crate::follow_delivery::ChannelDelivery,
 ) -> Result<chanvoy_core::WaitFollowResult, CoreError> {
     let WaitRequest {
         channel,
@@ -484,6 +485,7 @@ pub async fn wait_with_params_follow(
     validate_wait_timeout_secs(timeout_secs)?;
     validate_wait_channel_v3_strings(channel, team, contains, pattern, after)?;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    delivery.publish_deadline(deadline);
 
     WaitPredicate::compile(
         "pending",
@@ -493,50 +495,62 @@ pub async fn wait_with_params_follow(
         mention,
         &state.profile.bot_username,
     )?;
-    let monitored = channel_is_monitored(state, channel);
-    if monitored {
-        refuse_current_ws_failure(state, channel).await?;
-    }
-    let resolved = provider_retry(state, channel, deadline, || async {
-        state.client.resolve_channel(channel, team).await
-    })
-    .await?;
+    let acquire = async {
+        let monitored = channel_is_monitored(state, channel);
+        if monitored {
+            refuse_current_ws_failure(state, channel).await?;
+        }
+        let resolved = provider_retry(state, channel, deadline, || async {
+            state.client.resolve_channel(channel, team).await
+        })
+        .await?;
 
-    let prebound_after = if let Some(anchor) = after {
-        let (scan, baseline) =
-            establish_baseline(state, channel, &resolved.channel_id, Some(anchor), deadline)
-                .await?;
-        Some(crate::waitprims_hold::cursor_from_baseline(scan, baseline))
-    } else {
-        None
+        let prebound_after = if let Some(anchor) = after {
+            let (scan, baseline) =
+                establish_baseline(state, channel, &resolved.channel_id, Some(anchor), deadline)
+                    .await?;
+            Some(crate::waitprims_hold::cursor_from_baseline(scan, baseline))
+        } else {
+            None
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let lease = if is_dm_channel_name(&resolved.channel_name) {
+            state
+                .wait_owners
+                .acquire_direct(
+                    &resolved.channel_id,
+                    &resolved.team_name,
+                    &resolved.channel_name,
+                    replace_wait_id,
+                    remaining,
+                )
+                .await?
+        } else {
+            state
+                .wait_owners
+                .acquire(
+                    &resolved.channel_id,
+                    &resolved.team_name,
+                    &resolved.channel_name,
+                    replace_wait_id,
+                    remaining,
+                )
+                .await?
+        };
+        Ok::<_, CoreError>((monitored, resolved, prebound_after, lease))
     };
-
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let lease = if is_dm_channel_name(&resolved.channel_name) {
-        state
-            .wait_owners
-            .acquire_direct(
-                &resolved.channel_id,
-                &resolved.team_name,
-                &resolved.channel_name,
-                replace_wait_id,
-                remaining,
-            )
-            .await?
-    } else {
-        state
-            .wait_owners
-            .acquire(
-                &resolved.channel_id,
-                &resolved.team_name,
-                &resolved.channel_name,
-                replace_wait_id,
-                remaining,
-            )
-            .await?
+    let (monitored, resolved, prebound_after, lease) = tokio::select! {
+        biased;
+        result = acquire => result?,
+        _ = delivery.stopped() => return Err(CoreError::WaitProviderDegraded {
+            channel: channel.to_string(),
+            message: "held wait ended before ownership admission".into(),
+        }),
     };
     state.wait_owners.note_arm();
     let (session, guard) = lease.into_guard();
+    delivery.publish_session(&session);
     let predicate = WaitPredicate::compile(
         &state.my_user_id,
         &resolved.channel_id,
@@ -562,6 +576,7 @@ pub async fn wait_with_params_follow(
         stream,
         coalesce_ms,
         client_gone,
+        Some(delivery),
     )
     .await
 }
@@ -742,6 +757,7 @@ pub async fn wait_with_params_dm_follow(
         stream,
         coalesce_ms,
         client_gone,
+        None, // Dedicated DM RPC retains the legacy runner/writer route.
     )
     .await?;
     Ok(WaitDmFollowResult::from_follow(
@@ -2731,5 +2747,196 @@ mod tests {
             refuse_current_ws_failure(&state, "push").await.is_ok(),
             "the single authoritative completion commit opens admission"
         );
+    }
+    #[tokio::test]
+    async fn channel_follow_validation_refusal_uses_actual_wrapper_driver_and_ready_only_writer() {
+        use crate::follow_delivery::{tests::HeldWriter, ChannelDelivery};
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::UnixStream;
+        for invalid_channel in [false, true] {
+            for stage in [None, Some(0), Some(7)] {
+                let mock = wiremock::MockServer::start().await;
+                let mut state = state_with_failed_ws(&[]).await;
+                state.profile.server_url = mock.uri();
+                state.client =
+                    MattermostClient::new(&state.profile, "synthetic-token".into()).unwrap();
+                let state = Arc::new(state);
+                let watched = Arc::clone(&state);
+                let (server, client) = UnixStream::pair().unwrap();
+                let (read, write) = server.into_split();
+                write.as_ref().writable().await.unwrap();
+                let mut writer = HeldWriter::new(write, stage, false);
+                let mut reader = BufReader::new(read);
+                let delivery = ChannelDelivery::new(tokio_util::sync::CancellationToken::new());
+                let watched_delivery = delivery.clone();
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let task = tokio::spawn(async move {
+                    let follow = wait_with_params_follow(
+                        &state,
+                        WaitRequest {
+                            channel: if invalid_channel { "" } else { "ops" },
+                            timeout_secs: if invalid_channel { 2 } else { 0 },
+                            team: Some("org"),
+                            contains: None,
+                            pattern: None,
+                            mention: false,
+                            after: None,
+                            replace_wait_id: None,
+                            emit_wait_ids: true,
+                        },
+                        tx,
+                        None,
+                        tokio_util::sync::CancellationToken::new(),
+                        delivery.clone(),
+                    );
+                    delivery
+                        .serve(&mut writer, &mut reader, uuid::Uuid::nil(), rx, follow)
+                        .await
+                });
+                let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(outcome.is_ok(), stage.is_none());
+                let mut client = BufReader::new(client);
+                let mut line = String::new();
+                client.read_line(&mut line).await.unwrap();
+                if stage.is_none() {
+                    let response: serde_json::Value =
+                        serde_json::from_str(line.trim_end()).unwrap();
+                    assert!(response["error"].is_object());
+                    assert!(response.get("result").is_none());
+                } else {
+                    assert!(!line.ends_with('\n'));
+                }
+                assert!(watched_delivery.published_deadline().is_none());
+                assert!(!watched_delivery.session_published());
+                assert!(!watched_delivery.armed_committed());
+                assert!(watched.wait_owners.snapshot("ch-1").is_none());
+                assert_eq!(watched.wait_owners.armed_count(), 0);
+                assert_eq!(watched.wait_owners.provider_io_count(), 0);
+                assert!(watched.subscriptions.lock().await.is_empty());
+                assert!(mock.received_requests().await.unwrap().is_empty());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn channel_follow_later_validation_uses_original_deadline_without_early_exemption() {
+        use crate::follow_delivery::{tests::HeldWriter, ChannelDelivery};
+        use tokio::io::BufReader;
+        use tokio::net::UnixStream;
+        let mock = wiremock::MockServer::start().await;
+        let mut state = state_with_failed_ws(&[]).await;
+        state.profile.server_url = mock.uri();
+        state.client = MattermostClient::new(&state.profile, "synthetic-token".into()).unwrap();
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (read, write) = server.into_split();
+        let mut writer = HeldWriter::new(write, Some(0), false);
+        let mut reader = BufReader::new(read);
+        let client_gone = tokio_util::sync::CancellationToken::new();
+        let delivery = ChannelDelivery::new(client_gone.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let follow = wait_with_params_follow(
+            &state,
+            WaitRequest {
+                channel: "ops",
+                timeout_secs: 1,
+                team: Some("org"),
+                contains: None,
+                pattern: Some("["),
+                mention: false,
+                after: None,
+                replace_wait_id: None,
+                emit_wait_ids: true,
+            },
+            tx,
+            None,
+            client_gone,
+            delivery.clone(),
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_secs(3),
+            delivery.serve(&mut writer, &mut reader, uuid::Uuid::nil(), rx, follow)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(Instant::now() >= delivery.published_deadline().unwrap());
+        assert!(!delivery.session_published());
+        assert!(!delivery.armed_committed());
+        assert_eq!(state.wait_owners.armed_count(), 0);
+        assert_eq!(state.wait_owners.provider_io_count(), 0);
+        assert!(mock.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_follow_eof_interrupts_actual_preacquire_provider_future() {
+        use crate::follow_delivery::ChannelDelivery;
+        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&mock)
+            .await;
+        let mut state = state_with_failed_ws(&[]).await;
+        state.profile.server_url = mock.uri();
+        state.client = MattermostClient::new(&state.profile, "synthetic-token".into()).unwrap();
+        let state = Arc::new(state);
+        let watched = Arc::clone(&state);
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (read, mut writer) = server.into_split();
+        writer.as_ref().writable().await.unwrap();
+        let mut reader = BufReader::new(read);
+        let client_gone = tokio_util::sync::CancellationToken::new();
+        let delivery = ChannelDelivery::new(client_gone.clone());
+        let watched_delivery = delivery.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let follow = wait_with_params_follow(
+                &state,
+                WaitRequest {
+                    channel: "ops",
+                    timeout_secs: 3,
+                    team: Some("org"),
+                    contains: None,
+                    pattern: None,
+                    mention: false,
+                    after: None,
+                    replace_wait_id: None,
+                    emit_wait_ids: true,
+                },
+                tx,
+                None,
+                client_gone,
+                delivery.clone(),
+            );
+            delivery
+                .serve(&mut writer, &mut reader, uuid::Uuid::nil(), rx, follow)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mock.received_requests().await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        client.shutdown().await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        assert!(Instant::now() < watched_delivery.published_deadline().unwrap());
+        assert!(!watched_delivery.session_published());
+        assert!(!watched_delivery.armed_committed());
+        assert_eq!(watched.wait_owners.armed_count(), 0);
+        assert!(watched.subscriptions.lock().await.is_empty());
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
     }
 }
