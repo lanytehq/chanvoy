@@ -84,10 +84,9 @@ jobs:
           set -euo pipefail
           qual_dir="$RUNNER_TEMP/qualification-linux-x86_64"
           mkdir -m700 "$qual_dir"
-          cargo fetch --locked >"$qual_dir/fetch.log" 2>&1
-          # Same compilation flags as make build-release; JSON is output formatting only.
-          cargo build --release --locked --package chanvoy --message-format=json-render-diagnostics \
-            >"$qual_dir/normal-build.jsonl" 2>"$qual_dir/normal-build.stderr.log"
+          python3 scripts/build-production-binary.py --root "$PWD" --platform linux-x86_64 \
+            --expected-commit "$QUALIFICATION_COMMIT" --mode candidate --output "$qual_dir" \
+            >"$qual_dir/producer.log" 2>&1
       - name: Qualify preserved candidate bytes
         timeout-minutes: 15
         run: |

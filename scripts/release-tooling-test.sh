@@ -6,6 +6,7 @@ for tool in bash python3 git gpg gpgconf minisign jq shasum; do
 	command -v "$tool" >/dev/null || { echo "error: required test tool missing: $tool" >&2; exit 1; }
 done
 export CHANVOY_DECERNOR_BIN="${CHANVOY_DECERNOR_BIN:-$(command -v decernor)}"
+python3 -B "$root/scripts/production-build-policy.test.py"
 python3 -B "$root/scripts/qualify-production-binary.test.py"
 python3 -B "$root/scripts/shipping-sbom.test.py"
 for test in release-decernor-resolver release-workflow-permissions release-assets release-staging \

@@ -23,6 +23,10 @@ DRIVER = REPO / "scripts/qualify-production-binary.py"
 HEAD = "a" * 40
 TREE = "b" * 40
 RUST = "rustc 1.89.0 (29483883e 2025-08-04)"
+native_spec = importlib.util.spec_from_file_location("native_synthetic", REPO / "scripts/production-build-policy.test.py")
+native = importlib.util.module_from_spec(native_spec)
+native_spec.loader.exec_module(native)
+
 TARGETS = {
     "linux-x86_64": ("x86_64-unknown-linux-gnu", "linux/x86_64"),
     "linux-aarch64": ("aarch64-unknown-linux-gnu", "linux/aarch64"),
@@ -56,6 +60,7 @@ def executable(path, body):
 
 class Synthetic:
     def __init__(self, directory, platform="linux-x86_64", **changes):
+        directory = directory.resolve()
         self.root = directory / "source"
         self.out = directory / "evidence"
         self.root.mkdir()
@@ -69,7 +74,10 @@ class Synthetic:
         self.state.update(changes)
         self.state_path.write_text(json.dumps(self.state))
         (self.root / "Cargo.toml").write_text('[package]\nname="chanvoy"\nversion="0.3.2"\n')
-        (self.root / "Cargo.lock").write_text("synthetic locked packages\n")
+        (self.root / "Cargo.lock").write_text("version = 4\n" + native.native_lock())
+        (self.root / "scripts").mkdir()
+        for name in native.policy.SOURCE_FILES:
+            (self.root / "scripts" / name).write_bytes((REPO / "scripts" / name).read_bytes())
         (self.root / "VERSION").write_text("0.3.2\n")
         self.cargo_home = directory / "owned-cargo-home"
         for key, location in (("cargo_config", self.root / ".cargo"),
@@ -118,7 +126,7 @@ def event(name,kind,path,test):
              profile=dict(test=test,opt_level='0',debug_assertions=True),
              executable=str(path),features=[])
 if sys.argv[1]=='metadata':
- print(json.dumps(dict(packages=[dict(name='chanvoy',id=package,manifest_path=str(root/'Cargo.toml'))],
+ print(json.dumps(dict(packages=[dict(name='chanvoy',id=package,manifest_path=str(root/'Cargo.toml')), state['aws_package']],
                        target_directory=str(target))))
  if state.get('human_stderr'):print('warning: synthetic metadata diagnostic',file=sys.stderr)
  if state.get('malformed_stdout')=='metadata':print('invalid machine output')
@@ -187,6 +195,27 @@ else:
             self.normal.write_text(json.dumps(normal_event) + "\n")
         if changes.get("duplicate_compiler"):
             self.normal.write_text("".join(json.dumps(x) + "\n" for x in [normal_event, *events]))
+
+        metadata = {"packages": [{"name": "chanvoy", "id": self.package_id,
+                                   "manifest_path": str(self.root / "Cargo.toml")}]}
+        complete = [json.loads(x) for x in self.normal.read_text().splitlines()]
+        native_out = native.add_native(complete, metadata, self.root)
+        native_out.mkdir(parents=True)
+        (native_out.parent / "output").write_text(native.native_output(native_out))
+        (native_out / native.policy.ARCHIVE).write_bytes(b"!<arch>\nowned synthetic source archive\n")
+        self.state["aws_package"] = native.native_package()
+        self.state_path.write_text(json.dumps(self.state))
+        mode = "candidate" if platform == "linux-x86_64" else "shipping"
+        expected = {"commit": HEAD, "tree": TREE, "lock_sha256": native.inputs.digest(self.root / "Cargo.lock"),
+                    "platform": platform, "target": target, "mode": mode,
+                    "tag": "v0.3.2" if mode == "shipping" else None,
+                    "tag_object": "d" * 40 if mode == "shipping" else None,
+                    "workflow": {"ref": os.environ.get("GITHUB_WORKFLOW_REF"), "sha": os.environ.get("GITHUB_WORKFLOW_SHA"),
+                                 "event_sha": os.environ.get("GITHUB_SHA"), "run_id": os.environ.get("GITHUB_RUN_ID"),
+                                 "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT")}}
+        self.producer = native.seal_synthetic(self.out, self.root, complete, metadata, self.normal_bytes, expected)
+        (self.out / "normal-Cargo.lock").write_bytes((self.root / "Cargo.lock").read_bytes())
+        self.normal.write_bytes((self.out / "normal-build.jsonl").read_bytes())
 
     def run(self, **overrides):
         env = os.environ.copy()
@@ -299,6 +328,29 @@ class QualificationTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("compiler override", receipt["failure"])
 
+    def test_substituted_normal_payload_after_legacy_hash_recompute_refuses_before_fixtures(self):
+        with tempfile.TemporaryDirectory(prefix="cv-producer-payload-") as directory:
+            fixture = Synthetic(Path(directory))
+            fixture.cli.write_bytes(fixture.normal_bytes + b"\n# owned substituted payload\n")
+            replacement = hashlib.sha256(fixture.cli.read_bytes()).hexdigest()
+            result, receipt = fixture.run(hash=replacement)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("producer normal executable association", receipt["failure"])
+            self.assertEqual(receipt["suites"], [])
+            self.assertNotIn("fixture-compile", [x["stage"] for x in receipt["commands"]])
+
+    def test_missing_wrong_size_mode_and_policy_fields_refuse_before_fixtures(self):
+        for field, wrong in (("normal_executable", None), ("normal_executable", {"sha256": "1" * 64, "bytes": 1}),
+                             ("mode", "local"), ("target", "wrong"), ("source_files_sha256", {})):
+            with self.subTest(field=field), tempfile.TemporaryDirectory(prefix="cv-producer-association-") as directory:
+                fixture = Synthetic(Path(directory))
+                fixture.producer[field] = wrong
+                native.json_file(fixture.out / "native-build-policy.json", fixture.producer)
+                result, receipt = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(receipt["suites"], [])
+                self.assertNotIn("fixture-compile", [x["stage"] for x in receipt["commands"]])
+
     def test_process_horizon_is_failed_not_a_suite_assertion(self):
         with tempfile.TemporaryDirectory(prefix="cv-qualify-horizon-") as directory:
             fixture = Synthetic(Path(directory))
@@ -371,8 +423,9 @@ class QualificationTests(unittest.TestCase):
             fixture = Synthetic(Path(directory))
             result, receipt = fixture.run(env={"CARGO_TARGET_DIR": str(fixture.root / "target"),
                                               "CARGO_TARGET_TMPDIR": str(Path(directory) / "owned-output")})
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(receipt["status"], "pass")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(receipt["failure"], "unsupported Cargo selector: CARGO_TARGET_DIR")
+            self.assertEqual(receipt["commands"], [])
 
     def test_unapproved_cargo_config_cannot_select_a_hidden_compiler(self):
         for location in ("cargo_config", "cargo_parent_config", "cargo_home_config"):

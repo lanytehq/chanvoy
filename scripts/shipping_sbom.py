@@ -13,6 +13,8 @@ from bounded_evidence import EvidenceError
 from offline_schema import regular_bytes, sha
 from offline_schema import validate as validate_schema
 from sbom_evidence import Controller, scanner
+import production_build_policy as policy
+from production_build_inputs import verify_native_policy, bounded_file, budget_check
 
 
 PLATFORMS = {"linux-x86_64": "x86_64-unknown-linux-gnu",
@@ -136,11 +138,11 @@ def normal_projection(events, metadata, root):
     return packages, roles, units, scripts
 
 
-def bind_platform(platform, folder, payload, expected):
+def bind_platform(platform, folder, payload, expected, check=lambda: None):
     qualification = object_file(folder / "qualification.json")
     captured = object_file(folder / "normal-build-inputs.json")
     if (qualification.get("status") != "pass" or qualification.get("mode") != "shipping"
-            or captured.get("schema") != "normal-build-inputs-v1"
+            or captured.get("schema") != "normal-build-inputs-v2"
             or captured.get("before_fixture_compilation") is not True or captured.get("mode") != "shipping"):
         raise EvidenceError("missing successful shipping qualification/input receipt")
     for field in ("commit", "tree", "tag", "tag_object", "lock_sha256"):
@@ -157,10 +159,12 @@ def bind_platform(platform, folder, payload, expected):
         if not value.get("rustc", "").startswith("rustc 1.89.0 "):
             raise EvidenceError("unsupported shipping compiler")
     asset = "chanvoy-v" + expected["version"] + "-" + platform
-    payload_hash = sha(regular_bytes(payload))
+    payload_observation = bounded_file(payload, payload.parent, policy.EXECUTABLE_LIMIT, check)["observation"]
+    payload_hash = payload_observation["sha256"]
     if (payload.name != asset or qualification.get("payload") != asset or captured.get("payload") != asset
             or qualification.get("payload_sha256") != payload_hash or captured.get("payload_sha256") != payload_hash
-            or sha(regular_bytes(folder / "payload" / asset)) != payload_hash):
+            or bounded_file(folder / "payload" / asset, folder, policy.EXECUTABLE_LIMIT, check)["observation"]
+                != payload_observation):
         raise EvidenceError("shipping payload association mismatch")
     if (qualification.get("normal_build_inputs") != "normal-build-inputs.json"
             or qualification.get("normal_build_inputs_sha256") != sha(regular_bytes(folder / "normal-build-inputs.json"))
@@ -203,6 +207,25 @@ def bind_platform(platform, folder, payload, expected):
             or normal_roots[0]["profile"].get("opt_level") not in ("1", "2", "3", "s", "z")
             or normal_roots[0]["profile"].get("debug_assertions") or normal_roots[0].get("features") != []):
         raise EvidenceError("not the approved optimized root build")
+    expected_policy = {**expected, "mode": "shipping", "platform": platform, "target": PLATFORMS[platform]}
+    producer, producer_hash, manifest_hash = verify_native_policy(
+        folder, expected_policy, SCRIPTS.parent, events, metadata, payload, check)
+    policy.bind_payload(producer, bounded_file(folder / "payload" / asset, folder,
+                                             policy.EXECUTABLE_LIMIT, check)["observation"])
+    for value in (qualification, captured):
+        if (value.get("native_build_policy") != "native-build-policy.json"
+                or value.get("native_build_policy_sha256") != producer_hash
+                or value.get("native_snapshot_manifest_sha256") != manifest_hash
+                or value.get("normal_executable") != producer["normal_executable"]):
+            raise EvidenceError("shipping native producer association mismatch")
+    aws_rows = [r for r in native["build_scripts"] if r["package_id"] == producer["native_package"]["package_id"]]
+    if len(aws_rows) != len(producer["native_events"]):
+        raise EvidenceError("missing native build-script producer association")
+    for row, observed in zip(aws_rows, producer["native_events"]):
+        archives = [{"name": a.get("name"), "sha256": a.get("sha256")} for a in row.get("archives", [])]
+        if (archives != [{"name": policy.ARCHIVE, "sha256": observed["archive"]["sha256"]}]
+                or row.get("unresolved_static_inputs")):
+            raise EvidenceError("native producer archive/input association mismatch")
     return captured, events, metadata, payload_hash
 
 
@@ -232,7 +255,10 @@ def inventory(platform, captured, events, metadata, payload_hash, expected, scan
                               "properties": properties({"evidence-class": "artifact-observation",
                                                         "target": PLATFORMS[platform], "source-commit": expected["commit"],
                                                         "source-tree": expected["tree"],
-                                                        "native-build-tool-discovery": json.dumps(public_discovery, sort_keys=True)})}, packages[root].get("license"))]
+                                                        "native-build-tool-discovery": json.dumps(public_discovery, sort_keys=True),
+                                                        "native-backend-policy": "bundled-source-v1",
+                                                        "native-build-policy-sha256": captured["native_build_policy_sha256"],
+                                                        "native-snapshot-manifest-sha256": captured["native_snapshot_manifest_sha256"]})}, packages[root].get("license"))]
     if packages[root]["version"] != expected["version"]:
         raise EvidenceError("root version differs from shipping version")
     native_by_package = {}
@@ -316,7 +342,7 @@ def inventory(platform, captured, events, metadata, payload_hash, expected, scan
     return components
 
 
-def assemble(evidence, binaries, scans, expected):
+def assemble(evidence, binaries, scans, expected, check=lambda: None):
     if set(evidence) != set(PLATFORMS) or set(scans) != set(PLATFORMS):
         raise EvidenceError("missing or duplicate shipping platform")
     expected_assets = {"chanvoy-v" + expected["version"] + "-" + p for p in PLATFORMS}
@@ -326,7 +352,7 @@ def assemble(evidence, binaries, scans, expected):
     components = []
     for platform in sorted(PLATFORMS):
         payload = binaries / ("chanvoy-v" + expected["version"] + "-" + platform)
-        captured, events, metadata, digest = bind_platform(platform, evidence[platform], payload, expected)
+        captured, events, metadata, digest = bind_platform(platform, evidence[platform], payload, expected, check)
         components.extend(inventory(platform, captured, events, metadata, digest, expected, scans[platform]))
     components.sort(key=lambda x: x["bom-ref"])
     if len({x["bom-ref"] for x in components}) != len(components):
@@ -406,7 +432,8 @@ def main():
             raise EvidenceError("unexpected canonical binary inventory")
         # Bind every native input before any artifact scan is admitted.
         for p in PLATFORMS:
-            bind_platform(p, evidence[p], args.binaries / ("chanvoy-v" + args.version + "-" + p), expected)
+            bind_platform(p, evidence[p], args.binaries / ("chanvoy-v" + args.version + "-" + p), expected,
+                          lambda: budget_check(controller))
         version = json.loads(scanner(controller, "syft-version", ["version", "-o", "json"], TOOLS["syft"]))
         if not isinstance(version, dict) or version.get("version") != TOOLS["syft"]["version"]:
             raise EvidenceError("pinned scanner reports wrong version")
@@ -418,7 +445,7 @@ def main():
             payload = args.binaries / ("chanvoy-v" + args.version + "-" + p)
             scans[p] = json.loads(scanner(controller, "syft-" + p,
                                           ["file:/payload/" + payload.name, "-o", "syft-json"], TOOLS["syft"], payload))
-        value = assemble(evidence, args.binaries, scans, expected)
+        value = assemble(evidence, args.binaries, scans, expected, lambda: budget_check(controller))
         candidate = controller.out / "candidate-bom.json"
         candidate.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         validated = validate_schema(controller, candidate, goneat)

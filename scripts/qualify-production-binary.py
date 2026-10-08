@@ -17,7 +17,9 @@ import time
 
 sys.dont_write_bytecode = True
 from bounded_evidence import EvidenceCommands, EvidenceError as QualificationError, json_write
-from production_build_inputs import capture as capture_build_inputs
+from production_build_inputs import (capture as capture_build_inputs, cargo_configuration_absent,
+                                     bounded_file, budget_check, verify_native_policy)
+import production_build_policy as policy
 
 
 PLATFORMS = {
@@ -190,6 +192,11 @@ class Driver(EvidenceCommands):
         }
         self.save()
 
+    def command(self, name, argv, horizon, env=None, **kwargs):
+        if argv and argv[0] == "cargo":
+            env = policy.child_environment(os.environ, PLATFORMS[self.args.platform][0])
+        return super().command(name, argv, horizon, env, **kwargs)
+
     def git(self, name, *args):
         return self.command(name, ["git", *args], 10).strip()
 
@@ -209,31 +216,8 @@ class Driver(EvidenceCommands):
         self.save()
 
     def qualify(self):
-        for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
-                     "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
-                     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS"):
-            if name in os.environ:
-                raise QualificationError("unsupported compiler override: " + name)
-        if any(name.startswith("CARGO_PROFILE_") for name in os.environ):
-            raise QualificationError("unsupported Cargo profile override")
-        for name in os.environ:
-            target_selector = (name.startswith("CARGO_TARGET_")
-                               and name.endswith(("_RUSTFLAGS", "_LINKER", "_RUNNER", "_RUSTDOCFLAGS")))
-            if (target_selector or name == "CARGO_TARGET_APPLIES_TO_HOST"
-                    or name.startswith(("CARGO_HOST_", "CARGO_UNSTABLE_"))):
-                raise QualificationError("unsupported Cargo selector: " + name)
-        # No Cargo config is approved by this fixed build contract. Presence
-        # refusal covers hidden compiler/wrapper/flag selection without parsing
-        # or disclosing unknown configuration contents (including symlinks).
-        cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
-        if not cargo_home.is_absolute():
-            cargo_home = self.root / cargo_home
-        config_dirs = [directory / ".cargo" for directory in (self.root, *self.root.parents)]
-        for directory in (*config_dirs, cargo_home):
-            for filename in ("config", "config.toml"):
-                path = directory / filename
-                if path.exists() or path.is_symlink():
-                    raise QualificationError("unsupported Cargo configuration")
+        policy.admit_selectors(os.environ, PLATFORMS[self.args.platform][0])
+        cargo_configuration_absent(self.root)
         self.receipt["cargo_configuration"] = "absent"
         self.boundary("before")
         target, pin_platform = PLATFORMS[self.args.platform]
@@ -274,8 +258,26 @@ class Driver(EvidenceCommands):
             raise QualificationError("normal executable is not the declared native release path")
         supplied = regular(self.args.binary)
         expected_hash = self.args.expected_sha256
-        if digest(original) != expected_hash or digest(supplied) != expected_hash:
+        normal_observation = bounded_file(original, target_dir, policy.EXECUTABLE_LIMIT,
+                                          lambda: budget_check(self))["observation"]
+        supplied_observation = bounded_file(supplied, supplied.parent, policy.EXECUTABLE_LIMIT,
+                                            lambda: budget_check(self))["observation"]
+        if normal_observation["sha256"] != expected_hash or supplied_observation["sha256"] != expected_hash:
             raise QualificationError("normal payload hash mismatch")
+        # Mandatory producer binding precedes even pin/suite admission. Original
+        # runner paths are read only here for the actual normal executable.
+        self.receipt.update(package_id=package_id)
+        expected_policy = {**self.receipt, "mode": self.args.mode, "tag": self.args.tag,
+                           "tag_object": self.args.tag_object, "platform": self.args.platform}
+        self.native_policy, policy_hash, manifest_hash = verify_native_policy(
+            self.out, expected_policy, self.root, normal_events, metadata, original,
+            lambda: budget_check(self))
+        if digest(self.args.normal_build) != self.native_policy["normal_build_messages_sha256"]:
+            raise QualificationError("normal producer/compiler message association mismatch")
+        policy.bind_payload(self.native_policy, supplied_observation)
+        self.receipt.update(native_build_policy="native-build-policy.json", native_build_policy_sha256=policy_hash,
+                            native_snapshot_manifest_sha256=manifest_hash,
+                            normal_executable=dict(self.native_policy["normal_executable"]))
         version = (self.root / "VERSION").read_text().strip()
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
             raise QualificationError("invalid source version")
@@ -286,6 +288,8 @@ class Driver(EvidenceCommands):
         preserved = payload_dir / ("chanvoy-v" + version + "-" + self.args.platform)
         shutil.copy2(supplied, preserved)
         preserved.chmod(0o555)
+        policy.bind_payload(self.native_policy, bounded_file(
+            preserved, payload_dir, policy.EXECUTABLE_LIMIT, lambda: budget_check(self))["observation"])
         self.receipt.update(
             payload=preserved.name, payload_sha256=expected_hash,
             normal_build_messages_sha256=digest(self.args.normal_build),
@@ -407,6 +411,12 @@ class Driver(EvidenceCommands):
                   **captured["native"]["logs_sha256"]}
         if any(digest(self.out / name) != value for name, value in inputs.items()):
             raise QualificationError("normal build evidence changed during qualification")
+        _, final_policy_hash, final_manifest_hash = verify_native_policy(
+            self.out, expected_policy, self.root, normal_events, metadata, preserved,
+            lambda: budget_check(self))
+        if (final_policy_hash != self.receipt["native_build_policy_sha256"]
+                or final_manifest_hash != self.receipt["native_snapshot_manifest_sha256"]):
+            raise QualificationError("native producer evidence changed during qualification")
         self.boundary("after")
         self.receipt["status"] = "pass"
         self.save()
@@ -420,7 +430,7 @@ def main():
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-sha256", required=True)
     parser.add_argument("--platform", required=True, choices=PLATFORMS)
-    parser.add_argument("--mode", required=True, choices=["candidate", "shipping"])
+    parser.add_argument("--mode", required=True, choices=["local", "candidate", "shipping"])
     parser.add_argument("--tag")
     parser.add_argument("--tag-object")
     parser.add_argument("--output", required=True, type=Path)
@@ -433,6 +443,8 @@ def main():
     if args.mode == "shipping" and (
             not args.tag or not re.fullmatch(r"[0-9a-f]{40}", args.tag_object or "")):
         parser.error("shipping requires the already-verified tag and tag object")
+    if args.mode == "local" and (args.tag or args.tag_object):
+        parser.error("local mode is an untagged final-candidate proof")
     if args.mode == "candidate" and (
             args.platform != "linux-x86_64" or args.tag or args.tag_object):
         parser.error("candidate mode is the untagged native x86 proof")

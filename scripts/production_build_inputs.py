@@ -1,13 +1,16 @@
 """Capture normal-build inputs and native metadata before fixture compilation."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import stat
+import time
 
-from bounded_evidence import EvidenceError, json_write
+from bounded_evidence import CLEANUP_SECONDS, EvidenceError, json_write
+import production_build_policy as policy
 
 
 def regular(path):
@@ -154,7 +157,12 @@ def capture(driver, events, metadata, payload):
     if driver.args.normal_build.resolve() != normal.resolve():
         shutil.copyfile(regular(driver.args.normal_build), normal)
     lock = driver.out / "normal-Cargo.lock"
-    shutil.copyfile(regular(driver.root / "Cargo.lock"), lock)
+    if lock.exists():
+        if digest(lock) != digest(driver.root / "Cargo.lock"):
+            raise EvidenceError("normal lock evidence changed before capture")
+    else:
+        with lock.open("xb") as output:
+            output.write(regular(driver.root / "Cargo.lock").read_bytes())
     metadata_path = driver.out / "metadata.log"
     if (digest(normal) != driver.receipt["normal_build_messages_sha256"]
             or digest(lock) != driver.receipt["lock_sha256"]
@@ -164,14 +172,29 @@ def capture(driver, events, metadata, payload):
     native_logs = {
         p.name: digest(p) for p in driver.out.glob("native-*.log") if p.is_file()
     }
+    scripts = native_inputs(events, Path(metadata["target_directory"]))
+    aws_rows = [r for r in scripts if r["package_id"] == driver.native_policy["native_package"]["package_id"]]
+    if len(aws_rows) != len(driver.native_policy["native_events"]):
+        raise EvidenceError("missing native build-script producer association")
+    for row, observed in zip(aws_rows, driver.native_policy["native_events"]):
+        if ([{"name": a.get("name"), "sha256": a.get("sha256")} for a in row["archives"]]
+                != [{"name": policy.ARCHIVE, "sha256": observed["archive"]["sha256"]}]
+                or row.get("unresolved_static_inputs")):
+            raise EvidenceError("native producer archive/input association mismatch before fixtures")
+    policy.bind_payload(driver.native_policy, bounded_file(payload, payload.parent, policy.EXECUTABLE_LIMIT,
+                                                         lambda: budget_check(driver))["observation"])
     value = {
-        "schema": "normal-build-inputs-v1", "before_fixture_compilation": True,
+        "schema": "normal-build-inputs-v2", "before_fixture_compilation": True,
         "mode": driver.args.mode, "platform": driver.args.platform,
         "target": driver.receipt["target"], "rustc": driver.receipt["rustc"],
         "source_root": str(driver.root), "commit": driver.receipt["commit"],
         "tree": driver.receipt["tree"], "tag": driver.args.tag, "tag_object": driver.args.tag_object,
         "workflow": driver.receipt["workflow"], "package_id": driver.receipt["package_id"],
         "payload": payload.name, "payload_sha256": digest(payload),
+        "normal_executable": dict(driver.native_policy["normal_executable"]),
+        "native_build_policy": "native-build-policy.json",
+        "native_build_policy_sha256": driver.receipt["native_build_policy_sha256"],
+        "native_snapshot_manifest_sha256": driver.receipt["native_snapshot_manifest_sha256"],
         "normal_build_messages_sha256": digest(normal),
         "metadata_sha256": digest(metadata_path), "lock_sha256": digest(lock),
         "native": {"tool": tool_name, "tool_sha256": tool_hash, "tool_version": version,
@@ -180,8 +203,204 @@ def capture(driver, events, metadata, payload):
                    "empty_observation": not requirements,
                    "coverage": "dynamic metadata only; static native completeness unknown",
                    "build_toolchain": toolchain,
-                   "build_scripts": native_inputs(events, Path(metadata["target_directory"]))},
+                   "build_scripts": scripts},
     }
     path = driver.out / "normal-build-inputs.json"
     json_write(path, value)
     return path
+
+
+# Native producer snapshots are portable, bounded build-input observations.
+# These routines deliberately do not reconstruct final linked archive members.
+def budget_check(driver):
+    if time.monotonic() >= driver.deadline - CLEANUP_SECONDS:
+        raise EvidenceError("owned operation horizon expired during native evidence")
+
+
+def safe_owned(path, root):
+    path, root = Path(path).absolute(), Path(root).absolute()
+    if not path.is_relative_to(root) or path == root or ".." in path.parts or root.is_symlink():
+        raise EvidenceError("native evidence escapes owned root")
+    relative = path.relative_to(root)
+    # Canonicalize the caller's enclosing root (e.g. macOS /var -> /private/var),
+    # but never resolve/accept aliases in any owned descendant.
+    root = root.resolve()
+    path = root / relative
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise EvidenceError("native evidence contains a symlink")
+    regular(path)
+    if path.resolve() != path:
+        raise EvidenceError("native evidence contains a path alias")
+    return path
+
+
+def bounded_file(path, root, limit, check=lambda: None, *, destination=None, text=False):
+    check()
+    path = safe_owned(path, root)
+    before = path.stat()
+    if not 0 < before.st_size <= limit:
+        raise EvidenceError("native evidence exceeds fixed byte bound")
+    value, size, blocks = hashlib.sha256(), 0, []
+    output = None
+    try:
+        if destination is not None:
+            output = Path(destination).open("xb")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            opened = os.fstat(source.fileno())
+            if (opened.st_dev, opened.st_ino, opened.st_size) != (before.st_dev, before.st_ino, before.st_size):
+                raise EvidenceError("native evidence changed before capture")
+            while True:
+                check()
+                block = source.read(min(1024 * 1024, limit + 1 - size))
+                if not block:
+                    break
+                size += len(block)
+                if size > limit:
+                    raise EvidenceError("native evidence exceeds fixed byte bound")
+                value.update(block)
+                if text:
+                    blocks.append(block)
+                if output is not None:
+                    output.write(block)
+            after = os.fstat(source.fileno())
+        if output is not None:
+            output.close()
+            output = None
+        safe_owned(path, root)
+        current = path.stat()
+        signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        if signature(before) != signature(after) or signature(before) != signature(current) or size != before.st_size:
+            raise EvidenceError("native evidence changed during capture")
+        check()
+        observation = {"sha256": value.hexdigest(), "bytes": size}
+        return {"observation": observation, **({"text": b"".join(blocks).decode()} if text else {})}
+    finally:
+        if output is not None:
+            output.close()
+
+
+def cargo_configuration_absent(root):
+    root = Path(root)
+    cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    if not cargo_home.is_absolute():
+        cargo_home = root / cargo_home
+    for directory in (*[p / ".cargo" for p in (root, *root.parents)], cargo_home):
+        for name in ("config", "config.toml"):
+            path = directory / name
+            if path.exists() or path.is_symlink():
+                raise EvidenceError("unsupported Cargo configuration")
+
+
+def policy_source_hashes(root):
+    return {name: digest(safe_owned(Path(root) / "scripts" / name, root)) for name in policy.SOURCE_FILES}
+
+
+def capture_native_snapshots(driver, events, metadata):
+    check = lambda: budget_check(driver)
+    selected = {p["id"] for p in metadata["packages"] if p.get("name") == "aws-lc-sys"}
+    outputs = {}
+    for ordinal, event in enumerate(events):
+        if event.get("reason") == "build-script-executed" and event.get("package_id") in selected:
+            if len(outputs) >= policy.MAX_EVENTS:
+                raise EvidenceError("native invocation count exceeds fixed bound")
+            out = policy.absolute_owned(event.get("out_dir"), driver.root / "target/release/build")
+            path = Path(out).parent / "output"
+            outputs[ordinal] = bounded_file(path, driver.root / "target", policy.OUTPUT_LIMIT, check, text=True)["text"]
+    package, classified = policy.backend_records(events, metadata, (driver.root / "Cargo.lock").read_text(),
+                                                 str(driver.root), outputs)
+    snapshot_root = driver.out / "native-snapshots"
+    snapshot_root.mkdir(mode=0o700)  # Exclusive: no old snapshot can be reused.
+    records, total = [], 0
+    for row in classified:
+        directory = snapshot_root / ("event-%02d" % row["event_ordinal"])
+        directory.mkdir(mode=0o700)
+        record = dict(row)
+        for kind, source_name, filename, limit in (
+                ("output", "output_source", "output.log", policy.OUTPUT_LIMIT),
+                ("archive", "archive_source", policy.ARCHIVE, policy.ARCHIVE_LIMIT)):
+            source = Path(row[source_name])
+            destination = directory / filename
+            before = bounded_file(source, driver.root / "target", limit, check)["observation"]
+            copied = bounded_file(source, driver.root / "target", limit, check, destination=destination)["observation"]
+            after = bounded_file(source, driver.root / "target", limit, check)["observation"]
+            snapshot = bounded_file(destination, driver.out, limit, check, text=kind == "output")
+            if before != copied or after != copied or snapshot["observation"] != copied:
+                raise EvidenceError("native source/copy changed during snapshot capture")
+            if kind == "output" and snapshot["text"] != outputs[row["event_ordinal"]]:
+                raise EvidenceError("native script output changed after classification")
+            total += copied["bytes"]
+            if total > policy.SNAPSHOT_LIMIT:
+                raise EvidenceError("native snapshot total exceeds fixed bound")
+            record[kind] = {"path": str(destination.relative_to(driver.out)), **copied}
+            destination.chmod(0o444)
+        records.append(record)
+    manifest = {"schema": "native-snapshots-v1", "association":
+                {k: driver.receipt[k] for k in (*policy.BINDINGS, "source_files_sha256", "normal_build_messages_sha256")},
+                "events": records}
+    path = driver.out / "native-snapshots.json"
+    with path.open("x") as output:
+        output.write(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+    return package, records, digest(path)
+
+
+def verify_native_policy(folder, expected, source_root, events, metadata, payload, check=lambda: None):
+    """Rehash only relative snapshots/payload; original runner paths are data."""
+    folder = Path(folder).absolute()
+    receipt_path = safe_owned(folder / "native-build-policy.json", folder)
+    manifest_path = safe_owned(folder / "native-snapshots.json", folder)
+    # Evidence objects are themselves small and bounded; no unbounded JSON input.
+    receipt = json.loads(bounded_file(receipt_path, folder, 1024 * 1024, check, text=True)["text"])
+    manifest_result = bounded_file(manifest_path, folder, 1024 * 1024, check, text=True)
+    manifest = json.loads(manifest_result["text"])
+    records = manifest.get("events", [])
+    if not isinstance(records, list) or not 1 <= len(records) <= policy.MAX_EVENTS:
+        raise EvidenceError("missing or over-limit native snapshots")
+    snapshots, total = {}, 0
+    for row in records:
+        for kind, limit in (("output", policy.OUTPUT_LIMIT), ("archive", policy.ARCHIVE_LIMIT)):
+            name = row.get(kind, {}).get("path")
+            policy.relative_name(name)
+            if name in snapshots:
+                raise EvidenceError("duplicate native snapshot path")
+            item = bounded_file(folder / name, folder, limit, check, text=kind == "output")
+            snapshots[name] = item
+            total += item["observation"]["bytes"]
+            if total > policy.SNAPSHOT_LIMIT:
+                raise EvidenceError("native snapshot total exceeds fixed bound")
+    # Inventory only this artifact's fixed native-snapshot subtree, never OUT_DIR.
+    root = folder / "native-snapshots"
+    if root.is_symlink() or not root.is_dir():
+        raise EvidenceError("unsafe native snapshot directory")
+    files, directories, entries = set(), set(), 0
+    for directory, child_dirs, child_files in os.walk(root, followlinks=False):
+        for name in (*child_dirs, *child_files):
+            entries += 1
+            if entries > policy.MAX_EVENTS * 3:
+                raise EvidenceError("extra native snapshot inventory")
+            path = Path(directory) / name
+            if path.is_symlink():
+                raise EvidenceError("native snapshot inventory contains a symlink")
+            if name in child_dirs:
+                directories.add(str(path.relative_to(folder)))
+            else:
+                files.add(str(path.relative_to(folder)))
+    if files != set(snapshots) or directories != {str(Path(name).parent) for name in snapshots}:
+        raise EvidenceError("extra or missing native snapshot inventory")
+    normal = bounded_file(folder / "normal-build.jsonl", folder, 64 * 1024 * 1024, check)["observation"]
+    # Empty stderr is legitimate; digest checks regularity without a positive size requirement.
+    stderr = safe_owned(folder / "normal-build.stderr.log", folder)
+    if stderr.stat().st_size > 64 * 1024 * 1024:
+        raise EvidenceError("normal stderr exceeds fixed bound")
+    stderr_hash = digest(stderr)
+    actual_payload = bounded_file(payload, Path(payload).absolute().parent, policy.EXECUTABLE_LIMIT, check)["observation"]
+    if digest(safe_owned(folder / "normal-Cargo.lock", folder)) != expected.get("lock_sha256"):
+        raise EvidenceError("native producer lock evidence changed")
+    policy.admit_receipt(receipt, manifest, expected, policy_source_hashes(source_root), events, metadata,
+                         (folder / "normal-Cargo.lock").read_text(), normal["sha256"], stderr_hash,
+                         manifest_result["observation"]["sha256"], snapshots, actual_payload)
+    check()
+    return receipt, digest(receipt_path), manifest_result["observation"]["sha256"]

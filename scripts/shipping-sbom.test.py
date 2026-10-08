@@ -27,12 +27,17 @@ from bounded_evidence import EvidenceCommands, EvidenceError, json_write
 from sbom_evidence import Controller, scanner
 
 
+native_spec = importlib.util.spec_from_file_location("native_synthetic", sbom.SCRIPTS / "production-build-policy.test.py")
+native_fixture = importlib.util.module_from_spec(native_spec)
+native_spec.loader.exec_module(native_fixture)
+
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 GIT = "git+https://github.com/example/synthetic?tag=v1.0.0#" + "d" * 40
 
 
 class ShippingFixture:
     def __init__(self, directory):
+        directory = directory.resolve()
         self.root = directory
         self.binaries = directory / "binaries"
         self.binaries.mkdir()
@@ -76,14 +81,19 @@ class ShippingFixture:
             native_script = {"reason": "build-script-executed", "package_id": "root",
                              "linked_libs": ["static=owned_native"], "linked_paths": ["native=/source/target/release/out"],
                              "cfgs": []}
-            events += [native_script, {"reason": "build-finished", "success": True}]
+            events += [native_script]
+            native_fixture.add_native(events, metadata, "/source")
+            events[0]["executable"] = "/source/target/release/chanvoy"
+            metadata["resolve"]["nodes"][0]["deps"].append({"pkg": native_fixture.AWS_ID, "dep_kinds": [{"kind": None}]})
+            metadata["resolve"]["nodes"].append({"id": native_fixture.AWS_ID, "deps": []})
+            events.append({"reason": "build-finished", "success": True})
             lock = "version = 4\n"
             for package in packages:
                 lock += '\n[[package]]\nname = ' + json.dumps(package["name"]) + '\nversion = ' + json.dumps(package["version"]) + '\n'
                 if package["source"]:
                     lock += 'source = ' + json.dumps(package["source"]) + '\n'
                     if package["source"] == REGISTRY:
-                        lock += 'checksum = "' + "1" * 64 + '"\n'
+                        lock += 'checksum = "' + (native_fixture.AWS_CHECKSUM if package["name"] == "aws-lc-sys" else "1" * 64) + '"\n'
             (folder / "normal-Cargo.lock").write_text(lock)
             self.expected["lock_sha256"] = schema.sha(lock.encode())
             self.write_json(folder / "metadata.log", metadata)
@@ -104,7 +114,7 @@ class ShippingFixture:
                     data = ("owned native evidence " + name).encode()
                     (folder / name).write_bytes(data)
                     native_logs[name] = schema.sha(data)
-            captured = {"schema": "normal-build-inputs-v1", "before_fixture_compilation": True, "mode": "shipping",
+            captured = {"schema": "normal-build-inputs-v2", "before_fixture_compilation": True, "mode": "shipping",
                         "platform": platform, "target": target, "rustc": "rustc 1.89.0 (owned synthetic)",
                         "source_root": "/source", "package_id": "root", "payload": asset,
                         "payload_sha256": schema.sha(payload), **{k: copy.deepcopy(v) for k, v in self.expected.items() if k != "version"},
@@ -117,6 +127,15 @@ class ShippingFixture:
                                   "evidence_class": "host/build-tool discovery/query observation",
                                   "selection": "selection-unconfirmed; not compiler invocation proof"} for name in ("cc", "c++")]}
             captured["native"]["build_scripts"][0]["archives"] = [{"name": "libowned_native.a", "sha256": "2" * 64}]
+            producer = native_fixture.seal_synthetic(folder, "/source", events, metadata, payload,
+                        {**self.expected, "mode": "shipping", "platform": platform, "target": target})
+            captured.update(native_build_policy="native-build-policy.json",
+                            native_build_policy_sha256=build_inputs.digest(folder / "native-build-policy.json"),
+                            native_snapshot_manifest_sha256=producer["native_snapshot_manifest_sha256"],
+                            normal_executable=producer["normal_executable"])
+            native_event = next(e for e in events if e.get("reason") == "build-script-executed" and e["package_id"] == native_fixture.AWS_ID)
+            captured["native"]["build_scripts"].append({**{k: v for k, v in native_event.items() if k != "reason"},
+                "archives": [{"name": native_fixture.policy.ARCHIVE, "sha256": producer["native_events"][0]["archive"]["sha256"]}]})
             q = {**{k: copy.deepcopy(v) for k, v in captured.items() if k not in ("schema", "native", "source_root")},
                  "status": "pass", "expected_commit": self.expected["commit"], "normal_build_inputs": "normal-build-inputs.json",
                  "qualification_driver_sha256": schema.sha(schema.regular_bytes(sbom.SCRIPTS / "qualify-production-binary.py"))}
@@ -184,7 +203,8 @@ class ShippingTests(unittest.TestCase):
         before = self.fixture.assemble()
         for folder in self.fixture.folders.values():
             events = [json.loads(x) for x in (folder / "normal-build.jsonl").read_text().splitlines()]
-            self.fixture.write_events(folder, list(reversed(events)))
+            # Normal compiler messages are an immutable producer observation.
+            # Metadata package/node ordering remains semantically irrelevant.
             metadata = sbom.object_file(folder / "metadata.log")
             metadata["packages"].reverse()
             metadata["resolve"]["nodes"].reverse()
@@ -213,6 +233,59 @@ class ShippingTests(unittest.TestCase):
         (folder / "qualification.json").write_bytes(original)
         (self.fixture.binaries / "chanvoy-v1.2.3-linux-x86_64").write_bytes(b"different owned payload")
         with self.assertRaisesRegex(EvidenceError, "payload association"):
+            self.fixture.assemble()
+
+    def test_substituted_shipping_payload_rehashed_legacy_receipts_still_refuses(self):
+        platform = "linux-x86_64"
+        folder = self.fixture.folders[platform]
+        captured = sbom.object_file(folder / "normal-build-inputs.json")
+        asset = captured["payload"]
+        replacement = b"owned substituted shipping payload with revised legacy hashes"
+        for path in (self.fixture.binaries / asset, folder / "payload" / asset):
+            path.write_bytes(replacement)
+        captured["payload_sha256"] = schema.sha(replacement)
+        self.fixture.write_json(folder / "normal-build-inputs.json", captured)
+        q = sbom.object_file(folder / "qualification.json")
+        q["payload_sha256"] = schema.sha(replacement)
+        self.fixture.write_json(folder / "qualification.json", q)
+        self.fixture.refresh(folder)
+        self.fixture.scans[platform]["source"]["metadata"]["digests"][0]["value"] = schema.sha(replacement)
+        with self.assertRaisesRegex(EvidenceError, "producer normal executable association"):
+            self.fixture.assemble()
+
+    def test_old_input_version_and_missing_producer_binding_cannot_upgrade(self):
+        folder = self.fixture.folders["linux-x86_64"]
+        original = schema.regular_bytes(folder / "normal-build-inputs.json")
+        for field, wrong in (("schema", "normal-build-inputs-v1"), ("normal_executable", None),
+                             ("native_build_policy_sha256", "0" * 64), ("native_snapshot_manifest_sha256", None)):
+            with self.subTest(field=field):
+                captured = json.loads(original)
+                captured[field] = wrong
+                self.fixture.write_json(folder / "normal-build-inputs.json", captured)
+                self.fixture.refresh(folder)
+                with self.assertRaises(EvidenceError):
+                    self.fixture.assemble()
+        (folder / "normal-build-inputs.json").write_bytes(original)
+        self.fixture.refresh(folder)
+        (folder / "native-build-policy.json").unlink()
+        with self.assertRaises(OSError):
+            self.fixture.assemble()
+
+    def test_departed_runner_paths_are_not_opened_by_aggregation(self):
+        original = Path.open
+        def open_owned(path, *args, **kwargs):
+            if str(path).startswith(("/source/", "/unavailable-registry/")):
+                self.fail("aggregation dereferenced a departed runner path")
+            return original(path, *args, **kwargs)
+        with mock.patch.object(Path, "open", open_owned):
+            self.fixture.assemble()
+
+    def test_normal_messages_cannot_be_reordered_after_producer_capture(self):
+        folder = self.fixture.folders["linux-x86_64"]
+        events = [json.loads(x) for x in (folder / "normal-build.jsonl").read_text().splitlines()]
+        self.fixture.write_events(folder, list(reversed(events)))
+        self.fixture.refresh(folder)
+        with self.assertRaisesRegex(EvidenceError, "native producer policy"):
             self.fixture.assemble()
 
     def test_missing_platform_and_extra_canonical_asset_refuse(self):

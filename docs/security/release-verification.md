@@ -11,11 +11,11 @@ ceremony additionally verifies the pinned tag and exact CI run before signing.
 Download the chosen binary, its `.minisig`, `chanvoy.pub`, `chanvoy.gpg.asc`,
 `checksums.txt` and `checksums.txt.asc`. Authenticate the public keys against your
 independently pinned fingerprints, import the approved public GPG key into an
-isolated keyring, then run:
+`verification-home` isolated keyring, then run:
 
 ```bash
 minisign -Vm chanvoy-vX.Y.Z-linux-x86_64 -p chanvoy.pub
-gpg --verify checksums.txt.asc checksums.txt
+gpg --homedir verification-home --verify checksums.txt.asc checksums.txt
 sha256sum -c checksums.txt --ignore-missing
 ```
 

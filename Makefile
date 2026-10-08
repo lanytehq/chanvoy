@@ -71,6 +71,14 @@ build:
 build-release:
 	cargo build --release --locked --package chanvoy
 
+# Guidance only: Make manufactures MAKEFLAGS, which the producer must refuse.
+.PHONY: build-release-receipt
+build-release-receipt: ## Show the direct production-receipt command (does not build)
+	@echo 'Run directly from a clean, fresh-target frozen checkout:' >&2
+	@echo 'python3 scripts/build-production-binary.py --root /absolute/checkout --platform <linux-x86_64|linux-aarch64|macos-aarch64> --expected-commit <full-commit> --mode local --output /absolute/external-evidence' >&2
+	@echo 'This guidance target does not invoke Cargo or the producer.' >&2
+	@exit 1
+
 # Install the release binary into $(LOCAL_BIN).
 #
 # Uses `rm -f` before `cp` intentionally. If a running chanvoy daemon
