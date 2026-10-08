@@ -19,7 +19,7 @@ fn release_notes_are_final_dated_and_distribution_honest() {
 #[test]
 fn changelog_has_checkpoint_and_first_public_entries() {
     let changelog = include_str!("../CHANGELOG.md");
-    assert!(changelog.contains("## [0.3.2] - unreleased"));
+    assert!(changelog.contains("## [0.3.2] - 2026-10-08"));
     assert!(changelog.contains("## [0.3.1] - 2026-08-27"));
     assert!(changelog.contains("## [0.3.0] - 2026-08-27"));
     assert!(changelog.contains("Signed development checkpoint only"));
@@ -31,7 +31,7 @@ fn changelog_has_checkpoint_and_first_public_entries() {
 fn root_release_notes_lead_with_current_and_keep_three() {
     let notes = include_str!("../RELEASE_NOTES.md");
     let current = notes
-        .find("## v0.3.2 - unreleased")
+        .find("## v0.3.2 - 2026-10-08")
         .expect("root notes lead with the current release");
     let first_public = notes
         .find("## v0.3.1 - 2026-08-27")
