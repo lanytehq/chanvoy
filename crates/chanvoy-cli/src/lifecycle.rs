@@ -1362,7 +1362,8 @@ mod tests {
         assert!(refusal.contains(&format!("Live({})", std::process::id())));
         assert!(pid.exists() && socket.exists());
         drop(listener);
-        assert!(cleanup_dead(&control).await.is_ok());
+        let cleanup = cleanup_dead(&control).await;
+        assert!(cleanup.is_ok(), "post-drop cleanup refused: {cleanup:?}");
         assert!(!pid.exists() && !socket.exists());
     }
 
