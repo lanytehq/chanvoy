@@ -345,7 +345,7 @@ def assemble(evidence, binaries, scans, expected):
 def tool_route_admission(receipt, expected):
     names = {"valid", "invalid-type", "invalid-spdx", "invalid-jsf", "malformed-data", "missing-spdx",
              "missing-jsf", "missing-meta", "tampered-schema", "symlink-schema", "invalid-isolation-setup",
-             "unknown-ref", "unknown-schema", "probe", "unresolved-reference"}
+             "unknown-ref", "unknown-schema", "probe", "unresolved-reference", "valid-bom-snapshot-tamper"}
     if (receipt.get("schema") != "sbom-tool-route-v1" or receipt.get("status") != "pass"
             or receipt.get("commit") != expected["commit"] or receipt.get("platform") != "Linux"
             or receipt.get("isolation") != "unshare user/map-root-user/network; no fallback"

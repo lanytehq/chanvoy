@@ -57,6 +57,35 @@ def denied_fetch_fixture(case_root, port):
     return fixture, data
 
 
+def arm_snapshot_hash_negative(controller):
+    """Named harness seam: change valid owned data only after validator success."""
+    original = controller.command
+
+    def command(stage, argv, *args, **kwargs):
+        result = original(stage, argv, *args, **kwargs)
+        if stage == "schema-validation":
+            snapshot = Path(argv[argv.index("--data") + 1])
+            before = schema.regular_bytes(snapshot)
+            value = json.loads(before)
+            if value.get("version") != 1:
+                raise EvidenceError("owned snapshot negative requires version 1")
+            value["version"] = 2  # Both versions are valid CycloneDX data.
+            after = (json.dumps(value, sort_keys=True) + "\n").encode()
+            snapshot.chmod(0o644)
+            try:
+                snapshot.write_bytes(after)
+            finally:
+                snapshot.chmod(0o444)
+            controller.receipt["owned_snapshot_hash_negative"] = {
+                "timing": "after successful isolated schema-validation command",
+                "before_sha256": schema.sha(before), "after_sha256": schema.sha(after),
+                "before_version": 1, "after_version": 2}
+            controller.save()
+        return result
+
+    controller.command = command
+
+
 def matrix(root, goneat):
     cases = []
     base = {"bomFormat": "CycloneDX", "specVersion": "1.6", "version": 1,
@@ -68,7 +97,8 @@ def matrix(root, goneat):
                ("malformed-data", "malformed", False), ("missing-spdx", "spdx.schema.json", False),
                ("missing-jsf", "jsf-0.82.schema.json", False), ("missing-meta", "draft07.schema.json", False),
                ("tampered-schema", "tamper", False), ("symlink-schema", "symlink", False),
-               ("invalid-isolation-setup", "setup", False)]
+               ("invalid-isolation-setup", "setup", False),
+               ("valid-bom-snapshot-tamper", "snapshot", False)]
     for name, change, success in changes:
         case_root = root / name
         case_root.mkdir(mode=0o700)
@@ -83,12 +113,18 @@ def matrix(root, goneat):
         for filename in schema.SCHEMAS:
             shutil.copyfile(schema.SCHEMA_ROOT / filename, closure / filename)
         if change in schema.SCHEMAS:(closure / change).unlink()
-        elif change == "tamper":(closure / "spdx.schema.json").write_text("{}")
+        elif change == "tamper":
+            path = closure / "spdx.schema.json"
+            changed = json.loads(path.read_text())
+            changed["title"] = "Owned ID-preserving schema hash negative"
+            path.write_text(json.dumps(changed))
         elif change == "symlink":
             target = closure / "spdx.schema.json"
             target.unlink()
             target.symlink_to(schema.SCHEMA_ROOT / target.name)
         controller = Controller(ROOT, case_root / "evidence", "sbom-tool-route-case-v1", 30)
+        if change == "snapshot":
+            arm_snapshot_hash_negative(controller)
         original_prefix = schema.isolation_prefix
         if change == "setup":
             schema.isolation_prefix = lambda: ["/usr/bin/unshare", "--owned-invalid-option"]
@@ -104,7 +140,15 @@ def matrix(root, goneat):
         launched = marker.exists()
         preflight_negative = change in (*schema.SCHEMAS, "tamper", "symlink", "malformed", "setup")
         outcome = actual == success and (not preflight_negative or not launched)
-        if not success and not preflight_negative:
+        if change == "snapshot":
+            commands = controller.receipt["commands"]
+            mutation = controller.receipt.get("owned_snapshot_hash_negative", {})
+            outcome = (outcome and launched and commands[-1].get("exit") == 0
+                       and not commands[-1].get("process_horizon_expired")
+                       and mutation.get("before_version") == 1 and mutation.get("after_version") == 2
+                       and mutation.get("before_sha256") != mutation.get("after_sha256")
+                       and "schema_validation" not in controller.receipt)
+        elif not success and not preflight_negative:
             commands = controller.receipt["commands"]
             outcome = outcome and launched and commands[-1].get("exit") == 1 and not commands[-1].get("process_horizon_expired")
         cases.append({"name": name, "expected_success": success, "matched": outcome, "validator_marker": launched})

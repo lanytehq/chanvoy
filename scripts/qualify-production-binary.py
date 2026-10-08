@@ -212,10 +212,16 @@ class Driver(EvidenceCommands):
         for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
                      "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
                      "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS"):
-            if os.environ.get(name):
+            if name in os.environ:
                 raise QualificationError("unsupported compiler override: " + name)
-        if any(value for name, value in os.environ.items() if name.startswith("CARGO_PROFILE_")):
+        if any(name.startswith("CARGO_PROFILE_") for name in os.environ):
             raise QualificationError("unsupported Cargo profile override")
+        for name in os.environ:
+            target_selector = (name.startswith("CARGO_TARGET_")
+                               and name.endswith(("_RUSTFLAGS", "_LINKER", "_RUNNER", "_RUSTDOCFLAGS")))
+            if (target_selector or name == "CARGO_TARGET_APPLIES_TO_HOST"
+                    or name.startswith(("CARGO_HOST_", "CARGO_UNSTABLE_"))):
+                raise QualificationError("unsupported Cargo selector: " + name)
         # No Cargo config is approved by this fixed build contract. Presence
         # refusal covers hidden compiler/wrapper/flag selection without parsing
         # or disclosing unknown configuration contents (including symlinks).

@@ -59,14 +59,14 @@ def scanner(controller, name, argv, pin, payload=None):
             raise EvidenceError("malformed owned scanner identity")
         labels = value["Config"].get("Labels")
         options = host.get("SecurityOpt")
-        if (not isinstance(labels, dict) or not isinstance(options, list)
-                or any(not isinstance(x, str) for x in options)):
+        if (not isinstance(labels, dict) or not isinstance(options, list) or not options
+                or any(not isinstance(x, str)
+                       or x not in {"no-new-privileges", "no-new-privileges=true"} for x in options)):
             raise EvidenceError("malformed owned scanner containment")
         if (value["Id"] != record["id"] or value["Config"]["Image"] != pin["image"]
                 or labels.get("chanvoy.sbom-owner") != owner
                 or host.get("NetworkMode") != "none" or host.get("ReadonlyRootfs") is not True
-                or host.get("CapDrop") != ["ALL"]
-                or not any(x.startswith("no-new-privileges") for x in options)):
+                or host.get("CapDrop") != ["ALL"]):
             raise EvidenceError("owned scanner identity/containment changed")
         if payload:
             mounts = value["Mounts"]

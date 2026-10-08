@@ -194,6 +194,12 @@ else:
                      "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
                      "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_RUSTFLAGS"):
             env.pop(name, None)
+        for name in list(env):
+            if (name.startswith(("CARGO_PROFILE_", "CARGO_HOST_", "CARGO_UNSTABLE_"))
+                    or name == "CARGO_TARGET_APPLIES_TO_HOST"
+                    or (name.startswith("CARGO_TARGET_")
+                        and name.endswith(("_RUSTFLAGS", "_LINKER", "_RUNNER", "_RUSTDOCFLAGS")))):
+                env.pop(name)
         env["PATH"] = str(self.tools) + os.pathsep + env["PATH"]
         env["CARGO_HOME"] = str(self.cargo_home)
         env.update(overrides.get("env", {}))
@@ -344,6 +350,29 @@ class QualificationTests(unittest.TestCase):
                 self.assertEqual(receipt["failure"], "unsupported compiler override: " + name)
                 self.assertEqual(receipt["commands"], [])
                 self.assertEqual(receipt["suites"], [])
+
+    def test_target_host_unstable_and_empty_selectors_refuse_before_admission(self):
+        names = ("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                 "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
+                 "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER",
+                 "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTDOCFLAGS",
+                 "CARGO_TARGET_APPLIES_TO_HOST", "CARGO_HOST_RUSTFLAGS", "CARGO_UNSTABLE_BUILD_STD")
+        for name in (*names, "RUSTC", "CARGO_PROFILE_RELEASE_OPT_LEVEL"):
+            for value in ("", "unsupported-owned-selector"):
+                with self.subTest(variable=name, value=value), tempfile.TemporaryDirectory(prefix="cv-target-selector-") as directory:
+                    fixture = Synthetic(Path(directory))
+                    result, receipt = fixture.run(env={name: value})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(receipt["status"], "failed")
+                    self.assertIn("unsupported", receipt["failure"])
+                    self.assertEqual(receipt["commands"], [])
+                    self.assertEqual(receipt["suites"], [])
+        with tempfile.TemporaryDirectory(prefix="cv-output-placement-") as directory:
+            fixture = Synthetic(Path(directory))
+            result, receipt = fixture.run(env={"CARGO_TARGET_DIR": str(fixture.root / "target"),
+                                              "CARGO_TARGET_TMPDIR": str(Path(directory) / "owned-output")})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(receipt["status"], "pass")
 
     def test_unapproved_cargo_config_cannot_select_a_hidden_compiler(self):
         for location in ("cargo_config", "cargo_parent_config", "cargo_home_config"):

@@ -246,6 +246,24 @@ class ShippingTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceError, "evidence changed"):
             self.fixture.assemble()
 
+    def test_native_receipt_shape_is_required_after_correct_rehash(self):
+        for platform in ("linux-x86_64", "macos-aarch64"):
+            folder = self.fixture.folders[platform]
+            original = (folder / "normal-build-inputs.json").read_bytes()
+            for change in ("missing-log-name", "wrong-tool"):
+                with self.subTest(platform=platform, change=change):
+                    captured = json.loads(original)
+                    if change == "missing-log-name":
+                        captured["native"]["logs_sha256"].pop("native-dynamic.log")
+                    else:
+                        captured["native"]["tool"] = "readelf" if platform == "macos-aarch64" else "otool"
+                    self.fixture.write_json(folder / "normal-build-inputs.json", captured)
+                    self.fixture.refresh(folder)
+                    with self.assertRaisesRegex(EvidenceError, "required native metadata receipt"):
+                        self.fixture.assemble()
+            (folder / "normal-build-inputs.json").write_bytes(original)
+            self.fixture.refresh(folder)
+
     def test_scanner_hash_version_selection_and_private_paths_refuse(self):
         platform = "linux-x86_64"
         original = copy.deepcopy(self.fixture.scans[platform])
@@ -266,7 +284,7 @@ class ShippingTests(unittest.TestCase):
                        fixture.expected["workflow"].values()))
         names = ["valid", "invalid-type", "invalid-spdx", "invalid-jsf", "malformed-data", "missing-spdx", "missing-jsf",
                  "missing-meta", "tampered-schema", "symlink-schema", "invalid-isolation-setup", "unknown-ref", "unknown-schema",
-                 "probe", "unresolved-reference"]
+                 "probe", "unresolved-reference", "valid-bom-snapshot-tamper"]
         route = fixture.root / "owned-route.json"
         self.fixture.write_json(route, {"schema": "sbom-tool-route-v1", "status": "pass", "commit": fixture.expected["commit"],
                                        "platform": "Linux", "workflow": env, "cases": [{"name": name, "matched": True} for name in names],
@@ -362,7 +380,9 @@ class SchemaTests(unittest.TestCase):
                 if change == "bom":
                     snapshot = Path(argv[argv.index("--data") + 1])
                     snapshot.chmod(0o644)
-                    snapshot.write_text("{}")
+                    value = json.loads(snapshot.read_text())
+                    value["version"] = 2
+                    snapshot.write_text(json.dumps(value))
                 elif change == "source":
                     data.write_text("{}")
                 elif change == "schema":
@@ -372,6 +392,11 @@ class SchemaTests(unittest.TestCase):
                 return "owned synthetic validator success"
 
             with mock.patch.object(controller, "command", side_effect=command):
+                if change == "hosted-snapshot-seam":
+                    spec = importlib.util.spec_from_file_location("owned_hash_route", sbom.SCRIPTS / "sbom-tool-route.py")
+                    route = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(route)
+                    route.arm_snapshot_hash_negative(controller)
                 if change:
                     with self.assertRaises(EvidenceError):
                         schema.validate(controller, data, goneat)
@@ -384,13 +409,17 @@ class SchemaTests(unittest.TestCase):
                     self.assertEqual(receipt["bom_sha256"], schema.sha(validated))
                     self.assertEqual(set(receipt["schemas_sha256"]), set(schema.SCHEMAS))
                     self.assertEqual((out / "validation-snapshot/bom.json").stat().st_mode & 0o777, 0o444)
+            if change == "hosted-snapshot-seam":
+                evidence = controller.receipt["owned_snapshot_hash_negative"]
+                self.assertNotEqual(evidence["before_sha256"], evidence["after_sha256"])
+                self.assertEqual(json.loads((out / "validation-snapshot/bom.json").read_text())["version"], 2)
             self.assertEqual(len(calls), 1 if change in ("setup-failure", "version-shape") else 2)
             self.assertTrue((out / "validation-snapshot/bom.json").exists())
             self.assertFalse((root / "canonical-release-bom.json").exists())
 
     def test_bom_and_closure_snapshots_are_bound_and_tampering_refuses(self):
         self.snapshot_control()
-        for change in ("bom", "source", "schema", "setup-failure", "version-shape"):
+        for change in ("bom", "source", "schema", "setup-failure", "version-shape", "hosted-snapshot-seam"):
             with self.subTest(change=change):
                 self.snapshot_control(change)
 
@@ -429,7 +458,10 @@ class SchemaTests(unittest.TestCase):
                     shutil.copyfile(schema.SCHEMA_ROOT / name, target / name)
                 path = target / "spdx.schema.json"
                 if case == "missing":path.unlink()
-                elif case == "tampered":path.write_text("{}")
+                elif case == "tampered":
+                    value = json.loads(path.read_text())
+                    value["title"] = "Owned ID-preserving schema hash negative"
+                    path.write_text(json.dumps(value))
                 else:
                     path.unlink()
                     path.symlink_to(schema.SCHEMA_ROOT / path.name)
@@ -453,6 +485,15 @@ class ScannerTests(unittest.TestCase):
                 nonlocal container
                 calls.append((name, argv, horizon))
                 if name.endswith("-create"):
+                    self.assertIn("--network", argv)
+                    self.assertIn("--security-opt", argv)
+                    self.assertIn("--cap-drop", argv)
+                    self.assertEqual(argv[argv.index("--network") + 1], "none")
+                    self.assertEqual(argv[argv.index("--security-opt") + 1], "no-new-privileges")
+                    self.assertIn("--read-only", argv)
+                    self.assertEqual(argv[argv.index("--cap-drop") + 1], "ALL")
+                    self.assertIn("SYFT_CHECK_FOR_APP_UPDATE=false", argv)
+                    self.assertIn(sbom.TOOLS["syft"]["image"], argv)
                     owner = argv[argv.index("--label") + 1].split("=", 1)[1]
                     mount = argv[argv.index("--mount") + 1]
                     source = mount.split("src=", 1)[1].split(",", 1)[0]
@@ -462,6 +503,13 @@ class ScannerTests(unittest.TestCase):
                                                 "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"]},
                                  "Mounts": [{"Source": source, "Destination": "/payload", "RW": False}],
                                  "State": {"Status": "exited", "ExitCode": 0}}
+                    options = {"enabled-explicit": ["no-new-privileges=true"],
+                               "disabled-nnp": ["no-new-privileges=false"],
+                               "unknown-nnp": ["no-new-privileges=owned-unknown"],
+                               "contradictory-nnp": ["no-new-privileges", "no-new-privileges=false"],
+                               "missing-nnp": [], "malformed-nnp": [True]}
+                    if mode in options:
+                        container["HostConfig"]["SecurityOpt"] = options[mode]
                     return "" if mode == "unknown-create" else container["Id"]
                 if "-before-remove" in name and mode == "changed-owner":
                     container["Config"]["Labels"]["chanvoy.sbom-owner"] = "another-owned-fixture"
@@ -483,14 +531,17 @@ class ScannerTests(unittest.TestCase):
                 raise AssertionError("unexpected owned scanner command")
 
             with mock.patch.object(controller, "command", side_effect=command):
-                if mode:
+                if mode not in (None, "enabled-explicit"):
                     with self.assertRaises(EvidenceError):
                         scanner(controller, "owned-scan", ["file:/payload/owned-payload", "-o", "syft-json"], sbom.TOOLS["syft"], payload)
                 else:
                     self.assertEqual(json.loads(scanner(controller, "owned-scan", ["file:/payload/owned-payload", "-o", "syft-json"],
                                                         sbom.TOOLS["syft"], payload)), {"owned": "scanner result"})
             record = controller.receipt["containers"][0]
-            self.assertEqual(record["cleanup"], "confirmed-absent" if mode in (None, "timeout") else "unknown")
+            self.assertEqual(record["cleanup"], "confirmed-absent" if mode in (None, "enabled-explicit", "timeout") else "unknown")
+            if mode in ("disabled-nnp", "unknown-nnp", "contradictory-nnp", "missing-nnp", "malformed-nnp"):
+                self.assertFalse(any(argv[1] in ("start", "rm") for _, argv, _ in calls))
+                self.assertNotIn("completed", record)
             if mode == "unknown-create":
                 self.assertIsNone(record["id"])
                 self.assertEqual(len(calls), 1)
@@ -506,7 +557,8 @@ class ScannerTests(unittest.TestCase):
             self.assertFalse((root / "canonical-bom.json").exists())
 
     def test_owned_container_cleanup_and_negative_receipts(self):
-        for mode in (None, "unknown-create", "changed-owner", "malformed-inspect", "denied-remove", "survivor", "timeout", "timeout-denied-remove"):
+        for mode in (None, "enabled-explicit", "disabled-nnp", "unknown-nnp", "contradictory-nnp", "missing-nnp",
+                     "malformed-nnp", "unknown-create", "changed-owner", "malformed-inspect", "denied-remove", "survivor", "timeout", "timeout-denied-remove"):
             with self.subTest(mode=mode):
                 self.controlled_scanner(mode)
 
@@ -547,7 +599,7 @@ class ScannerTests(unittest.TestCase):
         expected = {"commit": "a" * 40, "hosted_workflow": {"owned-run": "1"}}
         names = ["valid", "invalid-type", "invalid-spdx", "invalid-jsf", "malformed-data", "missing-spdx", "missing-jsf",
                  "missing-meta", "tampered-schema", "symlink-schema", "invalid-isolation-setup", "unknown-ref", "unknown-schema",
-                 "probe", "unresolved-reference"]
+                 "probe", "unresolved-reference", "valid-bom-snapshot-tamper"]
         receipt = {"schema": "sbom-tool-route-v1", "status": "pass", "commit": "a" * 40, "platform": "Linux",
                    "isolation": "unshare user/map-root-user/network; no fallback", "workflow": {"owned-run": "1"},
                    "cases": [{"name": name, "matched": True} for name in names],
