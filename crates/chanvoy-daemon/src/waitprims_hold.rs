@@ -504,7 +504,6 @@ where
     tokio::pin!(follow);
 
     let early_end = tokio::select! {
-        biased;
         bound = bind_ready_rx => {
             bound.map_err(|_| CoreError::WaitProviderDegraded {
                 channel: wait.channel.to_string(),
@@ -526,11 +525,16 @@ where
         });
     }
 
-    emit_armed(
+    #[cfg(test)]
+    if let Some(delivery) = delivery.as_ref() {
+        delivery.pause_before_armed().await;
+    }
+    emit_armed_with_admission(
         &stream,
         use_v2,
         wait.session.wait_id.clone(),
         wait.session.replaced_wait_id.clone(),
+        delivery.as_ref(),
     )
     .await?;
     if let Some(delivery) = delivery.as_ref() {
@@ -699,6 +703,14 @@ async fn emit_follow_v1(
     stream: &crate::wait::FollowStreamSender,
     event: WaitFollowEvent,
 ) -> Result<(), CoreError> {
+    emit_follow_v1_with_admission(stream, event, None).await
+}
+
+async fn emit_follow_v1_with_admission(
+    stream: &crate::wait::FollowStreamSender,
+    event: WaitFollowEvent,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
+) -> Result<(), CoreError> {
     event
         .validate()
         .map_err(|message| CoreError::WaitProviderDegraded {
@@ -709,13 +721,21 @@ async fn emit_follow_v1(
         channel: "follow".into(),
         message: err.to_string(),
     })?;
-    emit_follow_event(stream, WAIT_FOLLOW_V1_EVENT_METHOD, value).await
+    emit_follow_event(stream, WAIT_FOLLOW_V1_EVENT_METHOD, value, armed_admission).await
 }
 
 async fn emit_follow_v2(
     stream: &crate::wait::FollowStreamSender,
     event: WaitFollowV2Event,
 ) -> Result<(), CoreError> {
+    emit_follow_v2_with_admission(stream, event, None).await
+}
+
+async fn emit_follow_v2_with_admission(
+    stream: &crate::wait::FollowStreamSender,
+    event: WaitFollowV2Event,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
+) -> Result<(), CoreError> {
     event
         .validate()
         .map_err(|message| CoreError::WaitProviderDegraded {
@@ -726,26 +746,48 @@ async fn emit_follow_v2(
         channel: "follow".into(),
         message: err.to_string(),
     })?;
-    emit_follow_event(stream, WAIT_FOLLOW_V2_EVENT_METHOD, value).await
+    emit_follow_event(stream, WAIT_FOLLOW_V2_EVENT_METHOD, value, armed_admission).await
 }
 
 async fn emit_follow_event(
     stream: &crate::wait::FollowStreamSender,
     method: &'static str,
     event: serde_json::Value,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
 ) -> Result<(), CoreError> {
     let (written, receipt) = tokio::sync::oneshot::channel();
-    stream
-        .send(crate::wait::FollowStreamRecord {
-            method,
-            event,
-            written,
-        })
-        .await
-        .map_err(|_| CoreError::WaitProviderDegraded {
-            channel: "follow".into(),
-            message: "held wait stream closed".into(),
-        })?;
+    let record = crate::wait::FollowStreamRecord {
+        method,
+        event,
+        written,
+    };
+    if let Some(delivery) = armed_admission {
+        #[cfg(test)]
+        delivery.note_armed_reservation();
+        let permit = tokio::select! {
+            biased;
+            permit = stream.reserve() => permit.map_err(|_| CoreError::WaitProviderDegraded {
+                channel: "follow".into(), message: "held wait stream closed".into(),
+            })?,
+            cause = delivery.stopped() => return Err(delivery.prearmed_error(cause)),
+        };
+        #[cfg(test)]
+        delivery.pause_after_armed_reservation().await;
+        // Actual Armed admission frontier: capacity is reserved, then the
+        // original cause is revalidated. No await occurs before permit.send.
+        if let Some(cause) = delivery.cause() {
+            return Err(delivery.prearmed_error(cause));
+        }
+        permit.send(record);
+    } else {
+        stream
+            .send(record)
+            .await
+            .map_err(|_| CoreError::WaitProviderDegraded {
+                channel: "follow".into(),
+                message: "held wait stream closed".into(),
+            })?;
+    }
     receipt
         .await
         .map_err(|_| CoreError::WaitProviderDegraded {
@@ -758,16 +800,37 @@ async fn emit_follow_event(
         })
 }
 
+#[cfg(test)]
 async fn emit_armed(
     stream: &crate::wait::FollowStreamSender,
     use_v2: bool,
     wait_id: String,
     replaced_wait_id: Option<String>,
 ) -> Result<(), CoreError> {
+    emit_armed_with_admission(stream, use_v2, wait_id, replaced_wait_id, None).await
+}
+
+async fn emit_armed_with_admission(
+    stream: &crate::wait::FollowStreamSender,
+    use_v2: bool,
+    wait_id: String,
+    replaced_wait_id: Option<String>,
+    armed_admission: Option<&crate::follow_delivery::ChannelDelivery>,
+) -> Result<(), CoreError> {
     if use_v2 {
-        emit_follow_v2(stream, WaitFollowV2Event::armed(wait_id, replaced_wait_id)).await
+        emit_follow_v2_with_admission(
+            stream,
+            WaitFollowV2Event::armed(wait_id, replaced_wait_id),
+            armed_admission,
+        )
+        .await
     } else {
-        emit_follow_v1(stream, WaitFollowEvent::armed(wait_id, replaced_wait_id)).await
+        emit_follow_v1_with_admission(
+            stream,
+            WaitFollowEvent::armed(wait_id, replaced_wait_id),
+            armed_admission,
+        )
+        .await
     }
 }
 

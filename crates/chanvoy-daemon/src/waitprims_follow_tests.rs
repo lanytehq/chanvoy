@@ -1,6 +1,6 @@
 //! Actual pinned runner/production callback + production framed UDS writer.
 use super::*;
-use crate::follow_delivery::{tests::HeldWriter, ChannelDelivery};
+use crate::follow_delivery::{tests::HeldWriter, ArmPause, ChannelDelivery};
 use crate::wait_owner::WaitOwnerRegistry;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -75,6 +75,14 @@ impl Observer for SamePollObserver {
     }
 }
 
+#[derive(Default)]
+struct FixtureControl {
+    before: Option<Arc<ArmPause>>,
+    after_reservation: Option<Arc<ArmPause>>,
+    reservation_started: Option<Arc<tokio::sync::Notify>>,
+    full_queue: bool,
+}
+
 struct Fixture {
     registry: Arc<WaitOwnerRegistry>,
     session: WaitSession,
@@ -84,6 +92,7 @@ struct Fixture {
     inner_cancel: CancellationToken,
     delivery: ChannelDelivery,
     counts: Arc<Counts>,
+    receive_no: usize,
     records: tokio::sync::mpsc::Receiver<crate::wait::FollowStreamRecord>,
     task: tokio::task::JoinHandle<Result<WaitFollowResult, CoreError>>,
 }
@@ -108,6 +117,25 @@ impl Fixture {
         legacy: bool,
         budget: Duration,
         entries: &[(&str, FollowObservationPhase)],
+    ) -> Self {
+        Self::start_controlled(
+            coalesce,
+            direct,
+            legacy,
+            budget,
+            entries,
+            FixtureControl::default(),
+        )
+        .await
+    }
+
+    async fn start_controlled(
+        coalesce: Option<u64>,
+        direct: bool,
+        legacy: bool,
+        budget: Duration,
+        entries: &[(&str, FollowObservationPhase)],
+        controls: FixtureControl,
     ) -> Self {
         let registry = Arc::new(WaitOwnerRegistry::new());
         let lease = if direct {
@@ -164,11 +192,27 @@ impl Fixture {
             counts: Arc::clone(&counts),
         };
         let (stream, records) = tokio::sync::mpsc::channel(1);
+        if controls.full_queue {
+            let (written, receipt) = tokio::sync::oneshot::channel();
+            drop(receipt);
+            stream
+                .try_send(crate::wait::FollowStreamRecord {
+                    method: "owned.capacity.fixture",
+                    event: serde_json::json!({"fixture":"occupied"}),
+                    written,
+                })
+                .unwrap();
+        }
         let deadline = Instant::now() + budget;
         let client_gone = CancellationToken::new();
         let delivery = ChannelDelivery::new(client_gone.clone());
         delivery.publish_deadline(deadline);
         delivery.publish_session(&session);
+        delivery.set_armed_pauses(
+            controls.before,
+            controls.after_reservation,
+            controls.reservation_started,
+        );
         let tip = Arc::new(Mutex::new(None));
         let inner_cancel = CancellationToken::new();
         let run = FollowRun {
@@ -208,18 +252,43 @@ impl Fixture {
             inner_cancel,
             delivery,
             counts,
+            receive_no: 0,
             records,
             task,
         }
     }
     async fn recv(&mut self) -> crate::wait::FollowStreamRecord {
-        let record = tokio::time::timeout(Duration::from_secs(2), self.records.recv())
+        self.recv_guard(Instant::now() + Duration::from_secs(2), "next")
             .await
-            .unwrap();
+    }
+    async fn recv_deadline_flush(&mut self) -> crate::wait::FollowStreamRecord {
+        // Test observation horizon only: the deliberate flush is triggered
+        // by the published original deadline. Never passed to production.
+        self.recv_guard(
+            self.delivery.published_deadline().unwrap() + Duration::from_secs(1),
+            "deadline_flush",
+        )
+        .await
+    }
+    async fn recv_guard(
+        &mut self,
+        horizon: Instant,
+        phase: &str,
+    ) -> crate::wait::FollowStreamRecord {
+        self.receive_no += 1;
+        let started = Instant::now();
+        let record=tokio::time::timeout_at(horizon,self.records.recv()).await.inspect_err(|_| {
+            let now=Instant::now();let deadline=self.delivery.published_deadline().unwrap();
+            eprintln!("receive expired: case={} phase={} ordinal={} elapsed={:?} deadline_remaining={:?} deadline_elapsed={:?} armed={} stop={:?} producer_finished={} sidecar={} tip={:?} binds={} active={} drops={}",
+                std::thread::current().name().unwrap_or("unnamed"),phase,self.receive_no,started.elapsed(),deadline.saturating_duration_since(now),
+                now.saturating_duration_since(deadline),self.delivery.armed_committed(),self.delivery.captured_stop_state(),self.task.is_finished(),
+                self.sidecar.inner.lock().unwrap().len(),*self.tip.lock().unwrap(),self.counts.binds.load(Ordering::SeqCst),
+                self.counts.active.load(Ordering::SeqCst),self.counts.drops.load(Ordering::SeqCst));
+        }).unwrap();
         match record {
             Some(record) => record,
             None => panic!(
-                "runner closed stream before expected record: {:?}",
+                "runner closed stream before expected {phase} record: {:?}",
                 self.finish().await
             ),
         }
@@ -395,7 +464,7 @@ async fn v2_admitted_buffer_flushes_at_deadline_with_real_ready_writer_and_termi
         .await
         .unwrap();
     assert_eq!(read_line(&mut client).await["params"]["mode"], "armed");
-    let flush = fixture.recv().await;
+    let flush = fixture.recv_deadline_flush().await;
     assert_eq!(flush.event["mode"], "backlog");
     assert_eq!(flush.event["messages"].as_array().unwrap().len(), 2);
     assert_eq!(flush.event["tip"], P2);
@@ -449,7 +518,7 @@ async fn v2_pending_terminal_poison_releases_only_old_generation() {
         .await
         .unwrap();
     read_line(&mut client).await;
-    let flush = fixture.recv().await;
+    let flush = fixture.recv_deadline_flush().await;
     fixture
         .delivery
         .write_record(&mut writer, &mut reader, &mut String::new(), flush)
@@ -808,4 +877,194 @@ async fn actual_ready_eof_and_data_ack_commits_tip_before_freezing_next_entry() 
     read_line(&mut client).await;
     assert!(fixture.finish().await.is_err());
     fixture.clean();
+}
+
+async fn serve_prearmed(fixture: &mut Fixture) -> (serde_json::Value, Option<(String, String)>) {
+    use tokio::io::AsyncReadExt;
+    let (server, mut client) = UnixStream::pair().unwrap();
+    let (read, mut writer) = server.into_split();
+    writer.as_ref().writable().await.unwrap();
+    let mut reader = BufReader::new(read);
+    let (_, empty) = tokio::sync::mpsc::channel(1);
+    let records = std::mem::replace(&mut fixture.records, empty);
+    let delivery = fixture.delivery.clone();
+    let evidence = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&evidence);
+    let follow = async {
+        let outcome = (&mut fixture.task).await.unwrap();
+        *captured.lock().unwrap() = Some(match &outcome {
+            Err(CoreError::WaitReplaced {
+                wait_id,
+                replaced_by_wait_id,
+            }) => (wait_id.clone(), replaced_by_wait_id.clone()),
+            Err(CoreError::WaitProviderDegraded { .. }) => ("refused".into(), String::new()),
+            other => panic!("pre-Armed path must be non-success: {other:?}"),
+        });
+        outcome
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        delivery.serve(&mut writer, &mut reader, uuid::Uuid::nil(), records, follow),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(writer);
+    let mut bytes = String::new();
+    client.read_to_string(&mut bytes).await.unwrap();
+    let lines: Vec<_> = bytes.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "stopped producer emitted a new Armed/terminal: {bytes}"
+    );
+    let response: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert!(response["error"].is_object());
+    assert!(response.get("method").is_none());
+    assert!(response.get("result").is_none());
+    assert!(!fixture.delivery.armed_committed());
+    assert_eq!(
+        fixture.delivery.framed_calls(),
+        1,
+        "only final non-success response may be written"
+    );
+    let captured = evidence.lock().unwrap().clone();
+    (response, captured)
+}
+
+#[tokio::test]
+async fn actual_postbind_stop_never_enqueues_or_acks_armed_and_preserves_replacement() {
+    use crate::follow_delivery::StopCause;
+    for v2 in [false, true] {
+        for cause in [
+            StopCause::Deadline,
+            StopCause::Canceled,
+            StopCause::Replaced,
+        ] {
+            let pause = Arc::new(ArmPause::default());
+            let mut fixture = Fixture::start_controlled(
+                v2.then_some(10_000),
+                false,
+                false,
+                if cause == StopCause::Deadline {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(5)
+                },
+                &[
+                    (P1, FollowObservationPhase::Backlog),
+                    (P2, FollowObservationPhase::Backlog),
+                ],
+                FixtureControl {
+                    before: Some(Arc::clone(&pause)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+                .await
+                .unwrap();
+            fixture.held();
+            assert_eq!(fixture.counts.binds.load(Ordering::SeqCst), 1);
+            assert!(fixture.delivery.cause().is_none());
+            assert!(!fixture.delivery.armed_committed());
+            assert_eq!(fixture.sidecar.inner.lock().unwrap().len(), 2);
+            assert_eq!(*fixture.tip.lock().unwrap(), None);
+            assert!(fixture.records.try_recv().is_err());
+            let mut replacing = None;
+            match cause {
+                StopCause::Deadline => {
+                    tokio::time::sleep_until(fixture.delivery.published_deadline().unwrap()).await
+                }
+                StopCause::Canceled => fixture.session.cancel.cancel(),
+                StopCause::Replaced => {
+                    let registry = Arc::clone(&fixture.registry);
+                    let old = fixture.session.wait_id.clone();
+                    replacing = Some(tokio::spawn(async move {
+                        registry
+                            .acquire("ch-1", "org", "ops", Some(&old), Duration::from_secs(5))
+                            .await
+                    }));
+                    tokio::time::timeout(
+                        Duration::from_secs(1),
+                        fixture.session.cancel.cancelled(),
+                    )
+                    .await
+                    .unwrap();
+                }
+                StopCause::Transport => unreachable!(),
+            }
+            assert_eq!(fixture.delivery.cause(), Some(cause));
+            pause.release.notify_one();
+            let (_, evidence) = serve_prearmed(&mut fixture).await;
+            assert_eq!(fixture.sidecar.inner.lock().unwrap().len(), 2);
+            assert_eq!(*fixture.tip.lock().unwrap(), None);
+            if let Some(replacing) = replacing {
+                let successor = replacing.await.unwrap().unwrap();
+                assert_eq!(
+                    evidence.unwrap(),
+                    (fixture.session.wait_id.clone(), successor.wait_id.clone())
+                );
+                fixture.release.release();
+                assert_eq!(
+                    fixture.registry.snapshot("ch-1").unwrap().wait_id,
+                    successor.wait_id
+                );
+                let (_, successor_guard) = successor.into_guard();
+                drop(successor_guard);
+            }
+            fixture.clean();
+        }
+    }
+}
+
+#[tokio::test]
+async fn actual_capacity_and_stop_ready_rechecks_after_reservation_before_armed_send() {
+    for after_reservation in [false, true] {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let pause = Arc::new(ArmPause::default());
+        let mut fixture = Fixture::start_controlled(
+            Some(10_000),
+            false,
+            false,
+            Duration::from_secs(5),
+            &[
+                (P1, FollowObservationPhase::Backlog),
+                (P2, FollowObservationPhase::Backlog),
+            ],
+            FixtureControl {
+                full_queue: !after_reservation,
+                reservation_started: Some(Arc::clone(&started)),
+                after_reservation: after_reservation.then_some(Arc::clone(&pause)),
+                ..Default::default()
+            },
+        )
+        .await;
+        if after_reservation {
+            tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+                .await
+                .unwrap();
+        } else {
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+        }
+        assert!(fixture.delivery.cause().is_none());
+        fixture.held();
+        assert!(!fixture.delivery.armed_committed());
+        // No yield: in the full-queue case, reserve and stop are both ready
+        // at the next producer poll. The permit-biased branch alone fails.
+        fixture.session.cancel.cancel();
+        if after_reservation {
+            pause.release.notify_one();
+        } else {
+            let occupied = fixture.records.try_recv().unwrap();
+            assert_eq!(occupied.method, "owned.capacity.fixture");
+            drop(occupied);
+        }
+        serve_prearmed(&mut fixture).await;
+        assert_eq!(fixture.sidecar.inner.lock().unwrap().len(), 2);
+        assert_eq!(*fixture.tip.lock().unwrap(), None);
+        fixture.clean();
+    }
 }

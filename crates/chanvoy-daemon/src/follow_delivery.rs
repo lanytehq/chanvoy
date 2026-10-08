@@ -34,6 +34,13 @@ struct Published {
     session: Option<WaitSession>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ArmPause {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
 struct Inner {
     published: watch::Sender<Published>,
     gate: watch::Sender<Gate>,
@@ -46,6 +53,12 @@ struct Inner {
     ack_hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(test)]
     framed_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    before_armed: Mutex<Option<Arc<ArmPause>>>,
+    #[cfg(test)]
+    after_reservation: Mutex<Option<Arc<ArmPause>>>,
+    #[cfg(test)]
+    reservation_started: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 /// Allocated by the channel RPC, initialized by its wait wrapper. Publication
@@ -67,6 +80,12 @@ impl ChannelDelivery {
             ack_hold: Mutex::new(None),
             #[cfg(test)]
             framed_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            before_armed: Mutex::new(None),
+            #[cfg(test)]
+            after_reservation: Mutex::new(None),
+            #[cfg(test)]
+            reservation_started: Mutex::new(None),
         }))
     }
 
@@ -103,6 +122,86 @@ impl ChannelDelivery {
     #[cfg(test)]
     pub(crate) fn framed_calls(&self) -> usize {
         self.0.framed_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn prearmed_error(&self, cause: StopCause) -> chanvoy_core::CoreError {
+        if cause == StopCause::Replaced {
+            if let Some(session) = self.0.published.borrow().session.as_ref() {
+                return chanvoy_core::CoreError::WaitReplaced {
+                    wait_id: session.wait_id.clone(),
+                    replaced_by_wait_id: session.replaced_by_id(),
+                };
+            }
+        }
+        chanvoy_core::CoreError::WaitProviderDegraded {
+            channel: "follow".into(),
+            message: "held wait ended before armed receipt".into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn captured_stop_state(&self) -> (Option<StopCause>, bool, bool, bool) {
+        let published = self.0.published.borrow().clone();
+        (
+            *self.0.cause.lock().expect("capture cause"),
+            published
+                .session
+                .is_some_and(|session| session.cancel.is_cancelled()),
+            self.0.client_gone.is_cancelled(),
+            self.0.failed.is_cancelled(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_armed_pauses(
+        &self,
+        before: Option<Arc<ArmPause>>,
+        after: Option<Arc<ArmPause>>,
+        started: Option<Arc<tokio::sync::Notify>>,
+    ) {
+        *self.0.before_armed.lock().expect("before armed") = before;
+        *self.0.after_reservation.lock().expect("after reservation") = after;
+        *self
+            .0
+            .reservation_started
+            .lock()
+            .expect("reservation started") = started;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_before_armed(&self) {
+        let pause = self.0.before_armed.lock().expect("before armed").take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_armed_reservation(&self) {
+        let pause = self
+            .0
+            .after_reservation
+            .lock()
+            .expect("after reservation")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_armed_reservation(&self) {
+        if let Some(started) = self
+            .0
+            .reservation_started
+            .lock()
+            .expect("reservation started")
+            .take()
+        {
+            started.notify_one();
+        }
     }
 
     fn latch(&self, cause: StopCause) -> StopCause {
