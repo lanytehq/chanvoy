@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Read-only native artifact CI and maintainer-created, receipt-bound drafts.
 - Dual checksum manifests, paired public anchors and guarded fresh-download promotion.
+- Rotated OpenPGP and minisign release keys for v0.3.2; authenticate the tagged
+  anchors using the [verification guide](docs/security/release-verification.md#v032-identity).
+- Shipped receipt binaries use bundled AWS-LC; ordinary source builds without
+  the producer may select system AWS-LC.
 - Existing checksum, per-binary signature and public-key asset names remain available;
   legacy names are deprecated for a future cut, with removal subject to notice.
 
@@ -52,6 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Pin waitprims core and async to the signed v0.2.3 release.
+- Refresh TLS dependencies to rustls 0.23.45, rustls-webpki 0.103.15,
+  aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0, addressing
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
+- Update locked h2 to 0.4.16
+  ([RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258.html))
+  and quinn-proto to 0.11.15
+  ([RUSTSEC-2026-0185](https://rustsec.org/advisories/RUSTSEC-2026-0185.html)).
+- Allow MIT-0 in dependency license checks, alongside the existing permissive
+  licenses.
 - **Installation preserves running daemons.** `make install` updates the CLI
   and reports installed-path daemon candidates without automatically stopping
   or starting them. The legacy `install-restart-daemons` target reports only;
