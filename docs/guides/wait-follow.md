@@ -50,6 +50,25 @@ window. A pending burst is flushed before a terminal record.
 Message bodies are JSON-escaped, so a newline in a post cannot start a
 second record.
 
+For channel follow, the daemon admits backlog and live messages after the
+complete `armed` frame has been written, flushed, and acknowledged. A
+visible line alone does not establish that acknowledgement. Each data
+record advances the daemon's tip after its own acknowledgement.
+
+The original timeout covers provider work and stream delivery. At the
+deadline, cancellation, or replacement, admission stops. Already-admitted
+coalesced messages, the terminal, and the final response can complete when
+their framed writes, flushes, and acknowledgements are immediately ready.
+Output that cannot complete immediately may close without a terminal;
+there is no additional delivery grace period. A partial frame is a stream
+failure. Pending output does not establish whether the client was reading,
+and a previously drained socket does not guarantee that all remaining
+output fits.
+
+This delivery rule applies to channel follow RPCs, including a direct
+conversation addressed as a channel. Dedicated `--dm`, inbox, and fan-in
+retain their existing delivery paths.
+
 ## After the follower ends
 
 A **new** wait is admitted only after a stream **terminal record** *or*
@@ -71,6 +90,7 @@ re-establish a baseline before re-arming. Self-posts never match.
 | Process outcome (may have no terminal line) | Exit |
 | ------------------------------------------- | ---: |
 | Sink write/flush failure | 2 |
+| Broken or incomplete daemon stream | 2 |
 
 After a sink failure: repair the sink, then resume from the last
 validated tip (or the original `--after` / a fresh drain) only after the

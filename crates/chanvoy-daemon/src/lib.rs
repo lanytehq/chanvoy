@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, io};
 
+mod follow_delivery;
 mod wait;
 mod wait_channels;
 mod wait_coalesce;
@@ -873,8 +874,9 @@ async fn handle_client(
                             }
                         }
                     };
-                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
+                    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
+                    let delivery = follow_delivery::ChannelDelivery::new(client_gone.clone());
                     let follow = wait::wait_with_params_follow(
                         &state,
                         wait::WaitRequest {
@@ -890,74 +892,10 @@ async fn handle_client(
                         },
                         stream_tx,
                         coalesce_ms,
-                        client_gone.clone(),
+                        client_gone,
+                        delivery.clone(),
                     );
-                    tokio::pin!(follow);
-                    let mut eof_buf = String::new();
-                    let mut client_eof = false;
-                    loop {
-                        tokio::select! {
-                            biased;
-                            Some(record) = stream_rx.recv() => {
-                                let notification = JsonRpcNotification {
-                                    jsonrpc: "2.0".to_string(),
-                                    method: record.method.to_string(),
-                                    params: record.event,
-                                };
-                                let write_result = async {
-                                    writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
-                                    writer.flush().await
-                                }.await;
-                                let ack = write_result
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(ToString::to_string);
-                                let _ = record.written.send(ack);
-                                write_result?;
-                            }
-                            result = &mut follow => {
-                                while let Ok(record) = stream_rx.try_recv() {
-                                    let notification = JsonRpcNotification {
-                                        jsonrpc: "2.0".to_string(),
-                                        method: record.method.to_string(),
-                                        params: record.event,
-                                    };
-                                    let write_result = async {
-                                        writer.write_all(serde_json::to_string(&notification)?.as_bytes()).await?;
-                                        writer.write_all(b"\n").await?;
-                                        writer.flush().await
-                                    }.await;
-                                    let ack = write_result
-                                        .as_ref()
-                                        .map(|_| ())
-                                        .map_err(ToString::to_string);
-                                    let _ = record.written.send(ack);
-                                    write_result?;
-                                }
-                                let response = match result {
-                                    Ok(result) => rpc_result(request.id, to_value(result)),
-                                    Err(error) => {
-                                        let error = DaemonError::from(error);
-                                        let (code, message, data) = error_payload(&error);
-                                        rpc_error_with_data(request.id, code, message, data)
-                                    }
-                                };
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
-                                break;
-                            }
-                            peek = reader.read_line(&mut eof_buf), if !client_eof => {
-                                if coalesce_ms.is_some() {
-                                    client_gone.cancel();
-                                    client_eof = true;
-                                } else {
-                                    let _ = peek?;
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    delivery.serve(&mut writer, &mut reader, request.id, stream_rx, follow).await?;
                     line.clear();
                     continue;
                 }
