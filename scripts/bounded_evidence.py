@@ -1,8 +1,10 @@
 """Bounded owned-command evidence collection shared by qualification adapters."""
 
 import json
+import errno
 import os
 from pathlib import Path
+import platform
 import signal
 import subprocess
 import time
@@ -36,7 +38,71 @@ class EvidenceCommands:
             self.receipt.setdefault("secondary_failures", []).append(cause)
         self.save()
 
-    def expired_command(self, child, record, started):
+    def observe_expired_image(self, child, record, cleanup_deadline, expected_images):
+        observation = {"started_monotonic": time.monotonic(), "pid": child.pid,
+                       "captured_pgid": child.pid, "image": "unknown",
+                       "group_presence": "unknown", "other_live_member": "unknown",
+                       "image_attempts": 0, "pgid_attempts": 0, "presence_attempts": 0}
+        record["exec_observation"] = observation
+        self.save()
+
+        def available():
+            if time.monotonic() >= cleanup_deadline:
+                observation["budget_depleted"] = True
+                return False
+            if child.returncode is not None or child.pid <= 0:
+                observation["ownership_unavailable"] = True
+                return False
+            return True
+
+        def error_fields(error):
+            return {"error_class": type(error).__name__, "errno": error.errno}
+
+        try:
+            if platform.system() != "Linux":
+                observation["unsupported_platform"] = True
+                return
+            if not available():
+                return
+            observation["image_attempts"] = 1
+            try:
+                image = os.stat("/proc/" + str(child.pid) + "/exe")
+                identity = (image.st_dev, image.st_ino)
+                observation["image"] = (
+                    "expected-image-observed" if identity == expected_images["tool"] else
+                    "wrapper-image-observed" if identity == expected_images["wrapper"] else
+                    "different-image-observed")
+            except OSError as error:
+                observation["image_error"] = error_fields(error)
+            if not available():
+                return
+            observation["pgid_attempts"] = 1
+            try:
+                current = os.getpgid(child.pid)
+            except OSError as error:
+                observation["pgid_error"] = error_fields(error)
+                return
+            observation["pgid_matches"] = current == child.pid and current > 0
+            if not observation["pgid_matches"] or not available():
+                return
+            observation["presence_attempts"] = 1
+            try:
+                os.killpg(child.pid, 0)
+                observation["group_presence"] = "present"
+            except OSError as error:
+                observation["presence_error"] = error_fields(error)
+                if error.errno == errno.ESRCH:
+                    observation["group_presence"] = "not-present-at-observation"
+        finally:
+            # These finite synchronous reads are not independently preempted.
+            # Their measured time consumes the existing teardown deadline.
+            ended = time.monotonic()
+            observation.update(ended_monotonic=ended,
+                               elapsed_seconds=ended - observation["started_monotonic"],
+                               budget_depleted=ended >= cleanup_deadline)
+            self.save()
+
+    def expired_command(self, child, record, started, expected_images=None):
         cause = "owned command exceeded its process horizon"
         cleanup_deadline = min(self.deadline, time.monotonic() + CLEANUP_SECONDS)
         record.update(process_horizon_expired=True, owned_cleanup_confirmed=False,
@@ -44,6 +110,8 @@ class EvidenceCommands:
                       elapsed_seconds=time.monotonic() - started, teardown=[])
         # Persist the first failure and unknown cleanup BEFORE any signal/reap.
         self.fail(cause)
+        if expected_images is not None:
+            self.observe_expired_image(child, record, cleanup_deadline, expected_images)
         for stage, sig, cap in (("term", signal.SIGTERM, TERM_REAP_SECONDS),
                                 ("kill", signal.SIGKILL, CLEANUP_SECONDS)):
             remaining = cleanup_deadline - time.monotonic()
@@ -80,7 +148,7 @@ class EvidenceCommands:
         self.save()
         raise EvidenceError(cause)
 
-    def command(self, name, argv, horizon, env=None):
+    def command(self, name, argv, horizon, env=None, *, expected_images=None):
         # Cleanup is reserved INSIDE the total operation deadline. A depleted
         # execution budget starts no further command and never renews cleanup.
         remaining = self.deadline - time.monotonic() - CLEANUP_SECONDS
@@ -104,7 +172,7 @@ class EvidenceCommands:
             try:
                 code = child.wait(timeout=horizon)
             except subprocess.TimeoutExpired:
-                self.expired_command(child, record, started)
+                self.expired_command(child, record, started, expected_images)
         record.update(exit=code, elapsed_seconds=time.monotonic() - started)
         self.save()
         if code:

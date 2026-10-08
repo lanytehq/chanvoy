@@ -2,12 +2,14 @@
 """Owned synthetic association, inclusion and immutable schema controls."""
 
 import copy
+import errno
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sys
 import tempfile
 import tarfile
@@ -18,6 +20,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 import offline_schema as schema
+import bounded_evidence as bounded
 import shipping_sbom as sbom
 import production_build_inputs as build_inputs
 from bounded_evidence import EvidenceCommands, EvidenceError, json_write
@@ -366,8 +369,9 @@ class SchemaTests(unittest.TestCase):
             controller.receipt = {"schema": "owned-synthetic-schema-control", "commands": [], "status": "incomplete"}
             calls = []
 
-            def command(name, argv, horizon):
+            def command(name, argv, horizon, **kwargs):
                 calls.append((name, argv, horizon))
+                self.assertEqual(set(kwargs["expected_images"]), {"tool", "wrapper"})
                 if change == "setup-failure":
                     raise EvidenceError("owned isolation setup refusal")
                 marker = Path(argv[argv.index("--marker") + 1])
@@ -723,6 +727,186 @@ class NativeDiscoveryTests(unittest.TestCase):
             self.assertEqual(capture["normal_build_caches"][0]["package_id"], "producer")
             self.assertEqual(capture["normal_build_caches"][0]["choices"]["CMAKE_C_COMPILER"], str(tool))
             self.assertIn("unconfirmed", capture["selection"])
+
+
+class ExecObservationTests(unittest.TestCase):
+    def exercise(self, image="tool", pgid="match", presence="present", depleted=False, collected=False,
+                 platform_name="Linux"):
+        with tempfile.TemporaryDirectory(prefix="cv-owned-image-") as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            controller = Controller(source, root / "evidence", "owned-image-test", 30)
+            controller.deadline = 120
+            record = {"stage": "owned-version"}
+            controller.receipt["commands"].append(record)
+            child = SimpleNamespace(pid=424242, returncode=0 if collected else None)
+            clock, signals, reads = [100.0], [], []
+
+            def durable_first():
+                receipt = json.loads(controller.receipt_path.read_text())
+                self.assertEqual(receipt["failure"], "owned command exceeded its process horizon")
+                self.assertTrue(receipt["commands"][0]["process_horizon_expired"])
+                self.assertFalse(receipt["commands"][0]["owned_cleanup_confirmed"])
+
+            def image_stat(path):
+                durable_first()
+                self.assertEqual(path, "/proc/424242/exe")
+                reads.append(path)
+                if depleted:
+                    clock[0] = 110.5  # The already fixed cleanup deadline is 110.
+                if image == "missing":
+                    raise FileNotFoundError(errno.ENOENT, "owned synthetic missing image")
+                if image == "denied":
+                    raise PermissionError(errno.EACCES, "owned synthetic image denial")
+                device, inode = {"tool": (1, 2), "wrapper": (3, 4), "other": (5, 6)}[image]
+                return SimpleNamespace(st_dev=device, st_ino=inode)
+
+            def group_of(pid):
+                durable_first()
+                self.assertEqual(pid, child.pid)
+                if pgid == "denied":
+                    raise PermissionError(errno.EPERM, "owned synthetic PGID denial")
+                return child.pid if pgid == "match" else 0
+
+            def signal_owned(pid, sig):
+                durable_first()
+                self.assertEqual(pid, child.pid)
+                signals.append(sig)
+                if sig == 0 and presence != "present":
+                    raise OSError(errno.ESRCH if presence == "absent" else errno.EPERM,
+                                  "owned synthetic presence error")
+
+            def reap(*, timeout):
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(clock[0] + timeout, 110)
+                child.returncode = -signal.SIGTERM
+                return child.returncode
+
+            child.wait = reap
+            with mock.patch.object(bounded.platform, "system", return_value=platform_name), \
+                    mock.patch.object(bounded.time, "monotonic", side_effect=lambda: clock[0]), \
+                    mock.patch.object(bounded.os, "stat", side_effect=image_stat), \
+                    mock.patch.object(bounded.os, "getpgid", side_effect=group_of), \
+                    mock.patch.object(bounded.os, "killpg", side_effect=signal_owned):
+                with self.assertRaisesRegex(EvidenceError, "process horizon"):
+                    controller.expired_command(child, record, 99,
+                                               {"tool": (1, 2), "wrapper": (3, 4)})
+                if depleted:
+                    with mock.patch.object(bounded.subprocess, "Popen") as launch:
+                        with self.assertRaisesRegex(EvidenceError, "operation horizon"):
+                            controller.command("forbidden-late-command", ["synthetic"], 1)
+                        launch.assert_not_called()
+            result = json.loads(controller.receipt_path.read_text())
+            self.assertEqual(result["status"], "failed")
+            self.assertFalse(record["owned_cleanup_confirmed"])
+            self.assertEqual(record["exec_observation"]["other_live_member"], "unknown")
+            self.assertEqual(record["cleanup_deadline"], 110)
+            self.assertLessEqual(len(reads), 1)
+            self.assertLessEqual(signals.count(0), 1)
+            return record, signals
+
+    def test_images_and_unavailable_reads_are_diagnostic_only(self):
+        for image, expected in (("tool", "expected-image-observed"), ("wrapper", "wrapper-image-observed"),
+                                ("other", "different-image-observed"), ("missing", "unknown"),
+                                ("denied", "unknown")):
+            with self.subTest(image=image):
+                record, signals = self.exercise(image=image)
+                self.assertEqual(record["exec_observation"]["image"], expected)
+                self.assertEqual(signals, [0, signal.SIGTERM])
+                self.assertTrue(record["child_collected"])
+
+    def test_group_match_errors_and_mismatch_never_prove_other_members_absent(self):
+        for pgid, presence, expected, probes in (("match", "present", "present", 1),
+                                               ("match", "absent", "not-present-at-observation", 1),
+                                               ("match", "denied", "unknown", 1),
+                                               ("mismatch", "present", "unknown", 0),
+                                               ("denied", "present", "unknown", 0)):
+            with self.subTest(pgid=pgid, presence=presence):
+                record, signals = self.exercise(pgid=pgid, presence=presence)
+                self.assertEqual(record["exec_observation"]["group_presence"], expected)
+                self.assertEqual(signals.count(0), probes)
+
+    def test_depleted_observation_budget_and_collected_child_do_not_probe(self):
+        record, signals = self.exercise(depleted=True)
+        self.assertTrue(record["exec_observation"]["budget_depleted"])
+        self.assertEqual(record["exec_observation"]["pgid_attempts"], 0)
+        self.assertEqual(signals, [])
+        self.assertTrue(record["cleanup_horizon_expired"])
+        record, signals = self.exercise(collected=True)
+        self.assertTrue(record["exec_observation"]["ownership_unavailable"])
+        self.assertEqual(record["exec_observation"]["image_attempts"], 0)
+        self.assertNotIn(0, signals)
+
+    def test_unsupported_platform_keeps_unknown_without_metadata_reads(self):
+        for name in ("Darwin", "unsupported-synthetic"):
+            with self.subTest(platform=name):
+                record, signals = self.exercise(platform_name=name)
+                observation = record["exec_observation"]
+                self.assertTrue(observation["unsupported_platform"])
+                self.assertEqual(observation["image"], "unknown")
+                self.assertEqual(observation["image_attempts"], 0)
+                self.assertEqual(observation["pgid_attempts"], 0)
+                self.assertNotIn(0, signals)
+
+    def test_normal_exit_and_omitted_option_do_not_observe(self):
+        with tempfile.TemporaryDirectory(prefix="cv-owned-normal-") as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            controller = Controller(source, root / "evidence", "owned-normal-test", 30)
+            identity = Path(sys.executable).stat()
+            images = {"tool": (identity.st_dev, identity.st_ino), "wrapper": (identity.st_dev, identity.st_ino)}
+            with mock.patch.object(controller, "observe_expired_image") as observe:
+                self.assertEqual(controller.command("normal", [sys.executable, "-c", "print('{}')"], 2,
+                                                    expected_images=images).strip(), "{}")
+                with self.assertRaisesRegex(EvidenceError, "process horizon"):
+                    controller.command("no-option", [sys.executable, "-c", "import time; time.sleep(5)"], 0.1)
+                observe.assert_not_called()
+            self.assertTrue(all("exec_observation" not in r for r in controller.receipt["commands"]))
+
+    def test_exec_refusal_has_typed_errno_without_schema_admission(self):
+        with tempfile.TemporaryDirectory(prefix="cv-owned-exec-refusal-") as directory:
+            root = Path(directory)
+            tool = root / "nonexecutable-owned-tool"
+            tool.write_text("owned synthetic nonexecutable bytes")
+            tool.chmod(0o600)
+            marker = root / "version-witness.json"
+            argv = ["offline_schema.py", "--child", "--goneat", str(tool), "--tool-sha256",
+                    schema.sha(tool.read_bytes()), "--parent-namespace", "owned-parent", "--marker", str(marker)]
+            witness = {"platform": "synthetic-only", "scope": "not namespace proof"}
+            with mock.patch.object(schema.sys, "argv", argv), \
+                    mock.patch.object(schema, "namespace_witness", return_value=witness):
+                self.assertEqual(schema.child(), 65)
+            value = json.loads(marker.read_text())
+            self.assertEqual(value["exec_error"], {"error_class": "PermissionError", "errno": errno.EACCES})
+            self.assertTrue(value["exec_requested"])
+            self.assertNotIn("schema_validation", value)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux /proc native-image proof requires Linux")
+    def test_owned_native_image_and_owned_descendant_stay_failed(self):
+        with tempfile.TemporaryDirectory(prefix="cv-owned-native-") as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            native = root / "owned-sleep"
+            shutil.copy2(shutil.which("sleep"), native)
+            target, wrapper = native.stat(), Path(sys.executable).stat()
+            images = {"tool": (target.st_dev, target.st_ino), "wrapper": (wrapper.st_dev, wrapper.st_ino)}
+            commands = (([str(native), "5"], "expected-image-observed"),
+                        ([sys.executable, "-c", "import subprocess; subprocess.run(['" + str(native) + "','5'])"],
+                         "wrapper-image-observed"))
+            for index, (argv, expected) in enumerate(commands):
+                controller = Controller(source, root / ("evidence-" + str(index)), "owned-native-test", 30)
+                with self.assertRaisesRegex(EvidenceError, "process horizon"):
+                    controller.command("silent-owned-image", argv, 0.5, expected_images=images)
+                record = controller.receipt["commands"][0]
+                self.assertEqual(record["exec_observation"]["image"], expected)
+                self.assertEqual(record["exec_observation"]["group_presence"], "present")
+                self.assertEqual(record["exec_observation"]["other_live_member"], "unknown")
+                self.assertFalse(record["owned_cleanup_confirmed"])
+                self.assertTrue(record["child_collected"])
+                self.assertEqual(controller.receipt["status"], "failed")
 
 
 if __name__ == "__main__":

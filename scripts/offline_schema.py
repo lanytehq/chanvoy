@@ -157,7 +157,16 @@ def child():
         json_write(args.marker, {**witness, "exec_requested": True, "tool_sha256": args.tool_sha256})
         # exec preserves the owning outer Popen process group. There is no
         # nested unbounded wait or detached validator requiring a foreign scan.
-        os.execv(str(args.goneat), argv)
+        try:
+            os.execv(str(args.goneat), argv)
+        except OSError as error:
+            # Only an actual exec failure gets this typed errno receipt.
+            json_write(args.marker, {**witness, "exec_requested": True,
+                                    "tool_sha256": args.tool_sha256,
+                                    "exec_error": {"error_class": type(error).__name__,
+                                                   "errno": error.errno}})
+            print("schema exec failed: " + type(error).__name__, file=sys.stderr)
+            return 65
     except (EvidenceError, OSError, ValueError, KeyError, TypeError) as error:
         print("schema isolation/exec setup failed: " + type(error).__name__, file=sys.stderr)
         return 65
@@ -189,13 +198,21 @@ def validate(controller, data, goneat, schema_dir=SCHEMA_ROOT):
                 "--goneat", str(tool), "--tool-sha256", tool_hash,
                 "--parent-namespace", parent, "--marker", str(marker)]
 
+    def expected_images():
+        target = tool.stat()
+        wrapper = Path(sys.executable).stat()
+        return {"tool": (target.st_dev, target.st_ino),
+                "wrapper": (wrapper.st_dev, wrapper.st_ino)}
+
     version_marker = controller.out / "validator-version-child.json"
-    version = json.loads(controller.command("validator-version", argv(version_marker), 10))
+    version = json.loads(controller.command("validator-version", argv(version_marker), 10,
+                                            expected_images=expected_images()))
     if not isinstance(version, dict) or version.get("binaryVersion") != "v0.6.1":
         raise EvidenceError("unsupported validator version")
     marker = controller.out / "validator-child.json"
     controller.command("schema-validation", [*argv(marker), "--schema-dir", str(schemas),
-                                            "--data", str(bom), "--data-sha256", sha(source_data)], 20)
+                                            "--data", str(bom), "--data-sha256", sha(source_data)], 20,
+                       expected_images=expected_images())
     if (sha(regular_bytes(data)) != sha(source_data) or sha(regular_bytes(bom)) != sha(source_data)
             or sha(regular_bytes(tool)) != tool_hash):
         raise EvidenceError("validation source/data/tool changed")
