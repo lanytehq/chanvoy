@@ -52,6 +52,9 @@ jobs:
   build:
     name: Binary (${{ matrix.platform }})
     needs: validate
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: 1.89.0
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -85,8 +88,18 @@ jobs:
         env:
           EXPECTED_TARGET: ${{ matrix.target }}
         run: test "$(rustc -vV | awk '/^host:/{print $2}')" = "$EXPECTED_TARGET"
-      - name: Build standalone binary
-        run: make build-release
+      - name: Build normal standalone binary with compiler receipts
+        timeout-minutes: 12
+        env:
+          QUALIFICATION_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          qual_dir="$RUNNER_TEMP/qualification-$QUALIFICATION_PLATFORM"
+          mkdir -m700 "$qual_dir"
+          cargo fetch --locked >"$qual_dir/fetch.log" 2>&1
+          # Same compilation flags as make build-release; JSON is output formatting only.
+          cargo build --release --locked --package chanvoy --message-format=json-render-diagnostics \
+            >"$qual_dir/normal-build.jsonl" 2>"$qual_dir/normal-build.stderr.log"
       - name: Stage exact binary
         id: binary
         env:
@@ -95,9 +108,36 @@ jobs:
         run: |
           set -euo pipefail
           asset="chanvoy-v${RELEASE_VERSION}-${RELEASE_PLATFORM}"
-          cp target/release/chanvoy "$asset"
+          # The driver creates this preserved payload outside the source checkout.
+          asset="$RUNNER_TEMP/qualification-$RELEASE_PLATFORM/payload/$asset"
           printf 'asset=%s\n' "$asset" >>"$GITHUB_OUTPUT"
+      - name: Qualify actual tag-run payload before inventory admission
+        timeout-minutes: 15
+        env:
+          QUALIFICATION_PLATFORM: ${{ matrix.platform }}
+          QUALIFICATION_COMMIT: ${{ needs.validate.outputs.commit }}
+          QUALIFICATION_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+          QUALIFICATION_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          qual_dir="$RUNNER_TEMP/qualification-$QUALIFICATION_PLATFORM"
+          payload_hash="$(python3 -c 'import hashlib,pathlib; print(hashlib.sha256(pathlib.Path("target/release/chanvoy").read_bytes()).hexdigest())')"
+          python3 scripts/qualify-production-binary.py --root "$PWD" \
+            --binary "$PWD/target/release/chanvoy" --normal-build "$qual_dir/normal-build.jsonl" \
+            --expected-commit "$QUALIFICATION_COMMIT" --expected-sha256 "$payload_hash" \
+            --platform "$QUALIFICATION_PLATFORM" --mode shipping --tag "$QUALIFICATION_TAG" \
+            --tag-object "$QUALIFICATION_TAG_OBJECT" --output "$qual_dir" \
+            >"$qual_dir/driver.log" 2>&1
+      - name: Preserve shipping qualification and first-failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualification-shipping-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification-${{ matrix.platform }}/
+          if-no-files-found: warn
+          retention-days: 7
       - name: Upload exact binary artifact
+        if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: binary-${{ matrix.platform }}
