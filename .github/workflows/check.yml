@@ -1,25 +1,20 @@
----
 name: check
-
 'on':
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
 env:
   MSRV: "1.89.0"
   CARGO_TERM_COLOR: always
-
 permissions:
   contents: read
-
 jobs:
   release_tooling:
     name: Synthetic release provenance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           persist-credentials: false
       - name: Install synthetic ceremony tools
@@ -27,7 +22,6 @@ jobs:
       - name: Install checksum-pinned verification helper
         run: bash scripts/release-install-decernor.sh
       - run: make release-tooling-test
-
   check:
     runs-on: ubuntu-latest
     steps:
@@ -37,7 +31,18 @@ jobs:
           toolchain: "1.89.0"
           components: rustfmt, clippy
       - run: make check
-
+  stable_clippy:
+    name: Stable Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -46,7 +51,6 @@ jobs:
         with:
           toolchain: "1.89.0"
       - run: make msrv
-
   integration:
     runs-on: ubuntu-latest
     steps:
@@ -55,7 +59,6 @@ jobs:
         with:
           toolchain: "1.89.0"
       - run: make test-integration
-
   shipping_x86_qualification:
     name: Optimized native x86 qualification
     runs-on: ubuntu-22.04
@@ -70,7 +73,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout exact candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
@@ -100,7 +103,7 @@ jobs:
             >"$qual_dir/driver.log" 2>&1
       - name: Preserve candidate qualification and first-failure evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: qualification-candidate-linux-x86_64-${{ github.run_attempt }}
           path: ${{ runner.temp }}/qualification-linux-x86_64/
@@ -117,7 +120,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout exact candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
@@ -134,7 +137,7 @@ jobs:
             --output "$RUNNER_TEMP/sbom-tool-route"
       - name: Preserve tool-route and setup evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: sbom-tool-route-candidate-${{ github.run_attempt }}
           path: |
