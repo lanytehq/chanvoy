@@ -151,6 +151,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify pinned scanner effective configuration
+        timeout-minutes: 5
+        run: python3 scripts/sbom-scanner-preflight.py --output "$RUNNER_TEMP/sbom-scanner-preflight"
       - name: Stage checksum-pinned validator
         timeout-minutes: 3
         run: python3 scripts/setup-sbom-validator.py --output "$RUNNER_TEMP/sbom-validator"
@@ -170,5 +173,6 @@ jobs:
           path: |
             ${{ runner.temp }}/sbom-tool-route/
             ${{ runner.temp }}/sbom-validator/
+            ${{ runner.temp }}/sbom-scanner-preflight/
           if-no-files-found: error
           retention-days: 7
