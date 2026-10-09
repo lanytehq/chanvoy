@@ -24,6 +24,16 @@ SCRIPTS = Path(__file__).resolve().parent
 TOOLS = json.loads(regular_bytes(SCRIPTS / "sbom-tools.json"))
 
 
+def scanner_preflight(controller):
+    version = json.loads(scanner(controller, "syft-version", ["version", "-o", "json"], TOOLS["syft"]))
+    if not isinstance(version, dict) or version.get("version") != TOOLS["syft"]["version"]:
+        raise EvidenceError("pinned scanner reports wrong version")
+    config = scanner(controller, "syft-config", ["config", "--load"], TOOLS["syft"])
+    if not re.search(r"^check-for-app-update:\s*false\s*$", config, re.MULTILINE):
+        raise EvidenceError("scanner application update check is not disabled")
+    return version, config
+
+
 def object_file(path):
     value = json.loads(regular_bytes(path))
     if not isinstance(value, dict):
@@ -434,12 +444,7 @@ def main():
         for p in PLATFORMS:
             bind_platform(p, evidence[p], args.binaries / ("chanvoy-v" + args.version + "-" + p), expected,
                           lambda: budget_check(controller))
-        version = json.loads(scanner(controller, "syft-version", ["version", "-o", "json"], TOOLS["syft"]))
-        if not isinstance(version, dict) or version.get("version") != TOOLS["syft"]["version"]:
-            raise EvidenceError("pinned scanner reports wrong version")
-        config = scanner(controller, "syft-config", ["config"], TOOLS["syft"])
-        if not re.search(r"^check-for-app-update:\s*false\s*$", config, re.MULTILINE):
-            raise EvidenceError("scanner application update check is not disabled")
+        version, config = scanner_preflight(controller)
         scans = {}
         for p in sorted(PLATFORMS):
             payload = args.binaries / ("chanvoy-v" + args.version + "-" + p)

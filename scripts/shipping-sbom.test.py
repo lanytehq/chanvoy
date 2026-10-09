@@ -400,9 +400,10 @@ class ShippingTests(unittest.TestCase):
         def command(controller, name, *_args, **_kwargs):
             return {"head": fixture.expected["commit"], "tree": fixture.expected["tree"], "clean": "", "final-clean": ""}[name]
 
-        def scan(_controller, name, *_args):
+        def scan(_controller, name, argv, *_args):
             if name == "syft-version":return json.dumps({"version": "1.33.0"})
-            if name == "syft-config":return "check-for-app-update: false\n"
+            if name == "syft-config":
+                return "check-for-app-update: " + ("false" if "--load" in argv else "true") + "\n"
             return json.dumps(fixture.scans[name.removeprefix("syft-")])
 
         for failure in (False, True):
@@ -424,6 +425,28 @@ class ShippingTests(unittest.TestCase):
             self.assertEqual(receipt["status"], "failed" if failure else "pass")
             if not failure:
                 self.assertEqual(asset.read_bytes(), (output / "candidate-bom.json").read_bytes())
+
+    def test_effective_scanner_configuration_controls_admission(self):
+        for version, config, accepted in (
+            ("1.33.0", "check-for-app-update: false\n", True),
+            ("1.33.0", "check-for-app-update: true\n", False),
+            ("1.33.0", "log: {}\n", False),
+            ("1.32.0", "check-for-app-update: false\n", False),
+        ):
+            with self.subTest(version=version, config=config):
+                def observe(_controller, name, argv, _pin):
+                    if name == "syft-version":
+                        return json.dumps({"version": version})
+                    # The configuration command emits defaults unless asked to load.
+                    return config if "--load" in argv else "check-for-app-update: true\n"
+                with mock.patch.object(sbom, "scanner", side_effect=observe):
+                    if accepted:
+                        observed, text = sbom.scanner_preflight(object())
+                        self.assertEqual(observed["version"], version)
+                        self.assertEqual(text, config)
+                    else:
+                        with self.assertRaises(EvidenceError):
+                            sbom.scanner_preflight(object())
 
     def test_workflow_dependency_and_inventory_separation(self):
         release = (sbom.SCRIPTS.parent / ".github/workflows/release.yml").read_text()
