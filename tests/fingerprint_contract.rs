@@ -1,7 +1,7 @@
 //! Fingerprint contract: decernor 0.1.8 inserter + verifier.
 //!
 //! Tests stub `decernor` so CI does not need the binary. A live-path
-//! test runs only when `DECERNOR` (or PATH) is 0.1.8+.
+//! test runs only when a configured selector (or PATH) is 0.1.8+.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -88,6 +88,7 @@ gpg       TBD-GPG-FINGERPRINT-PENDING-DISPATCH-PROVISIONING
 struct StubDecernor {
     _dir: TempDir,
     bin: PathBuf,
+    calls: PathBuf,
 }
 
 impl StubDecernor {
@@ -95,12 +96,14 @@ impl StubDecernor {
         let dir = TempDir::new().expect("tempdir");
         let gpg_path = dir.path().join("gpg.json");
         let mini_path = dir.path().join("mini.json");
+        let calls = dir.path().join("calls");
         fs::write(&gpg_path, gpg_json).unwrap();
         fs::write(&mini_path, mini_json).unwrap();
         let bin = dir.path().join("decernor");
         let script = format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' call >> {calls}
 if [ "${{1:-}}" = "version" ]; then
   if [ "${{2:-}}" = "-e" ]; then
     printf '%s\n' 'Version: {version}' 'Commit: synthetic' 'Build Date: synthetic' 'Go Version: synthetic' 'Gofulmen: synthetic' 'Crucible: synthetic'
@@ -140,12 +143,17 @@ exit 2
             version = version,
             gpg = shell_quote(gpg_path.to_str().unwrap()),
             mini = shell_quote(mini_path.to_str().unwrap()),
+            calls = shell_quote(calls.to_str().unwrap()),
         );
         fs::write(&bin, script).unwrap();
         let mut perms = fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&bin, perms).unwrap();
-        Self { _dir: dir, bin }
+        Self {
+            _dir: dir,
+            bin,
+            calls,
+        }
     }
 }
 
@@ -158,8 +166,19 @@ fn seed_publics(dir: &Path) {
     fs::copy(fixture("chanvoy.gpg.asc"), dir.join("chanvoy.gpg.asc")).unwrap();
 }
 
+fn fingerprint_command(decernor: Option<&Path>) -> Command {
+    let mut command = Command::new("bash");
+    for selector in ["CHANVOY_DECERNOR_BIN", "DECERNOR_BIN", "DECERNOR"] {
+        command.env_remove(selector);
+    }
+    if let Some(bin) = decernor {
+        command.env("DECERNOR", bin);
+    }
+    command
+}
+
 fn run_insert(decernor: &Path, minisign: &Path, gpg: &Path, output: &Path) -> std::process::Output {
-    Command::new("bash")
+    fingerprint_command(Some(decernor))
         .arg(insert_script())
         .arg("--minisign")
         .arg(minisign)
@@ -167,19 +186,17 @@ fn run_insert(decernor: &Path, minisign: &Path, gpg: &Path, output: &Path) -> st
         .arg(gpg)
         .arg("--output")
         .arg(output)
-        .env("DECERNOR", decernor)
         .output()
         .expect("insert")
 }
 
 fn run_verify(decernor: &Path, release_dir: &Path, expected: &Path) -> std::process::Output {
-    Command::new("bash")
+    fingerprint_command(Some(decernor))
         .arg("-c")
         .arg(VERIFY_LEGACY)
         .arg("legacy-verifier")
         .arg(repo_root())
         .arg(release_dir)
-        .env("DECERNOR", decernor)
         .arg(expected)
         .output()
         .expect("verify")
@@ -431,9 +448,8 @@ fn malformed_decernor_version_is_refused() {
 #[test]
 fn check_decernor_preflight_accepts_stable_018() {
     let stub = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
-    let out = Command::new("bash")
+    let out = fingerprint_command(Some(&stub.bin))
         .arg(check_decernor_script())
-        .env("DECERNOR", &stub.bin)
         .output()
         .unwrap();
     assert!(
@@ -447,9 +463,8 @@ fn check_decernor_preflight_accepts_stable_018() {
 #[test]
 fn check_decernor_preflight_rejects_prerelease() {
     let stub = StubDecernor::new("0.1.8-rc1", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
-    let out = Command::new("bash")
+    let out = fingerprint_command(Some(&stub.bin))
         .arg(check_decernor_script())
-        .env("DECERNOR", &stub.bin)
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -468,11 +483,78 @@ fn verify_fails_closed_on_tbd_placeholders() {
 }
 
 #[test]
+fn fixture_commands_ignore_ambient_tool_selectors() {
+    for selector in ["CHANVOY_DECERNOR_BIN", "DECERNOR_BIN", "DECERNOR"] {
+        let ambient = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--skip",
+            "fixture_commands_ignore_ambient_tool_selectors",
+            "--skip",
+            "resolver_fixtures_ignore_ambient_tool_selectors",
+            "--skip",
+            "live_decernor_018_on_fixtures",
+            "--test-threads=4",
+        ]);
+        for name in ["CHANVOY_DECERNOR_BIN", "DECERNOR_BIN", "DECERNOR"] {
+            command.env_remove(name);
+        }
+        let out = command.env(selector, &ambient.bin).output().unwrap();
+        assert!(
+            out.status.success(),
+            "fixture checks failed for {selector}: {} {}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+        let report = stdout_of(&out);
+        for case in [
+            "happy_path_writes_both_lines_and_verify_passes",
+            "old_decernor_version_is_refused",
+            "check_decernor_preflight_rejects_prerelease",
+        ] {
+            assert!(
+                report.contains(&format!("test {case} ... ok")),
+                "fixture check {case} did not run for {selector}"
+            );
+        }
+        assert!(
+            !ambient.calls.exists(),
+            "fixture checks invoked the ambient {selector} tool"
+        );
+    }
+}
+
+#[test]
+fn resolver_fixtures_ignore_ambient_tool_selectors() {
+    for selector in ["CHANVOY_DECERNOR_BIN", "DECERNOR_BIN", "DECERNOR"] {
+        let ambient = StubDecernor::new("0.1.8", SAMPLE_GPG_PRIMARY, SAMPLE_MINI);
+        let mut command = Command::new("bash");
+        command.arg(repo_root().join("scripts/release-decernor-resolver.test.sh"));
+        for name in ["CHANVOY_DECERNOR_BIN", "DECERNOR_BIN", "DECERNOR"] {
+            command.env_remove(name);
+        }
+        let out = command.env(selector, &ambient.bin).output().unwrap();
+        assert!(
+            out.status.success(),
+            "resolver checks failed for {selector}: {} {}",
+            stdout_of(&out),
+            stderr_of(&out)
+        );
+        assert!(stdout_of(&out).contains("[ok] Decernor resolver"));
+        assert!(
+            !ambient.calls.exists(),
+            "resolver checks invoked the ambient {selector} tool"
+        );
+    }
+}
+
+#[test]
 fn live_decernor_018_on_fixtures() {
-    let override_bin = std::env::var("DECERNOR")
-        .ok()
-        .filter(|p| Path::new(p).is_file());
-    let mut ver_cmd = Command::new(override_bin.as_deref().unwrap_or("decernor"));
+    let override_bin = ["CHANVOY_DECERNOR_BIN", "DECERNOR_BIN", "DECERNOR"]
+        .into_iter()
+        .find_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
+        .map(PathBuf::from);
+    let mut ver_cmd = Command::new(override_bin.as_deref().unwrap_or(Path::new("decernor")));
     ver_cmd.arg("version");
     let ver = ver_cmd.output().ok();
     let Some(ver) = ver else {
@@ -492,7 +574,7 @@ fn live_decernor_018_on_fixtures() {
     seed_publics(dir.path());
     let dest = dir.path().join("expected-fingerprints.txt");
     fs::write(&dest, TBD_CONTRACT).unwrap();
-    let mut insert = Command::new("bash");
+    let mut insert = fingerprint_command(override_bin.as_deref());
     insert
         .arg(insert_script())
         .arg("--minisign")
@@ -501,11 +583,6 @@ fn live_decernor_018_on_fixtures() {
         .arg(dir.path().join("chanvoy.gpg.asc"))
         .arg("--output")
         .arg(&dest);
-    if let Some(b) = &override_bin {
-        insert.env("DECERNOR", b);
-    } else {
-        insert.env_remove("DECERNOR");
-    }
     let out = insert.output().unwrap();
     assert!(
         out.status.success(),
@@ -517,7 +594,7 @@ fn live_decernor_018_on_fixtures() {
         body.contains("minisign  91f40ebe76f5af9f554c8e32ff52a46937363cc8c303bf826fa30e52f037a340")
     );
     assert!(body.contains("gpg       5D8E7478C4EA08D97D39139CCEEA5771AED0966B"));
-    let mut verify = Command::new("bash");
+    let mut verify = fingerprint_command(override_bin.as_deref());
     verify
         .arg("-c")
         .arg(VERIFY_LEGACY)
@@ -525,11 +602,6 @@ fn live_decernor_018_on_fixtures() {
         .arg(repo_root())
         .arg(dir.path())
         .arg(&dest);
-    if let Some(b) = &override_bin {
-        verify.env("DECERNOR", b);
-    } else {
-        verify.env_remove("DECERNOR");
-    }
     let v = verify.output().unwrap();
     assert!(v.status.success(), "live verify failed: {}", stderr_of(&v));
 }

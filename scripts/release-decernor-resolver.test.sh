@@ -6,7 +6,7 @@ root="$(cd "$(dirname "$0")/.." && pwd -P)"
 fixture="$(mktemp -d "${TMPDIR:-/tmp}/chanvoy-decernor-resolver.XXXXXX")"
 trap 'rm -rf "$fixture"' EXIT
 source "$root/scripts/release-decernor.sh"
-unset CHANVOY_DECERNOR_BIN DECERNOR_BIN
+unset CHANVOY_DECERNOR_BIN DECERNOR_BIN DECERNOR
 
 make_stub() {
 	local name="$1" version="$2" extended_version="$3" identity="${4:-decernor}"
