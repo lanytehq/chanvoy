@@ -3752,7 +3752,7 @@ impl MattermostClient {
             })
             .collect();
 
-        channels.sort_by(|left, right| right.last_post_at.cmp(&left.last_post_at));
+        channels.sort_by_key(|channel| std::cmp::Reverse(channel.last_post_at));
         channels.truncate(20);
         Ok(channels)
     }
