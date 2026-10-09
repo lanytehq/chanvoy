@@ -54,6 +54,22 @@ jobs:
         run: |
           export DECERNOR_BIN="$CHANVOY_DECERNOR_BIN" DECERNOR="$CHANVOY_DECERNOR_BIN"
           make pr-final
+  macos_check:
+    name: macOS check (${{ matrix.toolchain }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.89.0", stable]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - run: make check
   msrv:
     runs-on: ubuntu-latest
     steps:

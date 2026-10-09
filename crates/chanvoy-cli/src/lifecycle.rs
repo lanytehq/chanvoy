@@ -1126,6 +1126,13 @@ mod tests {
 
     #[tokio::test]
     async fn failed_child_cleanup_requires_positive_socket_absence() {
+        if socket_fixture_in_child(
+            "lifecycle::tests::failed_child_cleanup_requires_positive_socket_absence",
+        )
+        .await
+        {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let listener =
             std::os::unix::net::UnixListener::bind(dir.path().join("synthetic.sock")).unwrap();
@@ -1342,6 +1349,56 @@ mod tests {
 
     #[tokio::test]
     async fn dead_pid_does_not_sweep_a_live_peers_socket() {
+        if socket_fixture_in_child("lifecycle::tests::dead_pid_does_not_sweep_a_live_peers_socket")
+            .await
+        {
+            return;
+        }
+        assert_socket_handle_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn closing_one_listener_descriptor_retains_live_peer() {
+        if socket_fixture_in_child(
+            "lifecycle::tests::closing_one_listener_descriptor_retains_live_peer",
+        )
+        .await
+        {
+            return;
+        }
+        assert_socket_handle_cleanup(true).await;
+    }
+
+    // Bind after exec in a single-test process, so parallel test spawns cannot
+    // inherit this fixture's listener during their fork-to-exec window.
+    async fn socket_fixture_in_child(test: &str) -> bool {
+        const FLAG: &str = "CHANVOY_SOCKET_OWNER_TEST";
+        if std::env::var(FLAG).as_deref() == Ok(test) {
+            return false;
+        }
+        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(FLAG, test)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+            .await
+            .expect("owned socket fixture deadline")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains(&format!("test {test} ... ok")));
+        true
+    }
+
+    async fn assert_socket_handle_cleanup(retain_descriptor: bool) {
         let mut child = child();
         let child_pid = child.0.id();
         child.0.kill().unwrap();
@@ -1361,7 +1418,14 @@ mod tests {
         let refusal = cleanup_dead(&control).await.unwrap_err();
         assert!(refusal.contains(&format!("Live({})", std::process::id())));
         assert!(pid.exists() && socket.exists());
+        let retained = retain_descriptor.then(|| listener.try_clone().unwrap());
         drop(listener);
+        if let Some(retained) = retained {
+            let refusal = cleanup_dead(&control).await.unwrap_err();
+            assert!(refusal.contains(&format!("Live({})", std::process::id())));
+            assert!(pid.exists() && socket.exists());
+            drop(retained);
+        }
         let cleanup = cleanup_dead(&control).await;
         assert!(cleanup.is_ok(), "post-drop cleanup refused: {cleanup:?}");
         assert!(!pid.exists() && !socket.exists());
