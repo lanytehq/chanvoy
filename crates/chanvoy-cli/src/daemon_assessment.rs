@@ -1,7 +1,7 @@
 //! Bounded, non-destructive assessment of local and provider health.
 use chanvoy_core::recovery::{assess_daemon, DaemonDisposition, IdentityProbe, RemoteProbeOutcome};
 use chanvoy_core::{DaemonStatus, Profile};
-use chanvoy_daemon::{daemon_client, ping, ping_full, DaemonError};
+use chanvoy_daemon::{daemon_client, ping, ping_full, DaemonClient, DaemonError};
 use std::time::Duration;
 
 pub(super) const LOCAL_BUDGET: Duration = Duration::from_millis(750);
@@ -97,14 +97,50 @@ fn unsupported(error: &DaemonError) -> bool {
     matches!(error, DaemonError::Rpc { code: -32601, .. })
 }
 
+trait AssessmentProbe {
+    async fn observation(&self) -> Result<DaemonStatus, DaemonError>;
+    async fn local_ping(&self) -> Result<(), DaemonError>;
+    async fn remote_status(&self) -> Result<DaemonStatus, DaemonError>;
+}
+
+struct ProfileProbe<'a> {
+    name: &'a str,
+    client: DaemonClient,
+}
+
+impl AssessmentProbe for ProfileProbe<'_> {
+    async fn observation(&self) -> Result<DaemonStatus, DaemonError> {
+        self.client.daemon_observation().await
+    }
+
+    async fn local_ping(&self) -> Result<(), DaemonError> {
+        ping(self.name).await.map(|_| ())
+    }
+
+    async fn remote_status(&self) -> Result<DaemonStatus, DaemonError> {
+        ping_full(self.name).await
+    }
+}
+
 pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Instant) -> Assessment {
-    let client = daemon_client(&profile.name);
-    let local = tokio::time::timeout(LOCAL_BUDGET, client.daemon_observation()).await;
+    let probe = ProfileProbe {
+        name: &profile.name,
+        client: daemon_client(&profile.name),
+    };
+    assess_probe(&probe, &profile.bot_username, deadline).await
+}
+
+async fn assess_probe(
+    probe: &impl AssessmentProbe,
+    expected: &str,
+    deadline: tokio::time::Instant,
+) -> Assessment {
+    let local = tokio::time::timeout(LOCAL_BUDGET, probe.observation()).await;
     let (responsive, mut snapshot, legacy) = match local {
         Ok(Ok(snapshot)) => (true, Some(snapshot), false),
         Ok(Err(error)) if unsupported(&error) => {
             let responsive = matches!(
-                tokio::time::timeout(LOCAL_BUDGET, ping(&profile.name)).await,
+                tokio::time::timeout(LOCAL_BUDGET, probe.local_ping()).await,
                 Ok(Ok(_))
             );
             (responsive, None, true)
@@ -113,7 +149,7 @@ pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Insta
             // Independently prove local liveness before classifying an absent
             // observation reply. A status-method failure is not daemon death.
             let responsive = matches!(
-                tokio::time::timeout(LOCAL_BUDGET, ping(&profile.name)).await,
+                tokio::time::timeout(LOCAL_BUDGET, probe.local_ping()).await,
                 Ok(Ok(_))
             );
             (responsive, None, false)
@@ -130,7 +166,7 @@ pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Insta
     // daemon's classification plus transport margin. Local checks stay separate.
     let remote = if deadline.saturating_duration_since(tokio::time::Instant::now()) >= REMOTE_BUDGET
     {
-        tokio::time::timeout(REMOTE_BUDGET, ping_full(&profile.name))
+        tokio::time::timeout(REMOTE_BUDGET, probe.remote_status())
             .await
             .ok()
             .and_then(Result::ok)
@@ -141,9 +177,7 @@ pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Insta
         Some(remote) => snapshot = Some(remote),
         _ if !legacy => {
             // Obtain the current latch/admission after the failed remote call.
-            if let Ok(Ok(local)) =
-                tokio::time::timeout(LOCAL_BUDGET, client.daemon_observation()).await
-            {
+            if let Ok(Ok(local)) = tokio::time::timeout(LOCAL_BUDGET, probe.observation()).await {
                 snapshot = Some(local);
             }
         }
@@ -151,7 +185,7 @@ pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Insta
     }
     let disposition = snapshot
         .as_ref()
-        .map(|s| status_disposition(s, &profile.bot_username))
+        .map(|s| status_disposition(s, expected))
         .unwrap_or(DaemonDisposition::DegradedRemote);
     let observation_ready = snapshot.as_ref().and_then(observation_ready);
     Assessment {
@@ -164,6 +198,113 @@ pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Insta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct SyntheticProbe {
+        legacy: bool,
+        observations: Cell<usize>,
+        pings: Cell<usize>,
+        remote_calls: Cell<usize>,
+        active: Cell<usize>,
+        peak: Cell<usize>,
+    }
+
+    impl SyntheticProbe {
+        fn new(legacy: bool) -> Self {
+            Self {
+                legacy,
+                observations: Cell::new(0),
+                pings: Cell::new(0),
+                remote_calls: Cell::new(0),
+                active: Cell::new(0),
+                peak: Cell::new(0),
+            }
+        }
+    }
+
+    struct ActiveProbe<'a>(&'a Cell<usize>);
+
+    impl Drop for ActiveProbe<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() - 1);
+        }
+    }
+
+    impl AssessmentProbe for SyntheticProbe {
+        async fn observation(&self) -> Result<DaemonStatus, DaemonError> {
+            self.observations.set(self.observations.get() + 1);
+            if self.legacy {
+                Err(DaemonError::Rpc {
+                    code: -32601,
+                    message: "method unavailable".into(),
+                    data: None,
+                })
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn local_ping(&self) -> Result<(), DaemonError> {
+            self.pings.set(self.pings.get() + 1);
+            Ok(())
+        }
+
+        async fn remote_status(&self) -> Result<DaemonStatus, DaemonError> {
+            self.remote_calls.set(self.remote_calls.get() + 1);
+            self.active.set(self.active.get() + 1);
+            self.peak.set(self.peak.get().max(self.active.get()));
+            let _active = ActiveProbe(&self.active);
+            std::future::pending().await
+        }
+    }
+
+    fn assert_unknown(assessment: &Assessment) {
+        assert_eq!(assessment.disposition, DaemonDisposition::DegradedRemote);
+        assert!(assessment.observation_ready.is_none());
+        assert!(assessment.status.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_remote_timeout_has_an_exact_budget_and_cancels_the_probe() {
+        let probe = SyntheticProbe::new(true);
+        let start = tokio::time::Instant::now();
+        let assessment = assess_probe(&probe, "expected", deadline()).await;
+        assert_unknown(&assessment);
+        assert_eq!(start.elapsed(), Duration::from_millis(2750));
+        assert_eq!(probe.observations.get(), 1);
+        assert_eq!(probe.pings.get(), 1);
+        assert_eq!(probe.remote_calls.get(), 1);
+        assert_eq!(probe.peak.get(), 1);
+        assert_eq!(probe.active.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_checks_keep_separate_budgets_around_remote_timeout() {
+        let probe = SyntheticProbe::new(false);
+        let start = tokio::time::Instant::now();
+        let assessment = assess_probe(&probe, "expected", deadline()).await;
+        assert_unknown(&assessment);
+        assert_eq!(start.elapsed(), Duration::from_millis(4250));
+        assert_eq!(probe.observations.get(), 2);
+        assert_eq!(probe.pings.get(), 1);
+        assert_eq!(probe.remote_calls.get(), 1);
+        assert_eq!(probe.active.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insufficient_operation_budget_does_not_start_a_remote_probe() {
+        let probe = SyntheticProbe::new(true);
+        let start = tokio::time::Instant::now();
+        let assessment =
+            assess_probe(&probe, "expected", start + Duration::from_millis(2749)).await;
+        assert_unknown(&assessment);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(probe.observations.get(), 1);
+        assert_eq!(probe.pings.get(), 1);
+        assert_eq!(probe.remote_calls.get(), 0);
+        assert_eq!(probe.peak.get(), 0);
+    }
+
     #[test]
     fn fallback_requires_typed_method_not_found() {
         assert!(unsupported(&DaemonError::Rpc {
