@@ -13,6 +13,42 @@ smoke creates a disposable Mattermost channel; failed smoke stops the ceremony.
 Use clean main synchronized with live origin/main. Signing and publication each
 require the maintainer's separate approval.
 
+### Required repository readiness review
+
+Before local tag creation, confirm and record all of the following. Preflight
+scripts may automate these checks; any check they do not enforce must be
+completed manually. Successful signing or signature verification alone does
+not establish repository readiness.
+
+- [ ] All repository PRs are complete: merged or closed, with no open PRs,
+      including drafts. Review their dispositions and confirm all intended release
+      changes are merged. An unmerged PR with failed checks stops the ceremony.
+- [ ] The checkout is on `main`, updated from a fresh fetch of `origin/main`,
+      and `HEAD` equals `origin/main`. Stop on divergence; do not force an update.
+- [ ] The working tree and index are clean, with no unstaged or uncommitted
+      changes and no untracked files reported by Git.
+- [ ] Required checks passed for the exact final merged commit. If updating
+      main changes the reviewed cut, obtain the required review and qualification
+      for that new commit before tagging.
+
+Inspect the complete open-PR list, then update an already clean checkout:
+
+```bash
+gh pr list --state open --limit 1000 --json number,title,isDraft,url
+git status --porcelain=v1 --untracked-files=all
+# Proceed only when the PR list and working-tree status are empty.
+git switch main
+git pull --ff-only origin main
+git rev-parse HEAD refs/remotes/origin/main
+git status --porcelain=v1 --untracked-files=all
+# Require identical commit hashes and empty status.
+```
+
+An incomplete or failed PR query/fetch is unknown, not proof of readiness.
+Recheck PR completion, fresh main synchronization and clean status immediately
+before the separate tag push. If the cut changed after local signing, stop and
+resolve it before pushing; do not replace or retarget the signed tag.
+
 Configure existing approved inputs outside the checkout:
 
 ```bash
@@ -82,11 +118,11 @@ Wait for the exact successful `release.yml` **push** run for the tag commit.
 CI restores the annotated ref, verifies its committed public pin in an isolated
 keyring plus GitHub Verified/valid, checks VERSION, and builds natively:
 
-| Platform | Asset | Runner |
-| --- | --- | --- |
-| Linux x86_64 | `chanvoy-vX.Y.Z-linux-x86_64` | `ubuntu-22.04` |
+| Platform      | Asset                          | Runner                  |
+| ------------- | ------------------------------ | ----------------------- |
+| Linux x86_64  | `chanvoy-vX.Y.Z-linux-x86_64`  | `ubuntu-22.04`          |
 | Linux aarch64 | `chanvoy-vX.Y.Z-linux-aarch64` | `ubuntu-latest-arm64-s` |
-| macOS aarch64 | `chanvoy-vX.Y.Z-macos-aarch64` | `macos-14` |
+| macOS aarch64 | `chanvoy-vX.Y.Z-macos-aarch64` | `macos-14`              |
 
 Confirm runner availability and hosted success on the actual cut. CI also creates
 a versioned CycloneDX SBOM and stages both licenses in one exact base inventory.

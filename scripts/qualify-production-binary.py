@@ -43,8 +43,11 @@ SUITES = {
         "unresponsive_existing_socket_is_bounded_and_retained"
     ],
     "restart_harness": [
+        "auto_setup_activate_writes_active_profile_marker",
         "auto_setup_daemon_detaches_into_new_session",
         "auto_setup_detached_daemon_state_survives_session_transition",
+        "auto_setup_does_not_create_active_profile_marker",
+        "auto_setup_does_not_overwrite_other_active_profile_marker",
         "auto_setup_preserves_daemon_when_observation_admission_is_closed",
         "auto_setup_promotes_reuse_to_refreshed_on_bot_username_drift",
         "auto_setup_recovers_from_stale_socket",

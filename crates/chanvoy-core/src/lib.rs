@@ -2333,7 +2333,7 @@ pub enum ResolverError {
     #[error(
         "the persistent active_profile marker points at '{name}' but no such profile exists \
          (likely renamed or deleted); pass --profile, set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE, \
-         or run `chanvoy auto-setup` to refresh the marker. Available profiles: {available:?}"
+         or run `chanvoy auto-setup --activate` to refresh the marker. Available profiles: {available:?}"
     )]
     ActiveProfileNotFound {
         name: String,
