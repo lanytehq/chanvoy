@@ -109,12 +109,12 @@ This single command:
 Start, auto-setup and doctor report `daemon_disposition` and a separate
 `observation_ready` field (`true`, `false` or unknown/null):
 
-| Disposition | Meaning | Lifecycle exit |
-| --- | --- | --- |
-| `healthy` | Expected remote identity verified and admission open | 0 |
-| `degraded-remote` | Local RPC answers; remote identity or observation readiness is inconclusive/degraded | 0 |
-| `identity-refused` | Authoritative identity rejection or username mismatch | Nonzero |
-| `unresponsive-local` | Local RPC did not answer within its budget | Nonzero |
+| Disposition          | Meaning                                                                              | Lifecycle exit |
+| -------------------- | ------------------------------------------------------------------------------------ | -------------- |
+| `healthy`            | Expected remote identity verified and admission open                                 | 0              |
+| `degraded-remote`    | Local RPC answers; remote identity or observation readiness is inconclusive/degraded | 0              |
+| `identity-refused`   | Authoritative identity rejection or username mismatch                                | Nonzero        |
+| `unresponsive-local` | Local RPC did not answer within its budget                                           | Nonzero        |
 
 A timeout, connection failure or server error preserves a responsive daemon.
 Closed/recovering WebSocket admission also preserves it. A successful lifecycle
@@ -243,10 +243,10 @@ long-running channel:
    precision delivered by each flag depends on the underlying API
    surface:
 
-   | Flag | Resolution | Why |
-   |---|---|---|
-   | `read --since` | second-precise | hits MM `posts?since={millis}` directly |
-   | `wait --timeout` | second-precise | absolute deadman from RPC entry |
+   | Flag                    | Resolution                 | Why                                                 |
+   | ----------------------- | -------------------------- | --------------------------------------------------- |
+   | `read --since`          | second-precise             | hits MM `posts?since={millis}` directly             |
+   | `wait --timeout`        | second-precise             | absolute deadman from RPC entry                     |
    | `notifications --since` | minute-rounded (rounds up) | underlying MM notifications surface is minute-keyed |
 
    So `chanvoy notifications --since 30s` behaves like ~1 minute (not
@@ -340,16 +340,16 @@ Choose the wait posture by what the host can use to start a turn:
    observation while it lives; it cannot start a turn.
 
 All three postures keep a single owner. Do not detach and forget a follower or
-fan out multiple owners. Start a new wait only after a terminal record *or
-confirmed old-process exit*. Resume from the last drained `tip` (or the
+fan out multiple owners. Start a new wait only after a terminal record _or
+confirmed old-process exit_. Resume from the last drained `tip` (or the
 original `--after`; drain first if neither exists). After a sink failure,
 repair the sink before re-arming.
 
-| Outcome | Exit | Notes |
-| --- | ---: | --- |
-| Match | 0 | One message in `{channel, messages:[…]}` |
-| Clean deadman | 1 | JSON `timeout: true` only when observation actually ran |
-| Hard / provider | 2 | `error_class` + `retryable`; never `timeout: true` |
+| Outcome         | Exit | Notes                                                   |
+| --------------- | ---: | ------------------------------------------------------- |
+| Match           |    0 | One message in `{channel, messages:[…]}`                |
+| Clean deadman   |    1 | JSON `timeout: true` only when observation actually ran |
+| Hard / provider |    2 | `error_class` + `retryable`; never `timeout: true`      |
 
 Filters are case-sensitive by default; use `--pattern '(?i)…'` when case should not
 matter. Self posts never wake the wait. Empty filters are refused. Bare wait
@@ -367,13 +367,13 @@ trusting new wait features. Prefer
 unique dogfood markers (`PANEL-VERIFY-<seat>-<shortid>`) over bare vocabulary
 words on busy channels.
 
-   **`notifications --unread` does not use `--since` for counting.**
-   The unread branch counts mentions since the stored anchor cursor,
-   not since a time window. The supplied `--since` value is still
-   parsed and validated for shape (so a malformed suffix on either
-   path still rejects loudly with the same diagnostic), but the parsed
-   window is not consumed on the unread path. This is the long-standing
-   semantic; documented here for clarity.
+**`notifications --unread` does not use `--since` for counting.**
+The unread branch counts mentions since the stored anchor cursor,
+not since a time window. The supplied `--since` value is still
+parsed and validated for shape (so a malformed suffix on either
+path still rejects loudly with the same diagnostic), but the parsed
+window is not consumed on the unread path. This is the long-standing
+semantic; documented here for clarity.
 
 Worked example, walking into a fresh channel:
 
@@ -492,13 +492,13 @@ chanvoy --profile <seat> doctor <channel> --json
 or calls `check`. It reports separate checks so the three common empty-read
 states stay distinct:
 
-| Check | What it answers |
-| --- | --- |
-| `daemon` | Socket reachable; drift bit; Mattermost probe on the daemon |
-| `generation` | CLI/daemon dual pin when this environment owns the daemon (PER-038A) |
-| `identity` | Token whoami (status class only on failure — no provider body) |
-| `clock` | Local wall clock vs HTTP `Date` on `GET /users/me` |
-| `channel` (optional) | Pure resolve / membership for a named channel |
+| Check                | What it answers                                                      |
+| -------------------- | -------------------------------------------------------------------- |
+| `daemon`             | Socket reachable; drift bit; Mattermost probe on the daemon          |
+| `generation`         | CLI/daemon dual pin when this environment owns the daemon (PER-038A) |
+| `identity`           | Token whoami (status class only on failure — no provider body)       |
+| `clock`              | Local wall clock vs HTTP `Date` on `GET /users/me`                   |
+| `channel` (optional) | Pure resolve / membership for a named channel                        |
 
 Within one diagnostic, parent credential evidence and daemon credential evidence
 remain separate. An identity-endpoint 401/403 or observed wrong username remains
@@ -508,12 +508,12 @@ cannot clear daemon refusal. Unresolved refusal means exit 2 and unscored genera
 
 Clock verdicts (residual after RTT/2):
 
-| Verdict | Residual band |
-| --- | --- |
-| `healthy` | ≤ 5s noise |
-| `elevated_ahead` / `elevated_behind` | (5s, 30s] — soft non-healthy (exit 1) |
-| `suspected_ahead` / `suspected_behind` | > 30s |
-| `unavailable` | no trustworthy `Date` |
+| Verdict                                | Residual band                         |
+| -------------------------------------- | ------------------------------------- |
+| `healthy`                              | ≤ 5s noise                            |
+| `elevated_ahead` / `elevated_behind`   | (5s, 30s] — soft non-healthy (exit 1) |
+| `suspected_ahead` / `suspected_behind` | > 30s                                 |
+| `unavailable`                          | no trustworthy `Date`                 |
 
 A missing or unparseable `Date` is **unavailable** — never a green skew
 verdict. **Never** report `healthy` / exit 0 when residual is above the
@@ -583,7 +583,7 @@ by post id so repeated calls agree.
 newest by timestamp, ties broken by id. That is not always the last
 element of the full list: the root is pinned first regardless of its
 timestamp, so on a thread whose root carries the later timestamp
-(an edited or backdated root) the newest message *is* the root.
+(an edited or backdated root) the newest message _is_ the root.
 
 **`--json` emits an array in both modes.** With `--latest` it is a
 one-element array. A flag never changes the type of the output, so a
@@ -599,7 +599,7 @@ is returned:
   reaches you.
 - On `thread`, a mismatched anchor issues **no thread request at all** —
   the refusal happens before the conversation is fetched.
-- A provider answer that is a *different* post from the one asked for is
+- A provider answer that is a _different_ post from the one asked for is
   refused rather than returned under a successful-looking fetch.
 - On `thread`, every post in the response is checked, not only the
   anchor: the bot's credential reaches more channels than the one you
@@ -654,10 +654,10 @@ message object carries one added field, `root_id`.
 
 The crumbs are human output and are not JSON keys, but each maps to one:
 
-| Human crumb | JSON field |
-| --- | --- |
-| `id=` | `id`, which was always there |
-| `root=` | `root_id`, added by this release |
+| Human crumb | JSON field                       |
+| ----------- | -------------------------------- |
+| `id=`       | `id`, which was always there     |
+| `root=`     | `root_id`, added by this release |
 
 A consumer that reads fields by name is unaffected. One that asserts an
 exact set of keys will see `root_id` and should be updated.
@@ -729,8 +729,9 @@ substitution form interacts badly with history/command expansion and
 can hit `ARG_MAX`. The file/stdin paths read the body directly.
 
 Rules:
+
 - **Exactly one** source per call. Supplying more than one (e.g. a
-  positional message *and* `--message-file`) is refused up front, so
+  positional message _and_ `--message-file`) is refused up front, so
   message content is never silently dropped.
 - The body is sent **verbatim** — trailing newlines and CRLF line
   endings are preserved (the file's bytes are your intent).
@@ -821,12 +822,12 @@ unknown name, the error surfaces with the typed value preserved.
 
 ### When to use threading vs reactions
 
-| Use | Choose |
-|---|---|
-| Acking a finding ("noted", "lgtm", "seen") | reaction (`+1` / `eyes`) |
+| Use                                                     | Choose                        |
+| ------------------------------------------------------- | ----------------------------- |
+| Acking a finding ("noted", "lgtm", "seen")              | reaction (`+1` / `eyes`)      |
 | Following up on a finding with new info or a fix commit | threaded reply (`--reply-to`) |
-| Quick agreement / disagreement | reaction (`+1` / `-1`) |
-| Adding context that needs attribution + history | threaded reply |
+| Quick agreement / disagreement                          | reaction (`+1` / `-1`)        |
+| Adding context that needs attribution + history         | threaded reply                |
 
 Pattern observed during a high-traffic review cycle: a dozen reviewer
 findings plus ~30% acks-as-text-posts made the signal-to-noise ratio
@@ -864,10 +865,10 @@ composes its owned scopes (`in:<resolved-channel>` always; plus
 set). Inline MM operators that **conflict** with chanvoy-owned scopes
 refuse with a clear diagnostic naming the conflict:
 
-| Conflict | Diagnostic |
-|---|---|
-| Inline `in:` + channel arg | "channel argument defines search scope; remove inline `in:`..." |
-| Inline `from:` + `--from` | "inline `from:` operator conflicts with the `--from` flag; pick one" |
+| Conflict                              | Diagnostic                                                                                         |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Inline `in:` + channel arg            | "channel argument defines search scope; remove inline `in:`..."                                    |
+| Inline `from:` + `--from`             | "inline `from:` operator conflicts with the `--from` flag; pick one"                               |
 | Inline `before:`/`after:` + `--since` | "inline operator conflicts with the `--since` flag (both define the search time window); pick one" |
 
 Non-conflicting inline operators pass through verbatim — chanvoy
@@ -969,15 +970,15 @@ When the resolver can't pick a single team, the CLI refuses with one
 of three distinct error shapes — never a generic 404:
 
 - **No-match**: `channel "<name>" not found on any team you are a
-  member of. Teams searched: [...]`. Suggests either checking the
+member of. Teams searched: [...]`. Suggests either checking the
   spelling or asking dispatch to add the bot to the team that
   actually hosts the channel.
 - **Not-a-member** (only via explicit `<team>/<channel>` or
   `--team`): `team "<slug>" requested via <team>/<channel> syntax,
-  but you are not a member of it. Teams you are a member of: [...]`.
+but you are not a member of it. Teams you are a member of: [...]`.
 - **Ambiguous**: `channel "<name>" is ambiguous — found on multiple
-  teams: [...]. Use --team <slug> or <team>/<channel> syntax to
-  disambiguate.`
+teams: [...]. Use --team <slug> or <team>/<channel> syntax to
+disambiguate.`
 
 ### Cursor isolation
 
@@ -1013,6 +1014,7 @@ The qualified `<team>/<channel>` form on each line is directly
 copy-pasteable into `chanvoy read` / `post` / `check`.
 
 Flags:
+
 - `--team <slug>` — list only that team's channels.
 - `--primary-team` — pre-0.1.3 single-team output for tooling that
   depends on the old shape.
@@ -1040,17 +1042,17 @@ verb that touches a channel is now cross-team aware.
 
 ## Identity Reduction (Parallel-Stream Profiles)
 
-> Distinct from cross-team **fallback** above. Fallback decides *which
-> channel* a name resolves to (PER-019). Reduction decides *which
-> identity posts* once the channel is resolved (PER-035). They compose:
+> Distinct from cross-team **fallback** above. Fallback decides _which
+> channel_ a name resolves to (PER-019). Reduction decides _which
+> identity posts_ once the channel is resolved (PER-035). They compose:
 > a single write can resolve its channel via team-fallback **and** post
 > under a reduced identity, and the audit log names both independently.
 
 When one family bot runs multiple parallel sessions inside a
 confidential engagement (per SOP-MM-018: `agent-dataeng-blue-s1`,
 `-s2`, ... alongside the bare family `agent-dataeng-blue`), each stream
-session wants to post under its stream identity *inside* the engagement
-team but under the bare family identity *everywhere else in the galaxy*
+session wants to post under its stream identity _inside_ the engagement
+team but under the bare family identity _everywhere else in the galaxy_
 (shared 3leaps/fulmenhq channels, where `s2` is meaningless to outside
 readers).
 
@@ -1091,7 +1093,7 @@ stream identity (never the family identity).
 
 Explicit `--profile` still wins as an escape hatch: `chanvoy --profile
 dataeng-galaxy-s2 post <outside-channel>` still reduces (the `--profile`
-selects *which* reduction policy applies; the policy then fires);
+selects _which_ reduction policy applies; the policy then fires);
 `chanvoy --profile dataeng-galaxy post <outside-channel>` does **not**
 reduce (the family profile carries no policy).
 
@@ -1099,7 +1101,7 @@ The family profile **must have its own token env** (a distinct
 `env_name` from the stream profile). At startup the daemon loads the
 family token and validates it with `whoami` against the family profile's
 expected bot — if the family profile shares `env_name` with the stream
-(both default `LANYTE_MM_TOKEN`), it would resolve to the *stream* token
+(both default `LANYTE_MM_TOKEN`), it would resolve to the _stream_ token
 in a stream shell, and the daemon **refuses to start** with a
 `ReduceIdentityMismatch` rather than post stream identity under a false
 family attribution. Give the family profile a dedicated token env (e.g.
@@ -1164,16 +1166,16 @@ After a profile rename or deletion (e.g., a coordinated migration sweep), the `a
 Error: the persistent active_profile marker points at 'old-bare-name' but no such profile exists (likely renamed or deleted); pass --profile, set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE, or run `chanvoy auto-setup --activate` to refresh the marker. Available profiles: ["current-name"]
 ```
 
-Recovery: rerun `chanvoy auto-setup` to refresh the marker against your current sourced env. The diagnostic error is intentional — it surfaces the stale state instead of letting it propagate as silent mis-attribution.
+Recovery: rerun `chanvoy auto-setup --activate` to refresh the marker against your current sourced env. The diagnostic error is intentional — it surfaces the stale state instead of letting it propagate as silent mis-attribution.
 
 ### `chanvoy profile active`
 
 Reports the current marker contents directly. Output shape:
 
-| Marker state | Text mode | JSON mode |
-|---|---|---|
-| Set to `<name>` | `<name>` | `{"active_profile": "<name>"}` |
-| Empty | `(none)` | `{"active_profile": null}` |
+| Marker state    | Text mode | JSON mode                      |
+| --------------- | --------- | ------------------------------ |
+| Set to `<name>` | `<name>`  | `{"active_profile": "<name>"}` |
+| Empty           | `(none)`  | `{"active_profile": null}`     |
 
 This replaces a fallback in earlier chanvoy versions that synthesized a name from the resolver — scripts or agents parsing this output to gate behavior may need updating to handle the explicit-empty case (text `(none)` literal, or `.active_profile` field that may be JSON `null`).
 
@@ -1207,14 +1209,14 @@ stage, budget, elapsed, classified outcome, profile and PID. JSON stdout keeps
 the command's existing receipt shape. Provider bodies, credentials and observed
 identity strings are excluded from startup errors and phase events.
 
-| Startup phase | Budget and attempt count |
-| --- | --- |
-| Foreground existing-socket probe | 750 ms, one attempt; success ends this attempt as already-running, any unsuccessful result retains the socket/PID and refuses to bind |
-| Parent identity and team access | Separate 2-second phases, one attempt each |
-| Reduce-family and manual foreground identity | Separate 2-second phases, one attempt each, before listener/PID creation |
-| Detached-child readiness | Nominal 10-second polling window, at most 40 iterations; each local probe has 750 ms and each interval is 250 ms, followed by one final 750 ms probe |
-| Failed-child termination | One 5-second kill-and-reap deadline; expiry retains state and reports termination-unconfirmed |
-| Confirmed-dead failed-child socket absence | One 750 ms probe, followed by runtime identity checks before removal |
+| Startup phase                                | Budget and attempt count                                                                                                                             |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Foreground existing-socket probe             | 750 ms, one attempt; success ends this attempt as already-running, any unsuccessful result retains the socket/PID and refuses to bind                |
+| Parent identity and team access              | Separate 2-second phases, one attempt each                                                                                                           |
+| Reduce-family and manual foreground identity | Separate 2-second phases, one attempt each, before listener/PID creation                                                                             |
+| Detached-child readiness                     | Nominal 10-second polling window, at most 40 iterations; each local probe has 750 ms and each interval is 250 ms, followed by one final 750 ms probe |
+| Failed-child termination                     | One 5-second kill-and-reap deadline; expiry retains state and reports termination-unconfirmed                                                        |
+| Confirmed-dead failed-child socket absence   | One 750 ms probe, followed by runtime identity checks before removal                                                                                 |
 
 These are separate phases, not an end-to-end startup bound. A final readiness
 iteration can extend beyond the nominal window by its probe and sleep; the final
@@ -1326,7 +1328,7 @@ dimension from the network-access dimension — in the network case,
 
    CLI and daemon must agree on the value, so set it once at
    identity-source time, not per-invocation. This is the right
-   answer when the sandboxed shell can write *some* path the daemon
+   answer when the sandboxed shell can write _some_ path the daemon
    can also write.
 
 2. **Ask the supervisor for socket access** when no redirect target
