@@ -228,13 +228,20 @@ RELEASE_DIR ?= release/$(CHANVOY_RELEASE_TAG)
 RELEASE_ENV = CHANVOY_RELEASE_TAG="$(CHANVOY_RELEASE_TAG)"
 
 .PHONY: release-tooling-test release-prepare-tag-message release-fetch-ci-artifacts
+.PHONY: release-scanner-preflight
 .PHONY: release-create-draft release-stage-anchors release-verify-draft release-verify-published-tag
 .PHONY: release-export-pin release-insert-anchors release-validate-pin
 
 release-tooling-test: installer-reporting-test ## Synthetic-key and stub-remote provenance regression corpus
 	@bash scripts/release-tooling-test.sh
 
-release-preflight: release-prep ## Fresh quality gates and maintainer tag preflight
+release-scanner-preflight: ## Check the pinned scanner in owned offline containers
+	@set -eu; \
+	  preflight_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/chanvoy-scanner-preflight.XXXXXX"); \
+	  python3 scripts/sbom-scanner-preflight.py --output "$$preflight_dir/evidence"; \
+	  echo "[ok] scanner evidence: $$preflight_dir/evidence"
+
+release-preflight: release-scanner-preflight release-prep ## Fresh quality gates and maintainer tag preflight
 	@$(RELEASE_ENV) bash scripts/release-preflight.sh
 
 release-guard-tag-version: ## Check canonical version for tag creation

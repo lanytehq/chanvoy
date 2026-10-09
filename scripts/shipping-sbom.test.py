@@ -460,6 +460,9 @@ class ShippingTests(unittest.TestCase):
         upload = release[release.index("      - name: Upload exact SBOM artifact"):release.index("\n  packages:")]
         self.assertIn("if: success()", upload)
         self.assertNotIn("always()", upload)
+        makefile = (sbom.SCRIPTS.parent / "Makefile").read_text()
+        self.assertIn("release-preflight: release-scanner-preflight release-prep", makefile)
+        self.assertIn("scripts/sbom-scanner-preflight.py", check)
 
 
 class SchemaTests(unittest.TestCase):
