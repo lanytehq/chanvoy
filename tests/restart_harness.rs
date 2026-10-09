@@ -471,6 +471,84 @@ async fn auto_setup_reuses_clean_generation_matched_daemon_without_pid_change() 
     server.await.expect("fake daemon completed");
 }
 
+/// Plain `auto-setup` must never set or overwrite the host-wide
+/// `active_profile` marker; only an explicit `--activate` writes it.
+async fn auto_setup_marker_case(activate: bool, preexisting: Option<&str>) {
+    let label = if activate {
+        "auto-setup-activate"
+    } else {
+        "auto-setup-no-marker"
+    };
+    let env = TestEnv::new(label).await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-marker", "agent-bravo-devlead", "team-id-marker")
+        .await;
+    env.mock_empty_memberships("team-id-marker").await;
+    std::fs::create_dir_all(env.chanvoy_runtime_dir()).expect("runtime dir");
+    std::fs::write(
+        env.chanvoy_runtime_dir()
+            .join(format!("{}.pid", env.profile_name)),
+        "424242",
+    )
+    .expect("sentinel pid");
+    let marker = env.chanvoy_config_dir().join("active_profile");
+    if let Some(name) = preexisting {
+        std::fs::create_dir_all(env.chanvoy_config_dir()).expect("config dir");
+        std::fs::write(&marker, format!("{name}\n")).expect("seed marker");
+    }
+    let server = clean_fake_daemon(&env).await;
+
+    let mut cmd = auto_setup_command(&env, "lanytehq", "bravo-devlead");
+    if activate {
+        cmd.arg("--activate");
+    }
+    let output = cmd.output().await.expect("auto-setup");
+    assert!(
+        output.status.success(),
+        "auto-setup must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("auto-setup JSON");
+    server.await.expect("fake daemon completed");
+
+    let marker_now = std::fs::read_to_string(&marker).ok();
+    if activate {
+        assert_eq!(report["is_active"], true);
+        assert_eq!(
+            marker_now.as_deref().map(str::trim),
+            Some(env.profile_name.as_str()),
+            "--activate must write the active_profile marker"
+        );
+    } else {
+        assert_eq!(report["is_active"], false);
+        assert_eq!(
+            marker_now.as_deref().map(str::trim),
+            preexisting,
+            "plain auto-setup must not create or overwrite the active_profile marker"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_does_not_create_active_profile_marker() {
+    auto_setup_marker_case(false, None).await;
+}
+
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_does_not_overwrite_other_active_profile_marker() {
+    auto_setup_marker_case(false, Some("some-other-seat")).await;
+}
+
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn auto_setup_activate_writes_active_profile_marker() {
+    auto_setup_marker_case(true, None).await;
+}
+
 /// Closed observation admission preserves the responsive process without
 /// certifying that an observation wait is ready. Start and setup agree.
 #[tokio::test]

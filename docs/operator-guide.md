@@ -1059,8 +1059,7 @@ the stream profile once with a reduce target:
 
 ```bash
 chanvoy auto-setup --profile dataeng-galaxy-s2 \
-  --reduce-profile dataeng-galaxy \
-  --no-activate
+  --reduce-profile dataeng-galaxy
 ```
 
 This writes a `[reduce]` table onto the profile:
@@ -1147,7 +1146,7 @@ When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profi
 2. **`CHANVOY_PROFILE` env var** — explicit override. Refuses if the named profile doesn't exist on disk.
 3. **Env-derived `<role>-<scope>` exact-name** — when `LANYTE_AGENT_ROLE` and `LANYTE_AGENT_SCOPE` are set, resolves to the profile named exactly `<role>-<scope>`. Refuses with the available-profile list if no exact match exists (does not silently fall through to a different identity).
 4. **Single running daemon** — if exactly one chanvoy daemon is currently running on this machine, that profile is used.
-5. **`active_profile` marker** — single-tenant convenience. Only consulted when env vars are unset and no daemon is running. Updated explicitly by `chanvoy auto-setup` and by `--activate` on `chanvoy profile create` / `chanvoy profile create-from-env`. Also updated implicitly: `profile create` / `profile create-from-env` (without `--activate`) will activate a freshly created profile when no active marker exists yet, so first-profile setup leaves the marker pointing at the new profile.
+5. **`active_profile` marker** — single-tenant convenience. Only consulted when env vars are unset and no daemon is running. Updated explicitly by `chanvoy auto-setup --activate` and by `--activate` on `chanvoy profile create` / `chanvoy profile create-from-env`. Plain `chanvoy auto-setup` never sets or overwrites the marker; seats should pin `CHANVOY_PROFILE` (identity script) or pass `--profile`. Also updated implicitly: `profile create` / `profile create-from-env` (without `--activate`) will activate a freshly created profile when no active marker exists yet, so first-profile setup leaves the marker pointing at the new profile.
 6. **Refuse** — print the available-profile list and require explicit `--profile`.
 
 Two carve-outs:
@@ -1162,7 +1161,7 @@ The full resolver contract, including policy semantics and per-rule rationale, l
 After a profile rename or deletion (e.g., a coordinated migration sweep), the `active_profile` marker may point at a profile that no longer exists. The resolver detects this and refuses with `ActiveProfileNotFound` rather than silently falling through to a different identity:
 
 ```
-Error: the persistent active_profile marker points at 'old-bare-name' but no such profile exists (likely renamed or deleted); pass --profile, set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE, or run `chanvoy auto-setup` to refresh the marker. Available profiles: ["current-name"]
+Error: the persistent active_profile marker points at 'old-bare-name' but no such profile exists (likely renamed or deleted); pass --profile, set LANYTE_AGENT_ROLE+LANYTE_AGENT_SCOPE, or run `chanvoy auto-setup --activate` to refresh the marker. Available profiles: ["current-name"]
 ```
 
 Recovery: rerun `chanvoy auto-setup` to refresh the marker against your current sourced env. The diagnostic error is intentional — it surfaces the stale state instead of letting it propagate as silent mis-attribution.

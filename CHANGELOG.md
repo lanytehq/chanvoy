@@ -5,6 +5,16 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Profile resolution
+
+- `chanvoy auto-setup` no longer sets or overwrites the host-wide
+  `active_profile` marker. Pass `--activate` to opt in. `--no-activate` is
+  now the default and remains accepted as a hidden no-op. Seats on shared
+  hosts should pin `CHANVOY_PROFILE` (identity script) or pass `--profile`;
+  a missing marker never selects a profile implicitly.
+
 ## [0.3.2] - 2026-10-08
 
 ### Daemon lifecycle

@@ -297,9 +297,15 @@ struct AttentionShowArgs {
 
 #[derive(Debug, Args)]
 struct AutoSetupArgs {
-    /// Do not set the resulting profile as active. Use when bootstrapping or repairing a
-    /// secondary profile without stealing active-profile resolution (multi-profile operators).
-    #[arg(long)]
+    /// Also set the resulting profile as the host-wide `active_profile` marker. Off by
+    /// default: auto-setup never sets or overwrites a global default implicitly. Seats
+    /// should pin `CHANVOY_PROFILE` (identity script) or pass `--profile` instead.
+    #[arg(long, conflicts_with = "no_activate")]
+    activate: bool,
+    /// Deprecated no-op (now the default): auto-setup does not touch the `active_profile`
+    /// marker unless `--activate` is passed. Accepted for script compatibility.
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
     no_activate: bool,
     /// PER-035: register an identity-reduction policy on this profile.
     /// The value is the bare family profile name to reduce to. After
@@ -3649,7 +3655,7 @@ async fn handle_auto_setup(
             let existing = existing.expect("Reuse implies existing profile");
             let assessment = daemon_assessment::assess_until(&existing, deadline).await;
             if assessment.disposition == DaemonDisposition::DegradedRemote {
-                return print_preserved_setup(json, &existing, assessment, !args.no_activate);
+                return print_preserved_setup(json, &existing, assessment, args.activate);
             }
             existing_assessment = Some(assessment);
             // A responsive but remotely inconclusive daemon was preserved
@@ -3671,12 +3677,7 @@ async fn handle_auto_setup(
                     {
                         let mut assessment = existing_assessment.take().unwrap();
                         assessment.disposition = DaemonDisposition::DegradedRemote;
-                        return print_preserved_setup(
-                            json,
-                            &existing,
-                            assessment,
-                            !args.no_activate,
-                        );
+                        return print_preserved_setup(json, &existing, assessment, args.activate);
                     }
                     return exit_on_preflight(json, err);
                 }
@@ -3713,6 +3714,10 @@ async fn handle_auto_setup(
         }
     };
 
+    // Auto-setup never moves the host-wide active marker implicitly: only an
+    // explicit `--activate` writes it (a second seat bootstrapping on a shared
+    // host must not steal other seats' default resolution).
+    //
     // PER-012 AC #3: persist the active marker unconditionally when
     // activate_requested. Previous logic skipped the store when the
     // file already matched, which was order-dependent in subtle ways
@@ -3720,7 +3725,7 @@ async fn handle_auto_setup(
     // mutation, could leave the printed "active:" line out of sync
     // with the file). Always-persist removes the gap entirely; the
     // store is one small idempotent write.
-    let activate_requested = !args.no_activate;
+    let activate_requested = args.activate;
     let is_active_now = if activate_requested {
         store_active_profile(&persisted_profile.name)?;
         true
@@ -4273,7 +4278,8 @@ async fn ensure_daemon_running_assessed(
 ///
 /// The caller owns everything *around* the spawn — health checks, stopping a
 /// stale/unhealthy predecessor, and all profile-management semantics
-/// (`auto-setup` creates/refreshes profiles and moves the active marker;
+/// (`auto-setup` creates/refreshes profiles and moves the active marker only
+/// with `--activate`;
 /// `daemon start` deliberately does none of that). This helper owns only:
 ///
 /// 1. nonce generation;
