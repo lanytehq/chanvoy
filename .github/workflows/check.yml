@@ -41,8 +41,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: stable
-          components: clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+          components: rustfmt, clippy
+      - name: Install synthetic ceremony tools
+        run: sudo apt-get update && sudo apt-get install -y minisign gnupg jq
+      - name: Install workflow linter
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Install checksum-pinned verification helper
+        run: bash scripts/release-install-decernor.sh
+      - name: Run full PR gate with configured release tool
+        run: |
+          export DECERNOR_BIN="$CHANVOY_DECERNOR_BIN" DECERNOR="$CHANVOY_DECERNOR_BIN"
+          make pr-final
   msrv:
     runs-on: ubuntu-latest
     steps:
