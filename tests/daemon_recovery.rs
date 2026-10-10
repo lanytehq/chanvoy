@@ -401,6 +401,7 @@ async fn rejected_cached_token_requires_fresh_parent_identity_before_replacement
     let fresh = env
         .chanvoy_command()
         .env(&env.token_env_name, "test-token-parent")
+        .env("RUST_LOG", "chanvoy_cli::lifecycle=debug")
         .arg("--profile")
         .arg(&env.profile_name)
         .args(["--json", "daemon", "start"])
