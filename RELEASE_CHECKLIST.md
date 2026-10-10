@@ -142,6 +142,8 @@ a versioned CycloneDX SBOM and stages both licenses in one exact base inventory.
 make release-fetch-ci-artifacts
 make release-stage-anchors
 make release-checksums
+# Optional standalone check before draft creation:
+make release-verify-checksums
 make release-create-draft
 ```
 
@@ -155,6 +157,9 @@ helpers or substitutes current-main metadata.
 
 The maintainer creates the draft from the exact receipt-bound checksummed set.
 There must be no existing release for this tag. CI never creates this draft.
+`release-verify-checksums` verifies both manifests, all payload hashes and the
+byte-identical legacy alias without signing. These checks also remain mandatory
+inside draft creation and `release-verify`.
 
 ## Sign, upload, verify fresh bytes and promote
 
@@ -168,6 +173,15 @@ make release-verify-draft
 export CHANVOY_CONFIRM_PUBLISH="$CHANVOY_RELEASE_TAG"
 make release-undraft
 ```
+
+Run `release-sign` in the operator's terminal. Minisign prompts for the encrypted
+key passphrase for each manifest and each legacy binary signature (five signing
+calls). GPG uses the configured keyring and exact signing subkey, with its normal
+pinentry or hardware-key interaction for each manifest; cached authorization may
+avoid a second prompt. Signing prompts and errors remain visible. Never place a
+passphrase in an environment variable or command argument. A failure retains
+partial outputs for inspection; do not delete or retry them without checking
+which signatures were created.
 
 One exact inventory covers the three binaries, versioned SBOM, two licenses,
 `release-notes-vX.Y.Z.md`, TXT/NDJSON anchors, `SHA256SUMS`, `SHA512SUMS`, both
