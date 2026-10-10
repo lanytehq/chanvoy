@@ -237,9 +237,10 @@ release-tooling-test: installer-reporting-test ## Synthetic-key and stub-remote 
 
 release-scanner-preflight: ## Check the pinned scanner in owned offline containers
 	@set -eu; \
-	  preflight_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/chanvoy-scanner-preflight.XXXXXX"); \
-	  python3 scripts/sbom-scanner-preflight.py --output "$$preflight_dir/evidence"; \
-	  echo "[ok] scanner evidence: $$preflight_dir/evidence"
+	  preflight_root=$${CHANVOY_SCANNER_PREFLIGHT_ROOT:-$$(dirname "$$(pwd)")}; \
+	  preflight_dir=$$(mktemp -d "$$preflight_root/.chanvoy-scanner-preflight.XXXXXX"); \
+	  echo "[info] scanner evidence: $$preflight_dir/evidence"; \
+	  python3 scripts/sbom-scanner-preflight.py --output "$$preflight_dir/evidence"
 
 release-preflight: release-scanner-preflight release-prep ## Fresh quality gates and maintainer tag preflight
 	@$(RELEASE_ENV) bash scripts/release-preflight.sh

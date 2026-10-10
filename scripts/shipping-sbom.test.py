@@ -9,8 +9,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import tarfile
@@ -590,6 +592,54 @@ class SchemaTests(unittest.TestCase):
 
 
 class ScannerTests(unittest.TestCase):
+    def test_make_preflight_uses_external_private_evidence_and_reports_failure_path(self):
+        for mode in ("default", "override", "failure"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="cv-make-scanner-") as directory:
+                root = Path(directory).resolve()
+                checkout = root / "checkout"
+                checkout.mkdir()
+                (checkout / "Cargo.toml").write_text('rust-version = "1.89.0"\n')
+                temporary = root / "temporary"
+                temporary.mkdir()
+                selected = root / "selected"
+                selected.mkdir()
+                tools = root / "tools"
+                tools.mkdir()
+                helper = tools / "probe.py"
+                helper.write_text('''import json, pathlib, sys
+assert sys.argv[1:3] == ["scripts/sbom-scanner-preflight.py", "--output"]
+out = pathlib.Path(sys.argv[3])
+out.mkdir(mode=0o700)
+(out / "invocation.json").write_text(json.dumps({"output": str(out)}))
+sys.exit(1 if pathlib.Path("refuse").exists() else 0)
+''')
+                executable = tools / "python3"
+                executable.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " " +
+                                      shlex.quote(str(helper)) + ' "$@"\n')
+                executable.chmod(0o700)
+                environment = os.environ.copy()
+                for variable in ("CHANVOY_SCANNER_PREFLIGHT_ROOT", "MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
+                    environment.pop(variable, None)
+                environment["TMPDIR"] = str(temporary)
+                environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
+                if mode == "override":
+                    environment["CHANVOY_SCANNER_PREFLIGHT_ROOT"] = str(selected)
+                if mode == "failure":
+                    (checkout / "refuse").touch()
+                result = subprocess.run(["make", "--no-print-directory", "-f", str(sbom.SCRIPTS.parent / "Makefile"),
+                                         "release-scanner-preflight"], cwd=checkout, env=environment,
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, mode != "failure", result.stderr)
+                prefix = "[info] scanner evidence: "
+                receipts = [line[len(prefix):] for line in result.stdout.splitlines() if line.startswith(prefix)]
+                self.assertEqual(len(receipts), 1, result.stdout)
+                output = Path(receipts[0])
+                self.assertEqual(output.parent.parent, selected if mode == "override" else root)
+                self.assertEqual(stat.S_IMODE(output.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+                self.assertEqual(json.loads((output / "invocation.json").read_text()), {"output": str(output)})
+                self.assertEqual(list(temporary.iterdir()), [])
+
     def controlled_scanner(self, mode=None):
         with tempfile.TemporaryDirectory(prefix="cv-scanner-owned-") as directory:
             root = Path(directory)
