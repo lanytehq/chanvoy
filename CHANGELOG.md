@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hosts should pin `CHANVOY_PROFILE` (identity script) or pass `--profile`;
   a missing marker never selects a profile implicitly.
 
-## [0.3.2] - 2026-10-08
+## [0.3.2] - 2026-10-10
 
 ### Daemon lifecycle
 
