@@ -4,6 +4,9 @@ The maintainer signs locally. Tag CI has `contents: read`, builds exactly three
 native binaries with locked dependencies, and uploads artifacts. It does not
 create a GitHub draft, publish a release, or receive signing keys.
 
+See [CI and release gates](docs/cicd.md) for gate coverage, retained evidence
+and the procedure for a failed check.
+
 ## Prepare the reviewed cut
 
 Merge the independently reviewed release changes. Finalize the actual date in
@@ -11,8 +14,13 @@ Merge the independently reviewed release changes. Finalize the actual date in
 Run fresh `make release-prep`, hosted checks and `make release-smoke`. The live
 smoke creates a disposable Mattermost channel; failed smoke stops the ceremony.
 `make release-preflight` first checks the pinned scanner's effective configuration
-in owned offline containers. Docker must be available; the check prints the retained
-evidence directory.
+and reads an owned synthetic payload through its production snapshot mount.
+The outer evidence directory remains private; the single-file snapshot is
+read-only and traversable by the isolated scanner. Docker must be available;
+the check prints the retained evidence directory before execution. The Make target
+defaults to a private temporary directory beside the checkout. Set
+`CHANVOY_SCANNER_PREFLIGHT_ROOT` to an existing Docker-visible directory outside
+the checkout when a different evidence location is needed.
 Use clean main synchronized with live origin/main. Signing and publication each
 require the maintainer's separate approval.
 

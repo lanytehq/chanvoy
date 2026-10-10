@@ -9,7 +9,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
+import stat
+import subprocess
 import sys
 import tempfile
 import tarfile
@@ -24,7 +27,7 @@ import bounded_evidence as bounded
 import shipping_sbom as sbom
 import production_build_inputs as build_inputs
 from bounded_evidence import EvidenceCommands, EvidenceError, json_write
-from sbom_evidence import Controller, scanner
+from sbom_evidence import Controller, scanner, scanner_access_probe
 
 
 native_spec = importlib.util.spec_from_file_location("native_synthetic", sbom.SCRIPTS / "production-build-policy.test.py")
@@ -589,6 +592,54 @@ class SchemaTests(unittest.TestCase):
 
 
 class ScannerTests(unittest.TestCase):
+    def test_make_preflight_uses_external_private_evidence_and_reports_failure_path(self):
+        for mode in ("default", "override", "failure"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="cv-make-scanner-") as directory:
+                root = Path(directory).resolve()
+                checkout = root / "checkout"
+                checkout.mkdir()
+                (checkout / "Cargo.toml").write_text('rust-version = "1.89.0"\n')
+                temporary = root / "temporary"
+                temporary.mkdir()
+                selected = root / "selected"
+                selected.mkdir()
+                tools = root / "tools"
+                tools.mkdir()
+                helper = tools / "probe.py"
+                helper.write_text('''import json, pathlib, sys
+assert sys.argv[1:3] == ["scripts/sbom-scanner-preflight.py", "--output"]
+out = pathlib.Path(sys.argv[3])
+out.mkdir(mode=0o700)
+(out / "invocation.json").write_text(json.dumps({"output": str(out)}))
+sys.exit(1 if pathlib.Path("refuse").exists() else 0)
+''')
+                executable = tools / "python3"
+                executable.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " " +
+                                      shlex.quote(str(helper)) + ' "$@"\n')
+                executable.chmod(0o700)
+                environment = os.environ.copy()
+                for variable in ("CHANVOY_SCANNER_PREFLIGHT_ROOT", "MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
+                    environment.pop(variable, None)
+                environment["TMPDIR"] = str(temporary)
+                environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
+                if mode == "override":
+                    environment["CHANVOY_SCANNER_PREFLIGHT_ROOT"] = str(selected)
+                if mode == "failure":
+                    (checkout / "refuse").touch()
+                result = subprocess.run(["make", "--no-print-directory", "-f", str(sbom.SCRIPTS.parent / "Makefile"),
+                                         "release-scanner-preflight"], cwd=checkout, env=environment,
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, mode != "failure", result.stderr)
+                prefix = "[info] scanner evidence: "
+                receipts = [line[len(prefix):] for line in result.stdout.splitlines() if line.startswith(prefix)]
+                self.assertEqual(len(receipts), 1, result.stdout)
+                output = Path(receipts[0])
+                self.assertEqual(output.parent.parent, selected if mode == "override" else root)
+                self.assertEqual(stat.S_IMODE(output.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+                self.assertEqual(json.loads((output / "invocation.json").read_text()), {"output": str(output)})
+                self.assertEqual(list(temporary.iterdir()), [])
+
     def controlled_scanner(self, mode=None):
         with tempfile.TemporaryDirectory(prefix="cv-scanner-owned-") as directory:
             root = Path(directory)
@@ -614,6 +665,16 @@ class ScannerTests(unittest.TestCase):
                     owner = argv[argv.index("--label") + 1].split("=", 1)[1]
                     mount = argv[argv.index("--mount") + 1]
                     source = mount.split("src=", 1)[1].split(",", 1)[0]
+                    snapshot = Path(source)
+                    access = stat.S_IMODE(snapshot.stat().st_mode)
+                    self.assertTrue(access & stat.S_IROTH and access & stat.S_IXOTH)
+                    self.assertFalse(access & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+                    self.assertEqual(stat.S_IMODE(controller.out.stat().st_mode) & 0o077, 0)
+                    self.assertEqual(list(snapshot.iterdir()), [snapshot / payload.name])
+                    copied = snapshot / payload.name
+                    self.assertEqual(copied.read_bytes(), payload.read_bytes())
+                    self.assertTrue(copied.stat().st_mode & stat.S_IROTH)
+                    self.assertFalse(copied.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
                     container = {"Id": "c" * 64, "Config": {"Image": sbom.TOOLS["syft"]["image"],
                                                               "Labels": {"chanvoy.sbom-owner": owner}},
                                  "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True,
@@ -678,6 +739,48 @@ class ScannerTests(unittest.TestCase):
                      "malformed-nnp", "unknown-create", "changed-owner", "malformed-inspect", "denied-remove", "survivor", "timeout", "timeout-denied-remove"):
             with self.subTest(mode=mode):
                 self.controlled_scanner(mode)
+
+    def test_access_probe_requires_observed_source_contents(self):
+        for mode in ("valid", "wrong-path", "wrong-hash", "duplicate-hash", "changed-payload",
+                     "not-file", "malformed-source", "malformed-metadata", "malformed-digests"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="cv-access-probe-") as directory:
+                root = Path(directory)
+                controller = Controller(sbom.SCRIPTS.parent, root / "evidence", "owned-access-probe-v1", 180)
+
+                def observe(_controller, name, argv, pin, payload):
+                    self.assertEqual(name, "syft-access-probe")
+                    self.assertEqual(argv, ["file:/payload/" + payload.name, "-o", "syft-json"])
+                    document = {"source": {"type": "file", "metadata": {
+                        "path": "/payload/" + payload.name,
+                        "digests": [{"algorithm": "sha256", "value": schema.sha(payload.read_bytes())}]}}}
+                    metadata = document["source"]["metadata"]
+                    if mode == "wrong-path":
+                        metadata["path"] = "/payload/another-owned-file"
+                    elif mode == "wrong-hash":
+                        metadata["digests"][0]["value"] = "0" * 64
+                    elif mode == "duplicate-hash":
+                        metadata["digests"] *= 2
+                    elif mode == "changed-payload":
+                        payload.write_bytes(b"changed owned input")
+                    elif mode == "not-file":
+                        document["source"]["type"] = "directory"
+                    elif mode == "malformed-source":
+                        document["source"] = []
+                    elif mode == "malformed-metadata":
+                        document["source"]["metadata"] = []
+                    elif mode == "malformed-digests":
+                        metadata["digests"] = [None]
+                    return json.dumps(document)
+
+                with mock.patch("sbom_evidence.scanner", side_effect=observe):
+                    if mode == "valid":
+                        receipt = scanner_access_probe(controller, sbom.TOOLS["syft"])
+                        self.assertEqual(receipt["status"], "pass")
+                        self.assertEqual(receipt["payload_sha256"],
+                                         schema.sha((controller.out / "scanner-access-probe.txt").read_bytes()))
+                    else:
+                        with self.assertRaises(EvidenceError):
+                            scanner_access_probe(controller, sbom.TOOLS["syft"])
 
     def test_verified_archive_extracts_only_one_regular_owned_binary(self):
         spec = importlib.util.spec_from_file_location("setup_validator", sbom.SCRIPTS / "setup-sbom-validator.py")
