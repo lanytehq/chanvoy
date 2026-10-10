@@ -579,19 +579,48 @@ fn observe_pid(pid: u32) -> ProcessObservation {
         #[cfg(not(target_os = "linux"))]
         return ProcessObservation::Dead;
     }
-    match (info.start_time_unix_ms, info.exe_path) {
-        (Some(start_ms), Some(executable)) if !executable.ends_with(" (deleted)") => {
-            ProcessObservation::Alive(ProcessIdentity {
-                pid,
-                uid,
-                start_ms,
-                birth,
-                executable,
-                args: info.cmdline,
-            })
-        }
-        _ => death_or_unknown(pid),
+    if info.cmdline.is_empty() {
+        tracing::debug!(
+            stage = "process-identity-observation",
+            pid,
+            outcome = "arguments-unavailable"
+        );
     }
+    identity_from_metadata(
+        pid,
+        uid,
+        birth,
+        info.start_time_unix_ms,
+        info.exe_path,
+        info.cmdline,
+    )
+    .map(ProcessObservation::Alive)
+    .unwrap_or_else(|| death_or_unknown(pid))
+}
+
+/// Best-effort metadata can disappear during exit. An incomplete read cannot
+/// establish either ownership or identity drift; death needs separate proof.
+fn identity_from_metadata(
+    pid: u32,
+    uid: u32,
+    birth: u64,
+    start_ms: Option<u64>,
+    executable: Option<String>,
+    args: Vec<String>,
+) -> Option<ProcessIdentity> {
+    let start_ms = start_ms?;
+    let executable = executable?;
+    if executable.is_empty() || executable.ends_with(" (deleted)") || args.is_empty() {
+        return None;
+    }
+    Some(ProcessIdentity {
+        pid,
+        uid,
+        birth,
+        start_ms,
+        executable,
+        args,
+    })
 }
 
 /// A process may exit during metadata collection. Only a fresh ESRCH proves
@@ -725,7 +754,12 @@ impl NativeControl {
             (ProcessObservation::Alive(expected), ProcessObservation::Alive(actual))
                 if expected != actual =>
             {
-                return current
+                tracing::debug!(
+                    stage = "process-identity-revalidation",
+                    pid = self.pid,
+                    outcome = identity_difference(expected, actual)
+                );
+                return current;
             }
             (ProcessObservation::Dead, ProcessObservation::Alive(_)) => {
                 return ProcessObservation::Unknown
@@ -892,6 +926,24 @@ struct ProcessIdentity {
     birth: u64,
     executable: String,
     args: Vec<String>,
+}
+
+fn identity_difference(expected: &ProcessIdentity, actual: &ProcessIdentity) -> &'static str {
+    if expected.pid != actual.pid {
+        "pid-changed"
+    } else if expected.uid != actual.uid {
+        "owner-changed"
+    } else if expected.birth != actual.birth {
+        "birth-changed"
+    } else if expected.start_ms != actual.start_ms {
+        "start-time-changed"
+    } else if expected.executable != actual.executable {
+        "executable-changed"
+    } else if actual.args.is_empty() {
+        "arguments-unavailable"
+    } else {
+        "arguments-changed"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1485,6 +1537,114 @@ mod tests {
             executable: "/synthetic/chanvoy".into(),
             args: vec!["daemon".into(), "serve".into()],
         }
+    }
+    #[test]
+    fn process_identity_requires_complete_metadata() {
+        let expected = identity();
+        let read = |start, executable, args| {
+            identity_from_metadata(
+                expected.pid,
+                expected.uid,
+                expected.birth,
+                start,
+                executable,
+                args,
+            )
+        };
+        assert_eq!(
+            read(
+                Some(expected.start_ms),
+                Some(expected.executable.clone()),
+                expected.args.clone()
+            ),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            read(
+                Some(expected.start_ms),
+                Some(expected.executable.clone()),
+                vec![]
+            ),
+            None
+        );
+        assert_eq!(
+            read(
+                None,
+                Some(expected.executable.clone()),
+                expected.args.clone()
+            ),
+            None
+        );
+        for executable in [
+            None,
+            Some(String::new()),
+            Some("/synthetic/chanvoy (deleted)".into()),
+        ] {
+            assert_eq!(
+                read(Some(expected.start_ms), executable, expected.args.clone()),
+                None
+            );
+        }
+        let changed = read(
+            Some(expected.start_ms),
+            Some(expected.executable.clone()),
+            vec!["other".into()],
+        )
+        .unwrap();
+        assert_ne!(changed, expected);
+        assert_eq!(
+            identity_difference(&expected, &changed),
+            "arguments-changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_shutdown_metadata_requires_confirmed_death() {
+        let expected = identity();
+        let incomplete = identity_from_metadata(
+            expected.pid,
+            expected.uid,
+            expected.birth,
+            Some(expected.start_ms),
+            Some(expected.executable.clone()),
+            vec![],
+        )
+        .map(ProcessObservation::Alive)
+        .unwrap_or(ProcessObservation::Unknown);
+        for confirmed in [false, true] {
+            let mut observations = vec![
+                ProcessObservation::Alive(expected.clone()),
+                ProcessObservation::Alive(expected.clone()),
+                incomplete.clone(),
+            ];
+            if confirmed {
+                observations.push(ProcessObservation::Dead);
+            }
+            let f = fake(observations);
+            let result = stop_confirmed(
+                &f,
+                &expected,
+                StopBudget {
+                    polls: 2,
+                    ..budget()
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), confirmed);
+            assert_eq!(f.shutdowns.get(), 1);
+            assert_eq!(f.signals.get(), 0);
+            assert_eq!(f.cleanups.get(), usize::from(confirmed));
+        }
+        let mut changed = expected.clone();
+        changed.args = vec!["other".into()];
+        let f = fake(vec![
+            ProcessObservation::Alive(expected.clone()),
+            ProcessObservation::Alive(expected.clone()),
+            ProcessObservation::Alive(changed),
+            ProcessObservation::Dead,
+        ]);
+        assert!(stop_confirmed(&f, &expected, budget()).await.is_err());
+        assert_eq!((f.signals.get(), f.cleanups.get()), (0, 0));
     }
     #[test]
     fn monitor_registration_never_adopts_changed_or_unknown_identity() {

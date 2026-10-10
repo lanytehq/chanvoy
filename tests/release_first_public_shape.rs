@@ -1,5 +1,68 @@
 //! Static contracts for the first-public release documentation and gates.
 
+fn dated_field(document: &str, prefix: &str) -> Option<chrono::NaiveDate> {
+    let mut fields = document
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix));
+    let field = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let date = chrono::NaiveDate::parse_from_str(field, "%Y-%m-%d").ok()?;
+    (date.format("%Y-%m-%d").to_string() == field).then_some(date)
+}
+
+fn consistent_release_date(changelog: &str, notes: &str, release: &str) -> bool {
+    let Some(date) = dated_field(changelog, "## [0.3.2] - ") else {
+        return false;
+    };
+    dated_field(notes, "## v0.3.2 - ") == Some(date)
+        && dated_field(release, "**Release Date**: ") == Some(date)
+}
+
+#[test]
+fn current_release_dates_are_valid_and_consistent() {
+    assert!(consistent_release_date(
+        include_str!("../CHANGELOG.md"),
+        include_str!("../RELEASE_NOTES.md"),
+        include_str!("../docs/releases/v0.3.2.md"),
+    ));
+}
+
+#[test]
+fn release_date_validation_rejects_missing_duplicate_invalid_and_mixed_dates() {
+    for date in ["2026-10-08", "2026-10-10"] {
+        assert!(consistent_release_date(
+            &format!("## [0.3.2] - {date}"),
+            &format!("## v0.3.2 - {date}"),
+            &format!("**Release Date**: {date}"),
+        ));
+    }
+    let valid = [
+        "## [0.3.2] - 2026-10-10",
+        "## v0.3.2 - 2026-10-10",
+        "**Release Date**: 2026-10-10",
+    ];
+    for index in 0..3 {
+        for replacement in [
+            String::new(),
+            format!("{}\n{}", valid[index], valid[index]),
+            valid[index].replace("2026-10-10", "2026-02-30"),
+            valid[index].replace("2026-10-10", "2026-1-1"),
+            valid[index].replace("2026-10-10", "unreleased"),
+            valid[index].replace("2026-10-10", "2026-10-09"),
+        ] {
+            let mut documents = valid.map(str::to_string);
+            documents[index] = replacement;
+            assert!(!consistent_release_date(
+                &documents[0],
+                &documents[1],
+                &documents[2]
+            ));
+        }
+    }
+}
+
 #[test]
 fn release_notes_are_final_dated_and_distribution_honest() {
     let checkpoint = include_str!("../docs/releases/v0.3.0.md");
@@ -19,7 +82,7 @@ fn release_notes_are_final_dated_and_distribution_honest() {
 #[test]
 fn changelog_has_checkpoint_and_first_public_entries() {
     let changelog = include_str!("../CHANGELOG.md");
-    assert!(changelog.contains("## [0.3.2] - 2026-10-08"));
+    assert!(dated_field(changelog, "## [0.3.2] - ").is_some());
     assert!(changelog.contains("## [0.3.1] - 2026-08-27"));
     assert!(changelog.contains("## [0.3.0] - 2026-08-27"));
     assert!(changelog.contains("Signed development checkpoint only"));
@@ -31,7 +94,7 @@ fn changelog_has_checkpoint_and_first_public_entries() {
 fn root_release_notes_lead_with_current_and_keep_three() {
     let notes = include_str!("../RELEASE_NOTES.md");
     let current = notes
-        .find("## v0.3.2 - 2026-10-08")
+        .find("## v0.3.2 - ")
         .expect("root notes lead with the current release");
     let first_public = notes
         .find("## v0.3.1 - 2026-08-27")
