@@ -46,6 +46,9 @@ def scanner(controller, name, argv, pin, payload=None):
         copy.chmod(0o444)
         if sha(regular_bytes(copy)) != sha(regular_bytes(payload)):
             raise EvidenceError("scanner source copy mismatch")
+        # The private outer evidence directory remains 0700. The bind mount
+        # exposes only this sealed snapshot to a scanner with a different UID.
+        source.chmod(0o555)
         create += ["--mount", "type=bind,src=" + str(source) + ",dst=/payload,readonly", "--workdir", "/payload"]
     create += [pin["image"], *argv]
 
@@ -108,3 +111,32 @@ def scanner(controller, name, argv, pin, payload=None):
     if payload and sha(regular_bytes(copy)) != sha(regular_bytes(payload)):
         raise EvidenceError("scanner payload changed")
     return result
+
+
+def scanner_access_probe(controller, pin):
+    """Exercise file-source access through the production snapshot mount."""
+    payload = controller.out / "scanner-access-probe.txt"
+    content = b"scanner payload access probe\n"
+    with payload.open("xb") as stream:
+        stream.write(content)
+    source_hash = sha(content)
+    report = scanner(controller, "syft-access-probe",
+                     ["file:/payload/" + payload.name, "-o", "syft-json"], pin, payload)
+    document = json.loads(report)
+    if not isinstance(document, dict) or not isinstance(document.get("source"), dict):
+        raise EvidenceError("scanner access probe source mismatch")
+    source = document["source"]
+    metadata = source.get("metadata")
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("digests"), list):
+        raise EvidenceError("scanner access probe source mismatch")
+    digests = metadata["digests"]
+    if any(not isinstance(item, dict) for item in digests):
+        raise EvidenceError("scanner access probe source mismatch")
+    observed = [item.get("value") for item in digests if item.get("algorithm") == "sha256"]
+    if (source.get("type") != "file"
+            or metadata.get("path") != "/payload/" + payload.name
+            or observed != [source_hash]
+            or sha(regular_bytes(payload)) != source_hash):
+        raise EvidenceError("scanner access probe source mismatch")
+    return {"status": "pass", "payload_sha256": source_hash,
+            "report_sha256": sha(report.encode())}

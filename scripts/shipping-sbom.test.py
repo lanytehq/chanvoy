@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import tarfile
@@ -24,7 +25,7 @@ import bounded_evidence as bounded
 import shipping_sbom as sbom
 import production_build_inputs as build_inputs
 from bounded_evidence import EvidenceCommands, EvidenceError, json_write
-from sbom_evidence import Controller, scanner
+from sbom_evidence import Controller, scanner, scanner_access_probe
 
 
 native_spec = importlib.util.spec_from_file_location("native_synthetic", sbom.SCRIPTS / "production-build-policy.test.py")
@@ -614,6 +615,16 @@ class ScannerTests(unittest.TestCase):
                     owner = argv[argv.index("--label") + 1].split("=", 1)[1]
                     mount = argv[argv.index("--mount") + 1]
                     source = mount.split("src=", 1)[1].split(",", 1)[0]
+                    snapshot = Path(source)
+                    access = stat.S_IMODE(snapshot.stat().st_mode)
+                    self.assertTrue(access & stat.S_IROTH and access & stat.S_IXOTH)
+                    self.assertFalse(access & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+                    self.assertEqual(stat.S_IMODE(controller.out.stat().st_mode) & 0o077, 0)
+                    self.assertEqual(list(snapshot.iterdir()), [snapshot / payload.name])
+                    copied = snapshot / payload.name
+                    self.assertEqual(copied.read_bytes(), payload.read_bytes())
+                    self.assertTrue(copied.stat().st_mode & stat.S_IROTH)
+                    self.assertFalse(copied.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
                     container = {"Id": "c" * 64, "Config": {"Image": sbom.TOOLS["syft"]["image"],
                                                               "Labels": {"chanvoy.sbom-owner": owner}},
                                  "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True,
@@ -678,6 +689,48 @@ class ScannerTests(unittest.TestCase):
                      "malformed-nnp", "unknown-create", "changed-owner", "malformed-inspect", "denied-remove", "survivor", "timeout", "timeout-denied-remove"):
             with self.subTest(mode=mode):
                 self.controlled_scanner(mode)
+
+    def test_access_probe_requires_observed_source_contents(self):
+        for mode in ("valid", "wrong-path", "wrong-hash", "duplicate-hash", "changed-payload",
+                     "not-file", "malformed-source", "malformed-metadata", "malformed-digests"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix="cv-access-probe-") as directory:
+                root = Path(directory)
+                controller = Controller(sbom.SCRIPTS.parent, root / "evidence", "owned-access-probe-v1", 180)
+
+                def observe(_controller, name, argv, pin, payload):
+                    self.assertEqual(name, "syft-access-probe")
+                    self.assertEqual(argv, ["file:/payload/" + payload.name, "-o", "syft-json"])
+                    document = {"source": {"type": "file", "metadata": {
+                        "path": "/payload/" + payload.name,
+                        "digests": [{"algorithm": "sha256", "value": schema.sha(payload.read_bytes())}]}}}
+                    metadata = document["source"]["metadata"]
+                    if mode == "wrong-path":
+                        metadata["path"] = "/payload/another-owned-file"
+                    elif mode == "wrong-hash":
+                        metadata["digests"][0]["value"] = "0" * 64
+                    elif mode == "duplicate-hash":
+                        metadata["digests"] *= 2
+                    elif mode == "changed-payload":
+                        payload.write_bytes(b"changed owned input")
+                    elif mode == "not-file":
+                        document["source"]["type"] = "directory"
+                    elif mode == "malformed-source":
+                        document["source"] = []
+                    elif mode == "malformed-metadata":
+                        document["source"]["metadata"] = []
+                    elif mode == "malformed-digests":
+                        metadata["digests"] = [None]
+                    return json.dumps(document)
+
+                with mock.patch("sbom_evidence.scanner", side_effect=observe):
+                    if mode == "valid":
+                        receipt = scanner_access_probe(controller, sbom.TOOLS["syft"])
+                        self.assertEqual(receipt["status"], "pass")
+                        self.assertEqual(receipt["payload_sha256"],
+                                         schema.sha((controller.out / "scanner-access-probe.txt").read_bytes()))
+                    else:
+                        with self.assertRaises(EvidenceError):
+                            scanner_access_probe(controller, sbom.TOOLS["syft"])
 
     def test_verified_archive_extracts_only_one_regular_owned_binary(self):
         spec = importlib.util.spec_from_file_location("setup_validator", sbom.SCRIPTS / "setup-sbom-validator.py")

@@ -11,8 +11,10 @@ Merge the independently reviewed release changes. Finalize the actual date in
 Run fresh `make release-prep`, hosted checks and `make release-smoke`. The live
 smoke creates a disposable Mattermost channel; failed smoke stops the ceremony.
 `make release-preflight` first checks the pinned scanner's effective configuration
-in owned offline containers. Docker must be available; the check prints the retained
-evidence directory.
+and reads an owned synthetic payload through its production snapshot mount.
+The outer evidence directory remains private; the single-file snapshot is
+read-only and traversable by the isolated scanner. Docker must be available;
+the check prints the retained evidence directory.
 Use clean main synchronized with live origin/main. Signing and publication each
 require the maintainer's separate approval.
 
