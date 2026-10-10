@@ -20,7 +20,84 @@ gpg --batch --pinentry-mode loopback --passphrase '' --quick-add-key "$primary" 
 subkey="$(gpg --batch --with-colons --with-subkey-fingerprint --list-keys | awk -F: '$1=="sub" {s=1;next} s && $1=="fpr" {print $10;exit}')"
 export CHANVOY_GPG_SIGNING_FINGERPRINT="$primary" CHANVOY_PGP_KEY_ID="$subkey!" CHANVOY_GPG_HOMEDIR="$GNUPGHOME"
 export CHANVOY_MINISIGN_KEY="$scratch/minisign.key" CHANVOY_MINISIGN_PUB="$scratch/minisign.pub"
-minisign -G -W -s "$CHANVOY_MINISIGN_KEY" -p "$CHANVOY_MINISIGN_PUB" >/dev/null 2>&1
+# Only synthetic passwords enter the owned terminal fixture; no transcript is saved.
+cat >"$scratch/terminal.py" <<'PY'
+import errno
+import os
+import pty
+import re
+import select
+import signal
+import sys
+import termios
+import time
+
+mode, *command = sys.argv[1:]
+password = b'synthetic-ceremony-passphrase'
+response = b'synthetic-incorrect-passphrase' if mode == 'minisign-failure' else password
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execvp(command[0], command)
+output = b''
+answered = 0
+status = None
+deadline = time.monotonic() + 180
+try:
+    while True:
+        if time.monotonic() >= deadline:
+            raise AssertionError('owned signing terminal exceeded its deadline')
+        if not select.select([terminal], [], [], 0.1)[0]:
+            continue
+        try:
+            chunk = os.read(terminal, 65536)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not chunk:
+            break
+        output += chunk
+        prompts = len(re.findall(br'Password(?: \(one more time\))?: ?', output))
+        while answered < prompts:
+            # The prompt can arrive just before the signer disables terminal echo.
+            while termios.tcgetattr(terminal)[3] & termios.ECHO:
+                exited, exit_status = os.waitpid(pid, os.WNOHANG)
+                if exited:
+                    status = exit_status
+                    raise AssertionError('signer exited without terminal password input')
+                if time.monotonic() >= deadline:
+                    raise AssertionError('owned password prompt did not disable echo')
+                time.sleep(0.005)
+            os.write(terminal, response + b'\n')
+            answered += 1
+    _, status = os.waitpid(pid, 0)
+    assert password not in output and response not in output, 'terminal echoed synthetic password'
+    if mode == 'generate':
+        assert os.waitstatus_to_exitcode(status) == 0 and answered == 2, 'encrypted key generation failed'
+    elif mode == 'minisign-failure':
+        assert os.waitstatus_to_exitcode(status) != 0 and answered == 1, 'wrong password was accepted'
+        assert b'error: minisign signing failed' in output, 'missing Minisign failure receipt'
+        assert b'[info] GPG:' not in output, 'GPG ran after Minisign failure'
+    elif mode == 'gpg-failure':
+        assert os.waitstatus_to_exitcode(status) != 0 and answered == 1, 'GPG failure was accepted'
+        assert b'synthetic GPG signing refusal' in output, 'GPG diagnostic was hidden'
+        assert b'error: GPG signing failed' in output, 'missing GPG failure receipt'
+        assert b'[info] Minisign: signing SHA512SUMS' not in output, 'signing continued after failure'
+    else:
+        assert mode == 'sign' and os.waitstatus_to_exitcode(status) == 0, 'terminal signing failed'
+        assert answered == 5, 'expected two manifest and three binary password prompts'
+        assert output.count(b'[info] GPG:') == 2, 'expected both GPG signing stages'
+        assert b'[ok] both checksum manifests signed in both formats' in output, 'missing signing success'
+finally:
+    os.close(terminal)
+    if status is None:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+PY
+python3 "$scratch/terminal.py" generate minisign -G -s "$CHANVOY_MINISIGN_KEY" -p "$CHANVOY_MINISIGN_PUB"
 CHANVOY_DECERNOR_BIN="${CHANVOY_DECERNOR_BIN:-$(command -v decernor)}"
 export CHANVOY_DECERNOR_BIN CHANVOY_RELEASE_TAG=v1.2.3
 unset GH_REPO RELEASE_TAG CHANVOY_APPROVED_ENV_LOADER CHANVOY_ANCHOR_OUT \
@@ -29,6 +106,8 @@ repo="$scratch/repo"
 git init -q -b main "$repo"
 git -C "$repo" config user.name '3 Leaps Infosec Team'
 git -C "$repo" config user.email infosec@3leaps.net
+cp "$root/Makefile" "$repo/Makefile"
+printf '[package]\nrust-version = "1.89.0"\n' >"$repo/Cargo.toml"
 mkdir -p "$repo/scripts" "$repo/config/release" "$repo/keys" "$repo/docs/security" "$repo/docs/releases" "$repo/schemas/release/v0"
 for name in release-common.sh release-decernor.sh release-verify-staged.sh release-verify-staged-data.sh \
 	stage-release-anchors.sh validate-release-assets.sh validate-release-anchors.sh generate-checksums.sh \
@@ -260,7 +339,43 @@ FIXTURE_API_FAILURE=1 reject bash "$repo/scripts/release-create-draft.sh" v1.2.3
 bash "$repo/scripts/release-create-draft.sh" v1.2.3 "$directory" >/dev/null
 reject bash "$repo/scripts/release-create-draft.sh" v1.2.3 "$directory"
 # Create draft before signing, then mandate all four signatures for later stages.
-bash "$repo/scripts/sign-release-assets.sh" "$directory" >/dev/null
+echo '[test] encrypted Minisign terminal, signer failures and GPG terminal binding'
+real_gpg="$(command -v gpg)"
+export FIXTURE_REAL_GPG="$real_gpg" FIXTURE_SIGNING_LOG="$scratch/signing-calls"
+cat >"$scratch/bin/gpg" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+    if [[ "$arg" == --detach-sign ]]; then
+        [[ -t 0 && "${GPG_TTY:-}" == "$(tty)" ]] || {
+            echo 'error: GPG terminal binding missing' >&2; exit 1;
+        }
+        if [[ "${FIXTURE_GPG_REFUSE:-0}" == 1 ]]; then
+            echo 'synthetic GPG signing refusal' >&2; exit 17;
+        fi
+        echo gpg-sign >>"$FIXTURE_SIGNING_LOG"
+    fi
+done
+exec "$FIXTURE_REAL_GPG" "$@"
+SH
+chmod +x "$scratch/bin/gpg"
+for kind in minisign-failure gpg-failure; do
+	failed="$scratch/$kind"
+	cp -R "$directory" "$failed"
+	cp "$directory.anchor" "$failed.anchor"
+	if [[ "$kind" == gpg-failure ]]; then
+		FIXTURE_GPG_REFUSE=1 python3 "$scratch/terminal.py" "$kind" bash "$repo/scripts/sign-release-assets.sh" "$failed"
+		[[ -f "$failed/SHA256SUMS.minisig" && ! -e "$failed/SHA256SUMS.asc" ]]
+		minisign -Vm "$failed/SHA256SUMS" -p "$CHANVOY_MINISIGN_PUB" >/dev/null 2>&1
+	else
+		python3 "$scratch/terminal.py" "$kind" bash "$repo/scripts/sign-release-assets.sh" "$failed"
+		[[ ! -e "$failed/SHA256SUMS.minisig" && ! -e "$failed/SHA256SUMS.asc" ]]
+	fi
+	bash "$repo/scripts/verify-checksums.sh" "$failed" >/dev/null
+done
+python3 "$scratch/terminal.py" sign make -C "$repo" release-sign RELEASE_DIR="$directory"
+[[ "$(wc -l <"$FIXTURE_SIGNING_LOG" | tr -d ' ')" == 2 ]]
+rm "$scratch/bin/gpg"
 bash "$repo/scripts/export-release-keys.sh" "$directory" >/dev/null
 bash "$repo/scripts/verify-signatures.sh" "$directory" >/dev/null
 echo '[test] legacy single-platform consumer verification commands'

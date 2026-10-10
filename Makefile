@@ -25,7 +25,7 @@ VERSION_FILE := VERSION
 .PHONY: version version-patch version-minor version-major version-set version-sync version-check
 .PHONY: sbom security-scan license-check release-prep release-smoke workflow-lint
 .PHONY: release-preflight release-guard-tag-version release-guard-release-target release-tag release-tag-push release-clean release-download release-checksums release-sign
-.PHONY: release-export-keys release-verify-signatures release-verify-keys release-verify release-verify-identity insert-expected-fingerprints
+.PHONY: release-export-keys release-verify-checksums release-verify-signatures release-verify-keys release-verify release-verify-identity insert-expected-fingerprints
 .PHONY: release-notes release-upload release-undraft release-upload-all help
 
 all: check
@@ -274,6 +274,9 @@ release-stage-anchors: ## Stage exact tagged notes and anchors as inert data
 
 release-checksums: ## Generate two manifests and byte-identical legacy alias
 	@$(RELEASE_ENV) bash scripts/generate-checksums.sh "$(RELEASE_DIR)"
+
+release-verify-checksums: ## Verify exact manifests and payload hashes without signing
+	@$(RELEASE_ENV) bash scripts/verify-checksums.sh "$(RELEASE_DIR)"
 
 release-create-draft: ## Maintainer creates a draft from receipt-bound checksummed assets
 	@$(RELEASE_ENV) bash scripts/release-create-draft.sh "$(CHANVOY_RELEASE_TAG)" "$(RELEASE_DIR)"

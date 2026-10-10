@@ -54,25 +54,37 @@ permitted="$(gpg --homedir "$scratch" --batch --with-colons --with-subkey-finger
 	awk -F: '$1=="sub" {s=1;cap=$12;next} s && $1=="fpr" {if (cap ~ /s/) print $10; s=0}')"
 [[ "$permitted!" == "$CHANVOY_PGP_KEY_ID" ]] || { echo 'error: signing selector differs from reviewed pin' >&2; exit 1; }
 require_release_guard "$directory" >/dev/null
+# Let terminal pinentry use the invoking terminal, including hardware-key prompts.
+if [[ -t 0 ]]; then
+	GPG_TTY="$(tty)"
+	export GPG_TTY
+fi
 for manifest in SHA256SUMS SHA512SUMS; do
-	printf '[info] Signing %s in both formats; enter a passphrase if prompted.\n' "$manifest"
+	printf '[info] Minisign: signing %s; enter the key passphrase when prompted.\n' "$manifest"
 	minisign -S -s "$CHANVOY_MINISIGN_KEY" -m "$directory/$manifest" \
-		-t "chanvoy $tag" -x "$directory/$manifest.minisig" >/dev/null 2>&1 || {
+		-t "chanvoy $tag" -x "$directory/$manifest.minisig" || {
 		echo 'error: minisign signing failed; inspect partial local outputs before retrying' >&2; exit 1;
 	}
+	printf '[info] GPG: signing %s; complete pinentry or hardware-key approval if prompted.\n' "$manifest"
 	gpg --homedir "$CHANVOY_GPG_HOMEDIR" --batch --armor --detach-sign \
 		--local-user "$CHANVOY_PGP_KEY_ID" --output "$directory/$manifest.asc" \
-		"$directory/$manifest" >/dev/null 2>&1 || {
+		"$directory/$manifest" || {
 		echo 'error: GPG signing failed; inspect partial local outputs before retrying' >&2; exit 1;
 	}
 done
 cp "$directory/SHA256SUMS.asc" "$directory/checksums.txt.asc"
 inventory="$(release_binary_signatures)"
+signatures=()
 while IFS= read -r signature; do
+	signatures+=("$signature")
+done <<<"$inventory"
+# Signing must inherit the operator's stdin, not the inventory here-string.
+for signature in "${signatures[@]}"; do
+	printf '[info] Minisign: signing %s; enter the key passphrase when prompted.\n' "${signature%.minisig}"
 	minisign -S -s "$CHANVOY_MINISIGN_KEY" -m "$directory/${signature%.minisig}" \
-		-t "chanvoy $tag" -x "$directory/$signature" >/dev/null 2>&1 || {
+		-t "chanvoy $tag" -x "$directory/$signature" || {
 		echo 'error: binary signing failed; inspect partial local outputs before retrying' >&2; exit 1;
 	}
-done <<<"$inventory"
+done
 bash "$root/scripts/validate-release-assets.sh" "$directory" signed-without-keys >/dev/null
 echo '[ok] both checksum manifests signed in both formats'
