@@ -1,5 +1,6 @@
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 mod daemon_assessment;
+mod generation;
 mod lifecycle;
 use chanvoy_core::recovery::DaemonDisposition;
 use chanvoy_core::startup::{self, Outcome as StartupOutcome, Phase as StartupPhase};
@@ -208,6 +209,8 @@ enum CommandSet {
     #[command(subcommand)]
     Channel(ChannelCommand),
     /// Refresh profile from env and ensure the daemon is healthy.
+    /// Reuses only a generation-matched daemon; a different or unverifiable
+    /// build is retained and setup exits 6. Profile/credential refresh is unchanged.
     AutoSetup(AutoSetupArgs),
     /// Inspect daemon-held attention state (cursors, staleness verdicts).
     /// Strictly read-only: never mutates daemon state, never issues
@@ -3491,8 +3494,48 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
             Ok(())
         }
         DaemonCommand::Status => {
-            let daemon_status = status(profile).await?;
-            print_value(json, &daemon_status)
+            let mut daemon_status = status(profile).await.map_err(|error| match error {
+                DaemonError::Json(_) => {
+                    CliError::Bootstrap("daemon status response could not be decoded".into())
+                }
+                other => other.into(),
+            })?;
+            let generation = generation::Evidence::compare(
+                resolve_host_build_info(),
+                daemon_status.binary.clone(),
+                false,
+            );
+            daemon_status.binary = generation.daemon_binary.clone();
+            let mut value = serde_json::to_value(&daemon_status)?;
+            let object = value.as_object_mut().expect("daemon status object");
+            object.insert(
+                "cli_binary".into(),
+                serde_json::to_value(&generation.cli_binary)?,
+            );
+            object.insert(
+                "generation_match".into(),
+                serde_json::to_value(generation.generation_match)?,
+            );
+            object.insert(
+                "generation_reason".into(),
+                serde_json::to_value(generation.generation_reason)?,
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", daemon_status.to_human_string());
+                println!(
+                    "cli_version: {}\ncli_commit: {}\ngeneration: {}\ngeneration_reason: {}",
+                    generation.cli_binary.version,
+                    generation.cli_binary.commit_short,
+                    generation
+                        .generation_match
+                        .map(|matched| if matched { "match" } else { "mismatch" })
+                        .unwrap_or("unknown"),
+                    generation.generation_reason.label()
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -3601,11 +3644,19 @@ async fn handle_auto_setup(
         match build_desired_profile_from_env(profile_override, args.reduce_profile.as_deref()) {
             Ok(profile) => profile,
             Err(err) => {
-                print_auto_setup_error(json, "env_input", &err.to_string())?;
+                print_auto_setup_failure(
+                    json,
+                    "env_input",
+                    &err.to_string(),
+                    DaemonDisposition::UnresponsiveLocal,
+                    profile_override,
+                    &generation::Evidence::compare(resolve_host_build_info(), None, false),
+                )?;
                 process::exit(EXIT_ENV_INPUT);
             }
         };
 
+    let setup_name = desired.name.clone();
     let existing = match chanvoy_core::load_profile(&desired.name) {
         Ok(existing) => Some(existing),
         Err(chanvoy_core::CoreError::ProfileNotFound(_)) => None,
@@ -3614,6 +3665,11 @@ async fn handle_auto_setup(
 
     let action = decide_profile_action(&desired, existing.as_ref());
     let mut existing_assessment = None;
+    let mut reuse_candidate = None;
+    let mut predecessor_generation = None;
+    let mut predecessor_candidate = None;
+    let mut profile_refresh = false;
+    let mut identity_refresh = false;
     let (profile_state, persisted_profile, persisted_identity, refresh_diff) = match action {
         ProfileAction::Create => {
             let (validated, identity) = match within_health_budget(
@@ -3623,7 +3679,7 @@ async fn handle_auto_setup(
             .await
             {
                 Ok(pair) => pair,
-                Err(err) => return exit_on_preflight(json, err),
+                Err(err) => return exit_on_preflight(json, &setup_name, err, None),
             };
             store_profile(&validated)?;
             (ProfileState::Created, validated, identity, Vec::new())
@@ -3634,8 +3690,18 @@ async fn handle_auto_setup(
             let (validated, identity) =
                 match within_health_budget(deadline, validate_and_finalize_profile(merged)).await {
                     Ok(pair) => pair,
-                    Err(err) => return exit_on_preflight(json, err),
+                    Err(err) => return exit_on_preflight(json, &setup_name, err, None),
                 };
+            predecessor_candidate = lifecycle::ReuseCandidate::capture(&existing.name).await;
+            let mut observed = observe_generation(&existing.name).await;
+            if observed.generation_match.is_some()
+                && !candidate_unchanged(predecessor_candidate.as_ref(), &existing.name).await
+            {
+                observed = observed.unconfirmed();
+                predecessor_candidate = None;
+            }
+            predecessor_generation = Some(observed);
+            profile_refresh = true;
             store_profile(&validated)?;
             // A running daemon holds Profile + token in-memory from the last start
             // (`chanvoy-daemon::start`). Refresh writes to disk but the live daemon
@@ -3646,16 +3712,39 @@ async fn handle_auto_setup(
             // the updated profile. The Reuse path gets analogous zombie protection
             // inside `ensure_daemon_running` itself.
             if let Err(err) = stop_daemon_if_present(&validated.name).await {
-                print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
+                let generation = observe_generation(&validated.name).await.refreshed(
+                    predecessor_generation.clone().expect("refresh predecessor"),
+                    true,
+                    false,
+                    false,
+                );
+                print_auto_setup_failure(
+                    json,
+                    "daemon_refresh_stop",
+                    &err.to_string(),
+                    failure_disposition(&err, DaemonDisposition::UnresponsiveLocal),
+                    Some(&setup_name),
+                    &generation,
+                )?;
                 process::exit(EXIT_DAEMON_FAILED);
             }
             (ProfileState::Refreshed, validated, identity, diff)
         }
         ProfileAction::Reuse => {
             let existing = existing.expect("Reuse implies existing profile");
+            reuse_candidate = lifecycle::ReuseCandidate::capture(&existing.name).await;
             let assessment = daemon_assessment::assess_until(&existing, deadline).await;
             if assessment.disposition == DaemonDisposition::DegradedRemote {
-                return print_preserved_setup(json, &existing, assessment, args.activate);
+                let generation =
+                    require_matching_reuse(json, &existing, &assessment, reuse_candidate.as_ref())
+                        .await?;
+                return print_preserved_setup(
+                    json,
+                    &existing,
+                    assessment,
+                    args.activate,
+                    generation,
+                );
             }
             existing_assessment = Some(assessment);
             // A responsive but remotely inconclusive daemon was preserved
@@ -3669,7 +3758,15 @@ async fn handle_auto_setup(
             {
                 Ok(pair) => pair,
                 Err(err) => {
-                    let authoritative = matches!(&err, CliError::IdentityRejected { .. });
+                    let authoritative = match &err {
+                        CliError::IdentityRejected { .. } | CliError::ParentIdentityMismatch => {
+                            true
+                        }
+                        CliError::Core(chanvoy_core::CoreError::Api { status, .. }) => {
+                            matches!(status.as_u16(), 401 | 403)
+                        }
+                        _ => false,
+                    };
                     if !authoritative
                         && existing_assessment
                             .as_ref()
@@ -3677,9 +3774,23 @@ async fn handle_auto_setup(
                     {
                         let mut assessment = existing_assessment.take().unwrap();
                         assessment.disposition = DaemonDisposition::DegradedRemote;
-                        return print_preserved_setup(json, &existing, assessment, args.activate);
+                        let generation = require_matching_reuse(
+                            json,
+                            &existing,
+                            &assessment,
+                            reuse_candidate.as_ref(),
+                        )
+                        .await?;
+                        return print_preserved_setup(
+                            json,
+                            &existing,
+                            assessment,
+                            args.activate,
+                            generation,
+                        );
                     }
-                    return exit_on_preflight(json, err);
+                    let generation = existing_assessment.as_ref().map(generation_from_assessment);
+                    return exit_on_preflight(json, &setup_name, err, generation.as_ref());
                 }
             };
             // If the env credential now authenticates as a different bot than
@@ -3692,10 +3803,31 @@ async fn handle_auto_setup(
             // decide_profile_action phase; treating a post-whoami change as a
             // surfaced refresh is consistent with that rule.
             if validated.bot_username != existing.bot_username {
+                predecessor_generation = Some(generation_from_assessment(
+                    existing_assessment.as_ref().expect("reuse assessment"),
+                ));
+                predecessor_candidate = reuse_candidate.take();
+                identity_refresh = true;
+                reuse_candidate = None;
                 existing_assessment = None;
                 store_profile(&validated)?;
                 if let Err(err) = stop_daemon_if_present(&validated.name).await {
-                    print_auto_setup_error(json, "daemon_refresh_stop", &err.to_string())?;
+                    let generation = observe_generation(&validated.name).await.refreshed(
+                        predecessor_generation
+                            .clone()
+                            .expect("identity predecessor"),
+                        false,
+                        true,
+                        false,
+                    );
+                    print_auto_setup_failure(
+                        json,
+                        "daemon_refresh_stop",
+                        &err.to_string(),
+                        failure_disposition(&err, DaemonDisposition::UnresponsiveLocal),
+                        Some(&setup_name),
+                        &generation,
+                    )?;
                     process::exit(EXIT_DAEMON_FAILED);
                 }
                 let diff = vec![ProfileFieldDiff {
@@ -3705,11 +3837,23 @@ async fn handle_auto_setup(
                 }];
                 (ProfileState::Refreshed, validated, identity, diff)
             } else {
+                if let Some(assessment) = existing_assessment.as_ref().filter(|a| {
+                    a.disposition.successful()
+                        || (reuse_candidate.is_some()
+                            && a.disposition == DaemonDisposition::UnresponsiveLocal)
+                        || a.status
+                            .as_ref()
+                            .and_then(daemon_assessment::observed_username)
+                            .is_some_and(|owner| owner != existing.bot_username)
+                }) {
+                    require_matching_reuse(json, &existing, assessment, reuse_candidate.as_ref())
+                        .await?;
+                }
                 (ProfileState::Reused, validated, identity, Vec::new())
             }
         }
         ProfileAction::IdentityDrift(diff) => {
-            print_identity_drift_error(json, &diff)?;
+            print_identity_drift_error(json, &setup_name, &diff)?;
             process::exit(EXIT_IDENTITY_DRIFT);
         }
     };
@@ -3725,17 +3869,6 @@ async fn handle_auto_setup(
     // mutation, could leave the printed "active:" line out of sync
     // with the file). Always-persist removes the gap entirely; the
     // store is one small idempotent write.
-    let activate_requested = args.activate;
-    let is_active_now = if activate_requested {
-        store_active_profile(&persisted_profile.name)?;
-        true
-    } else {
-        load_active_profile()?
-            .as_deref()
-            .map(|name| name == persisted_profile.name)
-            .unwrap_or(false)
-    };
-
     let launch_result = if let Some(assessment) = existing_assessment {
         ensure_daemon_running_assessed(
             &persisted_profile,
@@ -3750,14 +3883,52 @@ async fn handle_auto_setup(
     let launched = match launch_result {
         Ok(state) => state,
         Err(err) => {
+            let mut generation = observe_generation(&setup_name).await;
+            if let Some(predecessor) = predecessor_generation {
+                generation =
+                    generation.refreshed(predecessor, profile_refresh, identity_refresh, false);
+            }
             print_auto_setup_failure(
                 json,
                 "daemon_start",
                 &err.to_string(),
                 failure_disposition(&err, DaemonDisposition::UnresponsiveLocal),
+                Some(&setup_name),
+                &generation,
             )?;
             process::exit(EXIT_DAEMON_FAILED);
         }
+    };
+
+    // Revalidate after the parent probes and before any marker/cursor writes.
+    let mut generation = generation_from_assessment(&launched.assessment);
+    if launched.state == DaemonState::AlreadyRunning && profile_state == ProfileState::Reused {
+        generation = require_matching_reuse(
+            json,
+            &persisted_profile,
+            &launched.assessment,
+            reuse_candidate.as_ref(),
+        )
+        .await?;
+    }
+    if let Some(predecessor) = predecessor_generation {
+        let confirmed_cycle = predecessor_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.terminated())
+            && generation.generation_match == Some(true)
+            && launched.state == DaemonState::Started;
+        generation = generation.refreshed(
+            predecessor,
+            profile_refresh,
+            identity_refresh,
+            confirmed_cycle,
+        );
+    }
+    let is_active_now = if args.activate {
+        store_active_profile(&persisted_profile.name)?;
+        true
+    } else {
+        load_active_profile()?.as_deref() == Some(persisted_profile.name.as_str())
     };
 
     let seed_outcomes: Vec<SeedOutcome> = if launched.assessment.disposition
@@ -3774,10 +3945,27 @@ async fn handle_auto_setup(
                 // daemon health failure (exit 4), not a per-channel seed problem
                 // (exit 1). auto-setup's contract requires a healthy daemon at the
                 // point of success — soft-degraded would mask the collapse.
-                print_auto_setup_error(
+                let mut failed_generation = observe_generation(&setup_name).await;
+                if let Some(predecessor) = &generation.predecessor {
+                    let prior = generation::Evidence::compare(
+                        resolve_host_build_info(),
+                        predecessor.predecessor_binary.clone(),
+                        predecessor.predecessor_generation_reason == generation::Reason::PinInvalid,
+                    );
+                    failed_generation = failed_generation.refreshed(
+                        prior,
+                        profile_refresh,
+                        identity_refresh,
+                        false,
+                    );
+                }
+                print_auto_setup_failure(
                 json,
                 "daemon_unreachable",
                 "daemon socket unavailable during seed_cursors RPC — daemon exited after the health check",
+                DaemonDisposition::UnresponsiveLocal,
+                Some(&setup_name),
+                &failed_generation,
             )?;
                 process::exit(EXIT_DAEMON_FAILED);
             }
@@ -3812,6 +4000,7 @@ async fn handle_auto_setup(
         refresh_diff,
         seed_outcomes,
         degraded,
+        generation,
     };
 
     print_auto_setup_report(json, &report)?;
@@ -3823,13 +4012,139 @@ const EXIT_PREFLIGHT_FAILED: i32 = 3;
 const EXIT_DAEMON_FAILED: i32 = 4;
 const EXIT_IDENTITY_DRIFT: i32 = 5;
 
-fn exit_on_preflight(json: bool, err: CliError) -> Result<(), CliError> {
+fn generation_from_assessment(assessment: &daemon_assessment::Assessment) -> generation::Evidence {
+    generation::Evidence::compare(
+        resolve_host_build_info(),
+        assessment
+            .status
+            .as_ref()
+            .and_then(|status| status.binary.clone()),
+        assessment.pin_invalid,
+    )
+}
+
+async fn observe_generation(profile: &str) -> generation::Evidence {
+    match tokio::time::timeout(
+        daemon_assessment::LOCAL_BUDGET,
+        daemon_client(profile).daemon_observation(),
+    )
+    .await
+    {
+        Ok(Ok(status)) => {
+            generation::Evidence::compare(resolve_host_build_info(), status.binary, false)
+        }
+        Ok(Err(DaemonError::Json(_))) => {
+            generation::Evidence::compare(resolve_host_build_info(), None, true)
+        }
+        _ => generation::Evidence::compare(resolve_host_build_info(), None, false),
+    }
+}
+
+async fn require_matching_reuse(
+    json: bool,
+    profile: &Profile,
+    assessment: &daemon_assessment::Assessment,
+    candidate: Option<&lifecycle::ReuseCandidate>,
+) -> Result<generation::Evidence, CliError> {
+    let mut generation = generation_from_assessment(assessment);
+    let confirmed = candidate_unchanged(candidate, &profile.name).await;
+    if generation.generation_match.is_some() && !confirmed {
+        generation = generation.unconfirmed();
+    }
+    if generation.generation_match != Some(true) {
+        let owner = if confirmed {
+            assessment
+                .status
+                .as_ref()
+                .and_then(daemon_assessment::observed_username)
+        } else {
+            None
+        };
+        let ownable = owner == Some(profile.bot_username.as_str());
+        let mut message = match owner {
+            Some(owner) if !ownable => format!("Daemon retained; verified owner is {owner}. Resolve ownership before any retirement."),
+            _ => generation.recovery(ownable).to_string(),
+        };
+        if !confirmed {
+            message.push_str(" Health fields describe the earlier assessment, not the current unconfirmed candidate.");
+        }
+        if !ownable {
+            // Profile names are validated before setup; still quote the
+            // inspection-only command independently of that validation.
+            let quoted = profile.name.replace('\'', "'\\''");
+            message.push_str(&format!(
+                " Inspect chanvoy --profile '{quoted}' daemon status."
+            ));
+        }
+        if json {
+            let mut report = serde_json::to_value(&generation)?;
+            let object = report.as_object_mut().expect("generation object");
+            object.insert("profile_name".into(), serde_json::json!(profile.name));
+            object.insert(
+                "error_code".into(),
+                serde_json::json!(generation.error_code()),
+            );
+            object.insert("message".into(), serde_json::json!(message));
+            object.insert(
+                "daemon_disposition".into(),
+                serde_json::to_value(assessment.disposition)?,
+            );
+            object.insert(
+                "observation_ready".into(),
+                serde_json::json!(assessment.observation_ready),
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            let label = if generation.generation_match == Some(false) {
+                "generation mismatch"
+            } else {
+                "generation unknown"
+            };
+            eprintln!(
+                "{label}: {} ({})",
+                profile.name,
+                generation.generation_reason.label()
+            );
+            eprintln!(
+                "cli: {} dirty={:?}; daemon: {} dirty={:?}",
+                generation.cli_binary.commit,
+                generation.cli_binary.dirty,
+                generation
+                    .daemon_binary
+                    .as_ref()
+                    .map(|pin| pin.commit.as_str())
+                    .unwrap_or("unknown"),
+                generation.daemon_binary.as_ref().and_then(|pin| pin.dirty)
+            );
+            eprintln!("{message}");
+        }
+        process::exit(generation::EXIT_GENERATION_REFUSED);
+    }
+    Ok(generation)
+}
+
+async fn candidate_unchanged(candidate: Option<&lifecycle::ReuseCandidate>, profile: &str) -> bool {
+    match candidate {
+        Some(candidate) => candidate.unchanged(profile).await,
+        None => false,
+    }
+}
+
+fn exit_on_preflight(
+    json: bool,
+    profile: &str,
+    err: CliError,
+    generation: Option<&generation::Evidence>,
+) -> Result<(), CliError> {
     let (code, message) = classify_preflight_error(&err);
+    let unknown = generation::Evidence::compare(resolve_host_build_info(), None, false);
     print_auto_setup_failure(
         json,
         code,
         &message,
         failure_disposition(&err, DaemonDisposition::UnresponsiveLocal),
+        Some(profile),
+        generation.unwrap_or(&unknown),
     )?;
     process::exit(EXIT_PREFLIGHT_FAILED);
 }
@@ -3880,45 +4195,52 @@ fn merge_forward_for_refresh(mut desired: Profile, existing: &Profile) -> Profil
     desired
 }
 
-fn print_auto_setup_error(json: bool, code: &str, message: &str) -> Result<(), CliError> {
-    print_auto_setup_failure(json, code, message, DaemonDisposition::UnresponsiveLocal)
-}
-
 fn print_auto_setup_failure(
     json: bool,
     code: &str,
     message: &str,
     disposition: DaemonDisposition,
+    profile: Option<&str>,
+    generation: &generation::Evidence,
 ) -> Result<(), CliError> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "error_code": code,
-                "message": message,
-                "daemon_disposition": disposition,
-                "observation_ready": null,
-            }))?
+        let mut report = serde_json::to_value(generation)?;
+        let object = report.as_object_mut().expect("generation object");
+        object.extend(
+            serde_json::json!({"profile_name": profile, "error_code": code,
+            "message": message, "daemon_disposition": disposition, "observation_ready": null})
+            .as_object()
+            .unwrap()
+            .clone(),
         );
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         eprintln!("{}: {code}: {message}", disposition.label());
     }
     Ok(())
 }
 
-fn print_identity_drift_error(json: bool, diff: &[ProfileFieldDiff]) -> Result<(), CliError> {
+fn print_identity_drift_error(
+    json: bool,
+    profile: &str,
+    diff: &[ProfileFieldDiff],
+) -> Result<(), CliError> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let mut report = serde_json::to_value(generation::Evidence::compare(
+            resolve_host_build_info(),
+            None,
+            false,
+        ))?;
+        report.as_object_mut().unwrap().extend(serde_json::json!({
+                "profile_name": profile,
                 "error_code": "identity_drift",
                 "daemon_disposition": "identity-refused",
                 "observation_ready": null,
                 "message": "persisted profile identity does not match env-derived identity; refusing silent refresh",
                 "drift": diff,
                 "recovery": "resolve the mismatch (correct the env, or rename/remove the persisted profile), then re-run auto-setup",
-            }))?
-        );
+            }).as_object().unwrap().clone());
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         eprintln!("identity_drift: persisted profile identity does not match env-derived identity");
         for field in diff {
@@ -4879,7 +5201,7 @@ fn push_if_diff(diff: &mut Vec<ProfileFieldDiff>, field: &str, from: &str, to: &
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ProfileState {
     Created,
@@ -4887,7 +5209,7 @@ enum ProfileState {
     Reused,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DaemonState {
     AlreadyRunning,
@@ -4936,6 +5258,8 @@ struct AutoSetupReport {
     refresh_diff: Vec<ProfileFieldDiff>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     seed_outcomes: Vec<SeedOutcome>,
+    #[serde(flatten)]
+    generation: generation::Evidence,
 }
 
 fn print_preserved_setup(
@@ -4943,6 +5267,7 @@ fn print_preserved_setup(
     profile: &Profile,
     assessment: daemon_assessment::Assessment,
     activate: bool,
+    generation: generation::Evidence,
 ) -> Result<(), CliError> {
     let is_active = if activate {
         store_active_profile(&profile.name)?;
@@ -4963,6 +5288,7 @@ fn print_preserved_setup(
             degraded: true,
             refresh_diff: Vec::new(),
             seed_outcomes: Vec::new(),
+            generation,
         },
     )
 }
@@ -4992,6 +5318,16 @@ fn print_auto_setup_report(json: bool, report: &AutoSetupReport) -> Result<(), C
             .unwrap_or_else(|| "unknown".into())
     );
     println!("bot_username: {}", report.bot_username);
+    println!(
+        "generation: {}; generation_reason={}; cycled={}",
+        report
+            .generation
+            .generation_match
+            .map(|matched| if matched { "match" } else { "mismatch" })
+            .unwrap_or("unknown"),
+        report.generation.generation_reason.label(),
+        report.generation.cycled
+    );
     if report.is_active {
         println!("active: {}", report.profile_name);
     }
@@ -5399,6 +5735,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
                 disposition: DaemonDisposition::DegradedRemote,
                 status: None,
                 observation_ready: None,
+                pin_invalid: false,
             }
         };
         assessment.absorb(next, &profile.bot_username);
@@ -8380,6 +8717,38 @@ mod tests {
         status.remote_probe = Some(chanvoy_core::recovery::RemoteProbeOutcome::Verified);
         status.identity_refused = Some(true);
         assert!(!ownership_from_status(&profile, &identity, &status).ownable);
+    }
+
+    #[test]
+    fn version_and_doctor_shared_scoring_keeps_incomplete_dirty_unknown() {
+        for (cli_dirty, daemon_dirty) in [(None, None), (None, Some(false)), (Some(false), None)] {
+            let cli = pin(COMMIT_A, cli_dirty);
+            let daemon = pin(COMMIT_A, daemon_dirty);
+            assert_eq!(
+                score_generation(Some(&ownership(true)), &cli, Some(&daemon)),
+                (true, None)
+            );
+            assert_eq!(
+                score_generation(Some(&ownership(false)), &cli, Some(&daemon)),
+                (false, None)
+            );
+        }
+        assert_eq!(
+            score_generation(
+                Some(&ownership(true)),
+                &pin(COMMIT_A, Some(false)),
+                Some(&pin(COMMIT_A, Some(true)))
+            ),
+            (true, Some(false))
+        );
+        assert_eq!(
+            score_generation(
+                Some(&ownership(true)),
+                &pin(COMMIT_A, Some(false)),
+                Some(&pin(COMMIT_B, Some(false)))
+            ),
+            (true, Some(false))
+        );
     }
 
     #[test]

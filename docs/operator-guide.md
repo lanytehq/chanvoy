@@ -123,6 +123,53 @@ fields report unknown evidence, rather than inferred token failure. Setup skips
 cursor seeding while degraded and keeps existing waits intact. Explicit profile
 refresh still requires fresh parent validation and an owned predecessor stop.
 
+### Daemon generation during setup
+
+`auto-setup` reuses a healthy or remotely degraded daemon only when its complete
+build identity matches the CLI and native process/socket observations still bind
+that identity to the same candidate. A different or unverifiable generation exits
+**6**, retaining the daemon, profile, active marker, cursors and waits. This gate
+also precedes `--activate`. It does not automatically migrate an installed daemon.
+Established profile refresh and positively verified bot-identity refresh retain
+their existing validation and confirmed retirement behavior.
+
+Setup JSON includes `profile_name`, `cli_binary`, `daemon_binary`, nullable
+`generation_match`, `generation_reason`, `cycled` and ordered, unique `reasons`.
+Treat only `true` as a generation match; `null` is unknown, not success.
+
+| Generation reason       | Match   | Meaning                                                                       |
+| ----------------------- | ------- | ----------------------------------------------------------------------------- |
+| `match`                 | `true`  | Complete matching commit and dirty metadata                                   |
+| `commit_mismatch`       | `false` | Different full commits                                                        |
+| `dirty_mismatch`        | `false` | Different dirty flags                                                         |
+| `pin_missing`           | `null`  | Absent/unavailable pin or missing/unknown commit; not proof of daemon absence |
+| `pin_invalid`           | `null`  | Malformed identity or undecodable identity-bearing reply                      |
+| `dirty_unknown`         | `null`  | Either build lacks a known dirty flag                                         |
+| `candidate_unconfirmed` | `null`  | Process/socket binding changed or could not be confirmed                      |
+
+Successful refresh reports `predecessor_binary`, `predecessor_generation_match`
+and `predecessor_generation_reason`; unprefixed generation fields describe the
+accepted resulting daemon. `reasons` orders `profile_refresh`, then
+`bot_identity_refresh` when applicable, then the generation reason. For a confirmed
+successful cycle that last reason is the predecessor cause; otherwise it describes
+the reported result. `cycled=true` requires confirmed predecessor death and an
+accepted successor. `cycled=false` on a failed refresh does **not** promise no
+effects: the predecessor may already have stopped.
+
+Generation is separate from health and observation readiness. Invalid env input,
+credential/team rejection, persisted identity drift and lifecycle failure retain
+exits **2**, **3**, **5** and **4**, respectively; do not retry exit 6 as exit 4.
+Human generation refusals use stderr only. JSON refusals produce one error object
+on stdout (`generation_mismatch` or `generation_unknown`). `daemon status` adds
+caller-derived `cli_binary`, `generation_match` and `generation_reason` to the
+existing daemon `binary` and health fields. A coherent status report still exits
+0 on mismatch; it neither grants ownership nor permits retirement.
+
+Inspect with an explicit profile. Unknown candidate/ownership evidence permits
+inspection only. When ownership is established, follow
+[Installation and daemon migration](#installation-and-daemon-migration); never
+use an unconditional stop/start chain to resolve exit 6.
+
 Subsequent `chanvoy ...` commands work without `--profile` — the resolver picks the canonical profile from your sourced env automatically. Required env: `LANYTE_AGENT_ROLE`, `LANYTE_AGENT_SCOPE`, `LANYTE_MM_URL`, and a token reachable via `LANYTE_MM_TOKEN` (or the env name configured by `CHANVOY_TOKEN_ENV_NAME`).
 
 ### Manual path (debugging or custom scenarios)

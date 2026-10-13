@@ -83,6 +83,65 @@ struct NativeControl {
     death_seen: Mutex<Option<Instant>>,
 }
 
+/// Read-only binding for a daemon observation. This carries no signaling or
+/// cleanup authority and does not require a pid file to inspect a live peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReuseCandidate {
+    socket: FileStamp,
+    pid: u32,
+    birth: u64,
+    uid: u32,
+}
+
+impl ReuseCandidate {
+    pub(super) async fn capture(profile: &str) -> Option<Self> {
+        let path = chanvoy_core::socket_path_for_profile(profile);
+        Self::capture_path(&path).await
+    }
+
+    async fn capture_path(path: &Path) -> Option<Self> {
+        let before = stamp(path).ok()??;
+        if !std::fs::symlink_metadata(path)
+            .ok()?
+            .file_type()
+            .is_socket()
+        {
+            return None;
+        }
+        let SocketOwner::Live(pid) = peer_owner(path, Duration::from_millis(750)).await else {
+            return None;
+        };
+        let birth = native_birth(pid)?;
+        let uid = native_owner(pid)?;
+        // SAFETY: geteuid has no pointer arguments or preconditions and only
+        // observes this process's effective user identity.
+        if uid != unsafe { libc::geteuid() }
+            || native_terminated(pid)
+            || native_birth(pid) != Some(birth)
+            || native_owner(pid) != Some(uid)
+            || stamp(path).ok()?.as_ref() != Some(&before)
+        {
+            return None;
+        }
+        Some(Self {
+            socket: before,
+            pid,
+            birth,
+            uid,
+        })
+    }
+
+    pub(super) async fn unchanged(&self, profile: &str) -> bool {
+        Self::capture(profile).await.as_ref() == Some(self)
+    }
+
+    pub(super) fn terminated(&self) -> bool {
+        native_birth(self.pid).is_some_and(|birth| birth != self.birth)
+            || native_terminated(self.pid)
+            || matches!(death_or_unknown(self.pid), ProcessObservation::Dead)
+    }
+}
+
 /// The parent's Child handle supplies death proof; these stamps separately
 /// govern its failed-start runtime cleanup. Capture before finalization.
 pub(super) struct FailedChildRuntime {
@@ -1130,6 +1189,49 @@ async fn stop_confirmed(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn read_only_candidate_binds_birth_uid_and_socket_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidate.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let before = super::ReuseCandidate::capture_path(&path)
+            .await
+            .expect("owned native listener evidence");
+        assert_eq!(before.pid, std::process::id());
+        assert_eq!(
+            super::ReuseCandidate::capture_path(&path).await.as_ref(),
+            Some(&before)
+        );
+        assert!(!before.terminated());
+
+        // Simulate an external replacement of this test-owned endpoint. The
+        // old listener stays open, so this is not a pathname-only death proof.
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let after = super::ReuseCandidate::capture_path(&path).await.unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            (before.pid, before.birth, before.uid),
+            (after.pid, after.birth, after.uid)
+        );
+        assert!(!before.terminated());
+        drop((replacement, listener));
+    }
+
+    #[tokio::test]
+    async fn read_only_candidate_refuses_non_socket_and_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"synthetic").unwrap();
+        assert!(super::ReuseCandidate::capture_path(&regular)
+            .await
+            .is_none());
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(super::ReuseCandidate::capture_path(&link).await.is_none());
+    }
+
     fn failed_child_fixture(dir: &std::path::Path, pid: u32) -> super::FailedChildRuntime {
         let pid_path = dir.join("synthetic.pid");
         let socket_path = dir.join("synthetic.sock");

@@ -380,19 +380,22 @@ async fn clean_fake_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
     let profile = env.profile_name.clone();
     let socket_json = socket_path.clone();
     tokio::spawn(async move {
-        for expected in ["daemon_observation", "profile_status", "daemon_status"] {
+        loop {
             let (stream, _) = listener.accept().await.expect("accept fake daemon client");
             let (reader, mut writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
-            reader
+            let read = reader
                 .read_line(&mut line)
                 .await
                 .expect("read fake daemon request");
+            if read == 0 {
+                // Native candidate binding connects without issuing an RPC.
+                continue;
+            }
             let request: JsonRpcRequest =
                 serde_json::from_str(line.trim_end()).expect("decode fake daemon request");
-            assert_eq!(request.method, expected);
-            if expected == "daemon_observation" {
+            if request.method == "daemon_observation" {
                 let response = chanvoy_core::rpc_error(request.id, -32601, "method not found");
                 writer
                     .write_all(
@@ -402,7 +405,7 @@ async fn clean_fake_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
                     .unwrap();
                 continue;
             }
-            let value = if expected == "daemon_status" {
+            let value = if request.method == "daemon_status" {
                 serde_json::json!({
                     "profile_name": profile,
                     "socket_path": socket_json,
@@ -431,7 +434,6 @@ async fn clean_fake_daemon(env: &TestEnv) -> tokio::task::JoinHandle<()> {
                 .await
                 .expect("write fake daemon response");
         }
-        let _ = std::fs::remove_file(socket_path);
     })
 }
 
@@ -468,7 +470,8 @@ async fn auto_setup_reuses_clean_generation_matched_daemon_without_pid_change() 
         "424242",
         "reuse must not cycle the daemon"
     );
-    server.await.expect("fake daemon completed");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 /// Plain `auto-setup` must never set or overwrite the host-wide
@@ -688,8 +691,9 @@ async fn auto_setup_retains_socket_without_readable_predecessor_pid() {
 /// Scenario: daemon1 is healthy after the first auto-setup. We then
 /// SIGSTOP daemon1 — process alive, socket file present, but no longer
 /// accepting connections (modeling an auth-broken or hung daemon). The
-/// second auto-setup's `ensure_daemon_running` must detect this via
-/// socket-presence (not ping!) and stop daemon1 before spawning daemon2.
+/// Generation-only reuse now refuses this unknown pin without effects. An
+/// explicit credential-source Refresh still reaches the existing guarded
+/// zombie-stop path and must retire daemon1 before spawning daemon2.
 /// Without the PER-009 F5/F6 fix we'd spawn alongside the zombie —
 /// two-daemons-one-profile.
 ///
@@ -729,12 +733,31 @@ async fn auto_setup_stops_zombie_and_respawns() {
         "SIGSTOP daemon1 pid={pid_before}"
     );
 
-    // Second auto-setup: detect stopped daemon via socket-presence path,
+    let refused = auto_setup_command(&env, "lanytehq", "bravo-devlead")
+        .output()
+        .await
+        .expect("generation-only setup");
+    assert_eq!(
+        refused.status.code(),
+        Some(6),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let refusal: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert!(refusal["generation_match"].is_null());
+    assert_eq!(refusal["cycled"], false);
+    assert_eq!(read_daemon_pid(&env), Some(pid_before));
+    assert!(sysprims_proc::get_process(pid_before).is_ok());
+
+    // Explicit credential-source Refresh: detect stopped daemon via socket-presence path,
     // stop it (force-kill fallback if shutdown RPC stalls on the paused
     // process), and spawn a fresh daemon.
     let out2_result = tokio::time::timeout(
         Duration::from_secs(30),
         auto_setup_command(&env, "lanytehq", "bravo-devlead")
+            .env("CHANVOY_TOKEN_ENV_NAME", "REFRESH_FIXTURE_TOKEN")
+            .env("REFRESH_FIXTURE_TOKEN", "test-token-refreshed")
             .env("RUST_LOG", "chanvoy_cli::lifecycle=debug")
             .output(),
     )

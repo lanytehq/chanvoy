@@ -17,6 +17,8 @@ pub(super) struct Assessment {
     pub disposition: DaemonDisposition,
     pub status: Option<DaemonStatus>,
     pub observation_ready: Option<bool>,
+    /// Typed decoding failure, never inferred from provider error text.
+    pub pin_invalid: bool,
 }
 
 impl Assessment {
@@ -25,6 +27,7 @@ impl Assessment {
             disposition: status_disposition(&status, expected),
             observation_ready: observation_ready(&status),
             status: Some(status),
+            pin_invalid: false,
         }
     }
 
@@ -136,6 +139,7 @@ async fn assess_probe(
     deadline: tokio::time::Instant,
 ) -> Assessment {
     let local = tokio::time::timeout(LOCAL_BUDGET, probe.observation()).await;
+    let mut pin_invalid = matches!(&local, Ok(Err(DaemonError::Json(_))));
     let (responsive, mut snapshot, legacy) = match local {
         Ok(Ok(snapshot)) => (true, Some(snapshot), false),
         Ok(Err(error)) if unsupported(&error) => {
@@ -160,16 +164,21 @@ async fn assess_probe(
             disposition: DaemonDisposition::UnresponsiveLocal,
             status: None,
             observation_ready: None,
+            pin_invalid,
         };
     }
     // Do not start a remote RPC without enough remaining budget for the
     // daemon's classification plus transport margin. Local checks stay separate.
     let remote = if deadline.saturating_duration_since(tokio::time::Instant::now()) >= REMOTE_BUDGET
     {
-        tokio::time::timeout(REMOTE_BUDGET, probe.remote_status())
-            .await
-            .ok()
-            .and_then(Result::ok)
+        match tokio::time::timeout(REMOTE_BUDGET, probe.remote_status()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(DaemonError::Json(_))) => {
+                pin_invalid = true;
+                None
+            }
+            _ => None,
+        }
     } else {
         None
     };
@@ -177,8 +186,10 @@ async fn assess_probe(
         Some(remote) => snapshot = Some(remote),
         _ if !legacy => {
             // Obtain the current latch/admission after the failed remote call.
-            if let Ok(Ok(local)) = tokio::time::timeout(LOCAL_BUDGET, probe.observation()).await {
-                snapshot = Some(local);
+            match tokio::time::timeout(LOCAL_BUDGET, probe.observation()).await {
+                Ok(Ok(local)) => snapshot = Some(local),
+                Ok(Err(DaemonError::Json(_))) => pin_invalid = true,
+                _ => {}
             }
         }
         _ => {}
@@ -192,6 +203,7 @@ async fn assess_probe(
         disposition,
         status: snapshot,
         observation_ready,
+        pin_invalid,
     }
 }
 

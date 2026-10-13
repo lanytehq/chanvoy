@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Daemon generation
+
+- `auto-setup` now exits **6** instead of reporting success when a reused
+  daemon has a different or unverifiable build generation. It retains the
+  daemon, profile, active marker, cursors and waits rather than automatically
+  cycling for a binary change. Existing profile/credential refresh is unchanged.
+- Setup JSON adds both build identities, explicit nullable `generation_match`,
+  `generation_reason`, `cycled` and ordered `reasons`. Missing commit or dirty
+  metadata is unknown, never a match. Successful refresh separates predecessor
+  evidence from the accepted resulting daemon.
+- `daemon status` reports the CLI generation alongside its existing daemon
+  identity and health. A coherent mismatch report remains an observation-only
+  exit 0; matching build pins do not establish ownership or retirement authority.
+
 ### Profile resolution
 
 - `chanvoy auto-setup` no longer sets or overwrites the host-wide

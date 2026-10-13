@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "cli_binary",
+    "daemon_binary",
+    "generation_match",
+    "generation_reason",
+    "cycled",
+    "reasons"
+  ],
+  "properties": {
+    "cli_binary": {
+      "$ref": "#/$defs/build"
+    },
+    "daemon_binary": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/build"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "generation_match": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "generation_reason": {
+      "enum": [
+        "match",
+        "commit_mismatch",
+        "dirty_mismatch",
+        "pin_missing",
+        "pin_invalid",
+        "dirty_unknown",
+        "candidate_unconfirmed"
+      ]
+    },
+    "cycled": {
+      "type": "boolean"
+    },
+    "reasons": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "profile_refresh",
+          "bot_identity_refresh",
+          "match",
+          "commit_mismatch",
+          "dirty_mismatch",
+          "pin_missing",
+          "pin_invalid",
+          "dirty_unknown",
+          "candidate_unconfirmed"
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "generation_reason": {
+            "const": "match"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "generation_match": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "generation_reason": {
+            "enum": [
+              "commit_mismatch",
+              "dirty_mismatch"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "generation_match": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "generation_reason": {
+            "enum": [
+              "pin_missing",
+              "pin_invalid",
+              "dirty_unknown",
+              "candidate_unconfirmed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "generation_match": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "commit",
+        "commit_short",
+        "build_date",
+        "dirty",
+        "rustc",
+        "platform"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "string"
+        },
+        "commit_short": {
+          "type": "string"
+        },
+        "build_date": {
+          "type": "string"
+        },
+        "dirty": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "rustc": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

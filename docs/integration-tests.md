@@ -11,8 +11,9 @@ make test-integration       # just the integration tests
 make pr-final               # full merge-gate (includes integration tests)
 ```
 
-Integration tests are marked `#[ignore]` so `cargo test` / `make check` skip
-them by default — the fast loop stays fast. `--ignored` turns them on.
+Longer lifecycle/wait suites are marked `#[ignore]` so `cargo test` / `make check`
+skip them by default. `--ignored` turns them on. Hermetic subprocess contract
+tests, including `setup_generation.rs`, run in the default suite.
 
 Tests are parallel-safe **within one cargo process**: each test owns
 independent `TempDir` instances for config and runtime paths, passed to the
@@ -57,6 +58,20 @@ stay in the file that uses them.
 
 ## What's covered
 
+**Setup generation contract** (`tests/setup_generation.rs`, default suite):
+
+- Complete healthy/degraded match permits reuse; mismatch, incomplete identity,
+  malformed/unavailable pins and candidate socket swaps refuse with exit 6.
+- Refusal preserves profile, pid file, socket identity, active marker, cursor
+  bytes and a controlled fixture wait inventory; activation and seed/shutdown
+  calls are checked independently. No live workspace credentials are used.
+- Profile/bot-identity Refresh retains precedence over generation-only refusal.
+  Native owned-daemon cases distinguish confirmed successful cycling from a
+  successful predecessor stop followed by successor-start failure.
+- Positive and negative generation-fragment JSON Schema fixtures preserve
+  explicit nulls, fixed reason names and unique reasons. Caller-side status
+  fields are tested separately from the daemon's original build identity.
+
 **PER-008C restart harness** (`tests/restart_harness.rs`):
 
 ### Phase 1 — scaffold + smoke
@@ -88,9 +103,11 @@ actually landed during PER-009) are caught.
   Plants a stale socket file (bind + drop); auto-setup must recover via
   `stop_daemon_if_present`'s NotRunning-on-shutdown fast path and spawn
   cleanly.
-- `auto_setup_stops_zombie_and_respawns` — F6 zombie-stop path.
+- `auto_setup_stops_zombie_and_respawns` — F6 zombie-stop path after explicit
+  credential-source Refresh. Generation-only reuse first refuses the paused
+  daemon's unknown build pin with exit 6, retaining its PID/socket.
   SIGSTOPs daemon1 to model a wedged daemon (alive + holding socket +
-  unresponsive). Second auto-setup must detect via socket-presence,
+  unresponsive). The explicit Refresh must detect via socket-presence,
   force-kill, and spawn fresh. Exercises the ping/shutdown timeout
   fallbacks in `chanvoy-cli`.
 - `auto_setup_promotes_reuse_to_refreshed_on_bot_username_drift` — F7.

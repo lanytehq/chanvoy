@@ -16,6 +16,7 @@ follow the recovery steps. Symptoms are listed roughly in
 ## Quick index
 
 - [Daemon NotRunning after auto-setup succeeded](#daemon-notrunning-after-auto-setup-succeeded)
+- [Auto-setup exits 6: generation mismatch or unknown](#auto-setup-exits-6-generation-mismatch-or-unknown)
 - [ActiveProfileNotFound — stale marker after a rename or delete](#activeprofilenotfound--stale-marker-after-a-rename-or-delete)
 - [ChannelNotFoundInAnyTeam / NotAMemberOfTeam / AmbiguousChannel](#channel-resolution-refusals)
 - [mattermost_identity_drift: true](#mattermost_identity_drift-true)
@@ -391,6 +392,36 @@ its daemon back; pick `auto-setup` when you also want the profile
 re-synthesized from the current environment.
 
 **Reference:** [operator-guide.md §Daemon Lifecycle](./operator-guide.md#daemon-lifecycle).
+
+---
+
+## Auto-setup exits 6: generation mismatch or unknown
+
+`generation mismatch:` or `generation unknown:` means setup withheld reuse of a
+different or unverifiable daemon build. The generation-only refusal leaves the
+daemon, profile, active marker (even with `--activate`), cursors and waits intact.
+It is not a daemon-start failure (exit 4) and should not trigger retry-on-4 loops.
+
+Inspect, without changing lifecycle state:
+
+```bash
+chanvoy --profile <your-profile> --json daemon status
+chanvoy --profile <your-profile> doctor
+```
+
+Compare `cli_binary` and daemon `binary`. `generation_match=false` means different
+commit or dirty metadata; `null` means unknown. `pin_missing` includes unavailable
+observation or an incomplete commit and does not establish daemon absence.
+`pin_invalid` is malformed metadata; `dirty_unknown` is incomplete dirty metadata.
+`candidate_unconfirmed` means the assessed process/socket candidate could not be
+bound to reuse. A status exit 0 only means a coherent report was produced.
+
+Unknown ownership or candidate binding permits inspection only: resolve ownership
+with the operator before retirement. For an independently owned candidate, use
+[the confirmed migration procedure](./operator-guide.md#installation-and-daemon-migration).
+Stop exit 0, socket absence or a missing pid file alone does not permit a new
+start. Installation changes the CLI, not running daemons. Existing explicit
+profile/credential refresh remains distinct from generation-only refusal.
 
 ---
 
