@@ -514,7 +514,8 @@ async fn auto_setup_marker_case(activate: bool, preexisting: Option<&str>) {
     );
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("auto-setup JSON");
-    server.await.expect("fake daemon completed");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 
     let marker_now = std::fs::read_to_string(&marker).ok();
     if activate {
