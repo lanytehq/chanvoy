@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 mod admission;
 #[cfg(test)]
 pub(crate) use admission::RetirementDecision;
-pub(crate) use admission::{AdmissionError, RequestPermit};
+pub(crate) use admission::{AdmissionError, RequestPermit, RetainedOwner};
 
 /// Test-only barrier: park `complete_guard` after it has observed the
 /// reservation and released the registry lock, before it publishes ack.

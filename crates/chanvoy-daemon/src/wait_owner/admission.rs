@@ -2,7 +2,7 @@
 //! No RPC, publisher, shutdown, provider or filesystem I/O occurs here.
 //! Callers must keep request guards with actual work and transfer retained
 //! ownership before an asynchronous effect can outlive that guard.
-// The foundation is intentionally not routed until the schema-pin gate.
+// Retirement control remains unrouted until the schema-pin gate.
 #![allow(dead_code)]
 
 use super::{Inner, WaitOwnerRegistry};
@@ -156,6 +156,20 @@ pub(crate) struct RequestPermit {
 }
 
 impl RequestPermit {
+    /// Reserve separate delivery ownership and transfer it while holding the
+    /// same arena lock. The initiating request remains independently owned.
+    pub(crate) fn reserve_stream(&self) -> Result<RetainedOwner, AdmissionError> {
+        let mut inner = self.registry.inner.lock().expect("wait registry");
+        inner.admission.validate(self.token)?;
+        let token = inner.admission.reserve()?;
+        let token = inner.admission.transfer(token, Kind::Stream)?;
+        drop(inner);
+        Ok(RetainedOwner {
+            registry: Arc::clone(&self.registry),
+            token,
+        })
+    }
+
     pub(crate) fn into_stream(self) -> Result<RetainedOwner, AdmissionError> {
         self.retain(Kind::Stream)
     }
@@ -274,6 +288,53 @@ mod tests {
             Arc::new(WaitOwnerRegistry::for_instance(instance)),
             instance,
         )
+    }
+
+    #[test]
+    fn separate_delivery_does_not_consume_parent_and_lost_child_stays_busy() {
+        let (reg, instance) = registry();
+        let request = reg.request_permit().unwrap();
+        let delivery = request.reserve_stream().unwrap();
+        let snapshot = reg.admission_snapshot();
+        assert_eq!((snapshot.requests, snapshot.streams), (1, 1));
+        request.confirm_done().unwrap();
+        assert!(matches!(
+            reg.retire_if_idle(instance),
+            Ok(RetirementDecision::Busy(_))
+        ));
+        drop(delivery);
+        assert_eq!(reg.admission_snapshot().streams, 1);
+        assert!(matches!(
+            reg.retire_if_idle(instance),
+            Ok(RetirementDecision::Busy(_))
+        ));
+    }
+
+    #[test]
+    fn delivery_reservation_validates_parent_and_refuses_exhaustion_without_mutation() {
+        let (reg, _) = registry();
+        let mut request = reg.request_permit().unwrap();
+        let original = request.token;
+        request.token.instance = InstanceId::new();
+        assert!(matches!(
+            request.reserve_stream(),
+            Err(AdmissionError::WrongInstance)
+        ));
+        request.token = original;
+        request.token.kind = Kind::Cleanup;
+        assert!(matches!(
+            request.reserve_stream(),
+            Err(AdmissionError::OwnerChanged)
+        ));
+        request.token = original;
+        reg.inner.lock().unwrap().admission.next_owner = None;
+        assert!(matches!(
+            request.reserve_stream(),
+            Err(AdmissionError::Exhausted)
+        ));
+        let snapshot = reg.admission_snapshot();
+        assert_eq!((snapshot.requests, snapshot.streams), (1, 0));
+        request.confirm_done().unwrap();
     }
 
     #[test]

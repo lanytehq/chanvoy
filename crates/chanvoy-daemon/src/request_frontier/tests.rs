@@ -255,7 +255,7 @@ async fn cancellation_after_full_response_before_staged_commit_retains_ownership
 }
 
 #[tokio::test]
-async fn closed_arena_refuses_all_six_ordinary_wait_aliases_before_provider_preflight() {
+async fn closed_arena_refuses_all_twelve_wait_aliases_before_provider_preflight() {
     let mock = MockServer::start().await;
     let state = state(&mock.uri());
     let instance = state.wait_owners.admission_snapshot().instance;
@@ -270,6 +270,12 @@ async fn closed_arena_refuses_all_six_ordinary_wait_aliases_before_provider_pref
         "wait_channels_v1",
         "wait_dm_v1",
         "wait_inbox_v1",
+        "wait_follow_v1",
+        "wait_follow_v2",
+        "wait_dm_follow_v1",
+        "wait_dm_follow_v2",
+        "wait_inbox_follow_v1",
+        "wait_inbox_follow_v2",
     ] {
         let (server, mut client) = UnixStream::pair().unwrap();
         let (shutdown, _receiver) = oneshot::channel();
@@ -443,3 +449,5 @@ async fn actual_wait_disconnect_during_provider_preflight_retains_unconfirmed_re
     assert_eq!(state.wait_owners.admission_snapshot().slots, 0);
     assert_eq!(state.wait_owners.armed_count(), 0);
 }
+
+mod held;

@@ -794,8 +794,20 @@ async fn handle_client(
     state: Arc<AppState>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 ) -> Result<(), DaemonError> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    let (reader, writer) = stream.into_split();
+    handle_client_io(BufReader::new(reader), writer, state, shutdown_tx).await
+}
+
+async fn handle_client_io<R, W>(
+    mut reader: R,
+    mut writer: W,
+    state: Arc<AppState>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+) -> Result<(), DaemonError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut line = String::new();
     let mut event_rx: Option<tokio::sync::broadcast::Receiver<Arc<DaemonEvent>>> = None;
     let mut client_sub_ids: Vec<String> = Vec::new();
@@ -807,6 +819,9 @@ async fn handle_client(
                     break;
                 }
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
+                // Admission precedes every legacy handler and provider preflight.
+                let request_permit = state.wait_owners.request_permit()
+                    .map_err(request_frontier::admission_error)?;
                 if request.method == WAIT_FOLLOW_V1_METHOD
                     || request.method == WAIT_FOLLOW_V2_METHOD
                 {
@@ -816,8 +831,7 @@ async fn handle_client(
                             -32_000,
                             "identity drift detected: held waits are refused until `chanvoy auto-setup` re-validates identity.",
                         );
-                        writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                        writer.write_all(b"\n").await?;
+                        request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                         line.clear();
                         continue;
                     }
@@ -830,8 +844,7 @@ async fn handle_client(
                                         -32_007,
                                         format!("wait_follow_v2 input: {err}"),
                                     );
-                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
+                                    request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                     line.clear();
                                     continue;
                                 }
@@ -855,8 +868,7 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_follow_v2 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
@@ -870,13 +882,14 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_follow_v1 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
                         }
                     };
+                    let delivery_owner = request_permit.reserve_stream()
+                        .map_err(request_frontier::admission_error)?;
                     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
                     let delivery = follow_delivery::ChannelDelivery::new(client_gone.clone());
@@ -899,6 +912,7 @@ async fn handle_client(
                         delivery.clone(),
                     );
                     delivery.serve(&mut writer, &mut reader, request.id, stream_rx, follow).await?;
+                    request_frontier::finish_held(&mut writer, request_permit, delivery_owner).await?;
                     line.clear();
                     continue;
                 }
@@ -912,8 +926,7 @@ async fn handle_client(
                             -32_000,
                             "identity drift detected: held waits are refused until `chanvoy auto-setup` re-validates identity.",
                         );
-                        writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                        writer.write_all(b"\n").await?;
+                        request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                         line.clear();
                         continue;
                     }
@@ -926,8 +939,7 @@ async fn handle_client(
                                         -32_007,
                                         format!("wait_dm_follow_v2 input: {err}"),
                                     );
-                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
+                                    request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                     line.clear();
                                     continue;
                                 }
@@ -950,8 +962,7 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_dm_follow_v2 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
@@ -965,14 +976,12 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_dm_follow_v1 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
                         }
                     };
-                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let deadline = match wait::deadline_from_rpc_entry(started, params.timeout_secs)
                     {
                         Ok(deadline) => deadline,
@@ -980,12 +989,14 @@ async fn handle_client(
                             let error = DaemonError::from(err);
                             let (code, message, data) = error_payload(&error);
                             let response = rpc_error_with_data(request.id, code, message, data);
-                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
+                            request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                             line.clear();
                             continue;
                         }
                     };
+                    let delivery_owner = request_permit.reserve_stream()
+                        .map_err(request_frontier::admission_error)?;
+                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
                     let follow = wait::wait_with_params_dm_follow(
                         &state,
@@ -1006,7 +1017,7 @@ async fn handle_client(
                     tokio::pin!(follow);
                     let mut eof_buf = String::new();
                     let mut client_eof = false;
-                    loop {
+                    let terminal_completed = loop {
                         tokio::select! {
                             biased;
                             Some(record) = stream_rx.recv() => {
@@ -1020,15 +1031,12 @@ async fn handle_client(
                                     writer.write_all(b"\n").await?;
                                     writer.flush().await
                                 }.await;
-                                let ack = write_result
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(ToString::to_string);
-                                let _ = record.written.send(ack);
-                                write_result?;
+                                request_frontier::acknowledge(record.written, write_result)?;
                             }
                             result = &mut follow => {
-                                while let Ok(record) = stream_rx.try_recv() {
+                                let queued = stream_rx.len();
+                                for _ in 0..queued {
+                                    let Ok(record) = stream_rx.try_recv() else { break };
                                     let notification = JsonRpcNotification {
                                         jsonrpc: "2.0".to_string(),
                                         method: record.method.to_string(),
@@ -1039,12 +1047,7 @@ async fn handle_client(
                                         writer.write_all(b"\n").await?;
                                         writer.flush().await
                                     }.await;
-                                    let ack = write_result
-                                        .as_ref()
-                                        .map(|_| ())
-                                        .map_err(ToString::to_string);
-                                    let _ = record.written.send(ack);
-                                    write_result?;
+                                    request_frontier::acknowledge(record.written, write_result)?;
                                 }
                                 let response = match result {
                                     Ok(result) => rpc_result(request.id, to_value(result)),
@@ -1056,7 +1059,7 @@ async fn handle_client(
                                 };
                                 writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
-                                break;
+                                break true;
                             }
                             peek = reader.read_line(&mut eof_buf), if !client_eof => {
                                 if coalesce_ms.is_some() {
@@ -1064,10 +1067,13 @@ async fn handle_client(
                                     client_eof = true;
                                 } else {
                                     let _ = peek?;
-                                    break;
+                                    break false;
                                 }
                             }
                         }
+                    };
+                    if terminal_completed {
+                        request_frontier::finish_held(&mut writer, request_permit, delivery_owner).await?;
                     }
                     line.clear();
                     continue;
@@ -1082,8 +1088,7 @@ async fn handle_client(
                             -32_000,
                             "identity drift detected: held waits are refused until `chanvoy auto-setup` re-validates identity.",
                         );
-                        writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                        writer.write_all(b"\n").await?;
+                        request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                         line.clear();
                         continue;
                     }
@@ -1096,8 +1101,7 @@ async fn handle_client(
                                         -32_007,
                                         format!("wait_inbox_follow_v2 input: {err}"),
                                     );
-                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
+                                    request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                     line.clear();
                                     continue;
                                 }
@@ -1119,8 +1123,7 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_inbox_follow_v2 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
@@ -1136,14 +1139,12 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_inbox_follow_v1 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
                         }
                     };
-                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let deadline = match wait::deadline_from_rpc_entry(started, params.timeout_secs)
                     {
                         Ok(deadline) => deadline,
@@ -1151,12 +1152,14 @@ async fn handle_client(
                             let error = DaemonError::from(err);
                             let (code, message, data) = error_payload(&error);
                             let response = rpc_error_with_data(request.id, code, message, data);
-                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
+                            request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                             line.clear();
                             continue;
                         }
                     };
+                    let delivery_owner = request_permit.reserve_stream()
+                        .map_err(request_frontier::admission_error)?;
+                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
                     let follow = wait_inbox::wait_with_params_inbox_follow(
                         &state,
@@ -1176,7 +1179,7 @@ async fn handle_client(
                     tokio::pin!(follow);
                     let mut eof_buf = String::new();
                     let mut client_eof = false;
-                    loop {
+                    let terminal_completed = loop {
                         tokio::select! {
                             biased;
                             Some(record) = stream_rx.recv() => {
@@ -1198,15 +1201,12 @@ async fn handle_client(
                                     writer.write_all(b"\n").await?;
                                     writer.flush().await
                                 }.await;
-                                let ack = write_result
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(ToString::to_string);
-                                let _ = record.written.send(ack);
-                                write_result?;
+                                request_frontier::acknowledge(record.written, write_result)?;
                             }
                             result = &mut follow => {
-                                while let Ok(record) = stream_rx.try_recv() {
+                                let queued = stream_rx.len();
+                                for _ in 0..queued {
+                                    let Ok(record) = stream_rx.try_recv() else { break };
                                     let (method, params) = match record.event {
                                         wait_inbox::InboxFollowStreamEvent::V1(event) => {
                                             (WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, to_value(event))
@@ -1225,12 +1225,7 @@ async fn handle_client(
                                         writer.write_all(b"\n").await?;
                                         writer.flush().await
                                     }.await;
-                                    let ack = write_result
-                                        .as_ref()
-                                        .map(|_| ())
-                                        .map_err(ToString::to_string);
-                                    let _ = record.written.send(ack);
-                                    write_result?;
+                                    request_frontier::acknowledge(record.written, write_result)?;
                                 }
                                 let response = match result {
                                     Ok(result) => rpc_result(request.id, to_value(result)),
@@ -1242,7 +1237,7 @@ async fn handle_client(
                                 };
                                 writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
-                                break;
+                                break true;
                             }
                             peek = reader.read_line(&mut eof_buf), if !client_eof => {
                                 if coalesce_ms.is_some() {
@@ -1250,19 +1245,17 @@ async fn handle_client(
                                     client_eof = true;
                                 } else {
                                     let _ = peek?;
-                                    break;
+                                    break false;
                                 }
                             }
                         }
+                    };
+                    if terminal_completed {
+                        request_frontier::finish_held(&mut writer, request_permit, delivery_owner).await?;
                     }
                     line.clear();
                     continue;
                 }
-                // This permit starts before ordinary dispatch, including its
-                // provider preflight. Held-follow and retained registration
-                // ownership are integrated separately before control activation.
-                let request_permit = state.wait_owners.request_permit()
-                    .map_err(request_frontier::admission_error)?;
                 let unsub_id = if request.method == "unsubscribe" {
                     request.params.get("subscription_id").and_then(|v| v.as_str()).map(|s| s.to_string())
                 } else {
