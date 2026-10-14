@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::{env, fs, io};
 
 mod follow_delivery;
+mod ipc_ownership;
 mod request_frontier;
 mod subscription_owner;
 mod wait;
@@ -490,6 +491,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     // gate as the local UDS surface.
     let identity_drift = Arc::new(AtomicBool::new(false));
 
+    let wait_owners = Arc::new(wait_owner::WaitOwnerRegistry::new());
     let ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>> = match &profile.ipc {
         Some(IpcConfig {
             enabled: true,
@@ -505,6 +507,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                 Arc::clone(&event_bus),
                 gateway_socket.clone(),
                 Arc::clone(&identity_drift),
+                Arc::new(ipc_ownership::IpcAdmission(Arc::clone(&wait_owners))),
             ));
             let state = ipc_peer.state();
             let cancel = cancel_token.clone();
@@ -550,7 +553,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         observed_identity_drift: Arc::new(AtomicBool::new(false)),
         probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
         reduce_writer,
-        wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
+        wait_owners,
         poll_cursors,
         fanin_replay: waitprims_fanin::FanInReplayStore::new(),
         inbox_armed: inbox_armed.clone(),

@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod doctor;
 pub mod host_build_info;
 pub mod recovery;
+pub mod request_ownership;
 #[cfg(unix)]
 pub mod runtime;
 pub mod safe_read;
