@@ -87,7 +87,7 @@ fn open_socket_parent(
     platform: NativePlatform,
 ) -> Result<PrivateDirectory, RuntimeError> {
     match platform {
-        NativePlatform::MacOs => PrivateDirectory::open_canonical(path, uid),
+        NativePlatform::MacOs => PrivateDirectory::open_native_socket_parent(path, uid),
         NativePlatform::Linux => PrivateDirectory::open_system_temporary_parent(path, uid),
     }
 }
@@ -133,6 +133,101 @@ fn native_parent() -> Result<PathBuf, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    #[test]
+    fn native_parent_accepts_protected_modes_without_weakening_private_children() {
+        let fixture = super::super::filesystem::tests::fixture();
+        let path = std::fs::canonicalize(fixture.path()).unwrap();
+        // SAFETY: pure effective UID getter; all mutations are fixture-only.
+        let uid = unsafe { libc::geteuid() };
+        for mode in [0o700, 0o750, 0o755, 0o500] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let parent = open_socket_parent(&path, uid, NativePlatform::MacOs).unwrap();
+            parent.verify_named().unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, mode);
+            if mode != 0o700 {
+                // This is also the explicit socket override/C directory policy.
+                assert!(PrivateDirectory::open_canonical(&path, uid).is_err());
+            }
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let parent = open_socket_parent(&path, uid, NativePlatform::MacOs).unwrap();
+        let child = parent.child(OsStr::new("chanvoy"), true).unwrap().unwrap();
+        let root = child.child(OsStr::new("r"), true).unwrap().unwrap();
+        assert_eq!(
+            std::fs::metadata(child.path()).unwrap().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(root.path()).unwrap().mode() & 0o7777,
+            0o700
+        );
+        std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(parent.child(OsStr::new("chanvoy"), true).is_err());
+        assert_eq!(
+            std::fs::metadata(child.path()).unwrap().mode() & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn native_parent_refuses_writable_foreign_and_redirected_paths() {
+        let fixture = super::super::filesystem::tests::fixture();
+        let path = std::fs::canonicalize(fixture.path()).unwrap();
+        // SAFETY: pure effective UID getter.
+        let uid = unsafe { libc::geteuid() };
+        for mode in [0o775, 0o757, 0o777, 0o1777] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, mode);
+            assert!(
+                open_socket_parent(&path, uid, NativePlatform::MacOs).is_err(),
+                "unexpected acceptance of mode {mode:o}"
+            );
+            assert!(!path.join("chanvoy").exists());
+            assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, mode);
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(open_socket_parent(&path, uid.wrapping_add(1), NativePlatform::MacOs).is_err());
+        let redirect = path.join("redirect");
+        symlink(&path, &redirect).unwrap();
+        assert!(open_socket_parent(&redirect, uid, NativePlatform::MacOs).is_err());
+        let regular = path.join("regular");
+        std::fs::write(&regular, b"not a directory").unwrap();
+        assert!(open_socket_parent(&regular, uid, NativePlatform::MacOs).is_err());
+        // Darwin ownership/permissions must not substitute for Linux's policy.
+        assert!(open_socket_parent(&path, uid, NativePlatform::Linux).is_err());
+    }
+
+    #[test]
+    fn native_parent_retained_descriptor_refuses_replacement_or_writable_ancestry() {
+        let fixture = super::super::filesystem::tests::fixture();
+        let path = std::fs::canonicalize(fixture.path()).unwrap();
+        // SAFETY: pure effective UID getter.
+        let uid = unsafe { libc::geteuid() };
+        let ancestor = PrivateDirectory::open_canonical(&path, uid).unwrap();
+        let child = ancestor.child(OsStr::new("parent"), true).unwrap().unwrap();
+        std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let parent = open_socket_parent(child.path(), uid, NativePlatform::MacOs).unwrap();
+        std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(parent.verify_named().is_err());
+        assert!(parent.child(OsStr::new("chanvoy"), true).is_err());
+        assert!(!child.path().join("chanvoy").exists());
+        std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(child.path(), path.join("old-parent")).unwrap();
+        std::fs::create_dir(child.path()).unwrap();
+        std::fs::set_permissions(child.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            parent.verify_named(),
+            Err(RuntimeError::Changed(_))
+        ));
+        assert!(parent.child(OsStr::new("chanvoy"), true).is_err());
+        assert!(!child.path().join("chanvoy").exists());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(open_socket_parent(child.path(), uid, NativePlatform::MacOs).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[test]
     #[ignore = "qualified normal-host default native R fixture; no socket/service bind"]
     fn native_socket_root_uses_account_local_selector_and_worst_case_budget() {

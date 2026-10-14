@@ -47,6 +47,7 @@ pub(super) struct PrivateDirectory {
 enum DirectoryPolicy {
     Private,
     NativeHome,
+    NativeSocketParent,
     SystemTemporary,
 }
 impl PrivateDirectory {
@@ -59,6 +60,13 @@ impl PrivateDirectory {
 
     pub fn open_native_home(path: &Path, uid: u32) -> Result<Self, RuntimeError> {
         Self::open_directory(path, uid, DirectoryPolicy::NativeHome)
+    }
+
+    /// Darwin's native per-account selector is system-managed ancestry, not
+    /// a dedicated private child. Stock 0755 is safe when account-owned and
+    /// protected from other-account writes; never repair its permissions.
+    pub fn open_native_socket_parent(path: &Path, uid: u32) -> Result<Self, RuntimeError> {
+        Self::open_directory(path, uid, DirectoryPolicy::NativeSocketParent)
     }
 
     pub fn open_system_temporary_parent(path: &Path, uid: u32) -> Result<Self, RuntimeError> {
@@ -359,6 +367,9 @@ fn validate_selected_directory(
 ) -> Result<(), RuntimeError> {
     match policy {
         DirectoryPolicy::Private => return validate_private_directory(meta, uid),
+        DirectoryPolicy::NativeSocketParent => {
+            return validate_native_socket_parent(meta.is_dir(), meta.uid(), meta.mode(), uid);
+        }
         DirectoryPolicy::SystemTemporary => {
             if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o7777 != 0o1777 {
                 return Err(RuntimeError::Invalid("native system temporary parent"));
@@ -370,6 +381,19 @@ fn validate_selected_directory(
     if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
         return Err(RuntimeError::Invalid(
             "native home is not account-owned protected ancestry",
+        ));
+    }
+    Ok(())
+}
+fn validate_native_socket_parent(
+    is_directory: bool,
+    owner: u32,
+    mode: u32,
+    uid: u32,
+) -> Result<(), RuntimeError> {
+    if !is_directory || owner != uid || mode & 0o6022 != 0 {
+        return Err(RuntimeError::Invalid(
+            "native socket parent is not account-owned protected ancestry",
         ));
     }
     Ok(())
@@ -434,6 +458,22 @@ fn owned_file(fd: i32) -> Result<File, RuntimeError> {
 pub(super) mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+
+    #[test]
+    fn native_socket_parent_policy_refuses_foreign_non_directory_and_setid_facts() {
+        let uid = 123;
+        for mode in [0o700, 0o750, 0o755, 0o500] {
+            validate_native_socket_parent(true, uid, mode, uid).unwrap();
+        }
+        // Some filesystems clear setid bits during chmod. Validate their
+        // rejection directly without relying on a fixture retaining them.
+        for mode in [0o775, 0o757, 0o777, 0o1777, 0o2755, 0o4755, 0o6755] {
+            assert!(validate_native_socket_parent(true, uid, mode, uid).is_err());
+        }
+        assert!(validate_native_socket_parent(true, 0, 0o755, uid).is_err());
+        assert!(validate_native_socket_parent(true, uid + 1, 0o755, uid).is_err());
+        assert!(validate_native_socket_parent(false, uid, 0o755, uid).is_err());
+    }
 
     // Generic I/O fixtures are persistent-base tests of the same directory
     // validator, not an alternate native C selector or native lifecycle proof.
