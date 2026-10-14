@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::{env, fs, io};
 
 mod follow_delivery;
+mod request_frontier;
 mod wait;
 mod wait_channels;
 mod wait_coalesce;
@@ -1257,6 +1258,11 @@ async fn handle_client(
                     line.clear();
                     continue;
                 }
+                // This permit starts before ordinary dispatch, including its
+                // provider preflight. Held-follow and retained registration
+                // ownership are integrated separately before control activation.
+                let request_permit = state.wait_owners.request_permit()
+                    .map_err(request_frontier::admission_error)?;
                 let unsub_id = if request.method == "unsubscribe" {
                     request.params.get("subscription_id").and_then(|v| v.as_str()).map(|s| s.to_string())
                 } else {
@@ -1274,9 +1280,7 @@ async fn handle_client(
                 } else {
                     dispatch_request(request, &state, &shutdown_tx).await
                 };
-                let response = dispatched.response;
-
-                if let Some(sub_ack) = extract_subscription_id(&response.result) {
+                if let Some(sub_ack) = extract_subscription_id(&dispatched.response.result) {
                     client_sub_ids.push(sub_ack);
                     if event_rx.is_none() {
                         event_rx = Some(state.event_bus.subscribe());
@@ -1287,33 +1291,7 @@ async fn handle_client(
                     client_sub_ids.retain(|id| id != &removed_id);
                 }
 
-                writer
-                    .write_all(serde_json::to_string(&response)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
-                if response.error.is_none()
-                    && (dispatched.staged_poll_ack.is_some()
-                        || dispatched.staged_attention.is_some())
-                {
-                    commit_staged_read_cursors(
-                        &state,
-                        dispatched.staged_poll_ack,
-                        dispatched.staged_attention,
-                    )
-                    .await
-                    .map_err(DaemonError::from)?;
-                }
-                if let Some(consume) = dispatched.staged_fanin_consume {
-                    if response.error.is_none() {
-                        state
-                            .fanin_replay
-                            .consume(&consume.channel_id, &consume.post_id)
-                            .map_err(DaemonError::from)?;
-                    }
-                }
-                if let Some(hold) = dispatched.fanin_hold {
-                    hold.release();
-                }
+                request_frontier::finish(&mut writer, &state, dispatched, request_permit).await?;
                 line.clear();
             }
             recv_result = async {

@@ -21,6 +21,9 @@ use tokio_util::sync::CancellationToken;
 // Non-wire ownership foundation. Runtime-control routing remains gated on
 // the reviewed schema pin and composed lifecycle activation.
 mod admission;
+#[cfg(test)]
+pub(crate) use admission::RetirementDecision;
+pub(crate) use admission::{AdmissionError, RequestPermit};
 
 /// Test-only barrier: park `complete_guard` after it has observed the
 /// reservation and released the registry lock, before it publishes ack.
