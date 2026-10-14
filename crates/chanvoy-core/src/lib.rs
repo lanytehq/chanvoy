@@ -1978,6 +1978,11 @@ pub enum CoreError {
     RequiresElevatedCapability,
     #[error("timeout waiting for channel {0}")]
     WaitTimeout(String),
+    /// Local arena refusal. This is not a serialized runtime-control type.
+    #[error("runtime is retiring; operational admission is closed")]
+    RuntimeAdmissionClosed,
+    #[error("runtime ownership counter is exhausted")]
+    RuntimeOwnershipExhausted,
     /// PER-038: wait input/config hard failure (bad filter, empty
     /// needle, foreign/missing/substituted anchor). Never a deadman:
     /// agents reconfigure rather than re-arm with backoff alone.
