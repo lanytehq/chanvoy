@@ -8,6 +8,7 @@ use std::{env, fs, io};
 
 mod follow_delivery;
 mod request_frontier;
+mod subscription_owner;
 mod wait;
 mod wait_channels;
 mod wait_coalesce;
@@ -126,7 +127,7 @@ struct AppState {
     socket_path: PathBuf,
     my_user_id: String,
     event_bus: Arc<EventBus>,
-    subscriptions: Arc<Mutex<HashMap<String, SubscriptionFilter>>>,
+    subscriptions: Arc<Mutex<HashMap<String, subscription_owner::Registration>>>,
     ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>>,
     ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>>,
     attention_state: Arc<Mutex<AttentionState>>,
@@ -1315,13 +1316,13 @@ where
                         let subs = state.subscriptions.lock().await;
                         let matches_any = client_sub_ids.iter().any(|id| {
                             subs.get(id)
-                                .is_some_and(|f| event_matches_filter(event.as_ref(), f))
+                                .is_some_and(|entry| event_matches_filter(event.as_ref(), &entry.filter))
                         });
                         if matches_any {
+                            let send_owner = state.wait_owners.request_permit()
+                                .map_err(request_frontier::admission_error)?;
                             let notification = daemon_event_to_notification(event.as_ref());
-                            let payload = serde_json::to_string(&notification)?;
-                            writer.write_all(payload.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
+                            subscription_owner::finish_send(&mut writer, &notification, send_owner).await?;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1330,6 +1331,8 @@ where
                         let missed_from = current_seq.saturating_sub(n);
                         for sub_id in &client_sub_ids {
                             if subs.contains_key(sub_id) {
+                                let send_owner = state.wait_owners.request_permit()
+                                    .map_err(request_frontier::admission_error)?;
                                 let gap = JsonRpcNotification {
                                     jsonrpc: "2.0".to_string(),
                                     method: "push.gap".to_string(),
@@ -1339,9 +1342,7 @@ where
                                         "missed_to_seq": current_seq,
                                     }),
                                 };
-                                let payload = serde_json::to_string(&gap)?;
-                                writer.write_all(payload.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                subscription_owner::finish_send(&mut writer, &gap, send_owner).await?;
                             }
                         }
                     }
@@ -1353,7 +1354,7 @@ where
     if !client_sub_ids.is_empty() {
         let mut subs = state.subscriptions.lock().await;
         for id in &client_sub_ids {
-            subs.remove(id);
+            subscription_owner::remove(&mut subs, id)?;
         }
     }
     Ok(())
@@ -2022,11 +2023,14 @@ async fn dispatch_request(
         "subscribe" => parse_and_call(&request.params, |params: SubscribeParams| async move {
             let sub_id = uuid::Uuid::new_v4().to_string();
             let start_seq = state.event_bus.current_seq();
-            state
-                .subscriptions
-                .lock()
-                .await
-                .insert(sub_id.clone(), params.filter);
+            let mut subs = state.subscriptions.lock().await;
+            subscription_owner::insert(
+                &mut subs,
+                &state.wait_owners,
+                sub_id.clone(),
+                params.filter,
+            )?;
+            drop(subs);
             Ok(SubscriptionAck {
                 subscription_id: sub_id,
                 start_sequence: start_seq,
@@ -2036,7 +2040,7 @@ async fn dispatch_request(
         .map(to_value),
         "unsubscribe" => parse_and_call(&request.params, |params: UnsubscribeParams| async move {
             let mut subs = state.subscriptions.lock().await;
-            Ok(subs.remove(&params.subscription_id).is_some())
+            subscription_owner::remove(&mut subs, &params.subscription_id)
         })
         .await
         .map(to_value),

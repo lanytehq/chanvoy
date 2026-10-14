@@ -451,3 +451,5 @@ async fn actual_wait_disconnect_during_provider_preflight_retains_unconfirmed_re
 }
 
 mod held;
+
+mod subscriptions;

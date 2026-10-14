@@ -236,6 +236,18 @@ impl RetainedOwner {
 }
 
 impl WaitOwnerRegistry {
+    /// Reserve a persistent registration before insertion or acknowledgement.
+    pub(crate) fn registration_owner(self: &Arc<Self>) -> Result<RetainedOwner, AdmissionError> {
+        let mut inner = self.inner.lock().expect("wait registry");
+        let token = inner.admission.reserve()?;
+        let token = inner.admission.transfer(token, Kind::Stream)?;
+        drop(inner);
+        Ok(RetainedOwner {
+            registry: Arc::clone(self),
+            token,
+        })
+    }
+
     /// Reserve child and detached collector cleanup before either can spawn.
     /// Capacity is checked for both before mutating the inventory.
     pub(crate) fn task_cleanup_pair(
