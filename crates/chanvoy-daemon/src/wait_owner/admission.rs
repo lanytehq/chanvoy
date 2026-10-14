@@ -236,6 +236,35 @@ impl RetainedOwner {
 }
 
 impl WaitOwnerRegistry {
+    /// Reserve child and detached collector cleanup before either can spawn.
+    /// Capacity is checked for both before mutating the inventory.
+    pub(crate) fn task_cleanup_pair(
+        self: &Arc<Self>,
+    ) -> Result<(RetainedOwner, RetainedOwner), AdmissionError> {
+        let mut inner = self.inner.lock().expect("wait registry");
+        inner.admission.ensure_running()?;
+        inner
+            .admission
+            .next_owner
+            .and_then(|id| id.checked_add(1))
+            .ok_or(AdmissionError::Exhausted)?;
+        let child = inner.admission.reserve()?;
+        let child = inner.admission.transfer(child, Kind::Cleanup)?;
+        let collector = inner.admission.reserve()?;
+        let collector = inner.admission.transfer(collector, Kind::Cleanup)?;
+        drop(inner);
+        Ok((
+            RetainedOwner {
+                registry: Arc::clone(self),
+                token: child,
+            },
+            RetainedOwner {
+                registry: Arc::clone(self),
+                token: collector,
+            },
+        ))
+    }
+
     pub(crate) fn request_permit(self: &Arc<Self>) -> Result<RequestPermit, AdmissionError> {
         let token = self
             .inner
@@ -288,6 +317,67 @@ mod tests {
             Arc::new(WaitOwnerRegistry::for_instance(instance)),
             instance,
         )
+    }
+
+    #[test]
+    fn task_pair_exhaustion_is_atomic_and_never_reuses_ids() {
+        let (reg, instance) = registry();
+        reg.inner.lock().unwrap().admission.next_owner = Some(u64::MAX);
+        assert!(matches!(
+            reg.task_cleanup_pair(),
+            Err(AdmissionError::Exhausted)
+        ));
+        assert!(reg.admission_snapshot().is_empty());
+        assert_eq!(
+            reg.inner.lock().unwrap().admission.next_owner,
+            Some(u64::MAX)
+        );
+        reg.inner.lock().unwrap().admission.next_owner = Some(u64::MAX - 1);
+        let (child, collector) = reg.task_cleanup_pair().unwrap();
+        assert_ne!(child.token.sequence, collector.token.sequence);
+        assert_eq!(reg.admission_snapshot().cleanup, 2);
+        assert_eq!(reg.inner.lock().unwrap().admission.next_owner, None);
+        child.confirm_done().unwrap();
+        assert!(matches!(
+            reg.retire_if_idle(instance),
+            Ok(RetirementDecision::Busy(_))
+        ));
+        collector.confirm_done().unwrap();
+        assert!(matches!(
+            reg.task_cleanup_pair(),
+            Err(AdmissionError::Exhausted)
+        ));
+        assert!(reg.admission_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_task_pair_refuses_before_child_poll_or_partial_reservation() {
+        let (reg, _) = registry();
+        reg.inner.lock().unwrap().admission.next_owner = Some(u64::MAX);
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_polled = Arc::clone(&polled);
+        let result = crate::wait_task::OwnedTask::spawn(&reg, async move {
+            child_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(matches!(result, Err(CoreError::RuntimeOwnershipExhausted)));
+        tokio::task::yield_now().await;
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(reg.admission_snapshot().is_empty());
+    }
+
+    #[test]
+    fn task_pair_stale_epoch_cannot_clear_child_or_collector() {
+        let (reg, instance) = registry();
+        let (mut child, collector) = reg.task_cleanup_pair().unwrap();
+        child.token.instance = InstanceId::new();
+        assert_eq!(child.confirm_done(), Err(AdmissionError::WrongInstance));
+        assert_eq!(reg.admission_snapshot().cleanup, 2);
+        collector.confirm_done().unwrap();
+        assert_eq!(reg.admission_snapshot().cleanup, 1);
+        assert!(matches!(
+            reg.retire_if_idle(instance),
+            Ok(RetirementDecision::Busy(_))
+        ));
     }
 
     #[test]

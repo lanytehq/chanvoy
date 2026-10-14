@@ -13,6 +13,7 @@ mod wait_channels;
 mod wait_coalesce;
 mod wait_inbox;
 mod wait_owner;
+mod wait_task;
 mod waitprims_fanin;
 mod waitprims_hold;
 mod waitprims_poll;

@@ -216,6 +216,7 @@ impl Fixture {
         let tip = Arc::new(Mutex::new(None));
         let inner_cancel = CancellationToken::new();
         let run = FollowRun {
+            registry: Arc::clone(&registry),
             release: Arc::clone(&release),
             sidecar: sidecar.clone(),
             last_error: Arc::new(Mutex::new(None)),

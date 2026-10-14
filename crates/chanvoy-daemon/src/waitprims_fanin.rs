@@ -51,18 +51,20 @@ struct FanArm {
 }
 
 async fn wait_any_cancel(tokens: &[CancellationToken]) {
-    if tokens.is_empty() {
-        std::future::pending::<()>().await;
-        return;
-    }
-    let mut set = tokio::task::JoinSet::new();
-    for token in tokens {
-        let token = token.clone();
-        set.spawn(async move {
-            token.cancelled().await;
-        });
-    }
-    let _ = set.join_next().await;
+    use std::future::Future;
+    use std::task::Poll;
+    // These futures stay inside the owning parent; dropping them leaves no
+    // subordinate task whose JoinSet abort would need later collection.
+    let mut waits: Vec<_> = tokens.iter().map(|t| Box::pin(t.cancelled())).collect();
+    std::future::poll_fn(|cx| {
+        for wait in &mut waits {
+            if wait.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending // The empty collection intentionally never completes.
+    })
+    .await
 }
 
 fn retained_may_restore(after_eligible: Option<&HashSet<String>>, post_id: &str) -> bool {
@@ -139,45 +141,32 @@ pub(crate) struct StagedFanInConsume {
 /// Abort the member-cancel watcher on drop, including client EOF.
 struct WatcherAbort {
     stop: CancellationToken,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    _task: crate::wait_task::OwnedTask,
 }
 
 impl WatcherAbort {
     fn spawn(
+        registry: &Arc<crate::wait_owner::WaitOwnerRegistry>,
         member_cancels: Vec<CancellationToken>,
         any_cancel: Cancel,
         stop: CancellationToken,
-    ) -> Self {
+    ) -> Result<Self, CoreError> {
         let watcher_stop = stop.clone();
-        let handle = tokio::spawn(async move {
+        let task = crate::wait_task::OwnedTask::spawn(registry, async move {
             tokio::select! {
                 _ = watcher_stop.cancelled() => {}
-                _ = async {
-                    let mut set = tokio::task::JoinSet::new();
-                    for token in member_cancels {
-                        set.spawn(async move {
-                            token.cancelled().await;
-                        });
-                    }
-                    let _ = set.join_next().await;
-                } => {
-                    any_cancel.trigger();
-                }
+                _ = wait_any_cancel(&member_cancels) => { any_cancel.trigger(); }
             }
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
+        })?;
+        Ok(Self { stop, _task: task })
     }
 }
 
 impl Drop for WatcherAbort {
     fn drop(&mut self) {
         self.stop.cancel();
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
+        // OwnedTask requests abort; its separately owned collector confirms
+        // actual child completion, never this Drop implementation.
     }
 }
 
@@ -421,8 +410,13 @@ pub(crate) async fn wait_channels_first_match(
         restored: Mutex::new(HashMap::new()),
     };
     let wp_cancel = Cancel::new();
-    let _fwd = CancelForward::spawn(lease_cancel, wp_cancel.clone());
-    let _watcher = WatcherAbort::spawn(member_cancels, wp_cancel.clone(), CancellationToken::new());
+    let _fwd = CancelForward::spawn(&state.wait_owners, lease_cancel, wp_cancel.clone())?;
+    let _watcher = WatcherAbort::spawn(
+        &state.wait_owners,
+        member_cancels,
+        wp_cancel.clone(),
+        CancellationToken::new(),
+    )?;
     let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel).await;
     inner_cancel.cancel();
     let outcome = outcome.map_err(|err| map_waitprims_err("fan-in", err))?;
@@ -1034,29 +1028,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_cancel_watcher_aborts_on_drop() {
-        let parked = CancellationToken::new();
-        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let started_task = started.clone();
-        let finished_task = finished.clone();
-        let parked_task = parked.clone();
-        let handle = tokio::spawn(async move {
-            started_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            parked_task.cancelled().await;
-            finished_task.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
-        let guard = WatcherAbort {
-            stop: CancellationToken::new(),
-            handle: Some(handle),
-        };
-        tokio::task::yield_now().await;
-        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    async fn member_cancel_watcher_drop_is_collected_before_ownership_clears() {
+        let registry = Arc::new(crate::wait_owner::WaitOwnerRegistry::new());
+        let member = CancellationToken::new();
+        let cancel = Cancel::new();
+        let guard = WatcherAbort::spawn(
+            &registry,
+            vec![member.clone()],
+            cancel.clone(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(registry.admission_snapshot().cleanup, 2);
         drop(guard);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            !finished.load(std::sync::atomic::Ordering::SeqCst),
-            "aborted watcher must not complete the parked wait"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.admission_snapshot().cleanup != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!cancel.is_cancelled());
+        assert!(!member.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod cancellation_future_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn any_member_cancel_completes_without_a_runtime_or_spawned_task() {
+        let tokens: Vec<_> = (0..3).map(|_| CancellationToken::new()).collect();
+        let mut wait = Box::pin(wait_any_cancel(&tokens));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+        tokens[1].cancel();
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(!tokens[0].is_cancelled());
+        assert!(!tokens[2].is_cancelled());
+    }
+
+    #[test]
+    fn empty_fan_in_stays_pending_and_dropped_wait_has_no_remaining_waker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
+        let mut empty = Box::pin(wait_any_cancel(&[]));
+        assert!(empty.as_mut().poll(&mut cx).is_pending());
+        drop(empty);
+        let tokens = vec![CancellationToken::new(), CancellationToken::new()];
+        let mut wait = Box::pin(wait_any_cancel(&tokens));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(wait);
+        for token in &tokens {
+            token.cancel();
+        }
+        assert_eq!(count.0.load(Ordering::SeqCst), 0);
     }
 }
