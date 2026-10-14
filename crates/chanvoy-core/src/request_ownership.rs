@@ -11,8 +11,17 @@ pub trait RequestAdmission: Send + Sync {
 }
 
 #[must_use = "retain through all required stages and explicitly confirm completion"]
-pub trait RequestCompletion: Send {
+pub trait RequestCompletion: Send + Sync {
+    /// Reserve an independent registration while this request remains admitted.
+    fn reserve_registration(&self) -> Result<Box<dyn RegistrationCompletion>, CoreError>;
+
     /// Consume this exact owner's handle after all required stages succeed.
     /// Implementations must validate the host's instance and owner identity.
+    fn confirm_done(self: Box<Self>) -> Result<(), CoreError>;
+}
+
+/// Retained registration ownership survives connection loss and handle Drop.
+#[must_use = "store with the registration until exact removal is confirmed"]
+pub trait RegistrationCompletion: Send + Sync {
     fn confirm_done(self: Box<Self>) -> Result<(), CoreError>;
 }

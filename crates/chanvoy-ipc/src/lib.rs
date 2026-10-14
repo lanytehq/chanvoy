@@ -1,4 +1,6 @@
 mod request_frontier;
+mod subscription_owner;
+use subscription_owner::SubscriptionEntry;
 #[cfg(test)]
 mod request_tests;
 use chanvoy_core::request_ownership::RequestAdmission;
@@ -505,10 +507,6 @@ fn non_empty_root(root_id: &str) -> Option<String> {
     }
 }
 
-struct SubscriptionEntry {
-    filter: IpcSubscriptionFilter,
-}
-
 #[derive(Debug, Clone)]
 pub struct IpcPeerState {
     pub connected: bool,
@@ -621,6 +619,14 @@ impl IpcPeer {
         }
     }
 
+    fn forwarding_state(&self) -> subscription_owner::Forwarding {
+        subscription_owner::Forwarding {
+            subscriptions: Arc::clone(&self.subscriptions),
+            admission: Arc::clone(&self.request_admission),
+            identity_drift: Arc::clone(&self.identity_drift),
+        }
+    }
+
     async fn connect_and_serve(
         &self,
         cancel: CancellationToken,
@@ -656,65 +662,10 @@ impl IpcPeer {
         let (tx, mut rx) = peer.into_split();
         let mut channel_rx = rx.take_channel_receiver(CHANNEL_260);
 
-        let event_bus = Arc::clone(&self.event_bus);
-        let mut event_rx = event_bus.subscribe();
-        let tx_clone = tx.clone();
-        let subscriptions = Arc::clone(&self.subscriptions);
-        let cancel_fwd = cancel.clone();
+        let forwarding = self.forwarding_state();
+        let forward_handle =
+            tokio::spawn(forwarding.run(self.event_bus.subscribe(), tx.clone(), cancel.clone()));
         let audit_peer_id = peer_id.clone();
-        let drift_for_fwd = Arc::clone(&self.identity_drift);
-
-        let forward_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    recv_result = event_rx.recv() => {
-                        match recv_result {
-                            Ok(event) => {
-                                // PER-014: drop Mattermost-sourced events
-                                // when identity drift is set. Same contract
-                                // as the local UDS subscription path —
-                                // operators query daemon_status to learn
-                                // why events stopped, then re-run
-                                // `chanvoy auto-setup`. Per
-                                // @agent-entarch-lanytehq's PR #16
-                                // finding (2026-04-28).
-                                if drift_for_fwd.load(Ordering::Relaxed) {
-                                    continue;
-                                }
-                                let subs = subscriptions.lock().await;
-                                for (sub_id, entry) in subs.iter() {
-                                    if event_matches_ipc_filter(&event, &entry.filter) {
-                                        if let DaemonEventPayloadInner::Gap(g) = &event.payload {
-                                            let gap = ChatFrame::SubscriptionGap {
-                                                subscription_id: sub_id.clone(),
-                                                expected_seq: g.missed_from_seq,
-                                                next_seq: g.missed_to_seq,
-                                                reason: "overflow".to_string(),
-                                                message: Some(format!(
-                                                    "missed {} events",
-                                                    g.missed_to_seq.saturating_sub(g.missed_from_seq)
-                                                )),
-                                            };
-                                            let payload = serde_json::to_vec(&gap).unwrap_or_default();
-                                            if tx_clone.send(CHANNEL_260, &payload).await.is_err() {
-                                                return;
-                                            }
-                                        } else if let Some(notification) = daemon_event_to_chat_notification(&event, sub_id) {
-                                            let payload = serde_json::to_vec(&notification).unwrap_or_default();
-                                            if tx_clone.send(CHANNEL_260, &payload).await.is_err() {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => return,
-                        }
-                    }
-                    _ = cancel_fwd.cancelled() => return,
-                }
-            }
-        });
 
         let _ = emit_audit(&tx, &audit_peer_id, "chat.peer_connected", None, "info").await;
 
@@ -745,9 +696,9 @@ impl IpcPeer {
 
         let _ = emit_audit(&tx, &audit_peer_id, "chat.peer_disconnected", None, "info").await;
 
-        forward_handle.abort();
+        let collected = subscription_owner::abort_and_collect(forward_handle).await;
         let _ = tx.shutdown().await;
-        outcome
+        outcome.and(collected)
     }
 
     async fn handle_frame<T: RequestTransport>(
@@ -771,7 +722,8 @@ impl IpcPeer {
             return Ok(());
         }
         let owner = self.request_admission.reserve_request()?;
-        self.dispatch_frame(chat_frame, tx, peer_id).await?;
+        self.dispatch_frame(chat_frame, tx, peer_id, owner.as_ref())
+            .await?;
         owner.confirm_done()?;
         Ok(())
     }
@@ -781,6 +733,7 @@ impl IpcPeer {
         chat_frame: ChatFrame,
         tx: &T,
         peer_id: &str,
+        owner: &dyn chanvoy_core::request_ownership::RequestCompletion,
     ) -> SendResult {
         match chat_frame {
             ChatFrame::ChannelListRequest {
@@ -973,7 +926,7 @@ impl IpcPeer {
 
                 {
                     let mut subs = self.subscriptions.lock().await;
-                    subs.insert(sub_id.clone(), SubscriptionEntry { filter: ipc_filter });
+                    subscription_owner::insert(&mut subs, sub_id.clone(), ipc_filter, owner)?;
                 }
 
                 emit_audit(
@@ -1000,7 +953,7 @@ impl IpcPeer {
                 let _ = &delegation_id;
                 let removed = {
                     let mut subs = self.subscriptions.lock().await;
-                    subs.remove(&subscription_id).is_some()
+                    subscription_owner::remove(&mut subs, &subscription_id)?
                 };
                 if removed {
                     emit_audit(

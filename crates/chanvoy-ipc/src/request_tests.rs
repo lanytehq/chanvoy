@@ -1,5 +1,7 @@
+mod subscriptions;
+
 use super::*;
-use chanvoy_core::request_ownership::RequestCompletion;
+use chanvoy_core::request_ownership::{RegistrationCompletion, RequestCompletion};
 use chanvoy_core::{CapabilityClass, CredentialMode, GapPayload, Provider};
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicUsize;
@@ -14,9 +16,18 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 struct Probe {
     reservations: AtomicUsize,
     active: AtomicUsize,
+    streams: AtomicUsize,
+    stream_reservations: AtomicUsize,
     refuse: AtomicUsize,
 }
 struct Completion(Arc<Probe>);
+struct StreamCompletion(Arc<Probe>);
+impl RegistrationCompletion for StreamCompletion {
+    fn confirm_done(self: Box<Self>) -> Result<(), CoreError> {
+        assert!(self.0.streams.fetch_sub(1, Ordering::SeqCst) > 0);
+        Ok(())
+    }
+}
 struct Admission(Arc<Probe>);
 impl RequestAdmission for Admission {
     fn reserve_request(&self) -> Result<Box<dyn RequestCompletion>, CoreError> {
@@ -31,8 +42,15 @@ impl RequestAdmission for Admission {
     }
 }
 impl RequestCompletion for Completion {
+    fn reserve_registration(&self) -> Result<Box<dyn RegistrationCompletion>, CoreError> {
+        assert!(self.0.active.load(Ordering::SeqCst) > 0);
+        self.0.stream_reservations.fetch_add(1, Ordering::SeqCst);
+        self.0.streams.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(StreamCompletion(Arc::clone(&self.0))))
+    }
+
     fn confirm_done(self: Box<Self>) -> Result<(), CoreError> {
-        assert_eq!(self.0.active.fetch_sub(1, Ordering::SeqCst), 1);
+        assert!(self.0.active.fetch_sub(1, Ordering::SeqCst) > 0);
         Ok(())
     }
 }
@@ -167,10 +185,12 @@ fn advance(peer: &IpcPeer) {
         }),
     });
 }
-async fn retained(peer: &IpcPeer) {
+async fn retained(peer: &IpcPeer, probe: &Arc<Probe>) {
+    probe.streams.fetch_add(1, Ordering::SeqCst);
     peer.subscriptions.lock().await.insert(
         "retained".into(),
         SubscriptionEntry {
+            owner: Box::new(StreamCompletion(Arc::clone(probe))),
             filter: IpcSubscriptionFilter {
                 channel_ids: None,
                 event_kinds: None,
@@ -229,7 +249,7 @@ async fn every_handled_variant_owns_provider_mutation_and_all_selected_sends() {
         let probe = Arc::new(Probe::default());
         let server = provider(&probe, false).await;
         let peer = peer(&server.uri(), &probe);
-        retained(&peer).await;
+        retained(&peer, &probe).await;
         advance(&peer);
         let tx = Transport::new(&probe, usize::MAX, false);
         collect(start(&peer, &tx, request(kind, threaded)))
@@ -259,7 +279,7 @@ async fn closed_and_exhausted_admission_refuse_every_variant_before_effects() {
             probe.refuse.store(refusal, Ordering::SeqCst);
             let server = MockServer::start().await;
             let peer = peer(&server.uri(), &probe);
-            retained(&peer).await;
+            retained(&peer, &probe).await;
             let tx = Transport::new(&probe, usize::MAX, false);
             let error = collect(start(&peer, &tx, request(kind, threaded)))
                 .await
@@ -355,6 +375,11 @@ async fn subscribe_gap_audit_and_ack_stay_owned_through_failure_or_drop() {
                 peer.subscriptions.lock().await.len(),
                 usize::from(stage > 0)
             );
+            assert_eq!(probe.streams.load(Ordering::SeqCst), usize::from(stage > 0));
+            assert_eq!(
+                probe.stream_reservations.load(Ordering::SeqCst),
+                usize::from(stage > 0)
+            );
             if outcome == 2 {
                 task.abort();
                 assert!(task.await.unwrap_err().is_cancelled());
@@ -368,6 +393,14 @@ async fn subscribe_gap_audit_and_ack_stay_owned_through_failure_or_drop() {
             );
             assert_eq!(
                 peer.subscriptions.lock().await.len(),
+                usize::from(outcome == 0 || stage > 0)
+            );
+            assert_eq!(
+                probe.streams.load(Ordering::SeqCst),
+                usize::from(outcome == 0 || stage > 0)
+            );
+            assert_eq!(
+                probe.stream_reservations.load(Ordering::SeqCst),
                 usize::from(outcome == 0 || stage > 0)
             );
         }
@@ -409,7 +442,7 @@ async fn unsubscribe_removal_does_not_confirm_its_pending_audit_or_reply() {
         for fail in [false, true] {
             let probe = Arc::new(Probe::default());
             let peer = peer("http://127.0.0.1:9", &probe);
-            retained(&peer).await;
+            retained(&peer, &probe).await;
             let tx = Transport::new(&probe, stage, fail);
             let task = start(&peer, &tx, request("chat_unsubscribe_request", false));
             entered(&tx).await;
