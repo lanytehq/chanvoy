@@ -16,3 +16,4 @@ AGENTS.local.md
 # release artifacts + locally-generated signatures + public keys
 # during the manual signing flow. Never committed.
 /release/
+/crates/chanvoy-core/.runtime-io-fixtures/

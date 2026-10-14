@@ -1,0 +1,329 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.lanyte.dev/runtime/v1/chanvoy-record.schema.json",
+  "title": "Chanvoy native runtime application record",
+  "description": "Tool-local application claims, not identity/death/readiness authority. Bounded at 65536 serialized bytes before decoding; independent native evidence is required. Cross-field namespace, PID pathname, phase/revision and native namespace invariants are also validated by the codec.",
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "inode"
+      ],
+      "properties": {
+        "device": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "inode": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "birth": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "clock_ticks"
+          ],
+          "properties": {
+            "kind": {
+              "const": "linux"
+            },
+            "clock_ticks": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "seconds",
+            "microseconds"
+          ],
+          "properties": {
+            "kind": {
+              "const": "mac_os"
+            },
+            "seconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "microseconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 999999
+            }
+          }
+        }
+      ]
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "uid",
+        "birth",
+        "executable",
+        "pid_namespace",
+        "mount_namespace"
+      ],
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "executable": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 8192,
+          "pattern": "^(?:[0-9a-f]{2})+$",
+          "description": "Lossless absolute OS path bytes, lowercase hex; native codec also rejects NUL/parent traversal."
+        },
+        "pid_namespace": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/identity"
+            }
+          ]
+        },
+        "mount_namespace": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/identity"
+            }
+          ]
+        }
+      }
+    },
+    "socket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "identity"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 8192,
+          "pattern": "^(?:[0-9a-f]{2})+$",
+          "description": "Lossless absolute OS path bytes, lowercase hex; native codec also rejects NUL/parent traversal."
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "commit",
+        "dirty"
+      ],
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-fA-F]{40}|unknown)$"
+        },
+        "dirty": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "namespace",
+    "instance_uuid",
+    "revision",
+    "phase",
+    "uid",
+    "config_root",
+    "profile",
+    "process",
+    "socket",
+    "build",
+    "ready"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "instance_uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "phase": {
+      "enum": [
+        "starting",
+        "running",
+        "retiring",
+        "exited"
+      ]
+    },
+    "uid": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "config_root": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 8192,
+      "pattern": "^(?:[0-9a-f]{2})+$",
+      "description": "Lossless absolute OS path bytes, lowercase hex; native codec also rejects NUL/parent traversal."
+    },
+    "profile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "process": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/process"
+        }
+      ]
+    },
+    "socket": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/socket"
+        }
+      ]
+    },
+    "build": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/build"
+        }
+      ]
+    },
+    "ready": {
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ready": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phase": {
+            "const": "running"
+          },
+          "process": {
+            "$ref": "#/$defs/process"
+          },
+          "socket": {
+            "$ref": "#/$defs/socket"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "running"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "ready": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "revision": {
+            "const": 0
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phase": {
+            "const": "starting"
+          },
+          "ready": {
+            "const": false
+          },
+          "process": {
+            "type": "null"
+          },
+          "socket": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

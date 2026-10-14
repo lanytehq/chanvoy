@@ -3693,7 +3693,10 @@ async fn handle_auto_setup(
                     Err(err) => return exit_on_preflight(json, &setup_name, err, None),
                 };
             predecessor_candidate = lifecycle::ReuseCandidate::capture(&existing.name).await;
-            let mut observed = observe_generation(&existing.name).await;
+            let mut observed = match predecessor_candidate.as_ref() {
+                Some(candidate) => observe_generation_bound(candidate.binding().clone()).await,
+                None => observe_generation(&existing.name).await,
+            };
             if observed.generation_match.is_some()
                 && !candidate_unchanged(predecessor_candidate.as_ref(), &existing.name).await
             {
@@ -3733,7 +3736,12 @@ async fn handle_auto_setup(
         ProfileAction::Reuse => {
             let existing = existing.expect("Reuse implies existing profile");
             reuse_candidate = lifecycle::ReuseCandidate::capture(&existing.name).await;
-            let assessment = daemon_assessment::assess_until(&existing, deadline).await;
+            let binding = reuse_candidate
+                .as_ref()
+                .map(|c| c.binding().clone())
+                .unwrap_or_else(|| chanvoy_core::runtime::RuntimeBinding::legacy(&existing.name));
+            let assessment =
+                daemon_assessment::assess_binding_until(&existing, deadline, binding).await?;
             if assessment.disposition == DaemonDisposition::DegradedRemote {
                 let generation =
                     require_matching_reuse(json, &existing, &assessment, reuse_candidate.as_ref())
@@ -4024,12 +4032,19 @@ fn generation_from_assessment(assessment: &daemon_assessment::Assessment) -> gen
 }
 
 async fn observe_generation(profile: &str) -> generation::Evidence {
-    match tokio::time::timeout(
-        daemon_assessment::LOCAL_BUDGET,
-        daemon_client(profile).daemon_observation(),
-    )
-    .await
-    {
+    observe_generation_bound(chanvoy_core::runtime::RuntimeBinding::legacy(profile)).await
+}
+async fn observe_generation_bound(
+    binding: chanvoy_core::runtime::RuntimeBinding,
+) -> generation::Evidence {
+    let client = match chanvoy_daemon::DaemonClient::from_runtime_binding(binding) {
+        Ok(client) => client,
+        Err(_) => {
+            return generation::Evidence::compare(resolve_host_build_info(), None, false)
+                .unconfirmed()
+        }
+    };
+    match tokio::time::timeout(daemon_assessment::LOCAL_BUDGET, client.daemon_observation()).await {
         Ok(Ok(status)) => {
             generation::Evidence::compare(resolve_host_build_info(), status.binary, false)
         }
@@ -4123,9 +4138,12 @@ async fn require_matching_reuse(
     Ok(generation)
 }
 
-async fn candidate_unchanged(candidate: Option<&lifecycle::ReuseCandidate>, profile: &str) -> bool {
+async fn candidate_unchanged(
+    candidate: Option<&lifecycle::ReuseCandidate>,
+    _profile: &str,
+) -> bool {
     match candidate {
-        Some(candidate) => candidate.unchanged(profile).await,
+        Some(candidate) => candidate.unchanged().await,
         None => false,
     }
 }

@@ -2,6 +2,8 @@ pub mod bootstrap;
 pub mod doctor;
 pub mod host_build_info;
 pub mod recovery;
+#[cfg(unix)]
+pub mod runtime;
 pub mod safe_read;
 pub mod startup;
 pub mod wait_channels;

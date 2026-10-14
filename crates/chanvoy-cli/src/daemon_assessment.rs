@@ -1,7 +1,7 @@
 //! Bounded, non-destructive assessment of local and provider health.
 use chanvoy_core::recovery::{assess_daemon, DaemonDisposition, IdentityProbe, RemoteProbeOutcome};
 use chanvoy_core::{DaemonStatus, Profile};
-use chanvoy_daemon::{daemon_client, ping, ping_full, DaemonClient, DaemonError};
+use chanvoy_daemon::{DaemonClient, DaemonError};
 use std::time::Duration;
 
 pub(super) const LOCAL_BUDGET: Duration = Duration::from_millis(750);
@@ -72,6 +72,13 @@ pub(super) fn observation_ready(status: &DaemonStatus) -> Option<bool> {
 }
 
 pub(super) fn status_disposition(status: &DaemonStatus, expected: &str) -> DaemonDisposition {
+    status_disposition_with_ready(status, expected, observation_ready(status))
+}
+fn status_disposition_with_ready(
+    status: &DaemonStatus,
+    expected: &str,
+    ready: Option<bool>,
+) -> DaemonDisposition {
     let outcome = if status.identity_refused.is_some() {
         status.remote_probe.unwrap_or(RemoteProbeOutcome::Unknown)
     } else {
@@ -91,7 +98,7 @@ pub(super) fn status_disposition(status: &DaemonStatus, expected: &str) -> Daemo
         expected,
         status.identity_refused.unwrap_or(false)
             || status.mattermost_identity_drift.unwrap_or(false),
-        observation_ready(status),
+        ready,
     )
 }
 
@@ -106,31 +113,61 @@ trait AssessmentProbe {
     async fn remote_status(&self) -> Result<DaemonStatus, DaemonError>;
 }
 
-struct ProfileProbe<'a> {
-    name: &'a str,
+struct ProfileProbe {
     client: DaemonClient,
 }
 
-impl AssessmentProbe for ProfileProbe<'_> {
+impl AssessmentProbe for ProfileProbe {
     async fn observation(&self) -> Result<DaemonStatus, DaemonError> {
         self.client.daemon_observation().await
     }
 
     async fn local_ping(&self) -> Result<(), DaemonError> {
-        ping(self.name).await.map(|_| ())
+        self.client.profile_status().await.map(|_| ())
     }
 
     async fn remote_status(&self) -> Result<DaemonStatus, DaemonError> {
-        ping_full(self.name).await
+        self.client.daemon_status().await
     }
 }
 
 pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Instant) -> Assessment {
+    match assess_binding_until(
+        profile,
+        deadline,
+        chanvoy_core::runtime::RuntimeBinding::legacy(&profile.name),
+    )
+    .await
+    {
+        Ok(assessment) => assessment,
+        Err(_) => Assessment {
+            disposition: DaemonDisposition::UnresponsiveLocal,
+            status: None,
+            observation_ready: None,
+            pin_invalid: false,
+        },
+    }
+}
+
+pub(super) async fn assess_binding_until(
+    profile: &Profile,
+    deadline: tokio::time::Instant,
+    binding: chanvoy_core::runtime::RuntimeBinding,
+) -> Result<Assessment, DaemonError> {
+    let phase = binding.phase();
     let probe = ProfileProbe {
-        name: &profile.name,
-        client: daemon_client(&profile.name),
+        client: DaemonClient::from_runtime_binding(binding.clone())?,
     };
-    assess_probe(&probe, &profile.bot_username, deadline).await
+    let mut assessment = assess_probe(&probe, &profile.bot_username, deadline).await;
+    binding.verify()?;
+    if phase.is_some_and(|p| p != chanvoy_core::runtime::RuntimePhase::Running) {
+        assessment.observation_ready = Some(false);
+        if let Some(status) = &assessment.status {
+            assessment.disposition =
+                status_disposition_with_ready(status, &profile.bot_username, Some(false));
+        }
+    }
+    Ok(assessment)
 }
 
 async fn assess_probe(
