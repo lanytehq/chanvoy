@@ -42,6 +42,7 @@ class CampaignTests(unittest.TestCase):
         self.log = self.base / "cargo.jsonl"
         self.env = {k: v for k, v in os.environ.items()
                     if k != campaign.FD_ENV and k not in campaign.SELECTORS
+                    and k not in {"BUILD_CAMPAIGN_ARGS", "MAKEFLAGS", "MAKEOVERRIDES", "MFLAGS"}
                     and not k.startswith("CARGO_PROFILE_") and k != "CARGO_INCREMENTAL"}
         self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                         TEST_CARGO_LOG=str(self.log))
