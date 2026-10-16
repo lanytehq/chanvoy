@@ -377,6 +377,34 @@ mod tests {
         assert!(reg.admission_snapshot().is_empty());
     }
 
+    #[tokio::test]
+    async fn startup_work_exhaustion_never_constructs_or_leaks_partial_owners() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for next in [None, Some(u64::MAX), Some(u64::MAX - 1)] {
+            let (reg, _) = registry();
+            reg.inner.lock().unwrap().admission.next_owner = next;
+            let constructed = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&constructed);
+            let mut tasks = crate::startup_work::StartupTasks::default();
+            let result = tasks.spawn(&reg, move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            });
+            assert!(matches!(
+                result,
+                Err(crate::DaemonError::Core(
+                    CoreError::RuntimeOwnershipExhausted
+                ))
+            ));
+            tasks.finish(Ok(())).await.unwrap();
+            assert_eq!(constructed.load(Ordering::SeqCst), 0);
+            assert!(
+                reg.admission_snapshot().is_empty(),
+                "unstarted reservation leaked"
+            );
+        }
+    }
+
     #[test]
     fn task_pair_stale_epoch_cannot_clear_child_or_collector() {
         let (reg, instance) = registry();

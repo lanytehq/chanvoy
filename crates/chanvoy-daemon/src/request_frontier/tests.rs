@@ -1,3 +1,4 @@
+mod startup_work;
 use super::*;
 use crate::{handle_client, rpc_result, StagedAttentionAdvance};
 use chanvoy_core::{

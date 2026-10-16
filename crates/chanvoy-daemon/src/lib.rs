@@ -10,6 +10,7 @@ mod follow_delivery;
 mod ipc_ownership;
 mod ipc_supervision;
 mod request_frontier;
+mod startup_work;
 mod subscription_owner;
 mod wait;
 mod wait_channels;
@@ -519,6 +520,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         _ => (None, None),
     };
 
+    let mut startup_tasks = startup_work::StartupTasks::default();
     let outcome: Result<DaemonHealth, DaemonError> = async {
         let mut attention = load_attention_state(&profile.name)?;
         let poll_cursors =
@@ -566,18 +568,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         // still equals the snapshot. A concurrent cursor write therefore wins and
         // causes this one bounded pass to defer rather than clobbering newer state.
         if legacy_attention_records > 0 {
-            let migration_state = Arc::clone(&state.attention_state);
-            let migration_client = state.client.clone();
-            let migration_profile = profile.name.clone();
-            tokio::spawn(async move {
-                run_attention_migration(
-                    migration_profile,
-                    migration_state,
-                    migration_client,
-                    ATTENTION_MIGRATION_TIMEOUT,
-                )
-                .await;
-            });
+            startup_tasks.spawn_migration(Arc::clone(&state))?;
         }
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
@@ -607,15 +598,9 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             );
         }
 
-        // Coordinated post-bind probing never gates local startup or stacks with status.
-        {
-            let probe_state = Arc::clone(&state);
-            tokio::spawn(async move {
-                let probe = probe_state.probe_identity().await;
-                info!(profile=%probe_state.profile.name,outcome=?probe.outcome,
-                "post-bind identity probe completed");
-            });
-        }
+        // Provider-backed startup work reserves admission before its child is
+        // constructed, and its collector retains ownership through actual join.
+        startup_tasks.spawn_probe(Arc::clone(&state))?;
 
         info!(
             profile = profile_name,
@@ -651,6 +636,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     }
     .await;
     cancel_token.cancel();
+    let outcome = startup_tasks.finish(outcome).await;
     let cleanup = || cleanup_runtime_files(&socket_path, &pid_path).map_err(DaemonError::from);
     match ipc_task {
         Some(task) => task.finish(outcome, cleanup).await,
@@ -667,7 +653,25 @@ async fn run_attention_migration(
     attention_state: Arc<Mutex<AttentionState>>,
     client: MattermostClient,
     deadline: Duration,
-) {
+) -> Result<(), CoreError> {
+    let store_profile = profile_name.clone();
+    run_attention_migration_with_persist(
+        profile_name,
+        attention_state,
+        client,
+        deadline,
+        move |candidate| store_attention_state(&store_profile, candidate).map(|_| ()),
+    )
+    .await
+}
+
+async fn run_attention_migration_with_persist(
+    profile_name: String,
+    attention_state: Arc<Mutex<AttentionState>>,
+    client: MattermostClient,
+    deadline: Duration,
+    persist: impl FnOnce(&AttentionState) -> Result<(), CoreError>,
+) -> Result<(), CoreError> {
     let snapshot = attention_state.lock().await.clone();
     let legacy_records = snapshot
         .channels
@@ -675,7 +679,7 @@ async fn run_attention_migration(
         .filter(|key| !key.contains('/'))
         .count();
     if legacy_records == 0 {
-        return;
+        return Ok(());
     }
     info!(
         profile = %profile_name,
@@ -698,7 +702,7 @@ async fn run_attention_migration(
                 timeout_ms = deadline.as_millis(),
                 "attention-state legacy migration timed out and was deferred"
             );
-            return;
+            return Ok(());
         }
         Ok(Err(err)) => {
             warn!(
@@ -706,7 +710,7 @@ async fn run_attention_migration(
                 error = %err,
                 "attention-state legacy migration failed and was deferred"
             );
-            return;
+            return Ok(());
         }
         Ok(Ok(outcome)) => outcome,
     };
@@ -714,7 +718,7 @@ async fn run_attention_migration(
     let mut live = attention_state.lock().await;
     let published = if outcome.migrated + outcome.quarantined > 0 {
         match publish_attention_migration_if_unchanged(
-            |candidate| store_attention_state(&profile_name, candidate).map(|_| ()),
+            persist,
             &mut live,
             &snapshot,
             migrated_state,
@@ -724,9 +728,9 @@ async fn run_attention_migration(
                 warn!(
                     profile = %profile_name,
                     error = %err,
-                    "attention-state legacy migration could not be persisted and was deferred"
+                    "attention-state legacy migration could not be persisted; cleanup remains unconfirmed"
                 );
-                return;
+                return Err(err);
             }
         }
     } else {
@@ -740,7 +744,7 @@ async fn run_attention_migration(
             skipped = outcome.skipped,
             "attention-state legacy migration deferred because live cursor state changed"
         );
-        return;
+        return Ok(());
     }
     info!(
         profile = %profile_name,
@@ -749,6 +753,7 @@ async fn run_attention_migration(
         skipped = outcome.skipped,
         "attention-state legacy migration completed"
     );
+    Ok(())
 }
 
 fn publish_attention_migration_if_unchanged(

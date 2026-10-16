@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Startup provider work
+
+- The post-bind identity probe and optional cursor migration reserve runtime
+  work before construction and retain task/collector ownership through actual
+  termination. Closed admission starts no work; capacity failures remain errors.
+- Completed read-only assessments and clean migration deferrals can finish
+  without promoting remote health. Unconfirmed migration persistence or task
+  failure retains request ownership and prevents successful runtime cleanup.
+
 ### IPC lifecycle audits
 
 - Daemon exits now cooperatively cancel and collect the IPC reconnect task
