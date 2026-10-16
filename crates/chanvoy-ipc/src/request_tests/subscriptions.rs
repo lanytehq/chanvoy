@@ -472,3 +472,49 @@ async fn collected_panic_is_not_success_and_does_not_release_stream_or_output() 
     );
     assert!(peer.subscriptions.lock().await.contains_key(&id));
 }
+
+#[tokio::test]
+async fn lifecycle_audit_and_session_loss_preserve_existing_registration() {
+    for failed in [false, true] {
+        let probe = Arc::new(Probe::default());
+        let peer = peer("http://127.0.0.1:9", &probe);
+        let id = subscribed(&peer, &probe).await;
+        let wire = Wire::new(&probe, true, failed);
+        let audit_peer = Arc::clone(&peer);
+        let tx = Arc::clone(&wire);
+        let audit = tokio::spawn(async move {
+            crate::lifecycle_audit::emit(
+                audit_peer.request_admission.as_ref(),
+                &tx,
+                "fixture",
+                "chat.peer_disconnected",
+            )
+            .await
+        });
+        notify(&wire.entered).await;
+        assert_eq!(probe.active.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.streams.load(Ordering::SeqCst), 1);
+        let old = run(&peer, Wire::new(&probe, false, false));
+        joined(old).await;
+        assert_eq!(probe.streams.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.active.load(Ordering::SeqCst), 1);
+        wire.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(3), audit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_err(), failed);
+        assert_eq!(probe.active.load(Ordering::SeqCst), usize::from(failed));
+        assert_eq!(probe.streams.load(Ordering::SeqCst), 1);
+        assert!(peer
+            .forwarding_state()
+            .subscriptions
+            .lock()
+            .await
+            .contains_key(&id));
+        assert_eq!(probe.stream_reservations.load(Ordering::SeqCst), 1);
+        assert!(unsubscribe(&peer, &probe, &id).await);
+        assert_eq!(probe.streams.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.active.load(Ordering::SeqCst), usize::from(failed));
+    }
+}

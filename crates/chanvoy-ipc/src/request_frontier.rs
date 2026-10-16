@@ -16,3 +16,15 @@ impl RequestTransport for AsyncPeerTx {
         Ok(())
     }
 }
+
+/// Session teardown delegates to the actual transport, after forwarder collection.
+pub(super) trait SessionTransport: RequestTransport {
+    fn shutdown(&self) -> impl Future<Output = SendResult> + Send;
+}
+
+impl SessionTransport for AsyncPeerTx {
+    async fn shutdown(&self) -> SendResult {
+        AsyncPeerTx::shutdown(self).await?;
+        Ok(())
+    }
+}

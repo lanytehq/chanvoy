@@ -1,3 +1,4 @@
+mod lifecycle_audit;
 mod request_frontier;
 mod subscription_owner;
 use subscription_owner::SubscriptionEntry;
@@ -667,38 +668,40 @@ impl IpcPeer {
             tokio::spawn(forwarding.run(self.event_bus.subscribe(), tx.clone(), cancel.clone()));
         let audit_peer_id = peer_id.clone();
 
-        let _ = emit_audit(&tx, &audit_peer_id, "chat.peer_connected", None, "info").await;
-
-        let outcome: SendResult = loop {
-            tokio::select! {
-                frame_result = async {
-                    match channel_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match frame_result {
-                        Ok(frame) => {
-                            if let Err(error) = self.handle_frame(frame, &tx, &audit_peer_id).await {
-                                break Err(error);
+        let serve = async {
+            loop {
+                tokio::select! {
+                    frame_result = async {
+                        match channel_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match frame_result {
+                            Ok(frame) => {
+                                if let Err(error) = self.handle_frame(frame, &tx, &audit_peer_id).await {
+                                    break Err(error);
+                                }
+                            }
+                            Err(_) => {
+                                break Ok(());
                             }
                         }
-                        Err(_) => {
-                            break Ok(());
-                        }
                     }
-                }
-                _ = cancel.cancelled() => {
-                    break Ok(());
+                    _ = cancel.cancelled() => {
+                        break Ok(());
+                    }
                 }
             }
         };
-
-        let _ = emit_audit(&tx, &audit_peer_id, "chat.peer_disconnected", None, "info").await;
-
-        let collected = subscription_owner::abort_and_collect(forward_handle).await;
-        let _ = tx.shutdown().await;
-        outcome.and(collected)
+        lifecycle_audit::session(
+            self.request_admission.as_ref(),
+            &tx,
+            &audit_peer_id,
+            forward_handle,
+            serve,
+        )
+        .await
     }
 
     async fn handle_frame<T: RequestTransport>(

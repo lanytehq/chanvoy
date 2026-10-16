@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### IPC lifecycle audits
+
+- Connected and disconnected audits reserve independent runtime ownership
+  before constructing output and confirm it only after transport write/flush
+  succeeds. Closed admission omits the audit; other admission failures remain
+  errors. Failed or interrupted sends retain unconfirmed ownership.
+- Session teardown preserves the first error while collecting the old event
+  forwarder and attempting transport shutdown. Connected-audit failure skips
+  request processing; retained subscriptions survive transport loss.
+
 ### Daemon generation
 
 - `auto-setup` now exits **6** instead of reporting success when a reused
