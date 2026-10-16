@@ -8,6 +8,7 @@ use std::{env, fs, io};
 
 mod follow_delivery;
 mod ipc_ownership;
+mod ipc_supervision;
 mod request_frontier;
 mod subscription_owner;
 mod wait;
@@ -492,7 +493,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let identity_drift = Arc::new(AtomicBool::new(false));
 
     let wait_owners = Arc::new(wait_owner::WaitOwnerRegistry::new());
-    let ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>> = match &profile.ipc {
+    let (ipc_state, ipc_task) = match &profile.ipc {
         Some(IpcConfig {
             enabled: true,
             gateway_socket,
@@ -510,144 +511,155 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                 Arc::new(ipc_ownership::IpcAdmission(Arc::clone(&wait_owners))),
             ));
             let state = ipc_peer.state();
-            let cancel = cancel_token.clone();
-            tokio::spawn(async move {
+            let task = ipc_supervision::IpcTask::spawn(&cancel_token, move |cancel| async move {
                 ipc_peer.run(cancel).await;
             });
-            Some(state)
+            (Some(state), Some(task))
         }
-        _ => None,
+        _ => (None, None),
     };
 
-    let mut attention = load_attention_state(&profile.name)?;
-    let poll_cursors =
-        waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
-    poll_cursors
-        .apply_pending_txn(&mut attention)
-        .map_err(DaemonError::from)?;
-    let legacy_attention_records = attention
-        .channels
-        .keys()
-        .filter(|key| !key.contains('/'))
-        .count();
-    info!(
-        profile = profile_name,
-        channel_records = attention.channels.len(),
-        legacy_records = legacy_attention_records,
-        quarantined_records = attention.quarantined.len(),
-        "chanvoy daemon local attention state recovered"
-    );
-
-    let inbox_armed = Arc::new(AtomicU64::new(0));
-    let state = Arc::new(AppState {
-        profile: profile.clone(),
-        client,
-        socket_path: socket_path.clone(),
-        my_user_id,
-        event_bus: Arc::clone(&event_bus),
-        subscriptions: Arc::new(Mutex::new(HashMap::new())),
-        ws_state_holder: ws_state_holder.clone(),
-        ipc_state,
-        attention_state: Arc::new(Mutex::new(attention)),
-        identity_drift,
-        observed_identity_drift: Arc::new(AtomicBool::new(false)),
-        probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
-        reduce_writer,
-        wait_owners,
-        poll_cursors,
-        fanin_replay: waitprims_fanin::FanInReplayStore::new(),
-        inbox_armed: inbox_armed.clone(),
-    });
-
-    // Legacy cursor migration is provider-backed, optional maintenance. It
-    // must not delay the local control plane: snapshot now, resolve without a
-    // state lock after this task is spawned, and publish only if the live state
-    // still equals the snapshot. A concurrent cursor write therefore wins and
-    // causes this one bounded pass to defer rather than clobbering newer state.
-    if legacy_attention_records > 0 {
-        let migration_state = Arc::clone(&state.attention_state);
-        let migration_client = state.client.clone();
-        let migration_profile = profile.name.clone();
-        tokio::spawn(async move {
-            run_attention_migration(
-                migration_profile,
-                migration_state,
-                migration_client,
-                ATTENTION_MIGRATION_TIMEOUT,
-            )
-            .await;
-        });
-    }
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
-
-    let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::watch::channel(false);
-    {
-        // Same-profile client, shared by clone (see the IPC peer above)
-        // so the websocket pipeline reads author names out of the same
-        // cache the request-response paths fill — and authenticates
-        // with that client's credential, which is why no token is
-        // passed here.
-        let client_for_ws = state.client.clone();
-        let event_bus = Arc::clone(&event_bus);
-        let mut ws =
-            MattermostWs::new(&profile, client_for_ws, event_bus, state.my_user_id.clone());
-        ws.set_inbox_gate(inbox_armed);
-        let ws = Arc::new(ws);
-        let ws_state = ws.ws_state();
-        let ws_ref = Arc::clone(&ws);
-        tokio::spawn(async move {
-            ws_ref.run(ws_shutdown_rx).await;
-        });
-        *ws_state_holder.lock().await = Some(ws_state);
+    let outcome: Result<DaemonHealth, DaemonError> = async {
+        let mut attention = load_attention_state(&profile.name)?;
+        let poll_cursors =
+            waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
+        poll_cursors
+            .apply_pending_txn(&mut attention)
+            .map_err(DaemonError::from)?;
+        let legacy_attention_records = attention
+            .channels
+            .keys()
+            .filter(|key| !key.contains('/'))
+            .count();
         info!(
             profile = profile_name,
-            "chanvoy websocket observation task started"
+            channel_records = attention.channels.len(),
+            legacy_records = legacy_attention_records,
+            quarantined_records = attention.quarantined.len(),
+            "chanvoy daemon local attention state recovered"
         );
-    }
 
-    // Coordinated post-bind probing never gates local startup or stacks with status.
-    {
-        let probe_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let probe = probe_state.probe_identity().await;
-            info!(profile=%probe_state.profile.name,outcome=?probe.outcome,
-                "post-bind identity probe completed");
+        let inbox_armed = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(AppState {
+            profile: profile.clone(),
+            client,
+            socket_path: socket_path.clone(),
+            my_user_id,
+            event_bus: Arc::clone(&event_bus),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            ws_state_holder: ws_state_holder.clone(),
+            ipc_state,
+            attention_state: Arc::new(Mutex::new(attention)),
+            identity_drift,
+            observed_identity_drift: Arc::new(AtomicBool::new(false)),
+            probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
+            reduce_writer,
+            wait_owners,
+            poll_cursors,
+            fanin_replay: waitprims_fanin::FanInReplayStore::new(),
+            inbox_armed: inbox_armed.clone(),
         });
-    }
 
-    info!(
-        profile = profile_name,
-        socket = %socket_path.display(),
-        "chanvoy daemon listening"
-    );
+        // Legacy cursor migration is provider-backed, optional maintenance. It
+        // must not delay the local control plane: snapshot now, resolve without a
+        // state lock after this task is spawned, and publish only if the live state
+        // still equals the snapshot. A concurrent cursor write therefore wins and
+        // causes this one bounded pass to defer rather than clobbering newer state.
+        if legacy_attention_records > 0 {
+            let migration_state = Arc::clone(&state.attention_state);
+            let migration_client = state.client.clone();
+            let migration_profile = profile.name.clone();
+            tokio::spawn(async move {
+                run_attention_migration(
+                    migration_profile,
+                    migration_state,
+                    migration_client,
+                    ATTENTION_MIGRATION_TIMEOUT,
+                )
+                .await;
+            });
+        }
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
 
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (stream, _) = accept_result?;
-                let state = Arc::clone(&state);
-                let shutdown_tx = Arc::clone(&shutdown_tx);
-                tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, state, shutdown_tx).await {
-                        tracing::warn!(%error, "client request failed");
-                    }
-                });
-            }
-            _ = &mut shutdown_rx => {
-                cancel_token.cancel();
-                state.wait_owners.cancel_all();
-                let _ = ws_shutdown_tx.send(true);
-                break;
+        let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::watch::channel(false);
+        {
+            // Same-profile client, shared by clone (see the IPC peer above)
+            // so the websocket pipeline reads author names out of the same
+            // cache the request-response paths fill — and authenticates
+            // with that client's credential, which is why no token is
+            // passed here.
+            let client_for_ws = state.client.clone();
+            let event_bus = Arc::clone(&event_bus);
+            let mut ws =
+                MattermostWs::new(&profile, client_for_ws, event_bus, state.my_user_id.clone());
+            ws.set_inbox_gate(inbox_armed);
+            let ws = Arc::new(ws);
+            let ws_state = ws.ws_state();
+            let ws_ref = Arc::clone(&ws);
+            tokio::spawn(async move {
+                ws_ref.run(ws_shutdown_rx).await;
+            });
+            *ws_state_holder.lock().await = Some(ws_state);
+            info!(
+                profile = profile_name,
+                "chanvoy websocket observation task started"
+            );
+        }
+
+        // Coordinated post-bind probing never gates local startup or stacks with status.
+        {
+            let probe_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let probe = probe_state.probe_identity().await;
+                info!(profile=%probe_state.profile.name,outcome=?probe.outcome,
+                "post-bind identity probe completed");
+            });
+        }
+
+        info!(
+            profile = profile_name,
+            socket = %socket_path.display(),
+            "chanvoy daemon listening"
+        );
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, _) = accept_result?;
+                    let state = Arc::clone(&state);
+                    let shutdown_tx = Arc::clone(&shutdown_tx);
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_client(stream, state, shutdown_tx).await {
+                            tracing::warn!(%error, "client request failed");
+                        }
+                    });
+                }
+                _ = &mut shutdown_rx => {
+                    cancel_token.cancel();
+                    state.wait_owners.cancel_all();
+                    let _ = ws_shutdown_tx.send(true);
+                    break;
+                }
             }
         }
-    }
 
-    cleanup_runtime_files(&socket_path, &pid_path)?;
-    Ok(DaemonHealth {
-        profile: profile_name.to_string(),
-        socket_path,
-    })
+        Ok(DaemonHealth {
+            profile: profile_name.to_string(),
+            socket_path: socket_path.clone(),
+        })
+    }
+    .await;
+    cancel_token.cancel();
+    let cleanup = || cleanup_runtime_files(&socket_path, &pid_path).map_err(DaemonError::from);
+    match ipc_task {
+        Some(task) => task.finish(outcome, cleanup).await,
+        None => {
+            let health = outcome?;
+            cleanup()?;
+            Ok(health)
+        }
+    }
 }
 
 async fn run_attention_migration(

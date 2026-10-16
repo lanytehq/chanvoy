@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### IPC lifecycle audits
 
+- Daemon exits now cooperatively cancel and collect the IPC reconnect task
+  before removing runtime artifacts. Startup/serve errors remain the primary
+  error; abnormal IPC task exit prevents successful artifact cleanup. Idle
+  reconnect infrastructure does not add a permanent operational request.
+
 - Connected and disconnected audits reserve independent runtime ownership
   before constructing output and confirm it only after transport write/flush
   succeeds. Closed admission omits the audit; other admission failures remain
