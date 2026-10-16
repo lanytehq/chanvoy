@@ -463,7 +463,8 @@ class ProducerTests(unittest.TestCase):
 
     def test_make_receipt_is_guidance_only_and_ordinary_install_stays_cached(self):
         makefile = (REPO / "Makefile").read_text()
-        self.assertIn("build-release:\n\tcargo build --release --locked --package chanvoy", makefile)
+        self.assertIn("build-release:\n\t$(BUILD_CAMPAIGN) local-release\n"
+                      "\tcargo build --release --locked --package chanvoy", makefile)
         self.assertIn("install: build-release", makefile)
         guidance = makefile.split("build-release-receipt:", 1)[1].split("\n#", 1)[0]
         self.assertIn("does not invoke Cargo or the producer", guidance)
