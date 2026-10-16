@@ -1,3 +1,5 @@
+#[path = "subscriptions/client_tasks.rs"]
+mod client_tasks;
 use super::*;
 use crate::subscription_owner;
 use chanvoy_core::{

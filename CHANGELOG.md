@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Client task collection
+
+- Daemon exits stop idle local clients and collect their actual tasks before
+  runtime cleanup. Admitted requests and selected output finish through their
+  existing delivery paths; idle connections add no operational request.
+- Completed client tasks are collected while serving. Abnormal task collection
+  prevents successful runtime cleanup, and a dropped parent retains independent
+  collectors instead of aborting active client work.
+
 ### Startup provider work
 
 - The post-bind identity probe and optional cursor migration reserve runtime

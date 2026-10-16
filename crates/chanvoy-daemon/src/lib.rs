@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, io};
 
+mod client_tasks;
 mod follow_delivery;
 mod ipc_ownership;
 mod ipc_supervision;
@@ -520,6 +521,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         _ => (None, None),
     };
 
+    let mut client_tasks = client_tasks::ClientTasks::new(&cancel_token);
     let mut startup_tasks = startup_work::StartupTasks::default();
     let outcome: Result<DaemonHealth, DaemonError> = async {
         let mut attention = load_attention_state(&profile.name)?;
@@ -614,11 +616,12 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                     let (stream, _) = accept_result?;
                     let state = Arc::clone(&state);
                     let shutdown_tx = Arc::clone(&shutdown_tx);
-                    tokio::spawn(async move {
-                        if let Err(error) = handle_client(stream, state, shutdown_tx).await {
-                            tracing::warn!(%error, "client request failed");
-                        }
+                    client_tasks.spawn(move |stop| async move {
+                        handle_client_with_shutdown(stream, state, shutdown_tx, stop).await
                     });
+                }
+                collected = client_tasks.collect_next(), if !client_tasks.is_empty() => {
+                    collected?;
                 }
                 _ = &mut shutdown_rx => {
                     cancel_token.cancel();
@@ -636,6 +639,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     }
     .await;
     cancel_token.cancel();
+    let outcome = client_tasks.finish(outcome).await;
     let outcome = startup_tasks.finish(outcome).await;
     let cleanup = || cleanup_runtime_files(&socket_path, &pid_path).map_err(DaemonError::from);
     match ipc_task {
@@ -811,20 +815,58 @@ pub async fn status(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
     daemon_client(profile_name).daemon_status().await
 }
 
+#[cfg(test)]
 async fn handle_client(
     stream: UnixStream,
     state: Arc<AppState>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 ) -> Result<(), DaemonError> {
-    let (reader, writer) = stream.into_split();
-    handle_client_io(BufReader::new(reader), writer, state, shutdown_tx).await
+    handle_client_with_shutdown(
+        stream,
+        state,
+        shutdown_tx,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
 }
 
+async fn handle_client_with_shutdown(
+    stream: UnixStream,
+    state: Arc<AppState>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<(), DaemonError> {
+    let (reader, writer) = stream.into_split();
+    handle_client_io_with_shutdown(BufReader::new(reader), writer, state, shutdown_tx, stop).await
+}
+
+#[cfg(test)]
 async fn handle_client_io<R, W>(
+    reader: R,
+    writer: W,
+    state: Arc<AppState>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+) -> Result<(), DaemonError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    handle_client_io_with_shutdown(
+        reader,
+        writer,
+        state,
+        shutdown_tx,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+async fn handle_client_io_with_shutdown<R, W>(
     mut reader: R,
     mut writer: W,
     state: Arc<AppState>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    stop: tokio_util::sync::CancellationToken,
 ) -> Result<(), DaemonError>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -836,8 +878,13 @@ where
 
     loop {
         tokio::select! {
+            _ = stop.cancelled() => break,
             read_result = reader.read_line(&mut line) => {
-                if read_result? == 0 {
+                // Check again when both input and stop are ready. Once a
+                // branch starts admitted work, it runs to its existing finish.
+                let bytes_read = read_result?;
+                if stop.is_cancelled() { break; }
+                if bytes_read == 0 {
                     break;
                 }
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
@@ -1315,6 +1362,7 @@ where
                     None => std::future::pending().await,
                 }
             } => {
+                if stop.is_cancelled() { break; }
                 match recv_result {
                     Ok(event) => {
                         // PER-014: if identity drift is set, suppress
