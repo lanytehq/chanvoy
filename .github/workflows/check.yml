@@ -7,6 +7,8 @@ name: check
 env:
   MSRV: "1.89.0"
   CARGO_TERM_COLOR: always
+  # Disposable CI runners have smaller free-space headroom than shared hosts.
+  BUILD_CAMPAIGN_ARGS: "--budget-gib 12 --min-free-gib 4"
 permissions:
   contents: read
 jobs:

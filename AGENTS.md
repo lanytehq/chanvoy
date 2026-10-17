@@ -66,6 +66,13 @@ make msrv     # verify MSRV compilation
 make pr-final # CI-exact merge gate
 ```
 
+Use these managed Make targets for development builds. They reuse bounded host
+caches across worktrees and hold a campaign lock through the gate. For focused
+Cargo commands or mutation campaigns, follow [build storage](docs/build-storage.md).
+Keep review artifacts outside mutable build caches; do not create a new target
+directory for every source worktree. Production qualification retains its separate
+fresh-target rules. Cache and worktree deletion require a separate inventory.
+
 ## Local machine overrides
 
 Create `AGENTS.local.md` for machine-specific notes. This file is gitignored and must not

@@ -28,37 +28,54 @@ VERSION_FILE := VERSION
 .PHONY: release-export-keys release-verify-checksums release-verify-signatures release-verify-keys release-verify release-verify-identity insert-expected-fingerprints
 .PHONY: release-notes release-upload release-undraft release-upload-all help
 
-all: check
+# Ordinary builds share bounded host caches across worktrees. The runner holds
+# ownership through the complete recursive Make, including tests and receipts.
+BUILD_CAMPAIGN := python3 -B scripts/build-campaign.py
+BUILD_CAMPAIGN_ARGS ?=
+BUILD_STEP := $(BUILD_CAMPAIGN) step --
+MANAGED_TARGETS := all check quality test test-integration build msrv pr-final precommit prepush
+.PHONY: $(MANAGED_TARGETS) $(addprefix managed-,$(MANAGED_TARGETS)) campaign-check build-storage-test
+$(MANAGED_TARGETS):
+	+$(BUILD_CAMPAIGN) run $(BUILD_CAMPAIGN_ARGS) -- $(MAKE) --no-print-directory -j1 managed-$@
+
+campaign-check:
+	@$(BUILD_CAMPAIGN) check
+
+build-storage-test:
+	@python3 -B scripts/build-campaign.test.py
+
+managed-all: managed-check
 
 clean:
-	cargo clean
+	@echo 'Automatic cache cleanup is disabled. Inspect build-storage documentation and retire explicit paths separately.' >&2
+	@exit 1
 
-check:
-	cargo fmt --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace --all-targets
+managed-check: campaign-check
+	$(BUILD_STEP) cargo fmt --check
+	$(BUILD_STEP) cargo clippy --workspace --all-targets -- -D warnings
+	$(BUILD_STEP) cargo test --workspace --all-targets
 
-test-integration:
-	cargo test --package chanvoy --test restart_harness -- --ignored --nocapture
-	cargo test --package chanvoy --test per_038_wait -- --ignored --nocapture
-	cargo test --package chanvoy --test per_040_wait -- --ignored --nocapture
-	cargo test --package chanvoy --test per_043_wait_follow -- --ignored --nocapture
-	cargo test --package chanvoy --test wait_direct_message -- --ignored --nocapture
-	cargo test --package chanvoy --test post_show_and_thread -- --ignored --nocapture
+managed-test-integration: campaign-check
+	$(BUILD_STEP) cargo test --package chanvoy --test restart_harness -- --ignored --nocapture
+	$(BUILD_STEP) cargo test --package chanvoy --test per_038_wait -- --ignored --nocapture
+	$(BUILD_STEP) cargo test --package chanvoy --test per_040_wait -- --ignored --nocapture
+	$(BUILD_STEP) cargo test --package chanvoy --test per_043_wait_follow -- --ignored --nocapture
+	$(BUILD_STEP) cargo test --package chanvoy --test wait_direct_message -- --ignored --nocapture
+	$(BUILD_STEP) cargo test --package chanvoy --test post_show_and_thread -- --ignored --nocapture
 
 fmt:
 	cargo fmt
 	$(GONEAT_FMT)
 
-quality:
-	cargo clippy --workspace --all-targets -- -D warnings
+managed-quality: campaign-check
+	$(BUILD_STEP) cargo clippy --workspace --all-targets -- -D warnings
 	$(GONEAT_ASSESS)
 
-test:
-	cargo test --workspace --all-targets
+managed-test: campaign-check
+	$(BUILD_STEP) cargo test --workspace --all-targets
 
-build:
-	cargo build --workspace --all-targets
+managed-build: campaign-check
+	$(BUILD_STEP) cargo build --workspace --all-targets
 
 # PER-031 AC 7a (entarch 2026-05-11 P2 + cxotech absorption pin):
 # release builds must use --locked so Cargo.lock is the trust anchor.
@@ -69,6 +86,7 @@ build:
 # not as a workflow-only bypass, so local `make build-release` and CI
 # `make build-release` produce identical dependency resolution.
 build-release:
+	$(BUILD_CAMPAIGN) local-release
 	cargo build --release --locked --package chanvoy
 
 # Guidance only: Make manufactures MAKEFLAGS, which the producer must refuse.
@@ -125,18 +143,18 @@ ensure-msrv:
 		rustup toolchain install $(MSRV) --profile minimal; \
 	fi
 
-msrv: ensure-msrv
-	cargo +$(MSRV) check --workspace --all-targets --locked
+managed-msrv: campaign-check ensure-msrv
+	$(BUILD_STEP) cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] MSRV $(MSRV) verified"
 
-pr-final: ensure-msrv version-check workflow-lint release-tooling-test
-	cargo fmt --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace --all-targets
-	cargo test --package chanvoy --test restart_harness -- --ignored
-	cargo test --package chanvoy --test per_038_wait -- --ignored
-	cargo test --package chanvoy --test post_show_and_thread -- --ignored
-	cargo +$(MSRV) check --workspace --all-targets --locked
+managed-pr-final: campaign-check ensure-msrv version-check workflow-lint release-tooling-test build-storage-test
+	$(BUILD_STEP) cargo fmt --check
+	$(BUILD_STEP) cargo clippy --workspace --all-targets -- -D warnings
+	$(BUILD_STEP) cargo test --workspace --all-targets
+	$(BUILD_STEP) cargo test --package chanvoy --test restart_harness -- --ignored
+	$(BUILD_STEP) cargo test --package chanvoy --test per_038_wait -- --ignored
+	$(BUILD_STEP) cargo test --package chanvoy --test post_show_and_thread -- --ignored
+	$(BUILD_STEP) cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] pr-final gate passed"
 
 # PER-031 AC #10: actionlint guards .github/workflows/ from drift on the
@@ -345,9 +363,9 @@ help: ## Print available targets grouped by category
 		$(MAKEFILE_LIST) | sort
 	@printf "\nFull procedure: RELEASE_CHECKLIST.md\n\n"
 
-precommit: check fmt quality
+managed-precommit: managed-check fmt managed-quality
 
-prepush: precommit build msrv version-check
+managed-prepush: managed-precommit managed-build managed-msrv version-check
 
 # -----------------------------------------------------------------------------
 # Version management
