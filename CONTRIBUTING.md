@@ -21,17 +21,14 @@ covers the contributor's side.
    - `rustup toolchain install 1.89.0`
    - `rustup component add rustfmt clippy`
 
-2. Run the full local quality loop:
-
-   - `cargo fmt --all`
-   - `cargo clippy --workspace --all-targets -- -D warnings`
-   - `cargo test --workspace --all-targets`
-
-   Or use the Makefile:
+2. Use the Makefile so ordinary builds share bounded caches across worktrees:
 
    - `make pr-final` — CI-exact final gate before pushing a PR branch
    - `make check` — fast loop (fmt + clippy + test)
    - `make install` — installs the release binary into `$LOCAL_BIN` (default `~/.local/bin` on Linux/macOS, `$USERPROFILE\bin` on Windows)
+
+   See [build storage](docs/build-storage.md) for placement, limits, focused Cargo
+   commands, mutation campaigns and the separate fresh-production path.
 
 > CI is the source of truth; see `.github/workflows/check.yml`.
 

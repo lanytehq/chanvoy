@@ -54,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity and health. A coherent mismatch report remains an observation-only
   exit 0; matching build pins do not establish ownership or retirement authority.
 
+### Development builds
+
+- Ordinary Make build and test targets reuse bounded host caches across
+  worktrees, with a separate mutation lane and a campaign-wide ownership lock.
+  Storage checks refuse new stages when the budget or free-space floor is
+  exceeded. Production qualification keeps its fresh local target requirements.
+- Managed builds refresh embedded source identity when changing worktrees or
+  commits. Release/install refuses redirected targets, and `make clean` requires
+  explicit cache review instead of automatically deleting build outputs.
+
 ### Profile resolution
 
 - `chanvoy auto-setup` no longer sets or overwrites the host-wide

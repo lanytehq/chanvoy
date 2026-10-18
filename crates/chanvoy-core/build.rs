@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // A managed development cache can serve several source checkouts. This
+    // selector only invalidates the build; identity still comes from Git below.
+    println!("cargo:rerun-if-env-changed=CHANVOY_BUILD_SOURCE_ID");
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
     );
