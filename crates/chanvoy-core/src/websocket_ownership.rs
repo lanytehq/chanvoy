@@ -150,10 +150,13 @@ impl Execution {
 }
 
 /// Reserve before constructing a selected output, then retain it through the
-/// actual sink send/flush. Stop never races an already-admitted send.
+/// actual sink send/flush. Stop never races an already-admitted send. A failed
+/// send transfers its owner to the session, which must retire the transport
+/// before confirming it; a returned sink error alone is not completion.
 pub(crate) async fn send_owned<S, F>(
     execution: Option<&Execution>,
     sink: &mut S,
+    residuals: &mut Vec<Operation>,
     message: F,
 ) -> Result<Result<(), S::Error>, CoreError>
 where
@@ -163,7 +166,13 @@ where
     use futures_util::SinkExt;
     let owner = crate::ws_reserve(execution)?;
     let result = sink.send(message()).await;
-    crate::ws_complete(owner, crate::LookupDisposition::Returned);
+    if result.is_ok() {
+        crate::ws_complete(owner, crate::LookupDisposition::Returned);
+    } else if let Some(owner) = owner {
+        // Sink errors can leave native output buffered. Only the session that
+        // owns the transport may confirm after destroying that buffer.
+        residuals.push(owner);
+    }
     Ok(result)
 }
 

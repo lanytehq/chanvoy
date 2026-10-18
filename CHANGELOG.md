@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Managed websocket work uses the daemon's existing runtime admission arena.
   Completed local attempts can finish even when the provider returned an error;
   dropped author lookups retain their enclosing work and refuse clean retirement.
+- Failed websocket sends retire the native transport before releasing their
+  buffered-output ownership. Busy incoming traffic cannot starve authentication
+  expiry or scheduled heartbeats, and late authentication success is rejected.
 - Public websocket and author-resolution interfaces retain their existing
   signatures. Managed execution receipts distinguish unresolved work from
   unconfirmed task collection and apply to one exclusively owned runner.

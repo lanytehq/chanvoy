@@ -488,10 +488,17 @@ async fn production_send_helper_retains_auth_pong_and_heartbeat_through_stop_and
                 release: gate,
                 fail: true,
             };
-            assert!(send_owned(Some(&execution), &mut sink, || payload)
-                .await
-                .unwrap()
-                .is_err());
+            let mut residuals = Vec::new();
+            assert!(
+                send_owned(Some(&execution), &mut sink, &mut residuals, || payload)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            drop(sink);
+            for owner in residuals {
+                owner.complete();
+            }
         });
         started.notified().await;
         let mut receipt = Box::pin(task.finish());
@@ -625,4 +632,310 @@ async fn receipt_waits_for_actual_child_destructor() {
     assert!(pending, "receipt preceded actual child destruction");
     let (execution, collection) = receipt.await.into_parts();
     assert!(execution.is_ok() && collection.is_ok());
+}
+
+#[derive(Default)]
+struct NativeState {
+    written: Mutex<Vec<u8>>,
+    writes: AtomicUsize,
+    flushes: AtomicUsize,
+    reads: AtomicUsize,
+    dropped_with_owners: AtomicUsize,
+    dropped: AtomicBool,
+}
+
+// The real locked tungstenite codec owns its buffers. This fixture controls
+// only the underlying I/O; it does not implement or simulate a WebSocket sink.
+struct NativeIo {
+    state: Arc<NativeState>,
+    arena: Arc<Arena>,
+    fail_write: Option<usize>,
+    first_frame: Option<Vec<u8>>,
+    busy: bool,
+    read_delay: Duration,
+}
+impl Drop for NativeIo {
+    fn drop(&mut self) {
+        self.state
+            .dropped_with_owners
+            .store(self.arena.active.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.state.dropped.store(true, Ordering::SeqCst);
+    }
+}
+impl tokio::io::AsyncRead for NativeIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let count = self.state.reads.fetch_add(1, Ordering::SeqCst);
+        // Bound fault-control failures instead of spinning forever.
+        if count >= 200 {
+            return std::task::Poll::Ready(Err(std::io::Error::other("fixture read limit")));
+        }
+        let frame = self
+            .first_frame
+            .take()
+            .or_else(|| self.busy.then(|| text_frame("{}")));
+        let Some(frame) = frame else {
+            return std::task::Poll::Pending;
+        };
+        std::thread::sleep(self.read_delay);
+        buf.put_slice(&frame);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+impl tokio::io::AsyncWrite for NativeIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let call = self.state.writes.fetch_add(1, Ordering::SeqCst);
+        if self.fail_write == Some(call) {
+            return std::task::Poll::Ready(Err(std::io::Error::other(
+                "injected partial-write failure",
+            )));
+        }
+        let size = if self.fail_write == Some(call + 1) {
+            3.min(buf.len())
+        } else {
+            buf.len()
+        };
+        self.state
+            .written
+            .lock()
+            .unwrap()
+            .extend_from_slice(&buf[..size]);
+        std::task::Poll::Ready(Ok(size))
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.state.flushes.fetch_add(1, Ordering::SeqCst);
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+fn text_frame(text: &str) -> Vec<u8> {
+    assert!(text.len() < 126);
+    let mut frame = vec![0x81, text.len() as u8];
+    frame.extend_from_slice(text.as_bytes());
+    frame
+}
+fn native_io(arena: Arc<Arena>, state: Arc<NativeState>) -> NativeIo {
+    NativeIo {
+        state,
+        arena,
+        fail_write: None,
+        first_frame: None,
+        busy: false,
+        read_delay: Duration::ZERO,
+    }
+}
+async fn native_socket(io: NativeIo) -> tokio_tungstenite::WebSocketStream<NativeIo> {
+    tokio_tungstenite::WebSocketStream::from_raw_socket(
+        io,
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_partial_send_retains_owner_through_later_flush_and_transport_drop() {
+    use futures_util::SinkExt;
+    for payload in [
+        crate::WsMessage::Text("test-token-synthetic".into()),
+        crate::WsMessage::Pong(vec![1, 2, 3].into()),
+        crate::WsMessage::Text("user_activity".into()),
+    ] {
+        let arena = Arc::new(Arena::default());
+        let state = Arc::new(NativeState::default());
+        let a = arena.clone();
+        let s = state.clone();
+        let task = launch(arena.clone(), move |_, execution| async move {
+            let mut io = native_io(a.clone(), s.clone());
+            io.fail_write = Some(1);
+            let mut socket = native_socket(io).await;
+            let mut residuals = Vec::new();
+            assert!(
+                send_owned(Some(&execution), &mut socket, &mut residuals, || payload)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(s.written.lock().unwrap().len(), 3);
+            assert_eq!(
+                a.active.load(Ordering::SeqCst),
+                1,
+                "native buffer still has output"
+            );
+            socket.flush().await.unwrap();
+            assert!(
+                s.written.lock().unwrap().len() > 3,
+                "locked native sink must flush the retained suffix"
+            );
+            assert_eq!(a.active.load(Ordering::SeqCst), 1);
+            drop(socket);
+            assert_eq!(s.dropped_with_owners.load(Ordering::SeqCst), 1);
+            for owner in residuals {
+                owner.complete();
+            }
+        });
+        // Wait for the actual body, without stopping its admission first.
+        let mut task = task;
+        let (execution, collection) = (&mut task.receipt).await.unwrap().into_parts();
+        assert!(execution.is_ok() && collection.is_ok());
+        assert_eq!(arena.active.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn production_session_destroys_failed_auth_pong_and_heartbeat_buffers_before_confirmation() {
+    for output in ["auth", "pong", "heartbeat"] {
+        let arena = Arc::new(Arena::default());
+        let state = Arc::new(NativeState::default());
+        let a = arena.clone();
+        let s = state.clone();
+        let mut task = launch(arena.clone(), move |mut stop, execution| async move {
+            let mut io = native_io(a, s);
+            io.fail_write = Some(if output == "auth" { 1 } else { 2 });
+            if output == "pong" {
+                io.first_frame = Some(vec![0x89, 3, 1, 2, 3]);
+            }
+            if output == "heartbeat" {
+                io.first_frame = Some(text_frame(r#"{"event":"hello"}"#));
+            }
+            let ws = websocket("http://localhost:1".into());
+            let result = ws
+                .listen_owned(
+                    native_socket(io).await,
+                    &mut stop,
+                    Some(&execution),
+                    Duration::from_secs(10),
+                    Duration::from_millis(5),
+                )
+                .await;
+            assert_eq!(result.is_err(), output == "auth");
+        });
+        let (execution, collection) =
+            tokio::time::timeout(Duration::from_secs(2), &mut task.receipt)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_parts();
+        assert!(execution.is_ok() && collection.is_ok());
+        assert!(state.dropped.load(Ordering::SeqCst));
+        assert_eq!(state.dropped_with_owners.load(Ordering::SeqCst), 1);
+        assert_eq!(arena.active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.writes.load(Ordering::SeqCst),
+            if output == "auth" { 2 } else { 3 },
+            "failed output must never be flushed by a later read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_failed_send_unwinding_does_not_confirm_residual_owner() {
+    let arena = Arc::new(Arena::default());
+    let state = Arc::new(NativeState::default());
+    let a = arena.clone();
+    let s = state.clone();
+    let mut task = launch(arena.clone(), move |_, execution| async move {
+        let mut io = native_io(a, s);
+        io.fail_write = Some(1);
+        let mut socket = native_socket(io).await;
+        let mut residuals = Vec::new();
+        assert!(
+            send_owned(Some(&execution), &mut socket, &mut residuals, || {
+                crate::WsMessage::Text("test-token-synthetic".into())
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        panic!("injected unwind before explicit transport retirement");
+    });
+    let (execution, collection) = (&mut task.receipt).await.unwrap().into_parts();
+    assert!(execution.is_err());
+    assert_eq!(collection, Err(WsCollectionError::OuterJoinUnconfirmed));
+    assert!(state.dropped.load(Ordering::SeqCst));
+    assert_eq!(arena.active.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_busy_input_cannot_starve_auth_expiry_or_heartbeat() {
+    for managed in [false, true] {
+        for authenticated in [false, true] {
+            let arena = Arc::new(Arena::default());
+            let state = Arc::new(NativeState::default());
+            let a = arena.clone();
+            let s = state.clone();
+            let mut task = launch(arena.clone(), move |mut stop, execution| async move {
+                let mut io = native_io(a, s.clone());
+                io.busy = true;
+                io.read_delay = Duration::from_millis(1);
+                if authenticated {
+                    io.first_frame = Some(text_frame(r#"{"event":"hello"}"#));
+                }
+                let ws = websocket("http://localhost:1".into());
+                let result = ws
+                    .listen_owned(
+                        native_socket(io).await,
+                        &mut stop,
+                        managed.then_some(&execution),
+                        Duration::from_millis(20),
+                        Duration::from_millis(5),
+                    )
+                    .await;
+                if authenticated {
+                    assert!(
+                        s.flushes.load(Ordering::SeqCst) > 2,
+                        "busy reads starved repeated heartbeats"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(CoreError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut)
+                    );
+                    assert!(s.reads.load(Ordering::SeqCst) < 200);
+                }
+            });
+            let (execution, collection) = (&mut task.receipt).await.unwrap().into_parts();
+            assert!(execution.is_ok() && collection.is_ok());
+            assert_eq!(arena.active.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn production_rejects_auth_success_returned_after_deadline() {
+    let arena = Arc::new(Arena::default());
+    let mut io = native_io(arena, Arc::new(NativeState::default()));
+    io.first_frame = Some(text_frame(r#"{"event":"hello"}"#));
+    io.read_delay = Duration::from_millis(30);
+    io.busy = true;
+    let ws = websocket("http://localhost:1".into());
+    let (_sender, mut stop) = watch::channel(false);
+    let result = ws
+        .listen_owned(
+            native_socket(io).await,
+            &mut stop,
+            None,
+            Duration::from_millis(10),
+            Duration::from_secs(30),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(CoreError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut)
+    );
+    assert!(!ws.ws_state.catchup_in_flight.load(Ordering::Relaxed));
+    assert_eq!(ws.ws_state.recovering_until.load(Ordering::Relaxed), 0);
 }

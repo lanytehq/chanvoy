@@ -6038,154 +6038,195 @@ impl MattermostWs {
         ws_complete(connect_owner, LookupDisposition::Returned);
         let (ws_stream, _) = connected?;
 
+        self.listen_owned(
+            ws_stream,
+            shutdown,
+            execution,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    async fn listen_owned<S>(
+        &self,
+        ws_stream: tokio_tungstenite::WebSocketStream<S>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        execution: Option<&websocket_ownership::Execution>,
+        auth_window: Duration,
+        heartbeat_period: Duration,
+    ) -> Result<(), CoreError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (mut write, mut read) = ws_stream.split();
+        let mut residuals = Vec::new();
+        let result = async {
+            websocket_ownership::send_owned(execution, &mut write, &mut residuals, || {
+                let auth = serde_json::json!({
+                    "seq": 1,
+                    "action": "authentication_challenge",
+                    "data": { "token": self.token }
+                });
+                WsMessage::Text(auth.to_string().into())
+            })
+            .await?
+            .map_err(|e| {
+                CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    e.to_string(),
+                ))
+            })?;
 
-        websocket_ownership::send_owned(execution, &mut write, || {
-            let auth = serde_json::json!({
-                "seq": 1,
-                "action": "authentication_challenge",
-                "data": { "token": self.token }
-            });
-            WsMessage::Text(auth.to_string().into())
-        })
-        .await?
-        .map_err(|e| {
-            CoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                e.to_string(),
-            ))
-        })?;
+            let mut authenticated = false;
+            let mut heartbeat = tokio::time::interval(heartbeat_period);
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // Auth window starts when the challenge is sent. Success may arrive as
+            // bare `hello` and/or `{"status":"OK","seq_reply":N}` in either order.
+            // Option (b): even after a provisional Healthy on the first success
+            // shape, keep treating is_auth_error as fatal until this deadline so a
+            // late FAIL/INVALID_TOKEN cannot be swallowed (devrev/entarch residual).
+            let auth_deadline = tokio::time::Instant::now() + auth_window;
 
-        let mut authenticated = false;
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Auth window starts when the challenge is sent. Success may arrive as
-        // bare `hello` and/or `{"status":"OK","seq_reply":N}` in either order.
-        // Option (b): even after a provisional Healthy on the first success
-        // shape, keep treating is_auth_error as fatal until this deadline so a
-        // late FAIL/INVALID_TOKEN cannot be swallowed (devrev/entarch residual).
-        let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-
-        loop {
-            if execution.is_some() && (*shutdown.borrow() || shutdown.has_changed().is_err()) {
-                return Ok(());
-            }
-            let now = tokio::time::Instant::now();
-            let in_auth_window = now < auth_deadline;
-            let remaining = if !authenticated {
-                auth_deadline.saturating_duration_since(now)
-            } else if in_auth_window {
-                // Stay selective until the auth window closes so a late FAIL
-                // can still be observed without a 3600s sleep arm.
-                auth_deadline.saturating_duration_since(now)
-            } else {
-                Duration::from_secs(3600)
-            };
-
-            tokio::select! {
-                biased;
-                _ = shutdown.changed(), if execution.is_some() => return Ok(()),
-                msg = read.next() => {
-                    match msg {
-                        Some(Ok(WsMessage::Text(text))) => {
-                            let mutating = auth_error_still_fatal(authenticated, in_auth_window, &text)
-                                || (!authenticated && is_auth_success(&text))
-                                || (authenticated && serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("event").and_then(Value::as_str).map(|e| matches!(e, "posted" | "post_edited" | "hello" | "status_change"))).unwrap_or(false));
-                            let owner = if mutating { ws_reserve(execution)? } else { None };
-                            let mut disposition = LookupDisposition::Returned;
-                            // Option (b): auth errors remain fatal for the whole
-                            // challenge window, including after provisional Healthy.
-                            if auth_error_still_fatal(authenticated, in_auth_window, &text) {
-                                if authenticated {
-                                    self.ws_state
-                                        .set_state(WsConnectionState::Disconnected)
-                                        .await;
-                                    self.ws_state
-                                        .set_error(format!(
-                                            "websocket auth rejected after provisional success: {text}"
-                                        ))
-                                        .await;
-                                    warn!(
-                                        "websocket auth rejected after provisional healthy (option b)"
-                                    );
-                                }
-                                ws_complete(owner, LookupDisposition::Returned);
-                                return Err(CoreError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::PermissionDenied,
-                                    format!("websocket auth rejected: {text}"),
-                                )));
-                            }
-                            if !authenticated {
-                                if is_auth_success(&text) {
-                                    authenticated = true;
-                                    // Close recovery admission before Healthy
-                                    // clears the live error latch. Readers at
-                                    // this exact boundary remain conservative.
-                                    self.ws_state.prepare_authenticated_session();
-                                    self.arm_recovery_owned(execution);
-                                    self.ws_state
-                                        .set_state(WsConnectionState::Healthy)
-                                        .await;
-                                    info!("websocket authenticated and healthy");
-                                    self.event_bus.emit(DaemonEvent {
-                                        seq: 0,
-                                        kind: DaemonEventKind::ConnectionStateChanged,
-                                        payload: DaemonEventPayloadInner::ConnectionStateChanged(
-                                            ConnectionStateChangedPayload {
-                                                profile: self.profile_name.clone(),
-                                                provider: Provider::Mattermost,
-                                                state: WsConnectionState::Healthy,
-                                                message: "connected and authenticated".to_string(),
-                                            },
-                                        ),
-                                    });
-                                    disposition = self.reconnect_catchup_assessed().await;
-                                }
-                                // Non-success, non-error frames before first
-                                // success are ignored (same as prior behavior).
-                            } else {
-                                disposition = self.handle_ws_message_assessed(&text).await;
-                            }
-                            ws_complete(owner, disposition);
-                        }
-                        Some(Ok(WsMessage::Ping(data))) => {
-                            let _ = websocket_ownership::send_owned(execution, &mut write, || WsMessage::Pong(data)).await?;
-                        }
-                        Some(Ok(WsMessage::Close(_))) | None => {
-                            return Ok(());
-                        }
-                        Some(Err(e)) => {
-                            return Err(CoreError::Io(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                e.to_string(),
-                            )));
-                        }
-                        _ => {}
-                    }
+            loop {
+                // Buffered frames need not touch cooperative Tokio I/O. Let the
+                // timer driver and stop sender run even under continuous input.
+                tokio::task::consume_budget().await;
+                if execution.is_some() && (*shutdown.borrow() || shutdown.has_changed().is_err()) {
+                    return Ok(());
                 }
-                _ = heartbeat.tick() => {
-                    if authenticated {
-                        let result = websocket_ownership::send_owned(execution, &mut write, || {
-                            let ping = serde_json::json!({ "seq": 0, "action": "user_activity" });
-                            WsMessage::Text(ping.to_string().into())
-                        }).await?;
-                        if result.is_err() {
-                            return Ok(());
-                        }
-                    }
+                let now = tokio::time::Instant::now();
+                let in_auth_window = now < auth_deadline;
+                if !authenticated && !in_auth_window {
+                    return Err(CoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "websocket auth timed out waiting for server ack",
+                    )));
                 }
-                _ = tokio::time::sleep(remaining) => {
-                    if !authenticated {
+
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed(), if execution.is_some() => return Ok(()),
+                    _ = tokio::time::sleep_until(auth_deadline), if !authenticated => {
                         return Err(CoreError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "websocket auth timed out waiting for server ack",
                         )));
                     }
-                    // Authenticated + auth window elapsed: loop continues with
-                    // a long remaining sleep on the next iteration.
+                    _ = heartbeat.tick() => {
+                        if authenticated {
+                            let result = websocket_ownership::send_owned(execution, &mut write, &mut residuals, || {
+                                let ping = serde_json::json!({ "seq": 0, "action": "user_activity" });
+                                WsMessage::Text(ping.to_string().into())
+                            }).await?;
+                            if result.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    msg = read.next() => {
+                        // A read poll can itself cross the deadline. Never accept
+                        // late success merely because that poll returned a frame.
+                        let in_auth_window = tokio::time::Instant::now() < auth_deadline;
+                        if !authenticated && !in_auth_window {
+                            return Err(CoreError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "websocket auth timed out waiting for server ack",
+                            )));
+                        }
+                        match msg {
+                            Some(Ok(WsMessage::Text(text))) => {
+                                let mutating = auth_error_still_fatal(authenticated, in_auth_window, &text)
+                                    || (!authenticated && is_auth_success(&text))
+                                    || (authenticated && serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("event").and_then(Value::as_str).map(|e| matches!(e, "posted" | "post_edited" | "hello" | "status_change"))).unwrap_or(false));
+                                let owner = if mutating { ws_reserve(execution)? } else { None };
+                                let mut disposition = LookupDisposition::Returned;
+                                // Option (b): auth errors remain fatal for the whole
+                                // challenge window, including after provisional Healthy.
+                                if auth_error_still_fatal(authenticated, in_auth_window, &text) {
+                                    if authenticated {
+                                        self.ws_state
+                                            .set_state(WsConnectionState::Disconnected)
+                                            .await;
+                                        self.ws_state
+                                            .set_error(format!(
+                                                "websocket auth rejected after provisional success: {text}"
+                                            ))
+                                            .await;
+                                        warn!(
+                                            "websocket auth rejected after provisional healthy (option b)"
+                                        );
+                                    }
+                                    ws_complete(owner, LookupDisposition::Returned);
+                                    return Err(CoreError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        format!("websocket auth rejected: {text}"),
+                                    )));
+                                }
+                                if !authenticated {
+                                    if is_auth_success(&text) {
+                                        authenticated = true;
+                                        // Close recovery admission before Healthy
+                                        // clears the live error latch. Readers at
+                                        // this exact boundary remain conservative.
+                                        self.ws_state.prepare_authenticated_session();
+                                        self.arm_recovery_owned(execution);
+                                        self.ws_state
+                                            .set_state(WsConnectionState::Healthy)
+                                            .await;
+                                        info!("websocket authenticated and healthy");
+                                        self.event_bus.emit(DaemonEvent {
+                                            seq: 0,
+                                            kind: DaemonEventKind::ConnectionStateChanged,
+                                            payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                                                ConnectionStateChangedPayload {
+                                                    profile: self.profile_name.clone(),
+                                                    provider: Provider::Mattermost,
+                                                    state: WsConnectionState::Healthy,
+                                                    message: "connected and authenticated".to_string(),
+                                                },
+                                            ),
+                                        });
+                                        disposition = self.reconnect_catchup_assessed().await;
+                                    }
+                                    // Non-success, non-error frames before first
+                                    // success are ignored (same as prior behavior).
+                                } else {
+                                    disposition = self.handle_ws_message_assessed(&text).await;
+                                }
+                                ws_complete(owner, disposition);
+                            }
+                            Some(Ok(WsMessage::Ping(data))) => {
+                                if websocket_ownership::send_owned(execution, &mut write, &mut residuals, || WsMessage::Pong(data)).await?.is_err() {
+                                    // Retire a failed sink before another read can
+                                    // automatically flush its retained output.
+                                    return Ok(());
+                                }
+                            }
+                            Some(Ok(WsMessage::Close(_))) | None => {
+                                return Ok(());
+                            }
+                            Some(Err(e)) => {
+                                return Err(CoreError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    e.to_string(),
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
+
                 }
             }
+        }.await;
+        // Both split halves share the native socket and its write buffer.
+        // No completion on cancellation/panic: Operation::drop stays unknown.
+        drop(read);
+        drop(write);
+        for owner in residuals {
+            owner.complete();
         }
+        result
     }
 
     async fn handle_ws_message_assessed(&self, text: &str) -> LookupDisposition {
