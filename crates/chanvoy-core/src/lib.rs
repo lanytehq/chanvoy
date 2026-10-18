@@ -3026,6 +3026,26 @@ struct AuthorCacheEntry {
 /// Note what is *not* here: the provider does not send an author name
 /// on a post, only `user_id`. Anything that wants a display name has to
 /// resolve it separately.
+/// Invocation-local evidence; a value fallback never clears a dropped lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupDisposition {
+    Returned,
+    InnerLookupDropped,
+}
+
+impl LookupDisposition {
+    fn combine(&mut self, other: Self) {
+        if other == Self::InnerLookupDropped {
+            *self = other;
+        }
+    }
+}
+
+struct Assessed<T> {
+    value: T,
+    disposition: LookupDisposition,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RawPost {
     pub id: String,
@@ -3301,13 +3321,23 @@ impl MattermostClient {
     /// us the name — an id an operator can look up beats a placeholder
     /// that pretends to be a person.
     pub async fn author_username(&self, user_id: &str) -> String {
+        self.author_username_assessed(user_id).await.value
+    }
+
+    async fn author_username_assessed(&self, user_id: &str) -> Assessed<String> {
         let mut wanted = BTreeSet::new();
         wanted.insert(user_id.to_string());
-        self.resolve_authors(&wanted)
-            .await
-            .get(user_id)
-            .cloned()
-            .unwrap_or_else(|| user_id.to_string())
+        let authors = self
+            .resolve_authors_assessed(&wanted, AUTHOR_RESOLVE_TIMEOUT)
+            .await;
+        Assessed {
+            value: authors
+                .value
+                .get(user_id)
+                .cloned()
+                .unwrap_or_else(|| user_id.to_string()),
+            disposition: authors.disposition,
+        }
     }
 
     /// Resolve display names for a set of author ids.
@@ -3320,7 +3350,12 @@ impl MattermostClient {
     ///
     /// Ids that could not be resolved are simply absent from the
     /// returned map; callers substitute the id itself.
-    async fn resolve_authors(&self, user_ids: &BTreeSet<String>) -> HashMap<String, String> {
+    async fn resolve_authors_assessed(
+        &self,
+        user_ids: &BTreeSet<String>,
+        deadline: Duration,
+    ) -> Assessed<HashMap<String, String>> {
+        let mut disposition = LookupDisposition::Returned;
         let mut resolved: HashMap<String, String> = HashMap::new();
         let mut missing: Vec<String> = Vec::new();
         {
@@ -3335,17 +3370,27 @@ impl MattermostClient {
             }
         }
         if missing.is_empty() {
-            return resolved;
+            return Assessed {
+                value: resolved,
+                disposition,
+            };
         }
 
         let mut fetched: Vec<(String, String)> = Vec::with_capacity(missing.len());
         for user_id in missing {
-            if let Some(username) = self.fetch_username(&user_id).await {
+            let lookup = self
+                .fetch_username_assessed_within(&user_id, deadline)
+                .await;
+            disposition.combine(lookup.disposition);
+            if let Some(username) = lookup.value {
                 fetched.push((user_id, username));
             }
         }
         if fetched.is_empty() {
-            return resolved;
+            return Assessed {
+                value: resolved,
+                disposition,
+            };
         }
 
         let now = std::time::Instant::now();
@@ -3354,7 +3399,10 @@ impl MattermostClient {
             insert_author_entry(&mut guard, user_id.clone(), username.clone(), now);
             resolved.insert(user_id, username);
         }
-        resolved
+        Assessed {
+            value: resolved,
+            disposition,
+        }
     }
 
     /// One author lookup. Returns `None` on any failure; the diagnostic
@@ -3369,6 +3417,16 @@ impl MattermostClient {
     /// so a test can prove the elapsed path without waiting out the
     /// production timeout.
     async fn fetch_username_within(&self, user_id: &str, deadline: Duration) -> Option<String> {
+        self.fetch_username_assessed_within(user_id, deadline)
+            .await
+            .value
+    }
+
+    async fn fetch_username_assessed_within(
+        &self,
+        user_id: &str,
+        deadline: Duration,
+    ) -> Assessed<Option<String>> {
         #[derive(Deserialize)]
         struct RawUser {
             username: String,
@@ -3383,10 +3441,13 @@ impl MattermostClient {
                     timeout_secs = deadline.as_secs(),
                     "author name lookup timed out; falling back to the user id"
                 );
-                return None;
+                return Assessed {
+                    value: None,
+                    disposition: LookupDisposition::InnerLookupDropped,
+                };
             }
         };
-        match outcome {
+        let value = match outcome {
             Ok(user) => Some(user.username),
             Err(err) => {
                 let reason = match &err {
@@ -3400,6 +3461,10 @@ impl MattermostClient {
                 );
                 None
             }
+        };
+        Assessed {
+            value,
+            disposition: LookupDisposition::Returned,
         }
     }
 
@@ -3411,12 +3476,23 @@ impl MattermostClient {
     /// ordering — search results stay in the provider's ranked order,
     /// channel reads sort chronologically.
     async fn hydrate_posts(&self, posts: Vec<RawPost>) -> Vec<Message> {
+        self.hydrate_posts_assessed(posts, AUTHOR_RESOLVE_TIMEOUT)
+            .await
+            .value
+    }
+
+    async fn hydrate_posts_assessed(
+        &self,
+        posts: Vec<RawPost>,
+        deadline: Duration,
+    ) -> Assessed<Vec<Message>> {
         let wanted: BTreeSet<String> = posts.iter().map(|p| p.user_id.clone()).collect();
-        let authors = self.resolve_authors(&wanted).await;
-        posts
+        let authors = self.resolve_authors_assessed(&wanted, deadline).await;
+        let value = posts
             .into_iter()
             .map(|post| {
                 let username = authors
+                    .value
                     .get(&post.user_id)
                     .cloned()
                     .unwrap_or_else(|| post.user_id.clone());
@@ -3431,7 +3507,11 @@ impl MattermostClient {
                     mention_user_ids: None,
                 }
             })
-            .collect()
+            .collect();
+        Assessed {
+            value,
+            disposition: authors.disposition,
+        }
     }
 
     /// Chronological order with a deterministic tie-break, used by
@@ -3944,6 +4024,17 @@ impl MattermostClient {
         channel_id: &str,
         since_millis: i64,
     ) -> Result<Vec<Message>, CoreError> {
+        Ok(self
+            .read_channel_by_id_since_millis_assessed(channel_id, since_millis)
+            .await?
+            .value)
+    }
+
+    async fn read_channel_by_id_since_millis_assessed(
+        &self,
+        channel_id: &str,
+        since_millis: i64,
+    ) -> Result<Assessed<Vec<Message>>, CoreError> {
         let response: PostsEnvelope = self
             .request(
                 "GET",
@@ -3954,9 +4045,12 @@ impl MattermostClient {
             )
             .await?;
         let mut posts = self
-            .hydrate_posts(response.posts.into_values().collect())
+            .hydrate_posts_assessed(
+                response.posts.into_values().collect(),
+                AUTHOR_RESOLVE_TIMEOUT,
+            )
             .await;
-        Self::sort_chronologically(&mut posts);
+        Self::sort_chronologically(&mut posts.value);
         Ok(posts)
     }
 
@@ -8711,6 +8805,129 @@ monitored_channels = ["per-003", "per-004"]
                 ipc: None,
                 reduce: None,
             }
+        }
+
+        #[tokio::test]
+        async fn assessed_lookup_separates_elapsed_from_returned_errors() {
+            let server = MockServer::start().await;
+            for (id, response) in [
+                (
+                    "slow",
+                    ResponseTemplate::new(200).set_delay(Duration::from_secs(30)),
+                ),
+                ("http", ResponseTemplate::new(500)),
+                (
+                    "decode",
+                    ResponseTemplate::new(200).set_body_string("invalid"),
+                ),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/api/v4/users/{id}")))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+            }
+            let client =
+                MattermostClient::new(&seat_profile(&server.uri()), "test-token".into()).unwrap();
+            for (id, expected) in [
+                ("slow", LookupDisposition::InnerLookupDropped),
+                ("http", LookupDisposition::Returned),
+                ("decode", LookupDisposition::Returned),
+            ] {
+                let result = client
+                    .fetch_username_assessed_within(id, Duration::from_millis(50))
+                    .await;
+                assert!(result.value.is_none());
+                assert_eq!(result.disposition, expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn assessed_batches_preserve_timeouts_across_early_return_and_success() {
+            let server = MockServer::start().await;
+            for id in ["a-slow", "z-slow"] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/api/v4/users/{id}")))
+                    .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/m-good"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"username":"good"})),
+                )
+                .mount(&server)
+                .await;
+            let client =
+                MattermostClient::new(&seat_profile(&server.uri()), "test-token".into()).unwrap();
+            for ids in [
+                vec!["a-slow"],
+                vec!["a-slow", "m-good"],
+                vec!["m-good", "z-slow"],
+            ] {
+                let wanted = ids.iter().map(|id| id.to_string()).collect();
+                let assessed = client
+                    .resolve_authors_assessed(&wanted, Duration::from_millis(50))
+                    .await;
+                assert_eq!(assessed.disposition, LookupDisposition::InnerLookupDropped);
+                assert!(!assessed.value.contains_key("a-slow"));
+                assert!(!assessed.value.contains_key("z-slow"));
+            }
+            let empty = client
+                .resolve_authors_assessed(&BTreeSet::new(), Duration::ZERO)
+                .await;
+            assert_eq!(empty.disposition, LookupDisposition::Returned);
+            let cached = client
+                .resolve_authors_assessed(&BTreeSet::from(["m-good".into()]), Duration::ZERO)
+                .await;
+            assert_eq!(cached.disposition, LookupDisposition::Returned);
+            assert_eq!(cached.value["m-good"], "good");
+            let cache = client.author_cache.read().await;
+            assert!(!cache.contains_key("a-slow"));
+            assert!(!cache.contains_key("z-slow"));
+        }
+
+        #[tokio::test]
+        async fn assessed_public_routes_carry_timeout_through_hydration_and_legacy_concurrency() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/slow"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/good"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"username":"known"})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch/posts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "posts": {"p": {"id":"p", "user_id":"slow", "message":"test", "create_at":1}}
+                })))
+                .mount(&server)
+                .await;
+            let client =
+                MattermostClient::new(&seat_profile(&server.uri()), "test-token".into()).unwrap();
+            // Exercise both real production routes with their actual deadline,
+            // while an unrelated legacy lookup completes on the shared client.
+            let (inbound, catchup, legacy) = tokio::join!(
+                client.author_username_assessed("slow"),
+                client.read_channel_by_id_since_millis_assessed("ch", 0),
+                client.author_username("good"),
+            );
+            assert_eq!(inbound.value, "slow");
+            assert_eq!(inbound.disposition, LookupDisposition::InnerLookupDropped);
+            let catchup = catchup.unwrap();
+            assert_eq!(catchup.value[0].username, "slow");
+            assert_eq!(catchup.disposition, LookupDisposition::InnerLookupDropped);
+            assert_eq!(legacy, "known");
+            assert!(!client.author_cache.read().await.contains_key("slow"));
         }
 
         /// A cached name is re-fetched once its entry has aged out, and
