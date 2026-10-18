@@ -3020,13 +3020,6 @@ struct AuthorCacheEntry {
     fetched_at: std::time::Instant,
 }
 
-/// The provider's post shape, as chanvoy consumes it. Every read path
-/// (channel reads, pinned, most-recent, search, thread) decodes into
-/// this one type so a shape fix lands in a single place.
-///
-/// Note what is *not* here: the provider does not send an author name
-/// on a post, only `user_id`. Anything that wants a display name has to
-/// resolve it separately.
 /// Invocation-local evidence; a value fallback never clears a dropped lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LookupDisposition {
@@ -3047,6 +3040,13 @@ struct Assessed<T> {
     disposition: LookupDisposition,
 }
 
+/// The provider's post shape, as chanvoy consumes it. Every read path
+/// (channel reads, pinned, most-recent, search, thread) decodes into
+/// this one type so a shape fix lands in a single place.
+///
+/// Note what is *not* here: the provider does not send an author name
+/// on a post, only `user_id`. Anything that wants a display name has to
+/// resolve it separately.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RawPost {
     pub id: String,

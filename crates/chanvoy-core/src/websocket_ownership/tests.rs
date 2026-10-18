@@ -581,3 +581,48 @@ async fn production_denied_auth_success_does_not_prepare_or_publish() {
         .load(Ordering::Acquire));
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn missing_receipt_is_unknown_execution_and_unconfirmed_collection() {
+    let (stop, _receiver) = watch::channel(false);
+    let (sender, receipt) = oneshot::channel();
+    drop(sender);
+    let (execution, collection) = finish(ManagedWs { stop, receipt }).await;
+    assert!(execution.is_err());
+    assert_eq!(collection, Err(WsCollectionError::CollectorUnavailable));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_waits_for_actual_child_destructor() {
+    struct Destructor {
+        entered: Arc<Notify>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for Destructor {
+        fn drop(&mut self) {
+            self.entered.notify_one();
+            self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+    }
+    let entered = Arc::new(Notify::new());
+    let signal = entered.clone();
+    let (release, gate) = std::sync::mpsc::channel();
+    let task = launch(Arc::new(Arena::default()), move |_, execution| async move {
+        execution.register(async move {
+            let _destructor = Destructor {
+                entered: signal,
+                release: gate,
+            };
+        });
+    });
+    entered.notified().await;
+    let mut receipt = Box::pin(task.finish());
+    let pending = tokio::time::timeout(Duration::from_millis(30), &mut receipt)
+        .await
+        .is_err();
+    // Always release the real destructor before asserting, including faults.
+    release.send(()).unwrap();
+    assert!(pending, "receipt preceded actual child destruction");
+    let (execution, collection) = receipt.await.into_parts();
+    assert!(execution.is_ok() && collection.is_ok());
+}
