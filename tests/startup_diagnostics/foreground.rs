@@ -300,12 +300,60 @@ mod tests {
         Foreground::spawn(&mut command).unwrap()
     }
 
+    // Publish a stream socket pathname without ever making it a listener.
+    // Creating and dropping UnixListener instead leaves a window in which a
+    // concurrently spawned child can inherit a live listener until exec.
+    fn bind_without_listening(path: &Path) -> std::os::fd::OwnedFd {
+        use std::os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        };
+        let bytes = path.as_os_str().as_bytes();
+        // SAFETY: sockaddr_un is a plain C address structure; zero initializes
+        // its padding and the pathname terminator.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        assert!(bytes.len() < address.sun_path.len());
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *target = *byte as libc::c_char;
+        }
+        let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+        #[cfg(target_os = "macos")]
+        {
+            address.sun_len = length as u8;
+        }
+        // SAFETY: socket has no pointer arguments; transfer its fresh descriptor
+        // into OwnedFd immediately so every subsequent exit closes it.
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+        let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: socket owns a valid descriptor. A concurrent fork before
+        // CLOEXEC is set can only inherit a socket that has never listened.
+        let result = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_eq!(result, 0, "cloexec: {}", io::Error::last_os_error());
+        // SAFETY: address remains alive and length covers its populated path,
+        // including the terminating NUL, within the allocated structure.
+        let result = unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                length as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "bind: {}", io::Error::last_os_error());
+        socket
+    }
+
     #[tokio::test]
     async fn published_path_without_stream_listener_does_not_become_ready() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("published.sock");
-        let published = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(published); // Leave this owned stream-socket pathname without a listener.
+        let published = bind_without_listening(&path);
+        use std::os::unix::fs::FileTypeExt;
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket());
         let mut child = sleeper();
         let observations = Arc::clone(&child.observations);
         let mut readiness = Box::pin(child.connect_ready(&path, Instant::now()));
@@ -320,6 +368,7 @@ mod tests {
         };
         // Only after the first actual refused attempt do we publish a stream
         // listener. Path existence by itself was never sufficient.
+        drop(published);
         std::fs::remove_file(&path).unwrap();
         let listener = UnixListener::bind(&path).unwrap();
         let (accepted, receive) = oneshot::channel();
