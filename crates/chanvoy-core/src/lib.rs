@@ -12,6 +12,7 @@ pub mod wait_dm;
 pub mod wait_follow;
 pub mod wait_inbox;
 pub mod wait_registry;
+pub mod websocket_ownership;
 
 pub use safe_read::{
     read_caller_named_file, read_credential_file, read_tool_owned_file, SafeReadError,
@@ -97,7 +98,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -5810,6 +5811,21 @@ pub struct MattermostWs {
     inbox_armed: Arc<AtomicU64>,
 }
 
+fn ws_reserve(
+    execution: Option<&websocket_ownership::Execution>,
+) -> Result<Option<websocket_ownership::Operation>, CoreError> {
+    execution.map(|e| e.operations.reserve()).transpose()
+}
+fn ws_complete(operation: Option<websocket_ownership::Operation>, disposition: LookupDisposition) {
+    if let Some(operation) = operation {
+        if disposition == LookupDisposition::InnerLookupDropped {
+            operation.unresolved();
+        } else {
+            operation.complete();
+        }
+    }
+}
+
 impl MattermostWs {
     /// The websocket credential is taken from `client` rather than
     /// accepted as a parameter, so the websocket and the
@@ -5849,12 +5865,67 @@ impl MattermostWs {
         Arc::clone(&self.ws_state)
     }
 
-    pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    fn arm_recovery_owned(&self, execution: Option<&websocket_ownership::Execution>) {
+        let Some(execution) = execution else {
+            self.ws_state.arm_recovery_window();
+            return;
+        };
+        if self.ws_state.last_disconnect_at.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let target = now_unix_millis() + RECOVERY_GRACE_MS;
+        let generation = self.ws_state.reconnect_count.load(Ordering::Acquire);
+        self.ws_state
+            .recovering_until
+            .store(target, Ordering::Relaxed);
+        let ws = Arc::clone(&self.ws_state);
+        let operations = execution.operations.clone();
+        execution.register(async move {
+            if !operations
+                .delay(Duration::from_millis((RECOVERY_GRACE_MS + 10) as u64))
+                .await
+            {
+                return;
+            }
+            if ws.recovering_until.load(Ordering::Relaxed) != target {
+                return;
+            }
+            let started = tokio::time::Instant::now();
+            while ws.catchup_in_flight.load(Ordering::Relaxed) {
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return;
+                }
+                if !operations.delay(Duration::from_millis(200)).await {
+                    return;
+                }
+            }
+            let Ok(owner) = operations.reserve() else {
+                return;
+            };
+            if !operations.stopped() {
+                ws.commit_recovery_open(target, generation).await;
+            }
+            owner.complete();
+        });
+    }
+
+    pub async fn run(self: Arc<Self>, shutdown: tokio::sync::watch::Receiver<bool>) {
+        self.run_execution(shutdown, None).await;
+    }
+
+    async fn run_execution(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        execution: Option<websocket_ownership::Execution>,
+    ) {
         let mut attempt: u64 = 0;
         loop {
-            if *shutdown.borrow() {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 break;
             }
+            let Ok(connect_owner) = ws_reserve(execution.as_ref()) else {
+                break;
+            };
             attempt += 1;
             self.ws_state.set_state(WsConnectionState::Connecting).await;
             self.event_bus.emit(DaemonEvent {
@@ -5870,20 +5941,31 @@ impl MattermostWs {
                 ),
             });
 
-            match self.connect_and_listen().await {
+            match self
+                .connect_and_listen_owned(&mut shutdown, execution.as_ref(), connect_owner)
+                .await
+            {
                 Ok(()) => {
                     info!("websocket session ended cleanly");
                 }
+                Err(CoreError::RuntimeAdmissionClosed) => break,
                 Err(e) => {
+                    let Ok(owner) = ws_reserve(execution.as_ref()) else {
+                        break;
+                    };
                     warn!(%e, "websocket session error");
                     self.ws_state.set_error(e.to_string()).await;
+                    ws_complete(owner, LookupDisposition::Returned);
                 }
             }
 
-            if *shutdown.borrow() {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 break;
             }
 
+            let Ok(owner) = ws_reserve(execution.as_ref()) else {
+                break;
+            };
             self.ws_state
                 .set_state(WsConnectionState::Disconnected)
                 .await;
@@ -5923,6 +6005,7 @@ impl MattermostWs {
                 Duration::from_secs(30)
             };
 
+            ws_complete(owner, LookupDisposition::Returned);
             tokio::select! {
                 _ = sleep(delay) => {}
                 _ = shutdown.changed() => {
@@ -5936,30 +6019,42 @@ impl MattermostWs {
             .await;
     }
 
-    async fn connect_and_listen(&self) -> Result<(), CoreError> {
-        let (ws_stream, _) = connect_async(&self.ws_url).await.map_err(|e| {
+    async fn connect_and_listen_owned(
+        &self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        execution: Option<&websocket_ownership::Execution>,
+        connect_owner: Option<websocket_ownership::Operation>,
+    ) -> Result<(), CoreError> {
+        if execution.is_some_and(|e| e.operations.stopped()) {
+            ws_complete(connect_owner, LookupDisposition::Returned);
+            return Err(CoreError::RuntimeAdmissionClosed);
+        }
+        let connected = connect_async(&self.ws_url).await.map_err(|e| {
             CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 e.to_string(),
             ))
-        })?;
+        });
+        ws_complete(connect_owner, LookupDisposition::Returned);
+        let (ws_stream, _) = connected?;
 
         let (mut write, mut read) = ws_stream.split();
 
-        let auth = serde_json::json!({
-            "seq": 1,
-            "action": "authentication_challenge",
-            "data": { "token": self.token }
-        });
-        write
-            .send(WsMessage::Text(auth.to_string().into()))
-            .await
-            .map_err(|e| {
-                CoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    e.to_string(),
-                ))
-            })?;
+        websocket_ownership::send_owned(execution, &mut write, || {
+            let auth = serde_json::json!({
+                "seq": 1,
+                "action": "authentication_challenge",
+                "data": { "token": self.token }
+            });
+            WsMessage::Text(auth.to_string().into())
+        })
+        .await?
+        .map_err(|e| {
+            CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                e.to_string(),
+            ))
+        })?;
 
         let mut authenticated = false;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
@@ -5972,6 +6067,9 @@ impl MattermostWs {
         let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
 
         loop {
+            if execution.is_some() && (*shutdown.borrow() || shutdown.has_changed().is_err()) {
+                return Ok(());
+            }
             let now = tokio::time::Instant::now();
             let in_auth_window = now < auth_deadline;
             let remaining = if !authenticated {
@@ -5985,9 +6083,16 @@ impl MattermostWs {
             };
 
             tokio::select! {
+                biased;
+                _ = shutdown.changed(), if execution.is_some() => return Ok(()),
                 msg = read.next() => {
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
+                            let mutating = auth_error_still_fatal(authenticated, in_auth_window, &text)
+                                || (!authenticated && is_auth_success(&text))
+                                || (authenticated && serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("event").and_then(Value::as_str).map(|e| matches!(e, "posted" | "post_edited" | "hello" | "status_change"))).unwrap_or(false));
+                            let owner = if mutating { ws_reserve(execution)? } else { None };
+                            let mut disposition = LookupDisposition::Returned;
                             // Option (b): auth errors remain fatal for the whole
                             // challenge window, including after provisional Healthy.
                             if auth_error_still_fatal(authenticated, in_auth_window, &text) {
@@ -6004,6 +6109,7 @@ impl MattermostWs {
                                         "websocket auth rejected after provisional healthy (option b)"
                                     );
                                 }
+                                ws_complete(owner, LookupDisposition::Returned);
                                 return Err(CoreError::Io(std::io::Error::new(
                                     std::io::ErrorKind::PermissionDenied,
                                     format!("websocket auth rejected: {text}"),
@@ -6016,7 +6122,7 @@ impl MattermostWs {
                                     // clears the live error latch. Readers at
                                     // this exact boundary remain conservative.
                                     self.ws_state.prepare_authenticated_session();
-                                    self.ws_state.arm_recovery_window();
+                                    self.arm_recovery_owned(execution);
                                     self.ws_state
                                         .set_state(WsConnectionState::Healthy)
                                         .await;
@@ -6033,16 +6139,17 @@ impl MattermostWs {
                                             },
                                         ),
                                     });
-                                    self.reconnect_catchup().await;
+                                    disposition = self.reconnect_catchup_assessed().await;
                                 }
                                 // Non-success, non-error frames before first
                                 // success are ignored (same as prior behavior).
                             } else {
-                                self.handle_ws_message(&text).await;
+                                disposition = self.handle_ws_message_assessed(&text).await;
                             }
+                            ws_complete(owner, disposition);
                         }
                         Some(Ok(WsMessage::Ping(data))) => {
-                            let _ = write.send(WsMessage::Pong(data)).await;
+                            let _ = websocket_ownership::send_owned(execution, &mut write, || WsMessage::Pong(data)).await?;
                         }
                         Some(Ok(WsMessage::Close(_))) | None => {
                             return Ok(());
@@ -6058,11 +6165,11 @@ impl MattermostWs {
                 }
                 _ = heartbeat.tick() => {
                     if authenticated {
-                        let ping = serde_json::json!({
-                            "seq": 0,
-                            "action": "user_activity"
-                        });
-                        if write.send(WsMessage::Text(ping.to_string().into())).await.is_err() {
+                        let result = websocket_ownership::send_owned(execution, &mut write, || {
+                            let ping = serde_json::json!({ "seq": 0, "action": "user_activity" });
+                            WsMessage::Text(ping.to_string().into())
+                        }).await?;
+                        if result.is_err() {
                             return Ok(());
                         }
                     }
@@ -6081,9 +6188,9 @@ impl MattermostWs {
         }
     }
 
-    async fn handle_ws_message(&self, text: &str) {
+    async fn handle_ws_message_assessed(&self, text: &str) -> LookupDisposition {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
-            return;
+            return LookupDisposition::Returned;
         };
 
         let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
@@ -6091,23 +6198,28 @@ impl MattermostWs {
 
         match event {
             "posted" | "post_edited" => {
-                self.handle_post_event(&data).await;
+                return self.handle_post_event_assessed(&data).await;
             }
             "status_change" | "hello" => {
                 self.ws_state.touch_event();
             }
             _ => {}
         }
+        LookupDisposition::Returned
     }
 
+    #[cfg(test)]
     async fn handle_post_event(&self, data: &Value) {
+        self.handle_post_event_assessed(data).await;
+    }
+    async fn handle_post_event_assessed(&self, data: &Value) -> LookupDisposition {
         self.ws_state.touch_event();
 
         let Some(post_str) = data.get("post").and_then(|v| v.as_str()) else {
-            return;
+            return LookupDisposition::Returned;
         };
         let Ok(post): Result<Value, _> = serde_json::from_str(post_str) else {
-            return;
+            return LookupDisposition::Returned;
         };
 
         let post_id = post
@@ -6138,11 +6250,11 @@ impl MattermostWs {
             .to_string();
 
         if sender_id == self.my_user_id {
-            return;
+            return LookupDisposition::Returned;
         }
 
         if post_id.is_empty() || channel_id.is_empty() {
-            return;
+            return LookupDisposition::Returned;
         }
 
         let root_id = normalize_root_id(&raw_root_id, &post_id);
@@ -6150,7 +6262,7 @@ impl MattermostWs {
         {
             let mut seen = self.seen_posts.lock().await;
             if !seen.insert(post_id.clone()) {
-                return;
+                return LookupDisposition::Returned;
             }
             if seen.len() > 10000 {
                 let to_remove: Vec<String> = seen.iter().take(5000).cloned().collect();
@@ -6161,7 +6273,8 @@ impl MattermostWs {
         }
 
         let channel_name = self.resolve_channel_name(&channel_id).await;
-        let sender_username = self.resolve_username(&sender_id).await;
+        let author = self.client.author_username_assessed(&sender_id).await;
+        let sender_username = author.value;
         let mentioned = mentions_bot(&self.bot_username, &message);
 
         let is_monitored = self
@@ -6220,9 +6333,11 @@ impl MattermostWs {
             };
             self.event_bus.emit(event);
         }
+        author.disposition
     }
 
-    async fn reconnect_catchup(&self) {
+    async fn reconnect_catchup_assessed(&self) -> LookupDisposition {
+        let mut disposition = LookupDisposition::Returned;
         // `prepare_authenticated_session` marks catch-up in flight and resets
         // the cycle's gap before Healthy is published. If this outage exceeded
         // the five-minute window, re-flag it below; the recovery-window task
@@ -6237,15 +6352,17 @@ impl MattermostWs {
             };
             let Ok(messages) = self
                 .client
-                .read_channel_by_id_since_millis(&channel_id, five_min_ago)
+                .read_channel_by_id_since_millis_assessed(&channel_id, five_min_ago)
                 .await
             else {
                 continue;
             };
 
+            disposition.combine(messages.disposition);
             let mut seen = self.seen_posts.lock().await;
 
             let new_messages: Vec<_> = messages
+                .value
                 .into_iter()
                 .filter(|m| m.user_id != self.my_user_id && seen.insert(m.id.clone()))
                 .collect();
@@ -6301,6 +6418,7 @@ impl MattermostWs {
         self.ws_state
             .catchup_in_flight
             .store(false, Ordering::Relaxed);
+        disposition
     }
 
     // TODO: this fetches the bot's entire channel list on every inbound
@@ -6314,13 +6432,6 @@ impl MattermostWs {
             .find(|c| c.id == channel_id)
             .map(|c| c.name.clone())
             .unwrap_or_else(|| channel_id.to_string())
-    }
-
-    /// Author name for an inbound push event. Delegates to the shared
-    /// client helper so pushed messages and messages read back over
-    /// REST can never disagree about who wrote something.
-    async fn resolve_username(&self, user_id: &str) -> String {
-        self.client.author_username(user_id).await
     }
 }
 

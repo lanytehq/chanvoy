@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Websocket task ownership
+
+- Daemon shutdown collects the websocket runner and every scheduled recovery
+  task before runtime cleanup. Idle observation stops cooperatively; admitted
+  provider work and selected output finish without being aborted by shutdown.
+- Managed websocket work uses the daemon's existing runtime admission arena.
+  Completed local attempts can finish even when the provider returned an error;
+  dropped author lookups retain their enclosing work and refuse clean retirement.
+- Public websocket and author-resolution interfaces retain their existing
+  signatures. Managed execution receipts distinguish unresolved work from
+  unconfirmed task collection and apply to one exclusively owned runner.
+
 ### Client task collection
 
 - Daemon exits stop idle local clients and collect their actual tasks before

@@ -22,6 +22,7 @@ mod wait_task;
 mod waitprims_fanin;
 mod waitprims_hold;
 mod waitprims_poll;
+mod websocket_task;
 
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
@@ -523,6 +524,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
 
     let mut client_tasks = client_tasks::ClientTasks::new(&cancel_token);
     let mut startup_tasks = startup_work::StartupTasks::default();
+    let mut websocket_task = websocket_task::WebsocketTask::default();
     let outcome: Result<DaemonHealth, DaemonError> = async {
         let mut attention = load_attention_state(&profile.name)?;
         let poll_cursors =
@@ -575,7 +577,6 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
 
-        let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::watch::channel(false);
         {
             // Same-profile client, shared by clone (see the IPC peer above)
             // so the websocket pipeline reads author names out of the same
@@ -589,10 +590,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             ws.set_inbox_gate(inbox_armed);
             let ws = Arc::new(ws);
             let ws_state = ws.ws_state();
-            let ws_ref = Arc::clone(&ws);
-            tokio::spawn(async move {
-                ws_ref.run(ws_shutdown_rx).await;
-            });
+            websocket_task.start(ws, Arc::clone(&state.wait_owners))?;
             *ws_state_holder.lock().await = Some(ws_state);
             info!(
                 profile = profile_name,
@@ -626,7 +624,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                 _ = &mut shutdown_rx => {
                     cancel_token.cancel();
                     state.wait_owners.cancel_all();
-                    let _ = ws_shutdown_tx.send(true);
+                    websocket_task.request_stop();
                     break;
                 }
             }
@@ -639,8 +637,10 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     }
     .await;
     cancel_token.cancel();
+    websocket_task.request_stop();
     let outcome = client_tasks.finish(outcome).await;
     let outcome = startup_tasks.finish(outcome).await;
+    let outcome = websocket_task.finish(outcome).await;
     let cleanup = || cleanup_runtime_files(&socket_path, &pid_path).map_err(DaemonError::from);
     match ipc_task {
         Some(task) => task.finish(outcome, cleanup).await,
