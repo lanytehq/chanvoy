@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Daemon status
+
+- Human-readable daemon status shows `daemon_version` from the responding
+  daemon, or `unknown` when its build metadata is absent. The CLI version
+  remains separate, and JSON status keeps its existing shape.
+
 ### Websocket task ownership
 
 - Daemon shutdown collects the websocket runner and every scheduled recovery

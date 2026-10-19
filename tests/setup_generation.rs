@@ -551,6 +551,50 @@ async fn human_refusal_has_no_stdout_success_or_dead_recipe() {
 }
 
 #[tokio::test]
+async fn human_status_reports_daemon_version_without_substituting_cli_version() {
+    for missing in [false, true] {
+        let env = environment(if missing {
+            "status-version-missing"
+        } else {
+            "status-version-different"
+        })
+        .await;
+        let cli = cli_pin(&env).await;
+        let mut daemon = cli.clone();
+        daemon["version"] = json!("0.0.0-test-daemon");
+        assert_ne!(daemon["version"], cli["version"]);
+        let expected_version = if missing {
+            "unknown"
+        } else {
+            "0.0.0-test-daemon"
+        };
+        if missing {
+            daemon = Value::Null;
+        }
+        let _server = fixture(&env, daemon.clone(), false, false);
+        let output = run_chanvoy(&env, &["daemon", "status"]).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let human = String::from_utf8(output.stdout).unwrap();
+        assert!(human
+            .lines()
+            .any(|line| line == format!("daemon_version: {expected_version}")));
+        assert!(human
+            .lines()
+            .any(|line| line == format!("cli_version: {}", cli["version"].as_str().unwrap())));
+        let output = run_chanvoy(&env, &["--json", "daemon", "status"]).await;
+        assert!(output.status.success());
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status.get("daemon_version"), None);
+        assert_eq!(status["binary"], daemon);
+        assert_eq!(status["cli_binary"], cli);
+    }
+}
+
+#[tokio::test]
 async fn matching_generation_reuses_and_status_reports_both_pins() {
     let env = environment("generation-matching").await;
     let pin = cli_pin(&env).await;

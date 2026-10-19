@@ -7037,6 +7037,13 @@ impl HumanReadable for DaemonStatus {
             self.mattermost_username,
             self.mattermost_ok
         );
+        out.push_str(&format!(
+            "\ndaemon_version: {}",
+            self.binary
+                .as_ref()
+                .map(|binary| binary.version.as_str())
+                .unwrap_or("unknown")
+        ));
         if let Some(bin) = &self.binary {
             out.push_str(&format!("\nbinary_commit: {}", bin.commit_short));
             if let Some(dirty) = bin.dirty {
