@@ -6,15 +6,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs, io};
 
+mod client_tasks;
 mod follow_delivery;
+mod ipc_ownership;
+mod ipc_supervision;
+mod request_frontier;
+mod startup_work;
+mod subscription_owner;
 mod wait;
 mod wait_channels;
 mod wait_coalesce;
 mod wait_inbox;
 mod wait_owner;
+mod wait_task;
 mod waitprims_fanin;
 mod waitprims_hold;
 mod waitprims_poll;
+mod websocket_task;
 
 use chanvoy_core::{
     daemon_event_to_notification, list_profiles, load_attention_state, load_profile, load_token,
@@ -57,6 +65,8 @@ const ATTENTION_MIGRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
+    #[error(transparent)]
+    Runtime(#[from] chanvoy_core::runtime::RuntimeError),
     #[error(transparent)]
     Core(#[from] CoreError),
     #[error("io error: {0}")]
@@ -122,7 +132,7 @@ struct AppState {
     socket_path: PathBuf,
     my_user_id: String,
     event_bus: Arc<EventBus>,
-    subscriptions: Arc<Mutex<HashMap<String, SubscriptionFilter>>>,
+    subscriptions: Arc<Mutex<HashMap<String, subscription_owner::Registration>>>,
     ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>>,
     ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>>,
     attention_state: Arc<Mutex<AttentionState>>,
@@ -485,7 +495,8 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     // gate as the local UDS surface.
     let identity_drift = Arc::new(AtomicBool::new(false));
 
-    let ipc_state: Option<Arc<tokio::sync::Mutex<IpcPeerState>>> = match &profile.ipc {
+    let wait_owners = Arc::new(wait_owner::WaitOwnerRegistry::new());
+    let (ipc_state, ipc_task) = match &profile.ipc {
         Some(IpcConfig {
             enabled: true,
             gateway_socket,
@@ -500,146 +511,145 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
                 Arc::clone(&event_bus),
                 gateway_socket.clone(),
                 Arc::clone(&identity_drift),
+                Arc::new(ipc_ownership::IpcAdmission(Arc::clone(&wait_owners))),
             ));
             let state = ipc_peer.state();
-            let cancel = cancel_token.clone();
-            tokio::spawn(async move {
+            let task = ipc_supervision::IpcTask::spawn(&cancel_token, move |cancel| async move {
                 ipc_peer.run(cancel).await;
             });
-            Some(state)
+            (Some(state), Some(task))
         }
-        _ => None,
+        _ => (None, None),
     };
 
-    let mut attention = load_attention_state(&profile.name)?;
-    let poll_cursors =
-        waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
-    poll_cursors
-        .apply_pending_txn(&mut attention)
-        .map_err(DaemonError::from)?;
-    let legacy_attention_records = attention
-        .channels
-        .keys()
-        .filter(|key| !key.contains('/'))
-        .count();
-    info!(
-        profile = profile_name,
-        channel_records = attention.channels.len(),
-        legacy_records = legacy_attention_records,
-        quarantined_records = attention.quarantined.len(),
-        "chanvoy daemon local attention state recovered"
-    );
-
-    let inbox_armed = Arc::new(AtomicU64::new(0));
-    let state = Arc::new(AppState {
-        profile: profile.clone(),
-        client,
-        socket_path: socket_path.clone(),
-        my_user_id,
-        event_bus: Arc::clone(&event_bus),
-        subscriptions: Arc::new(Mutex::new(HashMap::new())),
-        ws_state_holder: ws_state_holder.clone(),
-        ipc_state,
-        attention_state: Arc::new(Mutex::new(attention)),
-        identity_drift,
-        observed_identity_drift: Arc::new(AtomicBool::new(false)),
-        probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
-        reduce_writer,
-        wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
-        poll_cursors,
-        fanin_replay: waitprims_fanin::FanInReplayStore::new(),
-        inbox_armed: inbox_armed.clone(),
-    });
-
-    // Legacy cursor migration is provider-backed, optional maintenance. It
-    // must not delay the local control plane: snapshot now, resolve without a
-    // state lock after this task is spawned, and publish only if the live state
-    // still equals the snapshot. A concurrent cursor write therefore wins and
-    // causes this one bounded pass to defer rather than clobbering newer state.
-    if legacy_attention_records > 0 {
-        let migration_state = Arc::clone(&state.attention_state);
-        let migration_client = state.client.clone();
-        let migration_profile = profile.name.clone();
-        tokio::spawn(async move {
-            run_attention_migration(
-                migration_profile,
-                migration_state,
-                migration_client,
-                ATTENTION_MIGRATION_TIMEOUT,
-            )
-            .await;
-        });
-    }
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
-
-    let (ws_shutdown_tx, ws_shutdown_rx) = tokio::sync::watch::channel(false);
-    {
-        // Same-profile client, shared by clone (see the IPC peer above)
-        // so the websocket pipeline reads author names out of the same
-        // cache the request-response paths fill — and authenticates
-        // with that client's credential, which is why no token is
-        // passed here.
-        let client_for_ws = state.client.clone();
-        let event_bus = Arc::clone(&event_bus);
-        let mut ws =
-            MattermostWs::new(&profile, client_for_ws, event_bus, state.my_user_id.clone());
-        ws.set_inbox_gate(inbox_armed);
-        let ws = Arc::new(ws);
-        let ws_state = ws.ws_state();
-        let ws_ref = Arc::clone(&ws);
-        tokio::spawn(async move {
-            ws_ref.run(ws_shutdown_rx).await;
-        });
-        *ws_state_holder.lock().await = Some(ws_state);
+    let mut client_tasks = client_tasks::ClientTasks::new(&cancel_token);
+    let mut startup_tasks = startup_work::StartupTasks::default();
+    let mut websocket_task = websocket_task::WebsocketTask::default();
+    let outcome: Result<DaemonHealth, DaemonError> = async {
+        let mut attention = load_attention_state(&profile.name)?;
+        let poll_cursors =
+            waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
+        poll_cursors
+            .apply_pending_txn(&mut attention)
+            .map_err(DaemonError::from)?;
+        let legacy_attention_records = attention
+            .channels
+            .keys()
+            .filter(|key| !key.contains('/'))
+            .count();
         info!(
             profile = profile_name,
-            "chanvoy websocket observation task started"
+            channel_records = attention.channels.len(),
+            legacy_records = legacy_attention_records,
+            quarantined_records = attention.quarantined.len(),
+            "chanvoy daemon local attention state recovered"
         );
-    }
 
-    // Coordinated post-bind probing never gates local startup or stacks with status.
-    {
-        let probe_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let probe = probe_state.probe_identity().await;
-            info!(profile=%probe_state.profile.name,outcome=?probe.outcome,
-                "post-bind identity probe completed");
+        let inbox_armed = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(AppState {
+            profile: profile.clone(),
+            client,
+            socket_path: socket_path.clone(),
+            my_user_id,
+            event_bus: Arc::clone(&event_bus),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            ws_state_holder: ws_state_holder.clone(),
+            ipc_state,
+            attention_state: Arc::new(Mutex::new(attention)),
+            identity_drift,
+            observed_identity_drift: Arc::new(AtomicBool::new(false)),
+            probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
+            reduce_writer,
+            wait_owners,
+            poll_cursors,
+            fanin_replay: waitprims_fanin::FanInReplayStore::new(),
+            inbox_armed: inbox_armed.clone(),
         });
-    }
 
-    info!(
-        profile = profile_name,
-        socket = %socket_path.display(),
-        "chanvoy daemon listening"
-    );
+        // Legacy cursor migration is provider-backed, optional maintenance. It
+        // must not delay the local control plane: snapshot now, resolve without a
+        // state lock after this task is spawned, and publish only if the live state
+        // still equals the snapshot. A concurrent cursor write therefore wins and
+        // causes this one bounded pass to defer rather than clobbering newer state.
+        if legacy_attention_records > 0 {
+            startup_tasks.spawn_migration(Arc::clone(&state))?;
+        }
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
 
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                let (stream, _) = accept_result?;
-                let state = Arc::clone(&state);
-                let shutdown_tx = Arc::clone(&shutdown_tx);
-                tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, state, shutdown_tx).await {
-                        tracing::warn!(%error, "client request failed");
-                    }
-                });
-            }
-            _ = &mut shutdown_rx => {
-                cancel_token.cancel();
-                state.wait_owners.cancel_all();
-                let _ = ws_shutdown_tx.send(true);
-                break;
+        {
+            // Same-profile client, shared by clone (see the IPC peer above)
+            // so the websocket pipeline reads author names out of the same
+            // cache the request-response paths fill — and authenticates
+            // with that client's credential, which is why no token is
+            // passed here.
+            let client_for_ws = state.client.clone();
+            let event_bus = Arc::clone(&event_bus);
+            let mut ws =
+                MattermostWs::new(&profile, client_for_ws, event_bus, state.my_user_id.clone());
+            ws.set_inbox_gate(inbox_armed);
+            let ws = Arc::new(ws);
+            let ws_state = ws.ws_state();
+            websocket_task.start(ws, Arc::clone(&state.wait_owners))?;
+            *ws_state_holder.lock().await = Some(ws_state);
+            info!(
+                profile = profile_name,
+                "chanvoy websocket observation task started"
+            );
+        }
+
+        // Provider-backed startup work reserves admission before its child is
+        // constructed, and its collector retains ownership through actual join.
+        startup_tasks.spawn_probe(Arc::clone(&state))?;
+
+        info!(
+            profile = profile_name,
+            socket = %socket_path.display(),
+            "chanvoy daemon listening"
+        );
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, _) = accept_result?;
+                    let state = Arc::clone(&state);
+                    let shutdown_tx = Arc::clone(&shutdown_tx);
+                    client_tasks.spawn(move |stop| async move {
+                        handle_client_with_shutdown(stream, state, shutdown_tx, stop).await
+                    });
+                }
+                collected = client_tasks.collect_next(), if !client_tasks.is_empty() => {
+                    collected?;
+                }
+                _ = &mut shutdown_rx => {
+                    cancel_token.cancel();
+                    state.wait_owners.cancel_all();
+                    websocket_task.request_stop();
+                    break;
+                }
             }
         }
-    }
 
-    cleanup_runtime_files(&socket_path, &pid_path)?;
-    Ok(DaemonHealth {
-        profile: profile_name.to_string(),
-        socket_path,
-    })
+        Ok(DaemonHealth {
+            profile: profile_name.to_string(),
+            socket_path: socket_path.clone(),
+        })
+    }
+    .await;
+    cancel_token.cancel();
+    websocket_task.request_stop();
+    let outcome = client_tasks.finish(outcome).await;
+    let outcome = startup_tasks.finish(outcome).await;
+    let outcome = websocket_task.finish(outcome).await;
+    let cleanup = || cleanup_runtime_files(&socket_path, &pid_path).map_err(DaemonError::from);
+    match ipc_task {
+        Some(task) => task.finish(outcome, cleanup).await,
+        None => {
+            let health = outcome?;
+            cleanup()?;
+            Ok(health)
+        }
+    }
 }
 
 async fn run_attention_migration(
@@ -647,7 +657,25 @@ async fn run_attention_migration(
     attention_state: Arc<Mutex<AttentionState>>,
     client: MattermostClient,
     deadline: Duration,
-) {
+) -> Result<(), CoreError> {
+    let store_profile = profile_name.clone();
+    run_attention_migration_with_persist(
+        profile_name,
+        attention_state,
+        client,
+        deadline,
+        move |candidate| store_attention_state(&store_profile, candidate).map(|_| ()),
+    )
+    .await
+}
+
+async fn run_attention_migration_with_persist(
+    profile_name: String,
+    attention_state: Arc<Mutex<AttentionState>>,
+    client: MattermostClient,
+    deadline: Duration,
+    persist: impl FnOnce(&AttentionState) -> Result<(), CoreError>,
+) -> Result<(), CoreError> {
     let snapshot = attention_state.lock().await.clone();
     let legacy_records = snapshot
         .channels
@@ -655,7 +683,7 @@ async fn run_attention_migration(
         .filter(|key| !key.contains('/'))
         .count();
     if legacy_records == 0 {
-        return;
+        return Ok(());
     }
     info!(
         profile = %profile_name,
@@ -678,7 +706,7 @@ async fn run_attention_migration(
                 timeout_ms = deadline.as_millis(),
                 "attention-state legacy migration timed out and was deferred"
             );
-            return;
+            return Ok(());
         }
         Ok(Err(err)) => {
             warn!(
@@ -686,7 +714,7 @@ async fn run_attention_migration(
                 error = %err,
                 "attention-state legacy migration failed and was deferred"
             );
-            return;
+            return Ok(());
         }
         Ok(Ok(outcome)) => outcome,
     };
@@ -694,7 +722,7 @@ async fn run_attention_migration(
     let mut live = attention_state.lock().await;
     let published = if outcome.migrated + outcome.quarantined > 0 {
         match publish_attention_migration_if_unchanged(
-            |candidate| store_attention_state(&profile_name, candidate).map(|_| ()),
+            persist,
             &mut live,
             &snapshot,
             migrated_state,
@@ -704,9 +732,9 @@ async fn run_attention_migration(
                 warn!(
                     profile = %profile_name,
                     error = %err,
-                    "attention-state legacy migration could not be persisted and was deferred"
+                    "attention-state legacy migration could not be persisted; cleanup remains unconfirmed"
                 );
-                return;
+                return Err(err);
             }
         }
     } else {
@@ -720,7 +748,7 @@ async fn run_attention_migration(
             skipped = outcome.skipped,
             "attention-state legacy migration deferred because live cursor state changed"
         );
-        return;
+        return Ok(());
     }
     info!(
         profile = %profile_name,
@@ -729,6 +757,7 @@ async fn run_attention_migration(
         skipped = outcome.skipped,
         "attention-state legacy migration completed"
     );
+    Ok(())
 }
 
 fn publish_attention_migration_if_unchanged(
@@ -786,24 +815,82 @@ pub async fn status(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
     daemon_client(profile_name).daemon_status().await
 }
 
+#[cfg(test)]
 async fn handle_client(
     stream: UnixStream,
     state: Arc<AppState>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 ) -> Result<(), DaemonError> {
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    handle_client_with_shutdown(
+        stream,
+        state,
+        shutdown_tx,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+async fn handle_client_with_shutdown(
+    stream: UnixStream,
+    state: Arc<AppState>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<(), DaemonError> {
+    let (reader, writer) = stream.into_split();
+    handle_client_io_with_shutdown(BufReader::new(reader), writer, state, shutdown_tx, stop).await
+}
+
+#[cfg(test)]
+async fn handle_client_io<R, W>(
+    reader: R,
+    writer: W,
+    state: Arc<AppState>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+) -> Result<(), DaemonError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    handle_client_io_with_shutdown(
+        reader,
+        writer,
+        state,
+        shutdown_tx,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+async fn handle_client_io_with_shutdown<R, W>(
+    mut reader: R,
+    mut writer: W,
+    state: Arc<AppState>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<(), DaemonError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut line = String::new();
     let mut event_rx: Option<tokio::sync::broadcast::Receiver<Arc<DaemonEvent>>> = None;
     let mut client_sub_ids: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
+            _ = stop.cancelled() => break,
             read_result = reader.read_line(&mut line) => {
-                if read_result? == 0 {
+                // Check again when both input and stop are ready. Once a
+                // branch starts admitted work, it runs to its existing finish.
+                let bytes_read = read_result?;
+                if stop.is_cancelled() { break; }
+                if bytes_read == 0 {
                     break;
                 }
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
+                // Admission precedes every legacy handler and provider preflight.
+                let request_permit = state.wait_owners.request_permit()
+                    .map_err(request_frontier::admission_error)?;
                 if request.method == WAIT_FOLLOW_V1_METHOD
                     || request.method == WAIT_FOLLOW_V2_METHOD
                 {
@@ -813,8 +900,7 @@ async fn handle_client(
                             -32_000,
                             "identity drift detected: held waits are refused until `chanvoy auto-setup` re-validates identity.",
                         );
-                        writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                        writer.write_all(b"\n").await?;
+                        request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                         line.clear();
                         continue;
                     }
@@ -827,8 +913,7 @@ async fn handle_client(
                                         -32_007,
                                         format!("wait_follow_v2 input: {err}"),
                                     );
-                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
+                                    request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                     line.clear();
                                     continue;
                                 }
@@ -852,8 +937,7 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_follow_v2 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
@@ -867,13 +951,14 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_follow_v1 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
                         }
                     };
+                    let delivery_owner = request_permit.reserve_stream()
+                        .map_err(request_frontier::admission_error)?;
                     let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
                     let delivery = follow_delivery::ChannelDelivery::new(client_gone.clone());
@@ -896,6 +981,7 @@ async fn handle_client(
                         delivery.clone(),
                     );
                     delivery.serve(&mut writer, &mut reader, request.id, stream_rx, follow).await?;
+                    request_frontier::finish_held(&mut writer, request_permit, delivery_owner).await?;
                     line.clear();
                     continue;
                 }
@@ -909,8 +995,7 @@ async fn handle_client(
                             -32_000,
                             "identity drift detected: held waits are refused until `chanvoy auto-setup` re-validates identity.",
                         );
-                        writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                        writer.write_all(b"\n").await?;
+                        request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                         line.clear();
                         continue;
                     }
@@ -923,8 +1008,7 @@ async fn handle_client(
                                         -32_007,
                                         format!("wait_dm_follow_v2 input: {err}"),
                                     );
-                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
+                                    request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                     line.clear();
                                     continue;
                                 }
@@ -947,8 +1031,7 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_dm_follow_v2 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
@@ -962,14 +1045,12 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_dm_follow_v1 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
                         }
                     };
-                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let deadline = match wait::deadline_from_rpc_entry(started, params.timeout_secs)
                     {
                         Ok(deadline) => deadline,
@@ -977,12 +1058,14 @@ async fn handle_client(
                             let error = DaemonError::from(err);
                             let (code, message, data) = error_payload(&error);
                             let response = rpc_error_with_data(request.id, code, message, data);
-                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
+                            request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                             line.clear();
                             continue;
                         }
                     };
+                    let delivery_owner = request_permit.reserve_stream()
+                        .map_err(request_frontier::admission_error)?;
+                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
                     let follow = wait::wait_with_params_dm_follow(
                         &state,
@@ -1003,7 +1086,7 @@ async fn handle_client(
                     tokio::pin!(follow);
                     let mut eof_buf = String::new();
                     let mut client_eof = false;
-                    loop {
+                    let terminal_completed = loop {
                         tokio::select! {
                             biased;
                             Some(record) = stream_rx.recv() => {
@@ -1017,15 +1100,12 @@ async fn handle_client(
                                     writer.write_all(b"\n").await?;
                                     writer.flush().await
                                 }.await;
-                                let ack = write_result
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(ToString::to_string);
-                                let _ = record.written.send(ack);
-                                write_result?;
+                                request_frontier::acknowledge(record.written, write_result)?;
                             }
                             result = &mut follow => {
-                                while let Ok(record) = stream_rx.try_recv() {
+                                let queued = stream_rx.len();
+                                for _ in 0..queued {
+                                    let Ok(record) = stream_rx.try_recv() else { break };
                                     let notification = JsonRpcNotification {
                                         jsonrpc: "2.0".to_string(),
                                         method: record.method.to_string(),
@@ -1036,12 +1116,7 @@ async fn handle_client(
                                         writer.write_all(b"\n").await?;
                                         writer.flush().await
                                     }.await;
-                                    let ack = write_result
-                                        .as_ref()
-                                        .map(|_| ())
-                                        .map_err(ToString::to_string);
-                                    let _ = record.written.send(ack);
-                                    write_result?;
+                                    request_frontier::acknowledge(record.written, write_result)?;
                                 }
                                 let response = match result {
                                     Ok(result) => rpc_result(request.id, to_value(result)),
@@ -1053,7 +1128,7 @@ async fn handle_client(
                                 };
                                 writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
-                                break;
+                                break true;
                             }
                             peek = reader.read_line(&mut eof_buf), if !client_eof => {
                                 if coalesce_ms.is_some() {
@@ -1061,10 +1136,13 @@ async fn handle_client(
                                     client_eof = true;
                                 } else {
                                     let _ = peek?;
-                                    break;
+                                    break false;
                                 }
                             }
                         }
+                    };
+                    if terminal_completed {
+                        request_frontier::finish_held(&mut writer, request_permit, delivery_owner).await?;
                     }
                     line.clear();
                     continue;
@@ -1079,8 +1157,7 @@ async fn handle_client(
                             -32_000,
                             "identity drift detected: held waits are refused until `chanvoy auto-setup` re-validates identity.",
                         );
-                        writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                        writer.write_all(b"\n").await?;
+                        request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                         line.clear();
                         continue;
                     }
@@ -1093,8 +1170,7 @@ async fn handle_client(
                                         -32_007,
                                         format!("wait_inbox_follow_v2 input: {err}"),
                                     );
-                                    writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                    writer.write_all(b"\n").await?;
+                                    request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                     line.clear();
                                     continue;
                                 }
@@ -1116,8 +1192,7 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_inbox_follow_v2 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
@@ -1133,14 +1208,12 @@ async fn handle_client(
                                     -32_007,
                                     format!("wait_inbox_follow_v1 input: {err}"),
                                 );
-                                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                                 line.clear();
                                 continue;
                             }
                         }
                     };
-                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let deadline = match wait::deadline_from_rpc_entry(started, params.timeout_secs)
                     {
                         Ok(deadline) => deadline,
@@ -1148,12 +1221,14 @@ async fn handle_client(
                             let error = DaemonError::from(err);
                             let (code, message, data) = error_payload(&error);
                             let response = rpc_error_with_data(request.id, code, message, data);
-                            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
+                            request_frontier::finish_response(&mut writer, &response, request_permit).await?;
                             line.clear();
                             continue;
                         }
                     };
+                    let delivery_owner = request_permit.reserve_stream()
+                        .map_err(request_frontier::admission_error)?;
+                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1);
                     let client_gone = tokio_util::sync::CancellationToken::new();
                     let follow = wait_inbox::wait_with_params_inbox_follow(
                         &state,
@@ -1173,7 +1248,7 @@ async fn handle_client(
                     tokio::pin!(follow);
                     let mut eof_buf = String::new();
                     let mut client_eof = false;
-                    loop {
+                    let terminal_completed = loop {
                         tokio::select! {
                             biased;
                             Some(record) = stream_rx.recv() => {
@@ -1195,15 +1270,12 @@ async fn handle_client(
                                     writer.write_all(b"\n").await?;
                                     writer.flush().await
                                 }.await;
-                                let ack = write_result
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(ToString::to_string);
-                                let _ = record.written.send(ack);
-                                write_result?;
+                                request_frontier::acknowledge(record.written, write_result)?;
                             }
                             result = &mut follow => {
-                                while let Ok(record) = stream_rx.try_recv() {
+                                let queued = stream_rx.len();
+                                for _ in 0..queued {
+                                    let Ok(record) = stream_rx.try_recv() else { break };
                                     let (method, params) = match record.event {
                                         wait_inbox::InboxFollowStreamEvent::V1(event) => {
                                             (WAIT_INBOX_FOLLOW_V1_EVENT_METHOD, to_value(event))
@@ -1222,12 +1294,7 @@ async fn handle_client(
                                         writer.write_all(b"\n").await?;
                                         writer.flush().await
                                     }.await;
-                                    let ack = write_result
-                                        .as_ref()
-                                        .map(|_| ())
-                                        .map_err(ToString::to_string);
-                                    let _ = record.written.send(ack);
-                                    write_result?;
+                                    request_frontier::acknowledge(record.written, write_result)?;
                                 }
                                 let response = match result {
                                     Ok(result) => rpc_result(request.id, to_value(result)),
@@ -1239,7 +1306,7 @@ async fn handle_client(
                                 };
                                 writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
-                                break;
+                                break true;
                             }
                             peek = reader.read_line(&mut eof_buf), if !client_eof => {
                                 if coalesce_ms.is_some() {
@@ -1247,10 +1314,13 @@ async fn handle_client(
                                     client_eof = true;
                                 } else {
                                     let _ = peek?;
-                                    break;
+                                    break false;
                                 }
                             }
                         }
+                    };
+                    if terminal_completed {
+                        request_frontier::finish_held(&mut writer, request_permit, delivery_owner).await?;
                     }
                     line.clear();
                     continue;
@@ -1272,9 +1342,7 @@ async fn handle_client(
                 } else {
                     dispatch_request(request, &state, &shutdown_tx).await
                 };
-                let response = dispatched.response;
-
-                if let Some(sub_ack) = extract_subscription_id(&response.result) {
+                if let Some(sub_ack) = extract_subscription_id(&dispatched.response.result) {
                     client_sub_ids.push(sub_ack);
                     if event_rx.is_none() {
                         event_rx = Some(state.event_bus.subscribe());
@@ -1285,33 +1353,7 @@ async fn handle_client(
                     client_sub_ids.retain(|id| id != &removed_id);
                 }
 
-                writer
-                    .write_all(serde_json::to_string(&response)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
-                if response.error.is_none()
-                    && (dispatched.staged_poll_ack.is_some()
-                        || dispatched.staged_attention.is_some())
-                {
-                    commit_staged_read_cursors(
-                        &state,
-                        dispatched.staged_poll_ack,
-                        dispatched.staged_attention,
-                    )
-                    .await
-                    .map_err(DaemonError::from)?;
-                }
-                if let Some(consume) = dispatched.staged_fanin_consume {
-                    if response.error.is_none() {
-                        state
-                            .fanin_replay
-                            .consume(&consume.channel_id, &consume.post_id)
-                            .map_err(DaemonError::from)?;
-                    }
-                }
-                if let Some(hold) = dispatched.fanin_hold {
-                    hold.release();
-                }
+                request_frontier::finish(&mut writer, &state, dispatched, request_permit).await?;
                 line.clear();
             }
             recv_result = async {
@@ -1320,6 +1362,7 @@ async fn handle_client(
                     None => std::future::pending().await,
                 }
             } => {
+                if stop.is_cancelled() { break; }
                 match recv_result {
                     Ok(event) => {
                         // PER-014: if identity drift is set, suppress
@@ -1341,13 +1384,13 @@ async fn handle_client(
                         let subs = state.subscriptions.lock().await;
                         let matches_any = client_sub_ids.iter().any(|id| {
                             subs.get(id)
-                                .is_some_and(|f| event_matches_filter(event.as_ref(), f))
+                                .is_some_and(|entry| event_matches_filter(event.as_ref(), &entry.filter))
                         });
                         if matches_any {
+                            let send_owner = state.wait_owners.request_permit()
+                                .map_err(request_frontier::admission_error)?;
                             let notification = daemon_event_to_notification(event.as_ref());
-                            let payload = serde_json::to_string(&notification)?;
-                            writer.write_all(payload.as_bytes()).await?;
-                            writer.write_all(b"\n").await?;
+                            subscription_owner::finish_send(&mut writer, &notification, send_owner).await?;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1356,6 +1399,8 @@ async fn handle_client(
                         let missed_from = current_seq.saturating_sub(n);
                         for sub_id in &client_sub_ids {
                             if subs.contains_key(sub_id) {
+                                let send_owner = state.wait_owners.request_permit()
+                                    .map_err(request_frontier::admission_error)?;
                                 let gap = JsonRpcNotification {
                                     jsonrpc: "2.0".to_string(),
                                     method: "push.gap".to_string(),
@@ -1365,9 +1410,7 @@ async fn handle_client(
                                         "missed_to_seq": current_seq,
                                     }),
                                 };
-                                let payload = serde_json::to_string(&gap)?;
-                                writer.write_all(payload.as_bytes()).await?;
-                                writer.write_all(b"\n").await?;
+                                subscription_owner::finish_send(&mut writer, &gap, send_owner).await?;
                             }
                         }
                     }
@@ -1379,7 +1422,7 @@ async fn handle_client(
     if !client_sub_ids.is_empty() {
         let mut subs = state.subscriptions.lock().await;
         for id in &client_sub_ids {
-            subs.remove(id);
+            subscription_owner::remove(&mut subs, id)?;
         }
     }
     Ok(())
@@ -2048,11 +2091,14 @@ async fn dispatch_request(
         "subscribe" => parse_and_call(&request.params, |params: SubscribeParams| async move {
             let sub_id = uuid::Uuid::new_v4().to_string();
             let start_seq = state.event_bus.current_seq();
-            state
-                .subscriptions
-                .lock()
-                .await
-                .insert(sub_id.clone(), params.filter);
+            let mut subs = state.subscriptions.lock().await;
+            subscription_owner::insert(
+                &mut subs,
+                &state.wait_owners,
+                sub_id.clone(),
+                params.filter,
+            )?;
+            drop(subs);
             Ok(SubscriptionAck {
                 subscription_id: sub_id,
                 start_sequence: start_seq,
@@ -2062,7 +2108,7 @@ async fn dispatch_request(
         .map(to_value),
         "unsubscribe" => parse_and_call(&request.params, |params: UnsubscribeParams| async move {
             let mut subs = state.subscriptions.lock().await;
-            Ok(subs.remove(&params.subscription_id).is_some())
+            subscription_owner::remove(&mut subs, &params.subscription_id)
         })
         .await
         .map(to_value),
@@ -3362,18 +3408,64 @@ fn cleanup_runtime_files(socket_path: &Path, pid_path: &Path) -> Result<(), io::
 #[derive(Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
+    binding: chanvoy_core::runtime::RuntimeBinding,
 }
 
 impl DaemonClient {
+    /// Explicit legacy profile locator. Runtime-v1 callers must supply the
+    /// independently resolved record binding through `from_runtime_binding`.
     pub fn new(profile_name: &str) -> Self {
+        let binding = chanvoy_core::runtime::RuntimeBinding::legacy(profile_name);
         Self {
-            socket_path: socket_path_for_profile(profile_name),
+            socket_path: binding.socket_path().to_path_buf(),
+            binding,
         }
+    }
+
+    /// Read-only record-bound construction. Serving activation and independent
+    /// native/peer corroboration remain the lifecycle caller's responsibility.
+    pub fn from_runtime_binding(
+        binding: chanvoy_core::runtime::RuntimeBinding,
+    ) -> Result<Self, DaemonError> {
+        binding.verify()?;
+        Ok(Self {
+            socket_path: binding.socket_path().to_path_buf(),
+            binding,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn with_socket_path(socket_path: PathBuf) -> Self {
-        Self { socket_path }
+        Self {
+            binding: chanvoy_core::runtime::RuntimeBinding::legacy_socket(socket_path.clone()),
+            socket_path,
+        }
+    }
+
+    async fn connect_bound(&self) -> Result<UnixStream, DaemonError> {
+        self.binding.verify()?;
+        if !self.socket_path.exists() {
+            return Err(DaemonError::NotRunning(
+                self.socket_path.display().to_string(),
+            ));
+        }
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        if let Some(snapshot) = self.binding.record() {
+            let process = snapshot.record.process.as_ref().ok_or(
+                chanvoy_core::runtime::RuntimeError::Invalid("record peer process"),
+            )?;
+            let credentials = stream.peer_cred()?;
+            if credentials.uid() != process.uid || runtime_peer_pid(&stream)? != process.pid.get() {
+                return Err(chanvoy_core::runtime::RuntimeError::Changed(
+                    "record peer credentials",
+                )
+                .into());
+            }
+        }
+        self.binding.verify()?;
+        Ok(stream)
     }
 
     pub async fn whoami(&self) -> Result<chanvoy_core::Identity, DaemonError> {
@@ -3807,14 +3899,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitFollowEvent) -> Result<(), DaemonError>,
     {
-        if !self.socket_path.exists() {
-            return Err(DaemonError::NotRunning(
-                self.socket_path.display().to_string(),
-            ));
-        }
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let mut stream = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -3833,6 +3918,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            self.binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_FOLLOW_V1_EVENT_METHOD)
@@ -3920,14 +4006,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitFollowEvent) -> Result<(), DaemonError>,
     {
-        if !self.socket_path.exists() {
-            return Err(DaemonError::NotRunning(
-                self.socket_path.display().to_string(),
-            ));
-        }
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let mut stream = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_DM_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -3946,6 +4025,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            self.binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_FOLLOW_V1_EVENT_METHOD)
@@ -4033,14 +4113,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitInboxFollowEvent) -> Result<(), DaemonError>,
     {
-        if !self.socket_path.exists() {
-            return Err(DaemonError::NotRunning(
-                self.socket_path.display().to_string(),
-            ));
-        }
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let mut stream = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_INBOX_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -4059,6 +4132,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+            self.binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_INBOX_FOLLOW_V1_EVENT_METHOD)
@@ -4132,14 +4206,7 @@ impl DaemonClient {
         R: DeserializeOwned,
         F: FnMut(E) -> Result<(), DaemonError>,
     {
-        if !self.socket_path.exists() {
-            return Err(DaemonError::NotRunning(
-                self.socket_path.display().to_string(),
-            ));
-        }
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let stream = self.connect_bound().await?;
         let request = chanvoy_core::rpc_request(method, params);
         let (reader, mut writer) = stream.into_split();
         writer
@@ -4153,27 +4220,28 @@ impl DaemonClient {
         loop {
             let value = if let Some(rx) = cancel.as_mut() {
                 tokio::select! {
-                    biased;
-                    read = reader.read_line(&mut line) => {
-                        if read? == 0 {
-                            return Err(DaemonError::Rpc {
-                                code: -32_000,
-                                message: "held wait stream closed before terminal response".into(),
-                                data: None,
-                            });
+                        biased;
+                        read = reader.read_line(&mut line) => {
+                            if read? == 0 {
+                                return Err(DaemonError::Rpc {
+                                    code: -32_000,
+                                    message: "held wait stream closed before terminal response".into(),
+                                    data: None,
+                                });
+                            }
+                            let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+                self.binding.verify()?;
+                            line.clear();
+                            value
                         }
-                        let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-                        line.clear();
-                        value
-                    }
-                    _ = rx => {
-                        if let Some(mut write_half) = writer.take() {
-                            write_half.shutdown().await?;
+                        _ = rx => {
+                            if let Some(mut write_half) = writer.take() {
+                                write_half.shutdown().await?;
+                            }
+                            cancel = None;
+                            continue;
                         }
-                        cancel = None;
-                        continue;
                     }
-                }
             } else {
                 if reader.read_line(&mut line).await? == 0 {
                     return Err(DaemonError::Rpc {
@@ -4183,6 +4251,7 @@ impl DaemonClient {
                     });
                 }
                 let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
+                self.binding.verify()?;
                 line.clear();
                 value
             };
@@ -4315,14 +4384,7 @@ impl DaemonClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, DaemonError> {
-        if !self.socket_path.exists() {
-            return Err(DaemonError::NotRunning(
-                self.socket_path.display().to_string(),
-            ));
-        }
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
+        let mut stream = self.connect_bound().await?;
         let request = chanvoy_core::rpc_request(method, params);
         stream
             .write_all(serde_json::to_string(&request)?.as_bytes())
@@ -4333,6 +4395,7 @@ impl DaemonClient {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         let response: JsonRpcResponse = serde_json::from_str(line.trim_end())?;
+        self.binding.verify()?;
         if let Some(error) = response.error {
             return Err(DaemonError::Rpc {
                 code: error.code,
@@ -4347,6 +4410,11 @@ impl DaemonClient {
 
 pub fn daemon_client(profile_name: &str) -> DaemonClient {
     DaemonClient::new(profile_name)
+}
+
+fn runtime_peer_pid(stream: &UnixStream) -> Result<u32, DaemonError> {
+    use std::os::fd::AsFd;
+    Ok(chanvoy_core::runtime::native_peer_pid(stream.as_fd())?.get())
 }
 
 /// Devrev PR #20 P1 helper: round seconds up to the next whole minute,

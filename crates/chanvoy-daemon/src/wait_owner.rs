@@ -18,6 +18,13 @@ use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+// Non-wire ownership foundation. Runtime-control routing remains gated on
+// the reviewed schema pin and composed lifecycle activation.
+mod admission;
+#[cfg(test)]
+pub(crate) use admission::RetirementDecision;
+pub(crate) use admission::{AdmissionError, RequestPermit, RetainedOwner};
+
 /// Test-only barrier: park `complete_guard` after it has observed the
 /// reservation and released the registry lock, before it publishes ack.
 pub struct CompleteGuardHold {
@@ -71,6 +78,7 @@ pub struct WaitOwnerRegistry {
 
 #[derive(Debug)]
 struct Inner {
+    admission: admission::Inventory,
     slots: HashMap<String, LiveSlot>,
     next_generation: u64,
 }
@@ -144,8 +152,13 @@ impl Default for WaitOwnerRegistry {
 
 impl WaitOwnerRegistry {
     pub fn new() -> Self {
+        Self::for_instance(chanvoy_core::runtime::InstanceId::new())
+    }
+
+    pub(crate) fn for_instance(instance: chanvoy_core::runtime::InstanceId) -> Self {
         Self {
             inner: Mutex::new(Inner {
+                admission: admission::Inventory::new(instance),
                 slots: HashMap::new(),
                 next_generation: 1,
             }),
@@ -350,6 +363,10 @@ impl WaitOwnerRegistry {
 
         let prepared = {
             let mut inner = self.inner.lock().expect("wait registry");
+            inner
+                .admission
+                .ensure_running()
+                .map_err(|_| CoreError::RuntimeAdmissionClosed)?;
             if kind == WaitOwnerKind::Direct {
                 if let Some(slot) = inner
                     .slots
@@ -399,7 +416,9 @@ impl WaitOwnerRegistry {
                     generation,
                     started_at_ms,
                 } => {
-                    inner.next_generation = generation.saturating_add(1);
+                    inner.next_generation = generation
+                        .checked_add(1)
+                        .ok_or(CoreError::RuntimeOwnershipExhausted)?;
                     Prepared::Ready(self.install_locked(
                         &mut inner,
                         channel_id,
@@ -434,7 +453,9 @@ impl WaitOwnerRegistry {
                     new_generation,
                     started_at_ms,
                 } => {
-                    inner.next_generation = new_generation.saturating_add(1);
+                    inner.next_generation = new_generation
+                        .checked_add(1)
+                        .ok_or(CoreError::RuntimeOwnershipExhausted)?;
                     let slot = inner.slots.get_mut(channel_id).ok_or_else(|| {
                         CoreError::WaitConflictChanged {
                             team: team.to_string(),
@@ -492,6 +513,10 @@ impl WaitOwnerRegistry {
                     gate.notified().await;
                 }
                 let mut inner = self.inner.lock().expect("wait registry");
+                inner
+                    .admission
+                    .ensure_running()
+                    .map_err(|_| CoreError::RuntimeAdmissionClosed)?;
                 let current = inner.slots.get(channel_id).map(|s| s.view.clone());
                 if !can_install_replacement(current.as_ref(), old_generation, new_generation) {
                     if let Some(slot) = inner.slots.get_mut(channel_id) {

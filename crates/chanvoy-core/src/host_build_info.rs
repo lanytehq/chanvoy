@@ -17,6 +17,7 @@
 pub struct HostBuildInfo {
     pub version: String,
     /// Full git object name when known (prefer 40-char hex for machine pin).
+    #[serde(default, deserialize_with = "deserialize_commit")]
     pub commit: String,
     /// Short display form (typically 7 chars). Same as `commit` when unknown.
     pub commit_short: String,
@@ -65,14 +66,26 @@ fn short_from_full(commit: &str) -> String {
 
 /// Whether two host pins represent the same binary generation (PER-038A).
 ///
-/// Returns `None` when either commit is unknown — honest incomplete, not a
-/// false match. Dirty flags must also agree when both commits are known.
+/// Returns `None` when either commit or dirty flag is incomplete. Missing
+/// metadata on both sides is not proof of a matching generation.
 pub fn generation_match(cli: &HostBuildInfo, daemon: Option<&HostBuildInfo>) -> Option<bool> {
     let daemon = daemon?;
-    if cli.commit == "unknown" || daemon.commit == "unknown" {
+    if !valid_commit(&cli.commit) || !valid_commit(&daemon.commit) {
         return None;
     }
-    Some(cli.commit == daemon.commit && cli.dirty == daemon.dirty)
+    let cli_dirty = cli.dirty?;
+    let daemon_dirty = daemon.dirty?;
+    Some(cli.commit.eq_ignore_ascii_case(&daemon.commit) && cli_dirty == daemon_dirty)
+}
+
+fn valid_commit(commit: &str) -> bool {
+    commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn deserialize_commit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Basic line: `chanvoy <semver>`.
@@ -208,5 +221,52 @@ mod tests {
         let unknown = sample("unknown", "unknown", None);
         assert_eq!(generation_match(&a, Some(&unknown)), None);
         assert_eq!(generation_match(&unknown, Some(&a)), None);
+    }
+
+    #[test]
+    fn generation_match_requires_dirty_evidence_on_both_sides() {
+        let full = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for (cli_dirty, daemon_dirty) in [(None, None), (None, Some(false)), (Some(false), None)] {
+            let cli = sample(full, "aaaaaaa", cli_dirty);
+            let daemon = sample(full, "aaaaaaa", daemon_dirty);
+            assert_eq!(generation_match(&cli, Some(&daemon)), None);
+        }
+    }
+
+    #[test]
+    fn omitted_commit_is_incomplete_not_matching() {
+        let known = sample(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaa",
+            Some(false),
+        );
+        let mut json = serde_json::to_value(&known).unwrap();
+        json.as_object_mut().unwrap().remove("commit");
+        let incomplete: HostBuildInfo = serde_json::from_value(json).unwrap();
+        assert!(incomplete.commit.is_empty());
+        assert_eq!(generation_match(&known, Some(&incomplete)), None);
+        let mut json = serde_json::to_value(&known).unwrap();
+        json["commit"] = serde_json::Value::Null;
+        let incomplete: HostBuildInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(generation_match(&known, Some(&incomplete)), None);
+    }
+
+    #[test]
+    fn generation_match_rejects_malformed_commits() {
+        let valid = sample(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaa",
+            Some(false),
+        );
+        for commit in [
+            "",
+            "aaaaaaa",
+            "not-a-commit",
+            "gggggggggggggggggggggggggggggggggggggggg",
+        ] {
+            let invalid = sample(commit, commit, Some(false));
+            assert_eq!(generation_match(&valid, Some(&invalid)), None);
+            assert_eq!(generation_match(&invalid, Some(&invalid)), None);
+        }
     }
 }

@@ -2,6 +2,9 @@ pub mod bootstrap;
 pub mod doctor;
 pub mod host_build_info;
 pub mod recovery;
+pub mod request_ownership;
+#[cfg(unix)]
+pub mod runtime;
 pub mod safe_read;
 pub mod startup;
 pub mod wait_channels;
@@ -9,6 +12,7 @@ pub mod wait_dm;
 pub mod wait_follow;
 pub mod wait_inbox;
 pub mod wait_registry;
+pub mod websocket_ownership;
 
 pub use safe_read::{
     read_caller_named_file, read_credential_file, read_tool_owned_file, SafeReadError,
@@ -94,7 +98,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1976,6 +1980,11 @@ pub enum CoreError {
     RequiresElevatedCapability,
     #[error("timeout waiting for channel {0}")]
     WaitTimeout(String),
+    /// Local arena refusal. This is not a serialized runtime-control type.
+    #[error("runtime is retiring; operational admission is closed")]
+    RuntimeAdmissionClosed,
+    #[error("runtime ownership counter is exhausted")]
+    RuntimeOwnershipExhausted,
     /// PER-038: wait input/config hard failure (bad filter, empty
     /// needle, foreign/missing/substituted anchor). Never a deadman:
     /// agents reconfigure rather than re-arm with backoff alone.
@@ -3011,6 +3020,26 @@ struct AuthorCacheEntry {
     fetched_at: std::time::Instant,
 }
 
+/// Invocation-local evidence; a value fallback never clears a dropped lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupDisposition {
+    Returned,
+    InnerLookupDropped,
+}
+
+impl LookupDisposition {
+    fn combine(&mut self, other: Self) {
+        if other == Self::InnerLookupDropped {
+            *self = other;
+        }
+    }
+}
+
+struct Assessed<T> {
+    value: T,
+    disposition: LookupDisposition,
+}
+
 /// The provider's post shape, as chanvoy consumes it. Every read path
 /// (channel reads, pinned, most-recent, search, thread) decodes into
 /// this one type so a shape fix lands in a single place.
@@ -3293,13 +3322,23 @@ impl MattermostClient {
     /// us the name — an id an operator can look up beats a placeholder
     /// that pretends to be a person.
     pub async fn author_username(&self, user_id: &str) -> String {
+        self.author_username_assessed(user_id).await.value
+    }
+
+    async fn author_username_assessed(&self, user_id: &str) -> Assessed<String> {
         let mut wanted = BTreeSet::new();
         wanted.insert(user_id.to_string());
-        self.resolve_authors(&wanted)
-            .await
-            .get(user_id)
-            .cloned()
-            .unwrap_or_else(|| user_id.to_string())
+        let authors = self
+            .resolve_authors_assessed(&wanted, AUTHOR_RESOLVE_TIMEOUT)
+            .await;
+        Assessed {
+            value: authors
+                .value
+                .get(user_id)
+                .cloned()
+                .unwrap_or_else(|| user_id.to_string()),
+            disposition: authors.disposition,
+        }
     }
 
     /// Resolve display names for a set of author ids.
@@ -3312,7 +3351,12 @@ impl MattermostClient {
     ///
     /// Ids that could not be resolved are simply absent from the
     /// returned map; callers substitute the id itself.
-    async fn resolve_authors(&self, user_ids: &BTreeSet<String>) -> HashMap<String, String> {
+    async fn resolve_authors_assessed(
+        &self,
+        user_ids: &BTreeSet<String>,
+        deadline: Duration,
+    ) -> Assessed<HashMap<String, String>> {
+        let mut disposition = LookupDisposition::Returned;
         let mut resolved: HashMap<String, String> = HashMap::new();
         let mut missing: Vec<String> = Vec::new();
         {
@@ -3327,17 +3371,27 @@ impl MattermostClient {
             }
         }
         if missing.is_empty() {
-            return resolved;
+            return Assessed {
+                value: resolved,
+                disposition,
+            };
         }
 
         let mut fetched: Vec<(String, String)> = Vec::with_capacity(missing.len());
         for user_id in missing {
-            if let Some(username) = self.fetch_username(&user_id).await {
+            let lookup = self
+                .fetch_username_assessed_within(&user_id, deadline)
+                .await;
+            disposition.combine(lookup.disposition);
+            if let Some(username) = lookup.value {
                 fetched.push((user_id, username));
             }
         }
         if fetched.is_empty() {
-            return resolved;
+            return Assessed {
+                value: resolved,
+                disposition,
+            };
         }
 
         let now = std::time::Instant::now();
@@ -3346,7 +3400,10 @@ impl MattermostClient {
             insert_author_entry(&mut guard, user_id.clone(), username.clone(), now);
             resolved.insert(user_id, username);
         }
-        resolved
+        Assessed {
+            value: resolved,
+            disposition,
+        }
     }
 
     /// One author lookup. Returns `None` on any failure; the diagnostic
@@ -3361,6 +3418,16 @@ impl MattermostClient {
     /// so a test can prove the elapsed path without waiting out the
     /// production timeout.
     async fn fetch_username_within(&self, user_id: &str, deadline: Duration) -> Option<String> {
+        self.fetch_username_assessed_within(user_id, deadline)
+            .await
+            .value
+    }
+
+    async fn fetch_username_assessed_within(
+        &self,
+        user_id: &str,
+        deadline: Duration,
+    ) -> Assessed<Option<String>> {
         #[derive(Deserialize)]
         struct RawUser {
             username: String,
@@ -3375,10 +3442,13 @@ impl MattermostClient {
                     timeout_secs = deadline.as_secs(),
                     "author name lookup timed out; falling back to the user id"
                 );
-                return None;
+                return Assessed {
+                    value: None,
+                    disposition: LookupDisposition::InnerLookupDropped,
+                };
             }
         };
-        match outcome {
+        let value = match outcome {
             Ok(user) => Some(user.username),
             Err(err) => {
                 let reason = match &err {
@@ -3392,6 +3462,10 @@ impl MattermostClient {
                 );
                 None
             }
+        };
+        Assessed {
+            value,
+            disposition: LookupDisposition::Returned,
         }
     }
 
@@ -3403,12 +3477,23 @@ impl MattermostClient {
     /// ordering — search results stay in the provider's ranked order,
     /// channel reads sort chronologically.
     async fn hydrate_posts(&self, posts: Vec<RawPost>) -> Vec<Message> {
+        self.hydrate_posts_assessed(posts, AUTHOR_RESOLVE_TIMEOUT)
+            .await
+            .value
+    }
+
+    async fn hydrate_posts_assessed(
+        &self,
+        posts: Vec<RawPost>,
+        deadline: Duration,
+    ) -> Assessed<Vec<Message>> {
         let wanted: BTreeSet<String> = posts.iter().map(|p| p.user_id.clone()).collect();
-        let authors = self.resolve_authors(&wanted).await;
-        posts
+        let authors = self.resolve_authors_assessed(&wanted, deadline).await;
+        let value = posts
             .into_iter()
             .map(|post| {
                 let username = authors
+                    .value
                     .get(&post.user_id)
                     .cloned()
                     .unwrap_or_else(|| post.user_id.clone());
@@ -3423,7 +3508,11 @@ impl MattermostClient {
                     mention_user_ids: None,
                 }
             })
-            .collect()
+            .collect();
+        Assessed {
+            value,
+            disposition: authors.disposition,
+        }
     }
 
     /// Chronological order with a deterministic tie-break, used by
@@ -3936,6 +4025,17 @@ impl MattermostClient {
         channel_id: &str,
         since_millis: i64,
     ) -> Result<Vec<Message>, CoreError> {
+        Ok(self
+            .read_channel_by_id_since_millis_assessed(channel_id, since_millis)
+            .await?
+            .value)
+    }
+
+    async fn read_channel_by_id_since_millis_assessed(
+        &self,
+        channel_id: &str,
+        since_millis: i64,
+    ) -> Result<Assessed<Vec<Message>>, CoreError> {
         let response: PostsEnvelope = self
             .request(
                 "GET",
@@ -3946,9 +4046,12 @@ impl MattermostClient {
             )
             .await?;
         let mut posts = self
-            .hydrate_posts(response.posts.into_values().collect())
+            .hydrate_posts_assessed(
+                response.posts.into_values().collect(),
+                AUTHOR_RESOLVE_TIMEOUT,
+            )
             .await;
-        Self::sort_chronologically(&mut posts);
+        Self::sort_chronologically(&mut posts.value);
         Ok(posts)
     }
 
@@ -5708,6 +5811,21 @@ pub struct MattermostWs {
     inbox_armed: Arc<AtomicU64>,
 }
 
+fn ws_reserve(
+    execution: Option<&websocket_ownership::Execution>,
+) -> Result<Option<websocket_ownership::Operation>, CoreError> {
+    execution.map(|e| e.operations.reserve()).transpose()
+}
+fn ws_complete(operation: Option<websocket_ownership::Operation>, disposition: LookupDisposition) {
+    if let Some(operation) = operation {
+        if disposition == LookupDisposition::InnerLookupDropped {
+            operation.unresolved();
+        } else {
+            operation.complete();
+        }
+    }
+}
+
 impl MattermostWs {
     /// The websocket credential is taken from `client` rather than
     /// accepted as a parameter, so the websocket and the
@@ -5747,12 +5865,67 @@ impl MattermostWs {
         Arc::clone(&self.ws_state)
     }
 
-    pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    fn arm_recovery_owned(&self, execution: Option<&websocket_ownership::Execution>) {
+        let Some(execution) = execution else {
+            self.ws_state.arm_recovery_window();
+            return;
+        };
+        if self.ws_state.last_disconnect_at.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let target = now_unix_millis() + RECOVERY_GRACE_MS;
+        let generation = self.ws_state.reconnect_count.load(Ordering::Acquire);
+        self.ws_state
+            .recovering_until
+            .store(target, Ordering::Relaxed);
+        let ws = Arc::clone(&self.ws_state);
+        let operations = execution.operations.clone();
+        execution.register(async move {
+            if !operations
+                .delay(Duration::from_millis((RECOVERY_GRACE_MS + 10) as u64))
+                .await
+            {
+                return;
+            }
+            if ws.recovering_until.load(Ordering::Relaxed) != target {
+                return;
+            }
+            let started = tokio::time::Instant::now();
+            while ws.catchup_in_flight.load(Ordering::Relaxed) {
+                if started.elapsed() >= Duration::from_secs(60) {
+                    return;
+                }
+                if !operations.delay(Duration::from_millis(200)).await {
+                    return;
+                }
+            }
+            let Ok(owner) = operations.reserve() else {
+                return;
+            };
+            if !operations.stopped() {
+                ws.commit_recovery_open(target, generation).await;
+            }
+            owner.complete();
+        });
+    }
+
+    pub async fn run(self: Arc<Self>, shutdown: tokio::sync::watch::Receiver<bool>) {
+        self.run_execution(shutdown, None).await;
+    }
+
+    async fn run_execution(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        execution: Option<websocket_ownership::Execution>,
+    ) {
         let mut attempt: u64 = 0;
         loop {
-            if *shutdown.borrow() {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 break;
             }
+            let Ok(connect_owner) = ws_reserve(execution.as_ref()) else {
+                break;
+            };
             attempt += 1;
             self.ws_state.set_state(WsConnectionState::Connecting).await;
             self.event_bus.emit(DaemonEvent {
@@ -5768,20 +5941,31 @@ impl MattermostWs {
                 ),
             });
 
-            match self.connect_and_listen().await {
+            match self
+                .connect_and_listen_owned(&mut shutdown, execution.as_ref(), connect_owner)
+                .await
+            {
                 Ok(()) => {
                     info!("websocket session ended cleanly");
                 }
+                Err(CoreError::RuntimeAdmissionClosed) => break,
                 Err(e) => {
+                    let Ok(owner) = ws_reserve(execution.as_ref()) else {
+                        break;
+                    };
                     warn!(%e, "websocket session error");
                     self.ws_state.set_error(e.to_string()).await;
+                    ws_complete(owner, LookupDisposition::Returned);
                 }
             }
 
-            if *shutdown.borrow() {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 break;
             }
 
+            let Ok(owner) = ws_reserve(execution.as_ref()) else {
+                break;
+            };
             self.ws_state
                 .set_state(WsConnectionState::Disconnected)
                 .await;
@@ -5821,6 +6005,7 @@ impl MattermostWs {
                 Duration::from_secs(30)
             };
 
+            ws_complete(owner, LookupDisposition::Returned);
             tokio::select! {
                 _ = sleep(delay) => {}
                 _ = shutdown.changed() => {
@@ -5834,24 +6019,58 @@ impl MattermostWs {
             .await;
     }
 
-    async fn connect_and_listen(&self) -> Result<(), CoreError> {
-        let (ws_stream, _) = connect_async(&self.ws_url).await.map_err(|e| {
+    async fn connect_and_listen_owned(
+        &self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        execution: Option<&websocket_ownership::Execution>,
+        connect_owner: Option<websocket_ownership::Operation>,
+    ) -> Result<(), CoreError> {
+        if execution.is_some_and(|e| e.operations.stopped()) {
+            ws_complete(connect_owner, LookupDisposition::Returned);
+            return Err(CoreError::RuntimeAdmissionClosed);
+        }
+        let connected = connect_async(&self.ws_url).await.map_err(|e| {
             CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 e.to_string(),
             ))
-        })?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        let auth = serde_json::json!({
-            "seq": 1,
-            "action": "authentication_challenge",
-            "data": { "token": self.token }
         });
-        write
-            .send(WsMessage::Text(auth.to_string().into()))
-            .await
+        ws_complete(connect_owner, LookupDisposition::Returned);
+        let (ws_stream, _) = connected?;
+
+        self.listen_owned(
+            ws_stream,
+            shutdown,
+            execution,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    async fn listen_owned<S>(
+        &self,
+        ws_stream: tokio_tungstenite::WebSocketStream<S>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        execution: Option<&websocket_ownership::Execution>,
+        auth_window: Duration,
+        heartbeat_period: Duration,
+    ) -> Result<(), CoreError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (mut write, mut read) = ws_stream.split();
+        let mut residuals = Vec::new();
+        let result = async {
+            websocket_ownership::send_owned(execution, &mut write, &mut residuals, || {
+                let auth = serde_json::json!({
+                    "seq": 1,
+                    "action": "authentication_challenge",
+                    "data": { "token": self.token }
+                });
+                WsMessage::Text(auth.to_string().into())
+            })
+            .await?
             .map_err(|e| {
                 CoreError::Io(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -5859,129 +6078,160 @@ impl MattermostWs {
                 ))
             })?;
 
-        let mut authenticated = false;
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Auth window starts when the challenge is sent. Success may arrive as
-        // bare `hello` and/or `{"status":"OK","seq_reply":N}` in either order.
-        // Option (b): even after a provisional Healthy on the first success
-        // shape, keep treating is_auth_error as fatal until this deadline so a
-        // late FAIL/INVALID_TOKEN cannot be swallowed (devrev/entarch residual).
-        let auth_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut authenticated = false;
+            let mut heartbeat = tokio::time::interval(heartbeat_period);
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // Auth window starts when the challenge is sent. Success may arrive as
+            // bare `hello` and/or `{"status":"OK","seq_reply":N}` in either order.
+            // Option (b): even after a provisional Healthy on the first success
+            // shape, keep treating is_auth_error as fatal until this deadline so a
+            // late FAIL/INVALID_TOKEN cannot be swallowed (devrev/entarch residual).
+            let auth_deadline = tokio::time::Instant::now() + auth_window;
 
-        loop {
-            let now = tokio::time::Instant::now();
-            let in_auth_window = now < auth_deadline;
-            let remaining = if !authenticated {
-                auth_deadline.saturating_duration_since(now)
-            } else if in_auth_window {
-                // Stay selective until the auth window closes so a late FAIL
-                // can still be observed without a 3600s sleep arm.
-                auth_deadline.saturating_duration_since(now)
-            } else {
-                Duration::from_secs(3600)
-            };
+            loop {
+                // Buffered frames need not touch cooperative Tokio I/O. Let the
+                // timer driver and stop sender run even under continuous input.
+                tokio::task::consume_budget().await;
+                if execution.is_some() && (*shutdown.borrow() || shutdown.has_changed().is_err()) {
+                    return Ok(());
+                }
+                let now = tokio::time::Instant::now();
+                let in_auth_window = now < auth_deadline;
+                if !authenticated && !in_auth_window {
+                    return Err(CoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "websocket auth timed out waiting for server ack",
+                    )));
+                }
 
-            tokio::select! {
-                msg = read.next() => {
-                    match msg {
-                        Some(Ok(WsMessage::Text(text))) => {
-                            // Option (b): auth errors remain fatal for the whole
-                            // challenge window, including after provisional Healthy.
-                            if auth_error_still_fatal(authenticated, in_auth_window, &text) {
-                                if authenticated {
-                                    self.ws_state
-                                        .set_state(WsConnectionState::Disconnected)
-                                        .await;
-                                    self.ws_state
-                                        .set_error(format!(
-                                            "websocket auth rejected after provisional success: {text}"
-                                        ))
-                                        .await;
-                                    warn!(
-                                        "websocket auth rejected after provisional healthy (option b)"
-                                    );
-                                }
-                                return Err(CoreError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::PermissionDenied,
-                                    format!("websocket auth rejected: {text}"),
-                                )));
-                            }
-                            if !authenticated {
-                                if is_auth_success(&text) {
-                                    authenticated = true;
-                                    // Close recovery admission before Healthy
-                                    // clears the live error latch. Readers at
-                                    // this exact boundary remain conservative.
-                                    self.ws_state.prepare_authenticated_session();
-                                    self.ws_state.arm_recovery_window();
-                                    self.ws_state
-                                        .set_state(WsConnectionState::Healthy)
-                                        .await;
-                                    info!("websocket authenticated and healthy");
-                                    self.event_bus.emit(DaemonEvent {
-                                        seq: 0,
-                                        kind: DaemonEventKind::ConnectionStateChanged,
-                                        payload: DaemonEventPayloadInner::ConnectionStateChanged(
-                                            ConnectionStateChangedPayload {
-                                                profile: self.profile_name.clone(),
-                                                provider: Provider::Mattermost,
-                                                state: WsConnectionState::Healthy,
-                                                message: "connected and authenticated".to_string(),
-                                            },
-                                        ),
-                                    });
-                                    self.reconnect_catchup().await;
-                                }
-                                // Non-success, non-error frames before first
-                                // success are ignored (same as prior behavior).
-                            } else {
-                                self.handle_ws_message(&text).await;
-                            }
-                        }
-                        Some(Ok(WsMessage::Ping(data))) => {
-                            let _ = write.send(WsMessage::Pong(data)).await;
-                        }
-                        Some(Ok(WsMessage::Close(_))) | None => {
-                            return Ok(());
-                        }
-                        Some(Err(e)) => {
-                            return Err(CoreError::Io(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                e.to_string(),
-                            )));
-                        }
-                        _ => {}
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    if authenticated {
-                        let ping = serde_json::json!({
-                            "seq": 0,
-                            "action": "user_activity"
-                        });
-                        if write.send(WsMessage::Text(ping.to_string().into())).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(remaining) => {
-                    if !authenticated {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed(), if execution.is_some() => return Ok(()),
+                    _ = tokio::time::sleep_until(auth_deadline), if !authenticated => {
                         return Err(CoreError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "websocket auth timed out waiting for server ack",
                         )));
                     }
-                    // Authenticated + auth window elapsed: loop continues with
-                    // a long remaining sleep on the next iteration.
+                    _ = heartbeat.tick() => {
+                        if authenticated {
+                            let result = websocket_ownership::send_owned(execution, &mut write, &mut residuals, || {
+                                let ping = serde_json::json!({ "seq": 0, "action": "user_activity" });
+                                WsMessage::Text(ping.to_string().into())
+                            }).await?;
+                            if result.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    msg = read.next() => {
+                        // A read poll can itself cross the deadline. Never accept
+                        // late success merely because that poll returned a frame.
+                        let in_auth_window = tokio::time::Instant::now() < auth_deadline;
+                        if !authenticated && !in_auth_window {
+                            return Err(CoreError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "websocket auth timed out waiting for server ack",
+                            )));
+                        }
+                        match msg {
+                            Some(Ok(WsMessage::Text(text))) => {
+                                let mutating = auth_error_still_fatal(authenticated, in_auth_window, &text)
+                                    || (!authenticated && is_auth_success(&text))
+                                    || (authenticated && serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("event").and_then(Value::as_str).map(|e| matches!(e, "posted" | "post_edited" | "hello" | "status_change"))).unwrap_or(false));
+                                let owner = if mutating { ws_reserve(execution)? } else { None };
+                                let mut disposition = LookupDisposition::Returned;
+                                // Option (b): auth errors remain fatal for the whole
+                                // challenge window, including after provisional Healthy.
+                                if auth_error_still_fatal(authenticated, in_auth_window, &text) {
+                                    if authenticated {
+                                        self.ws_state
+                                            .set_state(WsConnectionState::Disconnected)
+                                            .await;
+                                        self.ws_state
+                                            .set_error(format!(
+                                                "websocket auth rejected after provisional success: {text}"
+                                            ))
+                                            .await;
+                                        warn!(
+                                            "websocket auth rejected after provisional healthy (option b)"
+                                        );
+                                    }
+                                    ws_complete(owner, LookupDisposition::Returned);
+                                    return Err(CoreError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        format!("websocket auth rejected: {text}"),
+                                    )));
+                                }
+                                if !authenticated {
+                                    if is_auth_success(&text) {
+                                        authenticated = true;
+                                        // Close recovery admission before Healthy
+                                        // clears the live error latch. Readers at
+                                        // this exact boundary remain conservative.
+                                        self.ws_state.prepare_authenticated_session();
+                                        self.arm_recovery_owned(execution);
+                                        self.ws_state
+                                            .set_state(WsConnectionState::Healthy)
+                                            .await;
+                                        info!("websocket authenticated and healthy");
+                                        self.event_bus.emit(DaemonEvent {
+                                            seq: 0,
+                                            kind: DaemonEventKind::ConnectionStateChanged,
+                                            payload: DaemonEventPayloadInner::ConnectionStateChanged(
+                                                ConnectionStateChangedPayload {
+                                                    profile: self.profile_name.clone(),
+                                                    provider: Provider::Mattermost,
+                                                    state: WsConnectionState::Healthy,
+                                                    message: "connected and authenticated".to_string(),
+                                                },
+                                            ),
+                                        });
+                                        disposition = self.reconnect_catchup_assessed().await;
+                                    }
+                                    // Non-success, non-error frames before first
+                                    // success are ignored (same as prior behavior).
+                                } else {
+                                    disposition = self.handle_ws_message_assessed(&text).await;
+                                }
+                                ws_complete(owner, disposition);
+                            }
+                            Some(Ok(WsMessage::Ping(data))) => {
+                                if websocket_ownership::send_owned(execution, &mut write, &mut residuals, || WsMessage::Pong(data)).await?.is_err() {
+                                    // Retire a failed sink before another read can
+                                    // automatically flush its retained output.
+                                    return Ok(());
+                                }
+                            }
+                            Some(Ok(WsMessage::Close(_))) | None => {
+                                return Ok(());
+                            }
+                            Some(Err(e)) => {
+                                return Err(CoreError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    e.to_string(),
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
+
                 }
             }
+        }.await;
+        // Both split halves share the native socket and its write buffer.
+        // No completion on cancellation/panic: Operation::drop stays unknown.
+        drop(read);
+        drop(write);
+        for owner in residuals {
+            owner.complete();
         }
+        result
     }
 
-    async fn handle_ws_message(&self, text: &str) {
+    async fn handle_ws_message_assessed(&self, text: &str) -> LookupDisposition {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
-            return;
+            return LookupDisposition::Returned;
         };
 
         let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
@@ -5989,23 +6239,28 @@ impl MattermostWs {
 
         match event {
             "posted" | "post_edited" => {
-                self.handle_post_event(&data).await;
+                return self.handle_post_event_assessed(&data).await;
             }
             "status_change" | "hello" => {
                 self.ws_state.touch_event();
             }
             _ => {}
         }
+        LookupDisposition::Returned
     }
 
+    #[cfg(test)]
     async fn handle_post_event(&self, data: &Value) {
+        self.handle_post_event_assessed(data).await;
+    }
+    async fn handle_post_event_assessed(&self, data: &Value) -> LookupDisposition {
         self.ws_state.touch_event();
 
         let Some(post_str) = data.get("post").and_then(|v| v.as_str()) else {
-            return;
+            return LookupDisposition::Returned;
         };
         let Ok(post): Result<Value, _> = serde_json::from_str(post_str) else {
-            return;
+            return LookupDisposition::Returned;
         };
 
         let post_id = post
@@ -6036,11 +6291,11 @@ impl MattermostWs {
             .to_string();
 
         if sender_id == self.my_user_id {
-            return;
+            return LookupDisposition::Returned;
         }
 
         if post_id.is_empty() || channel_id.is_empty() {
-            return;
+            return LookupDisposition::Returned;
         }
 
         let root_id = normalize_root_id(&raw_root_id, &post_id);
@@ -6048,7 +6303,7 @@ impl MattermostWs {
         {
             let mut seen = self.seen_posts.lock().await;
             if !seen.insert(post_id.clone()) {
-                return;
+                return LookupDisposition::Returned;
             }
             if seen.len() > 10000 {
                 let to_remove: Vec<String> = seen.iter().take(5000).cloned().collect();
@@ -6059,7 +6314,8 @@ impl MattermostWs {
         }
 
         let channel_name = self.resolve_channel_name(&channel_id).await;
-        let sender_username = self.resolve_username(&sender_id).await;
+        let author = self.client.author_username_assessed(&sender_id).await;
+        let sender_username = author.value;
         let mentioned = mentions_bot(&self.bot_username, &message);
 
         let is_monitored = self
@@ -6118,9 +6374,11 @@ impl MattermostWs {
             };
             self.event_bus.emit(event);
         }
+        author.disposition
     }
 
-    async fn reconnect_catchup(&self) {
+    async fn reconnect_catchup_assessed(&self) -> LookupDisposition {
+        let mut disposition = LookupDisposition::Returned;
         // `prepare_authenticated_session` marks catch-up in flight and resets
         // the cycle's gap before Healthy is published. If this outage exceeded
         // the five-minute window, re-flag it below; the recovery-window task
@@ -6135,15 +6393,17 @@ impl MattermostWs {
             };
             let Ok(messages) = self
                 .client
-                .read_channel_by_id_since_millis(&channel_id, five_min_ago)
+                .read_channel_by_id_since_millis_assessed(&channel_id, five_min_ago)
                 .await
             else {
                 continue;
             };
 
+            disposition.combine(messages.disposition);
             let mut seen = self.seen_posts.lock().await;
 
             let new_messages: Vec<_> = messages
+                .value
                 .into_iter()
                 .filter(|m| m.user_id != self.my_user_id && seen.insert(m.id.clone()))
                 .collect();
@@ -6199,6 +6459,7 @@ impl MattermostWs {
         self.ws_state
             .catchup_in_flight
             .store(false, Ordering::Relaxed);
+        disposition
     }
 
     // TODO: this fetches the bot's entire channel list on every inbound
@@ -6212,13 +6473,6 @@ impl MattermostWs {
             .find(|c| c.id == channel_id)
             .map(|c| c.name.clone())
             .unwrap_or_else(|| channel_id.to_string())
-    }
-
-    /// Author name for an inbound push event. Delegates to the shared
-    /// client helper so pushed messages and messages read back over
-    /// REST can never disagree about who wrote something.
-    async fn resolve_username(&self, user_id: &str) -> String {
-        self.client.author_username(user_id).await
     }
 }
 
@@ -8703,6 +8957,129 @@ monitored_channels = ["per-003", "per-004"]
                 ipc: None,
                 reduce: None,
             }
+        }
+
+        #[tokio::test]
+        async fn assessed_lookup_separates_elapsed_from_returned_errors() {
+            let server = MockServer::start().await;
+            for (id, response) in [
+                (
+                    "slow",
+                    ResponseTemplate::new(200).set_delay(Duration::from_secs(30)),
+                ),
+                ("http", ResponseTemplate::new(500)),
+                (
+                    "decode",
+                    ResponseTemplate::new(200).set_body_string("invalid"),
+                ),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/api/v4/users/{id}")))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+            }
+            let client =
+                MattermostClient::new(&seat_profile(&server.uri()), "test-token".into()).unwrap();
+            for (id, expected) in [
+                ("slow", LookupDisposition::InnerLookupDropped),
+                ("http", LookupDisposition::Returned),
+                ("decode", LookupDisposition::Returned),
+            ] {
+                let result = client
+                    .fetch_username_assessed_within(id, Duration::from_millis(50))
+                    .await;
+                assert!(result.value.is_none());
+                assert_eq!(result.disposition, expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn assessed_batches_preserve_timeouts_across_early_return_and_success() {
+            let server = MockServer::start().await;
+            for id in ["a-slow", "z-slow"] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/api/v4/users/{id}")))
+                    .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/m-good"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"username":"good"})),
+                )
+                .mount(&server)
+                .await;
+            let client =
+                MattermostClient::new(&seat_profile(&server.uri()), "test-token".into()).unwrap();
+            for ids in [
+                vec!["a-slow"],
+                vec!["a-slow", "m-good"],
+                vec!["m-good", "z-slow"],
+            ] {
+                let wanted = ids.iter().map(|id| id.to_string()).collect();
+                let assessed = client
+                    .resolve_authors_assessed(&wanted, Duration::from_millis(50))
+                    .await;
+                assert_eq!(assessed.disposition, LookupDisposition::InnerLookupDropped);
+                assert!(!assessed.value.contains_key("a-slow"));
+                assert!(!assessed.value.contains_key("z-slow"));
+            }
+            let empty = client
+                .resolve_authors_assessed(&BTreeSet::new(), Duration::ZERO)
+                .await;
+            assert_eq!(empty.disposition, LookupDisposition::Returned);
+            let cached = client
+                .resolve_authors_assessed(&BTreeSet::from(["m-good".into()]), Duration::ZERO)
+                .await;
+            assert_eq!(cached.disposition, LookupDisposition::Returned);
+            assert_eq!(cached.value["m-good"], "good");
+            let cache = client.author_cache.read().await;
+            assert!(!cache.contains_key("a-slow"));
+            assert!(!cache.contains_key("z-slow"));
+        }
+
+        #[tokio::test]
+        async fn assessed_public_routes_carry_timeout_through_hydration_and_legacy_concurrency() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/slow"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/good"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"username":"known"})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/channels/ch/posts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "posts": {"p": {"id":"p", "user_id":"slow", "message":"test", "create_at":1}}
+                })))
+                .mount(&server)
+                .await;
+            let client =
+                MattermostClient::new(&seat_profile(&server.uri()), "test-token".into()).unwrap();
+            // Exercise both real production routes with their actual deadline,
+            // while an unrelated legacy lookup completes on the shared client.
+            let (inbound, catchup, legacy) = tokio::join!(
+                client.author_username_assessed("slow"),
+                client.read_channel_by_id_since_millis_assessed("ch", 0),
+                client.author_username("good"),
+            );
+            assert_eq!(inbound.value, "slow");
+            assert_eq!(inbound.disposition, LookupDisposition::InnerLookupDropped);
+            let catchup = catchup.unwrap();
+            assert_eq!(catchup.value[0].username, "slow");
+            assert_eq!(catchup.disposition, LookupDisposition::InnerLookupDropped);
+            assert_eq!(legacy, "known");
+            assert!(!client.author_cache.read().await.contains_key("slow"));
         }
 
         /// A cached name is re-fetched once its entry has aged out, and

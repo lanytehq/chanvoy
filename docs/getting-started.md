@@ -10,6 +10,7 @@ teams, and pick up where you left off across sessions.
 >
 > ```bash
 > chanvoy auto-setup                  # one-time per shell session
+> # Exit 6: mismatched/unknown daemon generation retained; inspect before proceeding.
 > # make install updates the CLI and reports candidates; it never cycles them.
 > # Manual migration needs owning identity, same-candidate death and guarded cleanup.
 > # Prove dual pin (CLI + daemon generation_match):
@@ -576,14 +577,18 @@ cargo build -p chanvoy --bin chanvoy
 ./target/debug/chanvoy --version
 ```
 
-When iterating on daemon code, remember to restart the daemon to pick
-up a fresh binary:
+When iterating on daemon code, a running daemon keeps its old binary. Build
+without installing, then inspect the explicit-profile generation:
 
 ```bash
-chanvoy daemon stop
 cargo build -p chanvoy --bin chanvoy
-chanvoy auto-setup    # respawns on the new binary
+./target/debug/chanvoy --profile <name> daemon status
 ```
+
+Generation-only setup refuses mismatched or unknown reuse with exit 6. Follow
+[the confirmed migration procedure](./operator-guide.md#installation-and-daemon-migration)
+before a separate start; a worktree executable does not establish ownership of
+an installed-path daemon. Never use an unconditional stop/start chain.
 
 The CI-exact merge gate is `make pr-final`; run it locally before
 opening a PR.

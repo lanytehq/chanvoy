@@ -1,3 +1,12 @@
+mod lifecycle_audit;
+mod request_frontier;
+mod subscription_owner;
+use subscription_owner::SubscriptionEntry;
+#[cfg(test)]
+mod request_tests;
+use chanvoy_core::request_ownership::RequestAdmission;
+use request_frontier::{RequestTransport, SendResult};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -7,7 +16,7 @@ use chanvoy_core::{
     MattermostClient, Message, Profile, SubscriptionFilter,
 };
 use ipcprims::frame::Frame;
-use ipcprims::peer::{async_connect_with_config, AsyncPeerTx, HandshakeConfig, PeerConfig};
+use ipcprims::peer::{async_connect_with_config, HandshakeConfig, PeerConfig};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -499,10 +508,6 @@ fn non_empty_root(root_id: &str) -> Option<String> {
     }
 }
 
-struct SubscriptionEntry {
-    filter: IpcSubscriptionFilter,
-}
-
 #[derive(Debug, Clone)]
 pub struct IpcPeerState {
     pub connected: bool,
@@ -511,6 +516,7 @@ pub struct IpcPeerState {
 }
 
 pub struct IpcPeer {
+    request_admission: Arc<dyn RequestAdmission>,
     client: MattermostClient,
     event_bus: Arc<EventBus>,
     #[allow(dead_code)]
@@ -533,8 +539,10 @@ impl IpcPeer {
         event_bus: Arc<EventBus>,
         gateway_socket: String,
         identity_drift: Arc<AtomicBool>,
+        request_admission: Arc<dyn RequestAdmission>,
     ) -> Self {
         Self {
+            request_admission,
             client,
             event_bus,
             profile: profile.clone(),
@@ -612,6 +620,14 @@ impl IpcPeer {
         }
     }
 
+    fn forwarding_state(&self) -> subscription_owner::Forwarding {
+        subscription_owner::Forwarding {
+            subscriptions: Arc::clone(&self.subscriptions),
+            admission: Arc::clone(&self.request_admission),
+            identity_drift: Arc::clone(&self.identity_drift),
+        }
+    }
+
     async fn connect_and_serve(
         &self,
         cancel: CancellationToken,
@@ -647,103 +663,81 @@ impl IpcPeer {
         let (tx, mut rx) = peer.into_split();
         let mut channel_rx = rx.take_channel_receiver(CHANNEL_260);
 
-        let event_bus = Arc::clone(&self.event_bus);
-        let mut event_rx = event_bus.subscribe();
-        let tx_clone = tx.clone();
-        let subscriptions = Arc::clone(&self.subscriptions);
-        let cancel_fwd = cancel.clone();
+        let forwarding = self.forwarding_state();
+        let forward_handle =
+            tokio::spawn(forwarding.run(self.event_bus.subscribe(), tx.clone(), cancel.clone()));
         let audit_peer_id = peer_id.clone();
-        let drift_for_fwd = Arc::clone(&self.identity_drift);
 
-        let forward_handle = tokio::spawn(async move {
+        let serve = async {
             loop {
                 tokio::select! {
-                    recv_result = event_rx.recv() => {
-                        match recv_result {
-                            Ok(event) => {
-                                // PER-014: drop Mattermost-sourced events
-                                // when identity drift is set. Same contract
-                                // as the local UDS subscription path —
-                                // operators query daemon_status to learn
-                                // why events stopped, then re-run
-                                // `chanvoy auto-setup`. Per
-                                // @agent-entarch-lanytehq's PR #16
-                                // finding (2026-04-28).
-                                if drift_for_fwd.load(Ordering::Relaxed) {
-                                    continue;
-                                }
-                                let subs = subscriptions.lock().await;
-                                for (sub_id, entry) in subs.iter() {
-                                    if event_matches_ipc_filter(&event, &entry.filter) {
-                                        if let DaemonEventPayloadInner::Gap(g) = &event.payload {
-                                            let gap = ChatFrame::SubscriptionGap {
-                                                subscription_id: sub_id.clone(),
-                                                expected_seq: g.missed_from_seq,
-                                                next_seq: g.missed_to_seq,
-                                                reason: "overflow".to_string(),
-                                                message: Some(format!(
-                                                    "missed {} events",
-                                                    g.missed_to_seq.saturating_sub(g.missed_from_seq)
-                                                )),
-                                            };
-                                            let payload = serde_json::to_vec(&gap).unwrap_or_default();
-                                            if tx_clone.send(CHANNEL_260, &payload).await.is_err() {
-                                                return;
-                                            }
-                                        } else if let Some(notification) = daemon_event_to_chat_notification(&event, sub_id) {
-                                            let payload = serde_json::to_vec(&notification).unwrap_or_default();
-                                            if tx_clone.send(CHANNEL_260, &payload).await.is_err() {
-                                                return;
-                                            }
-                                        }
-                                    }
+                    frame_result = async {
+                        match channel_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match frame_result {
+                            Ok(frame) => {
+                                if let Err(error) = self.handle_frame(frame, &tx, &audit_peer_id).await {
+                                    break Err(error);
                                 }
                             }
-                            Err(_) => return,
+                            Err(_) => {
+                                break Ok(());
+                            }
                         }
                     }
-                    _ = cancel_fwd.cancelled() => return,
+                    _ = cancel.cancelled() => {
+                        break Ok(());
+                    }
                 }
             }
-        });
+        };
+        lifecycle_audit::session(
+            self.request_admission.as_ref(),
+            &tx,
+            &audit_peer_id,
+            forward_handle,
+            serve,
+        )
+        .await
+    }
 
-        emit_audit(&tx, &audit_peer_id, "chat.peer_connected", None, "info").await;
-
-        loop {
-            tokio::select! {
-                frame_result = async {
-                    match channel_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match frame_result {
-                        Ok(frame) => {
-                            self.handle_frame(frame, &tx, &audit_peer_id).await;
-                        }
-                        Err(_) => {
-                            break;
-                        }
-                    }
-                }
-                _ = cancel.cancelled() => {
-                    break;
-                }
-            }
+    async fn handle_frame<T: RequestTransport>(
+        &self,
+        frame: Frame,
+        tx: &T,
+        peer_id: &str,
+    ) -> SendResult {
+        let Ok(chat_frame) = serde_json::from_slice::<ChatFrame>(&frame.payload) else {
+            return Ok(());
+        };
+        if !matches!(
+            &chat_frame,
+            ChatFrame::ChannelListRequest { .. }
+                | ChatFrame::ChannelGetRequest { .. }
+                | ChatFrame::ReadRequest { .. }
+                | ChatFrame::PostRequest { .. }
+                | ChatFrame::SubscribeRequest { .. }
+                | ChatFrame::UnsubscribeRequest { .. }
+        ) {
+            return Ok(());
         }
-
-        emit_audit(&tx, &audit_peer_id, "chat.peer_disconnected", None, "info").await;
-
-        forward_handle.abort();
-        let _ = tx.shutdown().await;
+        let owner = self.request_admission.reserve_request()?;
+        self.dispatch_frame(chat_frame, tx, peer_id, owner.as_ref())
+            .await?;
+        owner.confirm_done()?;
         Ok(())
     }
 
-    async fn handle_frame(&self, frame: Frame, tx: &AsyncPeerTx, peer_id: &str) {
-        let Ok(chat_frame) = serde_json::from_slice::<ChatFrame>(&frame.payload) else {
-            return;
-        };
-
+    async fn dispatch_frame<T: RequestTransport>(
+        &self,
+        chat_frame: ChatFrame,
+        tx: &T,
+        peer_id: &str,
+        owner: &dyn chanvoy_core::request_ownership::RequestCompletion,
+    ) -> SendResult {
         match chat_frame {
             ChatFrame::ChannelListRequest {
                 request_id,
@@ -752,10 +746,9 @@ impl IpcPeer {
                 include_archived,
             } => {
                 if self.identity_drift.load(Ordering::Relaxed) {
-                    let _ = self
-                        .send_response(tx, &Self::drift_refusal(request_id))
-                        .await;
-                    return;
+                    self.send_response(tx, &Self::drift_refusal(request_id))
+                        .await?;
+                    return Ok(());
                 }
                 let _ = &delegation_id;
                 let result = self.client.list_channels().await;
@@ -775,7 +768,7 @@ impl IpcPeer {
                     }
                     Err(e) => core_error_to_chat(e, &request_id),
                 };
-                let _ = self.send_response(tx, &response).await;
+                self.send_response(tx, &response).await?;
             }
             ChatFrame::ReadRequest {
                 request_id,
@@ -785,10 +778,9 @@ impl IpcPeer {
                 limit,
             } => {
                 if self.identity_drift.load(Ordering::Relaxed) {
-                    let _ = self
-                        .send_response(tx, &Self::drift_refusal(request_id))
-                        .await;
-                    return;
+                    self.send_response(tx, &Self::drift_refusal(request_id))
+                        .await?;
+                    return Ok(());
                 }
                 let _ = &delegation_id;
                 let response = if let Some(root_id) = &thread_root_id {
@@ -798,7 +790,7 @@ impl IpcPeer {
                     self.channel_read_response(request_id, channel_id, limit)
                         .await
                 };
-                let _ = self.send_response(tx, &response).await;
+                self.send_response(tx, &response).await?;
             }
             ChatFrame::PostRequest {
                 request_id,
@@ -809,10 +801,9 @@ impl IpcPeer {
                 thread_root_id,
             } => {
                 if self.identity_drift.load(Ordering::Relaxed) {
-                    let _ = self
-                        .send_response(tx, &Self::drift_refusal(request_id))
-                        .await;
-                    return;
+                    self.send_response(tx, &Self::drift_refusal(request_id))
+                        .await?;
+                    return Ok(());
                 }
                 let _ = &delegation_id;
                 if gate_token.is_empty() {
@@ -822,8 +813,8 @@ impl IpcPeer {
                         message: "gate_token is required for post operations".to_string(),
                         retryable: Some(false),
                     };
-                    let _ = self.send_response(tx, &err).await;
-                    return;
+                    self.send_response(tx, &err).await?;
+                    return Ok(());
                 }
                 let result = if let Some(root_id) = &thread_root_id {
                     self.client
@@ -849,7 +840,7 @@ impl IpcPeer {
                             })),
                             "notice",
                         )
-                        .await;
+                        .await?;
                         ChatFrame::PostResponse {
                             request_id,
                             post: PostSummary {
@@ -864,7 +855,7 @@ impl IpcPeer {
                     }
                     Err(e) => core_error_to_chat(e, &request_id),
                 };
-                let _ = self.send_response(tx, &response).await;
+                self.send_response(tx, &response).await?;
             }
             ChatFrame::ChannelGetRequest {
                 request_id,
@@ -872,10 +863,9 @@ impl IpcPeer {
                 channel_id,
             } => {
                 if self.identity_drift.load(Ordering::Relaxed) {
-                    let _ = self
-                        .send_response(tx, &Self::drift_refusal(request_id))
-                        .await;
-                    return;
+                    self.send_response(tx, &Self::drift_refusal(request_id))
+                        .await?;
+                    return Ok(());
                 }
                 let _ = &delegation_id;
                 let result = self.client.list_channels().await;
@@ -897,7 +887,7 @@ impl IpcPeer {
                     }
                     Err(e) => core_error_to_chat(e, &request_id),
                 };
-                let _ = self.send_response(tx, &response).await;
+                self.send_response(tx, &response).await?;
             }
             ChatFrame::SubscribeRequest {
                 request_id,
@@ -906,10 +896,9 @@ impl IpcPeer {
                 resume_after_seq,
             } => {
                 if self.identity_drift.load(Ordering::Relaxed) {
-                    let _ = self
-                        .send_response(tx, &Self::drift_refusal(request_id))
-                        .await;
-                    return;
+                    self.send_response(tx, &Self::drift_refusal(request_id))
+                        .await?;
+                    return Ok(());
                 }
                 let _ = &delegation_id;
                 let sub_id = uuid::Uuid::new_v4().to_string();
@@ -934,13 +923,13 @@ impl IpcPeer {
                                 start_seq
                             )),
                         };
-                        let _ = self.send_response(tx, &gap).await;
+                        self.send_response(tx, &gap).await?;
                     }
                 }
 
                 {
                     let mut subs = self.subscriptions.lock().await;
-                    subs.insert(sub_id.clone(), SubscriptionEntry { filter: ipc_filter });
+                    subscription_owner::insert(&mut subs, sub_id.clone(), ipc_filter, owner)?;
                 }
 
                 emit_audit(
@@ -950,14 +939,14 @@ impl IpcPeer {
                     Some(serde_json::json!({ "subscription_id": &sub_id })),
                     "info",
                 )
-                .await;
+                .await?;
 
                 let response = ChatFrame::SubscribeResponse {
                     request_id,
                     subscription_id: sub_id,
                     starting_seq: start_seq,
                 };
-                let _ = self.send_response(tx, &response).await;
+                self.send_response(tx, &response).await?;
             }
             ChatFrame::UnsubscribeRequest {
                 request_id,
@@ -967,7 +956,7 @@ impl IpcPeer {
                 let _ = &delegation_id;
                 let removed = {
                     let mut subs = self.subscriptions.lock().await;
-                    subs.remove(&subscription_id).is_some()
+                    subscription_owner::remove(&mut subs, &subscription_id)?
                 };
                 if removed {
                     emit_audit(
@@ -977,16 +966,17 @@ impl IpcPeer {
                         Some(serde_json::json!({ "subscription_id": &subscription_id })),
                         "info",
                     )
-                    .await;
+                    .await?;
                 }
                 let response = ChatFrame::UnsubscribeResponse {
                     request_id,
                     success: removed,
                 };
-                let _ = self.send_response(tx, &response).await;
+                self.send_response(tx, &response).await?;
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// The ordinary (non-thread) branch of a read request: a time
@@ -1118,9 +1108,9 @@ impl IpcPeer {
         }
     }
 
-    async fn send_response(
+    async fn send_response<T: RequestTransport>(
         &self,
-        tx: &AsyncPeerTx,
+        tx: &T,
         frame: &ChatFrame,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = serde_json::to_vec(frame)?;
@@ -1129,13 +1119,13 @@ impl IpcPeer {
     }
 }
 
-async fn emit_audit(
-    tx: &AsyncPeerTx,
+async fn emit_audit<T: RequestTransport>(
+    tx: &T,
     peer_id: &str,
     action: &str,
     details: Option<serde_json::Value>,
     severity: &str,
-) {
+) -> SendResult {
     let event = AuditEvent {
         event_type: "audit_event".to_string(),
         entry_id: uuid::Uuid::new_v4().to_string(),
@@ -1147,14 +1137,22 @@ async fn emit_audit(
         details,
         severity: Some(severity.to_string()),
     };
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        let _ = tx.send(CHANNEL_3, &payload).await;
-    }
+    let payload = serde_json::to_vec(&event)?;
+    tx.send(CHANNEL_3, &payload).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct RefuseRequests;
+    impl RequestAdmission for RefuseRequests {
+        fn reserve_request(
+            &self,
+        ) -> Result<Box<dyn chanvoy_core::request_ownership::RequestCompletion>, CoreError>
+        {
+            Err(CoreError::RuntimeAdmissionClosed)
+        }
+    }
 
     #[test]
     fn core_error_maps_permission_denied() {
@@ -1734,6 +1732,7 @@ mod tests {
                 Arc::new(EventBus::new(16)),
                 "unused-gateway-socket".to_string(),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(RefuseRequests),
             )
         }
 

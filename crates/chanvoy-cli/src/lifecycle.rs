@@ -83,6 +83,201 @@ struct NativeControl {
     death_seen: Mutex<Option<Instant>>,
 }
 
+/// Read-only binding for a daemon observation. This carries no signaling or
+/// cleanup authority and does not require a pid file to inspect a live peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReuseCandidate {
+    binding: chanvoy_core::runtime::RuntimeBinding,
+    socket: FileStamp,
+    pid: u32,
+    birth: u64,
+    uid: u32,
+    native: Option<ProcessIdentity>,
+}
+
+impl ReuseCandidate {
+    pub(super) async fn capture(profile: &str) -> Option<Self> {
+        Self::capture_binding(chanvoy_core::runtime::RuntimeBinding::legacy(profile))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(test)]
+    async fn capture_path(path: &Path) -> Option<Self> {
+        Self::capture_binding(chanvoy_core::runtime::RuntimeBinding::legacy_socket(
+            path.to_path_buf(),
+        ))
+        .await
+        .ok()
+        .flatten()
+    }
+
+    pub(super) async fn capture_binding(
+        binding: chanvoy_core::runtime::RuntimeBinding,
+    ) -> Result<Option<Self>, chanvoy_core::runtime::RuntimeError> {
+        binding.verify()?;
+        let observed = Self::capture_bound_inner(binding.clone()).await;
+        binding.verify()?;
+        Ok(observed)
+    }
+
+    async fn capture_bound_inner(binding: chanvoy_core::runtime::RuntimeBinding) -> Option<Self> {
+        let path = binding.socket_path();
+        let before = stamp(path).ok()??;
+        if !std::fs::symlink_metadata(path)
+            .ok()?
+            .file_type()
+            .is_socket()
+        {
+            return None;
+        }
+        let SocketOwner::Live(pid) = peer_owner(path, Duration::from_millis(750)).await else {
+            return None;
+        };
+        let birth = native_birth(pid)?;
+        let uid = native_owner(pid)?;
+        // SAFETY: geteuid has no pointer arguments or preconditions and only
+        // observes this process's effective user identity.
+        if uid != unsafe { libc::geteuid() }
+            || native_terminated(pid)
+            || native_birth(pid) != Some(birth)
+            || native_owner(pid) != Some(uid)
+            || stamp(path).ok()?.as_ref() != Some(&before)
+        {
+            return None;
+        }
+        let native = if let Some(snapshot) = binding.record() {
+            let record = &snapshot.record;
+            if record.phase != chanvoy_core::runtime::RuntimePhase::Running {
+                return None;
+            }
+            let process = record.process.as_ref()?;
+            if process.pid.get() != pid
+                || process.uid != uid
+                || birth_claim(&process.birth)? != birth
+            {
+                return None;
+            }
+            let ProcessObservation::Alive(identity) = observe_pid(pid) else {
+                return None;
+            };
+            if Path::new(&identity.executable) != process.executable.to_path()
+                || unique_argument(&identity.args, "--runtime-namespace")
+                    != Some(record.namespace.hex())
+                || unique_argument(&identity.args, "--runtime-instance")
+                    != Some(record.instance_uuid.uuid().to_string().as_str())
+                || !namespace_claims_match(process)
+            {
+                return None;
+            }
+            Some(identity)
+        } else {
+            None
+        };
+        if native_birth(pid) != Some(birth)
+            || native_owner(pid) != Some(uid)
+            || native_terminated(pid)
+            || stamp(path).ok()?.as_ref() != Some(&before)
+        {
+            return None;
+        }
+        Some(Self {
+            binding,
+            socket: before,
+            pid,
+            birth,
+            uid,
+            native,
+        })
+    }
+
+    pub(super) async fn unchanged(&self) -> bool {
+        Self::capture_binding(self.binding.clone())
+            .await
+            .ok()
+            .flatten()
+            .as_ref()
+            == Some(self)
+    }
+
+    pub(super) fn binding(&self) -> &chanvoy_core::runtime::RuntimeBinding {
+        &self.binding
+    }
+
+    pub(super) fn terminated(&self) -> bool {
+        native_birth(self.pid).is_some_and(|birth| birth != self.birth)
+            || native_terminated(self.pid)
+            || matches!(death_or_unknown(self.pid), ProcessObservation::Dead)
+    }
+}
+
+fn unique_argument<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let mut result = None;
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            if result.is_some() {
+                return None;
+            }
+            result = Some(args.get(index + 1)?.as_str());
+        } else if arg.starts_with(&format!("{flag}=")) {
+            return None;
+        }
+    }
+    result.filter(|v| !v.is_empty() && !v.starts_with('-'))
+}
+fn birth_claim(birth: &chanvoy_core::runtime::NativeBirth) -> Option<u64> {
+    match birth {
+        chanvoy_core::runtime::NativeBirth::Linux { clock_ticks } => Some(*clock_ticks),
+        chanvoy_core::runtime::NativeBirth::MacOs {
+            seconds,
+            microseconds,
+        } => seconds
+            .checked_mul(1_000_000)?
+            .checked_add(u64::from(*microseconds)),
+    }
+}
+fn namespace_claims_match(process: &chanvoy_core::runtime::RuntimeProcess) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if !matches!(
+            process.birth,
+            chanvoy_core::runtime::NativeBirth::Linux { .. }
+        ) {
+            return false;
+        }
+        for (name, expected) in [
+            ("pid", process.pid_namespace),
+            ("mnt", process.mount_namespace),
+        ] {
+            let Some(expected) = expected else {
+                return false;
+            };
+            let Ok(meta) = std::fs::metadata(format!("/proc/{}/ns/{name}", process.pid.get()))
+            else {
+                return false;
+            };
+            if meta.dev() != expected.device || meta.ino() != expected.inode {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            process.birth,
+            chanvoy_core::runtime::NativeBirth::MacOs { .. }
+        ) && process.pid_namespace.is_none()
+            && process.mount_namespace.is_none()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = process;
+        false
+    }
+}
+
 /// The parent's Child handle supplies death proof; these stamps separately
 /// govern its failed-start runtime cleanup. Capture before finalization.
 pub(super) struct FailedChildRuntime {
@@ -1130,6 +1325,88 @@ async fn stop_confirmed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_markers_are_unique_explicit_and_birth_encoding_never_wraps() {
+        use super::{birth_claim, unique_argument};
+        let args = vec![
+            "chanvoy".into(),
+            "--runtime-namespace".into(),
+            "abc".into(),
+            "--runtime-instance".into(),
+            "def".into(),
+        ];
+        assert_eq!(unique_argument(&args, "--runtime-namespace"), Some("abc"));
+        for bad in [
+            vec!["--runtime-namespace".into()],
+            vec!["--runtime-namespace".into(), "--runtime-instance".into()],
+            vec!["--runtime-namespace=abc".into()],
+            vec![
+                "--runtime-namespace".into(),
+                "abc".into(),
+                "--runtime-namespace".into(),
+                "abc".into(),
+            ],
+        ] {
+            assert!(unique_argument(&bad, "--runtime-namespace").is_none());
+        }
+        assert_eq!(
+            birth_claim(&chanvoy_core::runtime::NativeBirth::MacOs {
+                seconds: 1,
+                microseconds: 2
+            }),
+            Some(1_000_002)
+        );
+        assert!(birth_claim(&chanvoy_core::runtime::NativeBirth::MacOs {
+            seconds: u64::MAX,
+            microseconds: 2
+        })
+        .is_none());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn read_only_candidate_binds_birth_uid_and_socket_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("candidate.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let before = super::ReuseCandidate::capture_path(&path)
+            .await
+            .expect("owned native listener evidence");
+        assert_eq!(before.pid, std::process::id());
+        assert_eq!(
+            super::ReuseCandidate::capture_path(&path).await.as_ref(),
+            Some(&before)
+        );
+        assert!(!before.terminated());
+        assert!(before.unchanged().await);
+        assert_eq!(before.binding().socket_path(), path);
+
+        // Simulate an external replacement of this test-owned endpoint. The
+        // old listener stays open, so this is not a pathname-only death proof.
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let after = super::ReuseCandidate::capture_path(&path).await.unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            (before.pid, before.birth, before.uid),
+            (after.pid, after.birth, after.uid)
+        );
+        assert!(!before.terminated());
+        drop((replacement, listener));
+    }
+
+    #[tokio::test]
+    async fn read_only_candidate_refuses_non_socket_and_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"synthetic").unwrap();
+        assert!(super::ReuseCandidate::capture_path(&regular)
+            .await
+            .is_none());
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(super::ReuseCandidate::capture_path(&link).await.is_none());
+    }
+
     fn failed_child_fixture(dir: &std::path::Path, pid: u32) -> super::FailedChildRuntime {
         let pid_path = dir.join("synthetic.pid");
         let socket_path = dir.join("synthetic.sock");

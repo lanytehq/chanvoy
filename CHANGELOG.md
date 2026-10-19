@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Websocket task ownership
+
+- Daemon shutdown collects the websocket runner and every scheduled recovery
+  task before runtime cleanup. Idle observation stops cooperatively; admitted
+  provider work and selected output finish without being aborted by shutdown.
+- Managed websocket work uses the daemon's existing runtime admission arena.
+  Completed local attempts can finish even when the provider returned an error;
+  dropped author lookups retain their enclosing work and refuse clean retirement.
+- Failed websocket sends retire the native transport before releasing their
+  buffered-output ownership. Busy incoming traffic cannot starve authentication
+  expiry or scheduled heartbeats, and late authentication success is rejected.
+- Public websocket and author-resolution interfaces retain their existing
+  signatures. Managed execution receipts distinguish unresolved work from
+  unconfirmed task collection and apply to one exclusively owned runner.
+
+### Client task collection
+
+- Daemon exits stop idle local clients and collect their actual tasks before
+  runtime cleanup. Admitted requests and selected output finish through their
+  existing delivery paths; idle connections add no operational request.
+- Completed client tasks are collected while serving. Abnormal task collection
+  prevents successful runtime cleanup, and a dropped parent retains independent
+  collectors instead of aborting active client work.
+
+### Startup provider work
+
+- The post-bind identity probe and optional cursor migration reserve runtime
+  work before construction and retain task/collector ownership through actual
+  termination. Closed admission starts no work; capacity failures remain errors.
+- Completed read-only assessments and clean migration deferrals can finish
+  without promoting remote health. Unconfirmed migration persistence or task
+  failure retains request ownership and prevents successful runtime cleanup.
+
+### IPC lifecycle audits
+
+- Daemon exits now cooperatively cancel and collect the IPC reconnect task
+  before removing runtime artifacts. Startup/serve errors remain the primary
+  error; abnormal IPC task exit prevents successful artifact cleanup. Idle
+  reconnect infrastructure does not add a permanent operational request.
+
+- Connected and disconnected audits reserve independent runtime ownership
+  before constructing output and confirm it only after transport write/flush
+  succeeds. Closed admission omits the audit; other admission failures remain
+  errors. Failed or interrupted sends retain unconfirmed ownership.
+- Session teardown preserves the first error while collecting the old event
+  forwarder and attempting transport shutdown. Connected-audit failure skips
+  request processing; retained subscriptions survive transport loss.
+
+### Daemon generation
+
+- `auto-setup` now exits **6** instead of reporting success when a reused
+  daemon has a different or unverifiable build generation. It retains the
+  daemon, profile, active marker, cursors and waits rather than automatically
+  cycling for a binary change. Existing profile/credential refresh is unchanged.
+- Setup JSON adds both build identities, explicit nullable `generation_match`,
+  `generation_reason`, `cycled` and ordered `reasons`. Missing commit or dirty
+  metadata is unknown, never a match. Successful refresh separates predecessor
+  evidence from the accepted resulting daemon.
+- `daemon status` reports the CLI generation alongside its existing daemon
+  identity and health. A coherent mismatch report remains an observation-only
+  exit 0; matching build pins do not establish ownership or retirement authority.
+
 ### Development builds
 
 - Ordinary Make build and test targets reuse bounded host caches across

@@ -67,23 +67,21 @@ pub(crate) struct FirstMatchWait<'a> {
 /// Forwards lease cancellation into waitprims `Cancel`. Abort on drop so a
 /// completed wait does not leave a dormant task parked on the lease token.
 pub(crate) struct CancelForward {
-    handle: tokio::task::JoinHandle<()>,
+    _task: crate::wait_task::OwnedTask,
 }
 
 impl CancelForward {
-    pub(crate) fn spawn(lease_cancel: CancellationToken, wp: Cancel) -> Self {
-        Self {
-            handle: tokio::spawn(async move {
+    pub(crate) fn spawn(
+        registry: &Arc<crate::wait_owner::WaitOwnerRegistry>,
+        lease_cancel: CancellationToken,
+        wp: Cancel,
+    ) -> Result<Self, CoreError> {
+        Ok(Self {
+            _task: crate::wait_task::OwnedTask::spawn(registry, async move {
                 lease_cancel.cancelled().await;
                 wp.trigger();
-            }),
-        }
-    }
-}
-
-impl Drop for CancelForward {
-    fn drop(&mut self) {
-        self.handle.abort();
+            })?,
+        })
     }
 }
 
@@ -150,7 +148,11 @@ pub(crate) async fn run_single_channel_first_match(
     let docs = admit_set_and_request(wait.channel, set, request)?;
 
     let wp_cancel = Cancel::new();
-    let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
+    let _cancel_fwd = CancelForward::spawn(
+        &state.wait_owners,
+        wait.session.cancel.clone(),
+        wp_cancel.clone(),
+    )?;
 
     let outcome = run_first_match(&docs.set, &docs.request, &observer, &clock, &wp_cancel)
         .await
@@ -246,6 +248,7 @@ pub(crate) async fn run_single_channel_follow(
             my_user_id: &state.my_user_id,
         },
         FollowRun {
+            registry: Arc::clone(&state.wait_owners),
             release,
             sidecar,
             last_error,
@@ -271,6 +274,7 @@ struct FollowWait<'a> {
 }
 
 struct FollowRun {
+    registry: Arc<crate::wait_owner::WaitOwnerRegistry>,
     release: Arc<LeaseRelease>,
     sidecar: MessageSidecar,
     last_error: Arc<Mutex<Option<CoreError>>>,
@@ -440,6 +444,7 @@ where
     O::Bind: 'static,
 {
     let FollowRun {
+        registry,
         release,
         sidecar,
         last_error,
@@ -466,8 +471,9 @@ where
     )?;
     let docs = admit_set_and_request(wait.channel, set, request)?;
     let wp_cancel = Cancel::new();
-    let _cancel_fwd = CancelForward::spawn(wait.session.cancel.clone(), wp_cancel.clone());
-    let _client_gone_fwd = CancelForward::spawn(client_gone, wp_cancel.clone());
+    let _cancel_fwd =
+        CancelForward::spawn(&registry, wait.session.cancel.clone(), wp_cancel.clone())?;
+    let _client_gone_fwd = CancelForward::spawn(&registry, client_gone, wp_cancel.clone())?;
 
     if let Some(ms) = coalesce_ms {
         validate_coalesce_ms(ms).map_err(CoreError::WaitFilterInvalid)?;
@@ -2470,16 +2476,23 @@ mod tests {
         assert!(matches!(invalid, CoreError::WaitFilterInvalid(_)));
     }
 
-    #[test]
-    fn cancel_forward_aborts_on_drop() {
-        futures_executor_block(async {
-            let lease = CancellationToken::new();
-            let wp = Cancel::new();
-            let fwd = CancelForward::spawn(lease.clone(), wp.clone());
-            drop(fwd);
-            assert!(!wp.is_cancelled());
-            assert!(!lease.is_cancelled());
-        });
+    #[tokio::test]
+    async fn cancel_forward_drop_is_collected_before_ownership_clears() {
+        let lease = CancellationToken::new();
+        let wp = Cancel::new();
+        let registry = Arc::new(crate::wait_owner::WaitOwnerRegistry::new());
+        let fwd = CancelForward::spawn(&registry, lease.clone(), wp.clone()).unwrap();
+        assert_eq!(registry.admission_snapshot().cleanup, 2);
+        drop(fwd);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.admission_snapshot().cleanup != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!wp.is_cancelled());
+        assert!(!lease.is_cancelled());
     }
 
     #[test]
