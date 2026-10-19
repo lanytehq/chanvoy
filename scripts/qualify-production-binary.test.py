@@ -40,14 +40,17 @@ def case_lists():
     result = {}
     for suite in ("startup_diagnostics", "restart_harness", "per_043_wait_follow",
                   "wait_direct_message", "wait_inbox"):
-        source = (REPO / "tests" / (suite + ".rs")).read_text()
+        sources = [(REPO / "tests" / (suite + ".rs"), "")]
+        if suite == "startup_diagnostics":
+            sources.append((REPO / "tests/startup_diagnostics/foreground.rs", "foreground::tests::"))
         cases = []
         all_cases = []
-        for attrs, name in re.findall(r"((?:#\[[^\n]*\]\s*)+)(?:async\s+)?fn\s+(\w+)\s*\(", source):
-            if "#[tokio::test" in attrs or "#[test]" in attrs:
-                all_cases.append(name)
-                if suite == "startup_diagnostics" or "#[ignore" in attrs:
-                    cases.append(name)
+        for path, prefix in sources:
+            for attrs, name in re.findall(r"((?:#\[[^\n]*\]\s*)+)(?:async\s+)?fn\s+(\w+)\s*\(", path.read_text()):
+                if "#[tokio::test" in attrs or "#[test]" in attrs:
+                    all_cases.append(prefix + name)
+                    if suite == "startup_diagnostics" or "#[ignore" in attrs:
+                        cases.append(prefix + name)
         result[suite] = {"selected": sorted(cases), "all": sorted(all_cases)}
     return result
 
@@ -155,6 +158,7 @@ else:raise SystemExit(9)
 if '--list' in sys.argv:
  names=state['cases'][suite]['all']
  if state.get('missing_list')==suite:names=names[1:]
+ if state.get('missing_nested')==suite:names=[name for name in names if '::' not in name]
  for name in names:print(name+': test')
 else:
  if state.get('zero_case')==suite:print('test result: ok. 0 passed; 0 failed; 0 ignored;')
@@ -330,6 +334,9 @@ class QualificationTests(unittest.TestCase):
 
     def test_compiled_name_list_cannot_silently_lose_a_case(self):
         self.check("exact case list", missing_list="startup_diagnostics")
+
+    def test_compiled_name_list_cannot_silently_lose_nested_helpers(self):
+        self.check("exact case list", missing_nested="startup_diagnostics")
 
     def test_symlink_and_incomplete_or_ambiguous_build_capture_refuse(self):
         self.check("regular file", symlink_payload=True)

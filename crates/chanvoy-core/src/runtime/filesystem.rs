@@ -347,7 +347,7 @@ fn validate_ancestor(meta: &Metadata, uid: u32) -> Result<(), RuntimeError> {
     // Sticky system-owned ancestors permit private children without letting
     // another account replace them. Root selection separately rejects reapable
     // authority paths; socket-only roots have a different persistence contract.
-    if meta.mode() & 0o022 != 0 && !(meta.uid() == 0 && meta.mode() & libc::S_ISVTX as u32 != 0) {
+    if meta.mode() & 0o022 != 0 && !(meta.uid() == 0 && meta.mode() & 0o1000 != 0) {
         return Err(RuntimeError::Invalid("writable directory ancestor"));
     }
     Ok(())
