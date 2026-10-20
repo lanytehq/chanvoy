@@ -791,7 +791,11 @@ impl NativeControl {
                 .args
                 .iter()
                 .any(|a| a == &format!("--profile={}", self.profile));
-        explicit_profile && is_daemon_serve(identity)
+        let serve = identity
+            .args
+            .windows(2)
+            .any(|a| a[0] == "daemon" && a[1] == "serve");
+        explicit_profile && serve
     }
 
     /// A pid record is stale only when timing says it predates the current
@@ -804,17 +808,16 @@ impl NativeControl {
             return false;
         };
         let predates = i128::from(identity.start_ms) > stamp_ms(record) + STALE_RECORD_SLACK_MS;
-        (predates || self.pre_boot_record) && !is_daemon_serve(identity)
+        (predates || self.pre_boot_record) && !maybe_daemon_serve(identity)
     }
 }
 
-/// A `daemon serve` invocation from any executable, with or without an
-/// explicit profile.
-fn is_daemon_serve(identity: &ProcessIdentity) -> bool {
-    identity
-        .args
-        .windows(2)
-        .any(|a| a[0] == "daemon" && a[1] == "serve")
+/// Whether a process could be a `daemon serve` of any profile. Global options
+/// may sit between the two words, so any argument order counts. This only
+/// blocks releasing a record; signalling still requires `owned_identity`.
+fn maybe_daemon_serve(identity: &ProcessIdentity) -> bool {
+    let has = |word: &str| identity.args.iter().skip(1).any(|a| a == word);
+    has("daemon") && has("serve")
 }
 
 fn capture_monitor<W>(
@@ -2088,6 +2091,9 @@ mod tests {
         for args in [
             &["--profile", "test", "daemon", "serve"][..],
             &["daemon", "serve"],
+            &["daemon", "--profile", "test", "serve"],
+            &["daemon", "--profile=test", "serve"],
+            &["--profile", "test", "daemon", "--json", "serve"],
         ] {
             old_record_holder_is_refused(args).await;
         }
