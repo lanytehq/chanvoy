@@ -350,3 +350,129 @@ fn correlation_checks_ids_and_method_pair_without_claiming_native_binding() {
     ));
     assert!(!format!("{request:?}").contains(request.value()["id"].as_str().unwrap()));
 }
+
+#[tokio::test]
+async fn numeric_wire_tokens_are_checked_before_any_float_conversion() {
+    // Remove only formatting newlines, never parse/reserialize the wire numbers.
+    let rpc = String::from_utf8(fixture(ControlRoot::RetireResponse))
+        .unwrap()
+        .replace('\n', "");
+    let file = String::from_utf8(fixture(ControlRoot::Readiness)).unwrap();
+    for (root, template) in [
+        (ControlRoot::RetireResponse, rpc),
+        (ControlRoot::Readiness, file),
+    ] {
+        for (needle, token, valid) in [
+            ("\"pid\": 123", "123", true),
+            ("\"pid\": 123", "123.0", true),
+            ("\"pid\": 123", "1.23e2", true),
+            ("\"pid\": 123", "1230e-1", true),
+            ("\"pid\": 123", "123.00000000000000000000001", false),
+            ("\"pid\": 123", "1e-400", false),
+            ("\"pid\": 123", "-1e-400", false),
+            ("\"pid\": 123", "2147483648", false),
+            ("\"record_revision\": 2", "18446744073709551615", true),
+            ("\"record_revision\": 2", "18446744073709551615.0", true),
+            ("\"record_revision\": 2", "184467440737095516150e-1", true),
+            ("\"record_revision\": 2", "1.8446744073709551615e19", true),
+            ("\"record_revision\": 2", "18446744073709551616", false),
+            ("\"record_revision\": 2", "18446744073709551616.0", false),
+            ("\"record_revision\": 2", "1.8446744073709551616e19", false),
+            (
+                "\"record_revision\": 2",
+                "18446744073709551614.999999",
+                false,
+            ),
+            ("\"record_revision\": 2", "2.0", true),
+            ("\"record_revision\": 2", "2e0", true),
+        ] {
+            let needle = if root == ControlRoot::Readiness && needle == "\"record_revision\": 2" {
+                "\"revision\": 2"
+            } else {
+                needle
+            };
+            assert!(template.contains(needle), "{}: {needle}", root.name());
+            let key = needle.split(':').next().unwrap();
+            let raw = template.replacen(needle, &format!("{key}: {token}"), 1);
+            assert_eq!(
+                ControlDocument::decode(root, raw.as_bytes()).is_ok(),
+                valid,
+                "decode {} {needle} -> {token}",
+                root.name()
+            );
+            let streamed = if root.is_rpc() {
+                let framed = format!("{raw}\n");
+                read_rpc(&mut framed.as_bytes(), root).await
+            } else {
+                read_document(&mut raw.as_bytes(), root).await
+            };
+            assert_eq!(
+                streamed.is_ok(),
+                valid,
+                "reader {} {needle} -> {token}",
+                root.name()
+            );
+        }
+    }
+    let template = String::from_utf8(fixture(ControlRoot::RetireResponse))
+        .unwrap()
+        .replace('\n', "");
+    for (token, valid) in [
+        ("1e-400", false),
+        ("-1e-400", false),
+        ("0.0000000000000000000001", false),
+        ("0", true),
+        ("-0", true),
+        ("0.0", true),
+        ("0e0", true),
+        ("0e999999999999999999999999999", true),
+        ("-0e-999999999999999999999999999", true),
+        ("1e999999999999999999999999999", false),
+        ("1e-999999999999999999999999999", false),
+        ("00", false),
+        ("01.0", false),
+        ("0.", false),
+        ("0e", false),
+        ("0e+", false),
+        ("--0", false),
+        ("0e+-1", false),
+    ] {
+        let raw = template.replacen("\"requests\": 0", &format!("\"requests\": {token}"), 1);
+        assert_eq!(
+            ControlDocument::decode(ControlRoot::RetireResponse, raw.as_bytes()).is_ok(),
+            valid,
+            "decode counts {token}"
+        );
+        let framed = format!("{raw}\n");
+        assert_eq!(
+            read_rpc(&mut framed.as_bytes(), ControlRoot::RetireResponse)
+                .await
+                .is_ok(),
+            valid,
+            "reader counts {token}"
+        );
+    }
+}
+
+#[test]
+fn exact_numeric_normalization_preserves_strings_and_integer_values() {
+    for token in ["1.0", "1e0", "10e-1", "0.01e2", "1000.000e-3"] {
+        assert_eq!(
+            strict::parse(&format!(r#"{{"n":{token}}}"#)).unwrap()["n"].as_u64(),
+            Some(1)
+        );
+    }
+    for token in ["18446744073709551615", "184467440737095516150.000e-1"] {
+        assert_eq!(
+            strict::parse(&format!(r#"{{"n":{token}}}"#)).unwrap()["n"].as_u64(),
+            Some(u64::MAX)
+        );
+    }
+    let raw = r#"{"1e-400":"escaped \" 1e-400 \\ and 18446744073709551616","n":1.0}"#;
+    let value = strict::parse(raw).unwrap();
+    assert_eq!(
+        value["1e-400"],
+        serde_json::from_str::<Value>(raw).unwrap()["1e-400"]
+    );
+    assert_eq!(value["n"].as_u64(), Some(1));
+}

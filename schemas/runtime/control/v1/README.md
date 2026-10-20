@@ -15,7 +15,13 @@ unification. The consumer never resolves a floating tag or fetches a schema.
 The caller selects `ControlRoot` from its transport. `ControlDocument::decode`
 checks the byte limit before UTF-8 and recursive strict JSON parsing, rejects
 duplicate decoded keys at every depth and trailing values, and validates the
-explicit selected root. The returned object is immutable. Debug and error output
+explicit selected root. Numeric tokens are checked with decimal arithmetic before
+JSON conversion: the pinned closed contract permits only nonnegative integers
+bounded by `u64::MAX`. Exact integer spellings such as `1.0`, `1e0` and negative
+zero remain accepted where the schema allows their value. Fractional and
+out-of-range values cannot round into valid counts, identities or revisions.
+Accepted numbers are stored and encoded as exact integer values; original number
+spellings are not retained. The returned object is immutable. Debug and error output
 do not expose the body. `correlate` checks the request/response method pair and
 exact non-null request id; it does not establish target identity or native facts.
 
