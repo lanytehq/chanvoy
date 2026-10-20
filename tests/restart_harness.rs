@@ -1375,75 +1375,164 @@ async fn daemon_start_classifies_child_startup_failure() {
 /// same `--profile` would false-count as a survivor. Ownership is proven by the
 /// candidate's inherited `CHANVOY_RUNTIME_DIR`, which is unique per harness env.
 ///
-/// Enumeration is in-process via `sysprims_proc` (no `ps`/`lsof` subprocess,
-/// which sandboxed agent hosts deny). Every pid is read individually because
-/// a bulk snapshot silently drops processes it cannot read. Each read either
-/// proves the process gone, proves it belongs to another user (the harness
-/// spawns every daemon as itself), or yields its owner, command line and
-/// environment. A live same-user `chanvoy` whose command line or environment
-/// stays unreadable panics, so an unreadable process can never make a
-/// survivor count look like zero. Panic text names pids only.
+/// Enumeration is in-process (no `ps`/`lsof` subprocess, which sandboxed
+/// agent hosts deny). Every pid is classified from positive evidence, never
+/// from a failed read: a numeric owner uid that the kernel reports for every
+/// process, then a full `sysprims_proc` read for same-user `chanvoy`
+/// processes only. A pid that is gone or owned by another uid is skipped
+/// (the harness spawns every daemon as itself). A live same-user process
+/// whose owner cannot be read, or a live same-user `chanvoy` whose command
+/// line or environment stays unreadable, panics, so an unreadable process
+/// can never make a survivor count look like zero. Panic text names pids
+/// only.
 fn count_daemon_serve_processes(env: &TestEnv) -> usize {
-    use sysprims_core::SysprimsError;
     let runtime = env.chanvoy_runtime_dir();
     let runtime = runtime.to_str().expect("runtime dir is UTF-8");
-    let with_env = sysprims_proc::ProcessOptions::default().with_env();
-    let me = sysprims_proc::get_process(std::process::id())
-        .expect("read own process")
-        .user
-        .expect("own process owner");
-    let mut count = 0;
-    for pid in all_pids() {
-        let p = match sysprims_proc::get_process_with_options(pid, with_env) {
-            Ok(p) => p,
-            Err(SysprimsError::NotFound { .. } | SysprimsError::PermissionDenied { .. }) => {
-                continue
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    all_pids()
+        .into_iter()
+        .filter(|&pid| match process_owner(pid) {
+            // The kernel short name is truncated (16 bytes on macOS, 15 on
+            // Linux); "chanvoy" fits either way.
+            Ok(Some((uid, comm))) => uid == me && comm == "chanvoy",
+            Ok(None) => false,
+            Err(e) => {
+                panic!("owner of pid {pid} is unreadable ({e}); survivor count cannot be proven")
             }
-            Err(e) => panic!("read pid {pid}: {e}"),
-        };
-        if p.state == sysprims_proc::ProcessState::Zombie {
-            continue;
-        }
-        match p.user.as_deref() {
-            Some(owner) if owner == me => {}
-            Some(_) => continue,
-            None => {
-                assert_gone(pid, "owner");
-                continue;
-            }
-        }
-        let named_chanvoy = p.name == "chanvoy" || argv0_is_chanvoy(&p.cmdline);
-        if !named_chanvoy {
-            continue;
-        }
-        if p.cmdline.is_empty() {
-            assert_gone(pid, "command line");
-            continue;
-        }
-        if !is_daemon_serve_for(&p.cmdline, &env.profile_name) {
-            continue;
-        }
-        let Some(env_vars) = p.env.as_ref() else {
-            assert_gone(pid, "environment");
-            continue;
-        };
-        if env_vars.get("CHANVOY_RUNTIME_DIR").map(String::as_str) == Some(runtime) {
-            count += 1;
-        }
-    }
-    count
+        })
+        .filter(|&pid| same_user_daemon_runtime(pid, &env.profile_name).as_deref() == Some(runtime))
+        .count()
 }
 
-/// A process read came back incomplete. Accept that only if the process has
-/// since exited; anything still alive is unprovable.
-fn assert_gone(pid: u32, what: &str) {
-    match sysprims_proc::get_process(pid) {
-        Err(sysprims_core::SysprimsError::NotFound { .. }) => {}
-        Ok(p) if p.state == sysprims_proc::ProcessState::Zombie => {}
-        _ => panic!(
-            "{what} of live pid {pid} is unreadable; \
-             survivor count cannot be proven"
-        ),
+/// For a same-user pid, the `CHANVOY_RUNTIME_DIR` of a matching
+/// `chanvoy --profile <profile> daemon serve` process, or `None` when the
+/// pid is gone, a zombie, or not such a daemon. Incomplete reads are retried
+/// against the process's start time so a reused pid cannot stand in for the
+/// original; a live process that stays unreadable panics.
+fn same_user_daemon_runtime(pid: u32, profile: &str) -> Option<String> {
+    use sysprims_core::SysprimsError;
+    let with_env = sysprims_proc::ProcessOptions::default().with_env();
+    let mut first_start = None;
+    for _ in 0..PROCESS_READ_ATTEMPTS {
+        let p = match sysprims_proc::get_process_with_options(pid, with_env) {
+            Ok(p) => p,
+            Err(SysprimsError::NotFound { .. }) => return None,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(20));
+                if matches!(process_owner(pid), Ok(None)) {
+                    return None;
+                }
+                continue;
+            }
+        };
+        if p.state == sysprims_proc::ProcessState::Zombie {
+            return None;
+        }
+        match (first_start, p.start_time_unix_ms) {
+            (None, start) => first_start = Some(start),
+            (Some(start), now) if start != now => return None,
+            _ => {}
+        }
+        if !(p.name == "chanvoy" || argv0_is_chanvoy(&p.cmdline)) {
+            return None;
+        }
+        if !p.cmdline.is_empty() {
+            if !is_daemon_serve_for(&p.cmdline, profile) {
+                return None;
+            }
+            if let Some(env_vars) = p.env {
+                return env_vars.get("CHANVOY_RUNTIME_DIR").cloned();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "command line or environment of live chanvoy pid {pid} is unreadable; \
+         survivor count cannot be proven"
+    )
+}
+
+const PROCESS_READ_ATTEMPTS: usize = 5;
+
+/// `struct proc_bsdshortinfo` from `<sys/proc_info.h>` (`PROC_PIDT_SHORTBSDINFO`).
+/// Not in the pinned `libc`. Unlike `PROC_PIDTBSDINFO`, the kernel answers
+/// this flavor for every process, including other users'.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    status: u32,
+    comm: [libc::c_char; 16],
+    flags: u32,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    ruid: libc::uid_t,
+    rgid: libc::gid_t,
+    svuid: libc::uid_t,
+    svgid: libc::gid_t,
+    rfu: u32,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
+
+#[cfg(target_os = "macos")]
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+/// Owner uid and kernel short name of `pid`, from a read that does not
+/// depend on argv/environment access: `Ok(None)` when the process no longer
+/// exists.
+#[cfg(target_os = "macos")]
+fn process_owner(pid: u32) -> std::io::Result<Option<(u32, String)>> {
+    // SAFETY: `info` is a plain C struct the kernel fills; the size passed is
+    // its exact size and the call writes nothing beyond it.
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdShortInfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdShortInfo).cast(),
+            size,
+        )
+    };
+    if n == size {
+        // SAFETY: the kernel NUL-terminates `comm` within its 16 bytes.
+        let comm = unsafe { std::ffi::CStr::from_ptr(info.comm.as_ptr()) };
+        return Ok(Some((info.uid, comm.to_string_lossy().into_owned())));
+    }
+    let err = std::io::Error::last_os_error();
+    if n <= 0 && err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(None);
+    }
+    Err(if n > 0 {
+        std::io::Error::other(format!("short read {n} of {size} bytes"))
+    } else {
+        err
+    })
+}
+
+/// Owner uid and kernel short name of `pid`, from a read that does not
+/// depend on argv/environment access: `Ok(None)` when the process no longer
+/// exists. `/proc/<pid>` is owned by the process's effective uid regardless
+/// of `hidepid`, which only hides other users' entries.
+#[cfg(target_os = "linux")]
+fn process_owner(pid: u32) -> std::io::Result<Option<(u32, String)>> {
+    use std::os::unix::fs::MetadataExt;
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let uid = match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(meta) => meta.uid(),
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(comm) => Ok(Some((uid, comm.trim_end().to_owned()))),
+        Err(e) if gone(&e) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
