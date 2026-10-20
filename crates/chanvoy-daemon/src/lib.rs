@@ -392,9 +392,11 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             })
         }
     }
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    for path in [&socket_path, &pid_path] {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
     }
     // Inspect without consumption before a reduction-enabled startup can
     // contact its family provider. The resolver revalidates/consumes later.

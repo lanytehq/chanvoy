@@ -34,7 +34,7 @@ Examples:
 Runtime files are separate from config:
 
 - Socket: `XDG_RUNTIME_DIR/chanvoy/<profile>.sock` when available, otherwise the OS temp dir
-- Pid: same runtime directory as the socket
+- Pid: same directory as the socket when a runtime dir is available; otherwise `<config root>/run/<profile>.pid`, outside the OS temp dir so periodic temp cleanup cannot remove it from a running daemon
 
 Note: the broader `LANYTE_CONFIG_ROOT` override is a cross-app standardization follow-up and is not implemented in `chanvoy` today.
 
@@ -47,7 +47,7 @@ The `lanytehq` segment in the default config root (`~/.config/lanytehq/chanvoy/`
 For isolated testing, parallel local sessions, or non-default deployment shapes:
 
 - **`CHANVOY_CONFIG_DIR`** — overrides the default config root (`~/.config/lanytehq/chanvoy/`). Profile files, the `active_profile` marker, and per-profile attention state all live under this path. Operator-set per shell.
-- **`CHANVOY_RUNTIME_DIR`** — overrides the default runtime directory (`$XDG_RUNTIME_DIR/chanvoy/` or OS temp). Socket and pid file locations follow this. Operator-set per shell.
+- **`CHANVOY_RUNTIME_DIR`** — overrides the default runtime directory (`$XDG_RUNTIME_DIR/chanvoy/` or OS temp). Socket and pid file both follow this. Operator-set per shell.
 
 Example: run a parallel chanvoy session against an isolated profile set:
 
@@ -195,9 +195,22 @@ files prevents automatic stop.
 
 Unknown liveness, denied process inspection, failed signaling and a survivor
 after the grace window return nonzero with the PID and attempted operation.
-Runtime files remain in place, and an automatic replacement is blocked. An
-orphan socket without a readable predecessor PID is also retained. A confirmed
-dead predecessor's unchanged files can be removed only when the socket has no
+Runtime files remain in place, and an automatic replacement is blocked. A
+confirmed dead predecessor's unchanged files can be removed only when the
+socket has no live owner.
+
+When the pid file is missing but the socket answers, the socket's kernel peer
+PID stands in for it. The same executable, argument, owner and birth checks
+apply, the peer is read again after the identity check, and the pid path must
+stay absent until cleanup. `daemon stop`, `auto-setup` and profile refresh all
+use this path, so a live daemon whose pid file was removed by OS temp cleanup
+is stopped normally; errors name the PID as `(socket peer)`. A socket with no
+live listener and no readable pid file is still retained.
+
+A pid file can outlive its process, for example across a reboot. A record
+written before the current boot, or more than two seconds before the process
+now holding that PID started, is treated as describing an exited daemon:
+nothing is signalled, and the files are removed only when the socket has no
 live owner.
 
 The exit observer uses macOS kernel process notifications or Linux pidfds

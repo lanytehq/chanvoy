@@ -2125,11 +2125,37 @@ pub fn default_runtime_dir() -> PathBuf {
     if let Some(dir) = env::var_os("CHANVOY_RUNTIME_DIR") {
         return PathBuf::from(dir);
     }
+    platform_runtime_dir().unwrap_or_else(|| env::temp_dir().join("chanvoy"))
+}
+
+fn platform_runtime_dir() -> Option<PathBuf> {
     env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .or_else(dirs::runtime_dir)
-        .unwrap_or_else(env::temp_dir)
-        .join("chanvoy")
+        .map(|dir| dir.join("chanvoy"))
+}
+
+/// Directory holding `<profile>.pid`. It follows an explicit or platform
+/// runtime directory. When the runtime directory would fall back to the OS
+/// temp dir (macOS, or Linux without `XDG_RUNTIME_DIR`), the pid file lives
+/// under the config dir instead: the OS ages temp files out from under a
+/// long-running daemon, and a lost pid file leaves only socket-peer evidence.
+pub fn default_pid_dir() -> PathBuf {
+    pid_dir_from(
+        env::var_os("CHANVOY_RUNTIME_DIR").map(PathBuf::from),
+        platform_runtime_dir(),
+        default_chanvoy_config_dir,
+    )
+}
+
+fn pid_dir_from(
+    runtime_override: Option<PathBuf>,
+    platform_runtime: Option<PathBuf>,
+    config_dir: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    runtime_override
+        .or(platform_runtime)
+        .unwrap_or_else(|| config_dir().join("run"))
 }
 
 pub fn socket_path_for_profile(profile: &str) -> PathBuf {
@@ -2137,7 +2163,7 @@ pub fn socket_path_for_profile(profile: &str) -> PathBuf {
 }
 
 pub fn pid_path_for_profile(profile: &str) -> PathBuf {
-    default_runtime_dir().join(format!("{profile}.pid"))
+    default_pid_dir().join(format!("{profile}.pid"))
 }
 
 pub fn active_profile_path() -> PathBuf {
@@ -6643,6 +6669,23 @@ mod tests {
     use std::sync::Mutex;
 
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn pid_dir_leaves_os_temp_only_when_no_runtime_dir_is_configured() {
+        let config = || PathBuf::from("/synthetic/config");
+        assert_eq!(
+            pid_dir_from(Some("/synthetic/override".into()), None, config),
+            PathBuf::from("/synthetic/override"),
+            "an explicit runtime override keeps socket and pid together"
+        );
+        assert_eq!(
+            pid_dir_from(None, Some("/synthetic/xdg/chanvoy".into()), config),
+            PathBuf::from("/synthetic/xdg/chanvoy"),
+        );
+        let durable = pid_dir_from(None, None, config);
+        assert_eq!(durable, PathBuf::from("/synthetic/config/run"));
+        assert!(!durable.starts_with(env::temp_dir()));
+    }
 
     // ------------------------------------------------------------------
     // Thread-root normalization. One rule, shared by the read path and

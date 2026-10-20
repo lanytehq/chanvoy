@@ -93,7 +93,7 @@ impl From<BootstrapError> for CoreError {
 
 /// Path to the bootstrap-state file for the given profile.
 ///
-/// Lives alongside `<profile>.sock` and `<profile>.pid` in the runtime dir,
+/// Lives alongside `<profile>.sock` in the runtime dir,
 /// using the established `<profile>.<ext>` naming convention.
 pub fn bootstrap_path_for_profile(profile: &str) -> PathBuf {
     default_runtime_dir().join(format!("{profile}.bootstrap.json"))

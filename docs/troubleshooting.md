@@ -76,10 +76,13 @@ daemon spawned under. This happens when:
    [socket permission denied](#sandbox-permission-denied-reading-or-binding-the-socket)
    entry below.
 
-2. Confirm the daemon is alive at the resolved pid:
+2. Confirm the daemon is alive at the resolved pid. `<pid-path>` is the
+   runtime directory when one is set; otherwise it is
+   `<config root>/run/` (see
+   [architecture.md §Storage layout](./architecture.md#storage-layout)):
 
    ```bash
-   cat <runtime-path>/<profile>.pid
+   cat <pid-path>/<profile>.pid
    ps -p <pid>
    ```
 

@@ -158,14 +158,17 @@ namespace):
 - macOS: `~/Library/Application Support/lanytehq/chanvoy/`
 
 Runtime sockets and pid files live separately, under
-`$XDG_RUNTIME_DIR/chanvoy/` when available, otherwise the OS temp
-dir.
+`$XDG_RUNTIME_DIR/chanvoy/` when available. Without a runtime dir
+(macOS, or Linux without `XDG_RUNTIME_DIR`), sockets use the OS temp
+dir and pid files use `<config root>/run/`, which the OS does not age
+out from under a long-running daemon.
 
 Two env overrides for non-default deployments (sandboxed agents,
 parallel test sessions, custom layouts):
 
 - `CHANVOY_CONFIG_DIR` — overrides the config root.
-- `CHANVOY_RUNTIME_DIR` — overrides the runtime directory.
+- `CHANVOY_RUNTIME_DIR` — overrides the runtime directory (socket and
+  pid file both).
 
 Note on the namespace: the `lanytehq` segment in the default config
 root is the **product namespace** (chanvoy is a lanytehq-developed

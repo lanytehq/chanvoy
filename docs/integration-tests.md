@@ -239,6 +239,9 @@ settle.
   bound-then-dropped socket inode plus a pid file naming a reaped
   process; a plain `daemon start` must recover with no manual file
   movement
+- `daemon_stop_recovers_a_live_daemon_without_its_pid_file` — removes a
+  live daemon's pid file; `daemon stop` must stop it through the socket
+  peer PID and remove the socket
 - `daemon_start_refuses_on_bot_identity_mismatch` — live credential
   resolves to a different bot than the profile records: nonzero exit,
   both names in the diagnostic, and nothing spawned or mutated (no

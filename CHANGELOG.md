@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Daemon pid file and pid-less stop
+
+- When no runtime directory is configured (macOS, or Linux without
+  `XDG_RUNTIME_DIR`), the daemon writes its pid file under
+  `<config root>/run/` instead of the OS temp dir, so temp cleanup can no
+  longer remove it from a running daemon. The socket location is unchanged,
+  and `CHANVOY_RUNTIME_DIR` still places both.
+- `daemon stop`, `auto-setup` and profile refresh can stop a live daemon whose
+  pid file is missing. The socket's kernel peer PID replaces the pid file, and
+  the same executable, argument, owner and birth checks apply before any
+  signal. A socket without a live listener and without a pid file is still
+  retained.
+- A pid file written before the current boot, or before the process now
+  holding its PID started, is treated as describing an exited daemon. That
+  process is never signalled; the record is removed only once the socket has
+  no live owner.
+
 ### Daemon status
 
 - Human-readable daemon status shows `daemon_version` from the responding

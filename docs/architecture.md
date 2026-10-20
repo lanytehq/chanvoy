@@ -480,13 +480,17 @@ $RUNTIME_ROOT/                         (default: $XDG_RUNTIME_DIR/chanvoy/
                                         override via CHANVOY_RUNTIME_DIR — used
                                         as-is, no chanvoy suffix added)
 ├── <profile-name>.sock                UDS socket — CLI ↔ daemon RPC
-├── <profile-name>.pid                 Daemon pid file
+├── <profile-name>.pid                 Daemon pid file (here only when a
+│                                       runtime dir or override is set)
 └── <profile-name>.bootstrap.json      One-shot bootstrap-state handoff
+
+$CONFIG_ROOT/run/                      Pid files when $RUNTIME_ROOT falls back
+└── <profile-name>.pid                 to the OS temp dir, which ages files out
 ```
 
 ### Permission contract
 
-- Config dirs: `0700`. Runtime dir: `0700`.
+- Config dirs: `0700`. Runtime dir and `run/` pid dir: `0700`.
 - Profile TOML files + state JSON files + bootstrap handoff: `0600`.
 - Socket: `0700` parent dir; the socket itself inherits.
 

@@ -687,6 +687,39 @@ async fn auto_setup_retains_socket_without_readable_predecessor_pid() {
         .exists());
 }
 
+/// A live daemon whose pid file was removed (the OS aging out temp files) is
+/// still stoppable: the socket peer supplies the pid, and the same executable,
+/// profile and serve-argument checks prove ownership before any signal.
+#[tokio::test]
+#[ignore = "integration: run via make test-integration"]
+async fn daemon_stop_recovers_a_live_daemon_without_its_pid_file() {
+    let env = TestEnv::new("pidless-live-stop").await;
+    env.write_default_profile("agent-bravo-devlead", "org-lanytehq");
+    env.mock_baseline("bot-id-pidless", "agent-bravo-devlead", "team-id-456")
+        .await;
+    let child = spawn_daemon(&env).await;
+    let daemon_pid = child.id().expect("daemon child pid");
+    let pid_path = env
+        .chanvoy_runtime_dir()
+        .join(format!("{}.pid", env.profile_name));
+    assert_eq!(read_daemon_pid(&env), Some(daemon_pid));
+    std::fs::remove_file(&pid_path).unwrap();
+
+    let out = run_chanvoy(&env, &["daemon", "stop"]).await;
+    assert!(
+        out.status.success(),
+        "daemon stop must recover a live pid-less daemon; exit={} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        stop_daemon_cleanly(&env, child).await,
+        "daemon must have exited"
+    );
+    assert!(!env.socket_path().exists(), "socket removed after stop");
+    assert!(!pid_path.exists());
+}
+
 /// F6 — `ensure_daemon_running` zombie-stop path.
 ///
 /// Scenario: daemon1 is healthy after the first auto-setup. We then
