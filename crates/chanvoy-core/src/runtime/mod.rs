@@ -21,7 +21,7 @@ pub use authority::{
 };
 pub use identity::{Namespace, NativeAccount, PathBytes};
 pub use peer::native_peer_pid;
-pub use publisher::RecordPublisher;
+pub use publisher::{PublicationView, RecordPublisher};
 pub use record::{
     child_socket_path, InodeIdentity, InstanceId, NativeBirth, NativePlatform, ProcessId,
     RuntimeBuildPin, RuntimePhase, RuntimeProcess, RuntimeRecord, RuntimeSocket,

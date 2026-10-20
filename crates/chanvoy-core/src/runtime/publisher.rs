@@ -6,6 +6,15 @@ use super::{
 };
 use std::sync::Mutex;
 
+/// Read-only publication claims captured from the child publisher. Observing a
+/// pending record on disk does not confirm its durability or prove native facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationView {
+    pub observed: RuntimeRecord,
+    pub logical: RuntimeRecord,
+    pub confirmed: bool,
+}
+
 pub struct RecordPublisher<'a> {
     authority: &'a RuntimeAuthority,
     lease: LifetimeLease,
@@ -16,6 +25,16 @@ struct PublicationState {
     pending: Option<RuntimeRecord>,
 }
 impl PublicationState {
+    fn inspect(&self, observed: &RecordSnapshot) -> Result<PublicationView, RuntimeError> {
+        if observed != &self.durable && self.pending.as_ref() != Some(&observed.record) {
+            return Err(RuntimeError::Changed("publisher record epoch/revision"));
+        }
+        Ok(PublicationView {
+            observed: observed.record.clone(),
+            logical: self.logical().clone(),
+            confirmed: self.pending.is_none() && observed == &self.durable,
+        })
+    }
     fn logical(&self) -> &RuntimeRecord {
         self.pending.as_ref().unwrap_or(&self.durable.record)
     }
@@ -96,6 +115,22 @@ impl<'a> RecordPublisher<'a> {
             lease,
             inner: Mutex::new(inner),
         })
+    }
+
+    /// Recheck lease and exact disk state without writing or completing pending
+    /// publication. A stale request must not cause a retry as a side effect of
+    /// observation. External epoch/revision replacement refuses.
+    pub fn inspect_publication(&self) -> Result<PublicationView, RuntimeError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| RuntimeError::Unavailable("publisher mutex"))?;
+        self.lease.verify(self.authority)?;
+        let observed = self
+            .authority
+            .read_record(&inner.durable.record.namespace)?
+            .ok_or(RuntimeError::Changed("publisher record missing"))?;
+        inner.inspect(&observed)
     }
 
     pub fn phase(&self) -> Result<RuntimePhase, RuntimeError> {
@@ -237,6 +272,33 @@ mod tests {
             pending: None,
         }
     }
+    #[test]
+    fn inspection_does_not_complete_pending_publication_or_adopt_external_state() {
+        let mut state = state();
+        assert!(state.inspect(&state.durable).unwrap().confirmed);
+        let mut next = state.durable.record.clone();
+        next.revision += 1;
+        next.phase = RuntimePhase::Retiring;
+        next.ready = false;
+        state.stage(next.clone()).unwrap();
+        let before = state.inspect(&state.durable).unwrap();
+        assert_eq!(before.observed.phase, RuntimePhase::Running);
+        assert_eq!(before.logical.phase, RuntimePhase::Retiring);
+        assert!(!before.confirmed);
+        let mut replaced = state.durable.clone();
+        replaced.record = next.clone();
+        let after = state.inspect(&replaced).unwrap();
+        assert_eq!(after.observed.revision, next.revision);
+        assert!(!after.confirmed);
+        assert_eq!(state.pending, Some(next));
+        assert_eq!(state.durable.record.phase, RuntimePhase::Running);
+        replaced.record.instance_uuid = InstanceId::new();
+        assert!(state.inspect(&replaced).is_err());
+        let mut substituted = state.durable.clone();
+        substituted.fingerprint.identity.inode += 1;
+        assert!(state.inspect(&substituted).is_err());
+    }
+
     #[test]
     fn retiring_failure_remains_closed_and_accepts_only_its_exact_forward_publication() {
         let mut state = state();

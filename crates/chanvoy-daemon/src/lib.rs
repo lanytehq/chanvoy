@@ -11,6 +11,7 @@ mod follow_delivery;
 mod ipc_ownership;
 mod ipc_supervision;
 mod request_frontier;
+mod retirement_control;
 mod startup_work;
 mod subscription_owner;
 mod wait;
