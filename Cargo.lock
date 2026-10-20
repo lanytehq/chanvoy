@@ -299,6 +299,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures-util",
+ "jsonschema 0.30.0",
  "libc",
  "reqwest",
  "serde",

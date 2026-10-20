@@ -1,0 +1,8 @@
+{
+  "id": "87654321-4321-4321-8321-cba987654321",
+  "error": {
+    "code": -32602,
+    "message": "Invalid local control payload",
+    "data": null
+  }
+}

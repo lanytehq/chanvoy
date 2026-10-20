@@ -1,0 +1,45 @@
+{
+  "jsonrpc": "2.0",
+  "id": "87654321-4321-4321-8321-cba987654321",
+  "result": {
+    "schema_version": 1,
+    "kind": "retirement_result",
+    "origin": "daemon_response",
+    "target": {
+      "namespace": "f691215e0d009bcb711257dd344ca628c882a411938ad516b9cc999981ee4acd",
+      "instance_uuid": "12345678-1234-4234-8234-123456789abc",
+      "record_revision": 2,
+      "process": {
+        "pid": 123,
+        "uid": 501,
+        "birth": {
+          "kind": "mac_os",
+          "seconds": 1,
+          "microseconds": 2
+        },
+        "executable": "2f6f776e65642f6368616e766f79",
+        "pid_namespace": null,
+        "mount_namespace": null
+      }
+    },
+    "outcome": "committed",
+    "request_committed": true,
+    "facts": {
+      "memory_retiring": true,
+      "durable_retiring": true,
+      "shutdown_started": false,
+      "responding_at_snapshot": true,
+      "admission_closed": true,
+      "durable_revision": 3
+    },
+    "counts": {
+      "requests": 0,
+      "streams": 0,
+      "slots": 0,
+      "replacements": 0,
+      "cleanup_obligations": 0
+    },
+    "reason": "durable_retiring",
+    "unknown": true
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": "87654321-4321-4321-8321-cba987654321",
+  "method": "runtime_observation_v1",
+  "params": {
+    "schema_version": 1,
+    "kind": "observation_params",
+    "namespace": "f691215e0d009bcb711257dd344ca628c882a411938ad516b9cc999981ee4acd",
+    "expected_instance_uuid": "12345678-1234-4234-8234-123456789abc",
+    "unknown": true
+  }
+}

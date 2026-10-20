@@ -4,6 +4,8 @@
 //! operational-readiness proof. Lifecycle service activation is separate from
 //! this foundation; existing legacy path helpers retain their explicit role.
 
+pub mod control;
+
 mod authority;
 mod filesystem;
 mod identity;

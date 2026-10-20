@@ -16,6 +16,8 @@ publish.workspace = true
 [dependencies]
 chrono = { workspace = true }
 dirs = { workspace = true }
+# Reuse the locked validator; external schema retrieval is disabled.
+jsonschema = { version = "=0.30.0", default-features = false }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
