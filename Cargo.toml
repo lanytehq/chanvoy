@@ -60,7 +60,6 @@ waitprims-core = { git = "https://github.com/3leaps/waitprims", tag = "v0.2.3" }
 # File-backed JSON Schema only. `schema-validation` enables rsfulmen's
 # `crucible` feature (compile-required). Foundry catalogs stay off.
 rsfulmen = { version = "0.2.0", default-features = false, features = ["schema-validation"] }
-sysprims-core = { git = "https://github.com/3leaps/sysprims.git", tag = "v0.1.16" }
 sysprims-proc = { git = "https://github.com/3leaps/sysprims.git", tag = "v0.1.16", default-features = false }
 sysprims-signal = { git = "https://github.com/3leaps/sysprims.git", tag = "v0.1.16" }
 
@@ -82,7 +81,6 @@ rsfulmen = { workspace = true }
 # restart harness for reliable SIGKILL delivery (tokio::process::Child::start_kill
 # has observed delivery gaps on macOS in a test context). Same git-pin pattern
 # chanvoy-ipc uses for ipcprims.
-sysprims-core = { workspace = true }
 sysprims-proc = { workspace = true, features = ["proc_ext"] }
 sysprims-signal = { workspace = true }
 tempfile = { workspace = true }

@@ -1392,16 +1392,10 @@ fn count_daemon_serve_processes(env: &TestEnv) -> usize {
     let me = unsafe { libc::getuid() };
     all_pids()
         .into_iter()
-        .filter(|&pid| match process_owner(pid) {
-            // The kernel short name is truncated (16 bytes on macOS, 15 on
-            // Linux); "chanvoy" fits either way.
-            Ok(Some((uid, comm))) => uid == me && comm == "chanvoy",
-            Ok(None) => false,
-            Err(e) => {
-                panic!("owner of pid {pid} is unreadable ({e}); survivor count cannot be proven")
-            }
+        .filter(|&pid| identity_or_panic(pid, me) == Identity::Candidate)
+        .filter(|&pid| {
+            same_user_daemon_runtime(pid, me, &env.profile_name).as_deref() == Some(runtime)
         })
-        .filter(|&pid| same_user_daemon_runtime(pid, &env.profile_name).as_deref() == Some(runtime))
         .count()
 }
 
@@ -1410,19 +1404,19 @@ fn count_daemon_serve_processes(env: &TestEnv) -> usize {
 /// pid is gone, a zombie, or not such a daemon. Incomplete reads are retried
 /// against the process's start time so a reused pid cannot stand in for the
 /// original; a live process that stays unreadable panics.
-fn same_user_daemon_runtime(pid: u32, profile: &str) -> Option<String> {
-    use sysprims_core::SysprimsError;
+fn same_user_daemon_runtime(pid: u32, me: u32, profile: &str) -> Option<String> {
     let with_env = sysprims_proc::ProcessOptions::default().with_env();
     let mut first_start = None;
     for _ in 0..PROCESS_READ_ATTEMPTS {
         let p = match sysprims_proc::get_process_with_options(pid, with_env) {
             Ok(p) => p,
-            Err(SysprimsError::NotFound { .. }) => return None,
+            // sysprims reports several unrelated errnos as NotFound, so no
+            // error is taken as exit until the owner read confirms it.
             Err(_) => {
-                std::thread::sleep(Duration::from_millis(20));
-                if matches!(process_owner(pid), Ok(None)) {
+                if identity_or_panic(pid, me) != Identity::Candidate {
                     return None;
                 }
+                std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
         };
@@ -1434,9 +1428,8 @@ fn same_user_daemon_runtime(pid: u32, profile: &str) -> Option<String> {
             (Some(start), now) if start != now => return None,
             _ => {}
         }
-        if !(p.name == "chanvoy" || argv0_is_chanvoy(&p.cmdline)) {
-            return None;
-        }
+        // The kernel short name already identified chanvoy; argv decides
+        // the profile and verb.
         if !p.cmdline.is_empty() {
             if !is_daemon_serve_for(&p.cmdline, profile) {
                 return None;
@@ -1482,11 +1475,30 @@ const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
 #[cfg(target_os = "macos")]
 const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
 
-/// Owner uid and kernel short name of `pid`, from a read that does not
-/// depend on argv/environment access: `Ok(None)` when the process no longer
-/// exists.
+#[derive(Debug, PartialEq, Eq)]
+enum Identity {
+    /// The kernel reports the pid gone.
+    Gone,
+    /// Another uid, or a same-uid process whose kernel short name is not
+    /// `chanvoy`.
+    Other,
+    /// A live same-uid process whose kernel short name is `chanvoy`.
+    Candidate,
+}
+
+/// The kernel short name is truncated (16 bytes on macOS, 15 on Linux);
+/// `chanvoy` fits either way and is compared as raw bytes.
+const CHANVOY_COMM: &[u8] = b"chanvoy";
+
+fn identity_or_panic(pid: u32, me: u32) -> Identity {
+    process_identity(pid, me).unwrap_or_else(|e| {
+        panic!("owner of pid {pid} is unreadable ({e}); survivor count cannot be proven")
+    })
+}
+
+/// Classify `pid` from reads that do not depend on argv/environment access.
 #[cfg(target_os = "macos")]
-fn process_owner(pid: u32) -> std::io::Result<Option<(u32, String)>> {
+fn process_identity(pid: u32, me: u32) -> std::io::Result<Identity> {
     // SAFETY: `info` is a plain C struct the kernel fills; the size passed is
     // its exact size and the call writes nothing beyond it.
     let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
@@ -1501,13 +1513,25 @@ fn process_owner(pid: u32) -> std::io::Result<Option<(u32, String)>> {
         )
     };
     if n == size {
-        // SAFETY: the kernel NUL-terminates `comm` within its 16 bytes.
-        let comm = unsafe { std::ffi::CStr::from_ptr(info.comm.as_ptr()) };
-        return Ok(Some((info.uid, comm.to_string_lossy().into_owned())));
+        if info.uid != me {
+            return Ok(Identity::Other);
+        }
+        // Bounded: the name ends at the first NUL or at the array end.
+        let comm: Vec<u8> = info
+            .comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        return Ok(if comm == CHANVOY_COMM {
+            Identity::Candidate
+        } else {
+            Identity::Other
+        });
     }
     let err = std::io::Error::last_os_error();
     if n <= 0 && err.raw_os_error() == Some(libc::ESRCH) {
-        return Ok(None);
+        return Ok(Identity::Gone);
     }
     Err(if n > 0 {
         std::io::Error::other(format!("short read {n} of {size} bytes"))
@@ -1516,22 +1540,26 @@ fn process_owner(pid: u32) -> std::io::Result<Option<(u32, String)>> {
     })
 }
 
-/// Owner uid and kernel short name of `pid`, from a read that does not
-/// depend on argv/environment access: `Ok(None)` when the process no longer
-/// exists. `/proc/<pid>` is owned by the process's effective uid regardless
-/// of `hidepid`, which only hides other users' entries.
+/// Classify `pid` from reads that do not depend on argv/environment access.
+/// `/proc/<pid>` is owned by the process's effective uid regardless of
+/// `hidepid`, which only hides other users' entries; `comm` is read only
+/// for same-uid pids.
 #[cfg(target_os = "linux")]
-fn process_owner(pid: u32) -> std::io::Result<Option<(u32, String)>> {
+fn process_identity(pid: u32, me: u32) -> std::io::Result<Identity> {
     use std::os::unix::fs::MetadataExt;
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
-    let uid = match std::fs::metadata(format!("/proc/{pid}")) {
-        Ok(meta) => meta.uid(),
-        Err(e) if gone(&e) => return Ok(None),
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(meta) if meta.uid() != me => return Ok(Identity::Other),
+        Ok(_) => {}
+        Err(e) if gone(&e) => return Ok(Identity::Gone),
         Err(e) => return Err(e),
-    };
-    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        Ok(comm) => Ok(Some((uid, comm.trim_end().to_owned()))),
-        Err(e) if gone(&e) => Ok(None),
+    }
+    match std::fs::read(format!("/proc/{pid}/comm")) {
+        Ok(comm) if comm.strip_suffix(b"\n").unwrap_or(&comm) == CHANVOY_COMM => {
+            Ok(Identity::Candidate)
+        }
+        Ok(_) => Ok(Identity::Other),
+        Err(e) if gone(&e) => Ok(Identity::Gone),
         Err(e) => Err(e),
     }
 }
