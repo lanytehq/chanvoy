@@ -261,6 +261,7 @@ dependencies = [
  "libc",
  "rsfulmen 0.2.0",
  "serde_json",
+ "sysprims-core",
  "sysprims-proc",
  "sysprims-signal",
  "tempfile",

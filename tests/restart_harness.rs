@@ -1376,51 +1376,120 @@ async fn daemon_start_classifies_child_startup_failure() {
 /// candidate's inherited `CHANVOY_RUNTIME_DIR`, which is unique per harness env.
 ///
 /// Enumeration is in-process via `sysprims_proc` (no `ps`/`lsof` subprocess,
-/// which sandboxed agent hosts deny). A candidate whose environment cannot be
-/// read panics instead of being skipped, so an unreadable process table can
-/// never make a survivor count look like zero.
+/// which sandboxed agent hosts deny). Every pid is read individually because
+/// a bulk snapshot silently drops processes it cannot read. Each read either
+/// proves the process gone, proves it belongs to another user (the harness
+/// spawns every daemon as itself), or yields its owner, command line and
+/// environment. A live same-user `chanvoy` whose command line or environment
+/// stays unreadable panics, so an unreadable process can never make a
+/// survivor count look like zero. Panic text names pids only.
 fn count_daemon_serve_processes(env: &TestEnv) -> usize {
+    use sysprims_core::SysprimsError;
     let runtime = env.chanvoy_runtime_dir();
     let runtime = runtime.to_str().expect("runtime dir is UTF-8");
-    let snapshot =
-        sysprims_proc::snapshot_with_options(sysprims_proc::ProcessOptions::default().with_env())
-            .expect("process snapshot");
-    snapshot
-        .processes
-        .iter()
-        .filter(|p| p.state != sysprims_proc::ProcessState::Zombie)
-        .filter(|p| {
-            // cmdline and env share one kernel read; the name does not. A
-            // live chanvoy with no readable cmdline must not drop out here.
-            assert!(
-                !(p.name == "chanvoy" && p.cmdline.is_empty()),
-                "command line of chanvoy pid {} is unreadable; \
-                 survivor count cannot be proven",
-                p.pid
-            );
-            is_daemon_serve_for(&p.cmdline, &env.profile_name)
-        })
-        .filter(|p| {
-            let env_vars = p.env.as_ref().unwrap_or_else(|| {
-                panic!(
-                    "environment of daemon candidate pid {} is unreadable; \
-                     ownership cannot be proven",
-                    p.pid
-                )
-            });
-            env_vars.get("CHANVOY_RUNTIME_DIR").map(String::as_str) == Some(runtime)
-        })
-        .count()
+    let with_env = sysprims_proc::ProcessOptions::default().with_env();
+    let me = sysprims_proc::get_process(std::process::id())
+        .expect("read own process")
+        .user
+        .expect("own process owner");
+    let mut count = 0;
+    for pid in all_pids() {
+        let p = match sysprims_proc::get_process_with_options(pid, with_env) {
+            Ok(p) => p,
+            Err(SysprimsError::NotFound { .. } | SysprimsError::PermissionDenied { .. }) => {
+                continue
+            }
+            Err(e) => panic!("read pid {pid}: {e}"),
+        };
+        if p.state == sysprims_proc::ProcessState::Zombie {
+            continue;
+        }
+        match p.user.as_deref() {
+            Some(owner) if owner == me => {}
+            Some(_) => continue,
+            None => {
+                assert_gone(pid, "owner");
+                continue;
+            }
+        }
+        let named_chanvoy = p.name == "chanvoy" || argv0_is_chanvoy(&p.cmdline);
+        if !named_chanvoy {
+            continue;
+        }
+        if p.cmdline.is_empty() {
+            assert_gone(pid, "command line");
+            continue;
+        }
+        if !is_daemon_serve_for(&p.cmdline, &env.profile_name) {
+            continue;
+        }
+        let Some(env_vars) = p.env.as_ref() else {
+            assert_gone(pid, "environment");
+            continue;
+        };
+        if env_vars.get("CHANVOY_RUNTIME_DIR").map(String::as_str) == Some(runtime) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// A process read came back incomplete. Accept that only if the process has
+/// since exited; anything still alive is unprovable.
+fn assert_gone(pid: u32, what: &str) {
+    match sysprims_proc::get_process(pid) {
+        Err(sysprims_core::SysprimsError::NotFound { .. }) => {}
+        Ok(p) if p.state == sysprims_proc::ProcessState::Zombie => {}
+        _ => panic!(
+            "{what} of live pid {pid} is unreadable; \
+             survivor count cannot be proven"
+        ),
+    }
+}
+
+/// Every pid on the host. Not a snapshot: callers must see unreadable pids.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<u32> {
+    // SAFETY: a null buffer asks for the current count; the second call
+    // writes at most `buf.len()` pids into memory we own.
+    let hint = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    assert!(hint > 0, "proc_listallpids count failed");
+    let mut buf = vec![0 as libc::c_int; hint as usize + 256];
+    let bytes = (buf.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+    let n = unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes) };
+    assert!(n > 0, "proc_listallpids failed");
+    assert!(
+        (n as usize) < buf.len(),
+        "process table grew past the listing buffer"
+    );
+    buf.truncate(n as usize);
+    buf.into_iter()
+        .filter(|&p| p > 0)
+        .map(|p| p as u32)
+        .collect()
+}
+
+/// Every pid on the host. Not a snapshot: callers must see unreadable pids.
+#[cfg(target_os = "linux")]
+fn all_pids() -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .expect("read /proc")
+        .map(|entry| entry.expect("read /proc entry").file_name())
+        .filter_map(|name| name.to_str().and_then(|n| n.parse().ok()))
+        .collect()
+}
+
+fn argv0_is_chanvoy(cmdline: &[String]) -> bool {
+    cmdline.first().is_some_and(|exe| {
+        std::path::Path::new(exe)
+            .file_name()
+            .is_some_and(|name| name == "chanvoy")
+    })
 }
 
 /// Whether `cmdline` is `chanvoy ... --profile <profile> ... daemon serve`.
 fn is_daemon_serve_for(cmdline: &[String], profile: &str) -> bool {
-    let is_chanvoy = cmdline.first().is_some_and(|exe| {
-        std::path::Path::new(exe)
-            .file_name()
-            .is_some_and(|name| name == "chanvoy")
-    });
-    is_chanvoy
+    argv0_is_chanvoy(cmdline)
         && cmdline
             .windows(2)
             .any(|w| w[0] == "--profile" && w[1] == profile)
