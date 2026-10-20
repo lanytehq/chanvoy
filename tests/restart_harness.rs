@@ -1372,55 +1372,247 @@ async fn daemon_start_classifies_child_startup_failure() {
 /// Process-table match on profile slug alone is **not** safe under concurrent
 /// multi-seat `make pr-final` on a shared host — seats use the same fixed test
 /// slugs with isolated `CHANVOY_RUNTIME_DIR` trees, so a foreign daemon with the
-/// same `--profile` would false-count as a survivor. Scope candidates to
-/// processes that hold open our runtime dir (or socket) via `lsof`.
+/// same `--profile` would false-count as a survivor. Ownership is proven by the
+/// candidate's inherited `CHANVOY_RUNTIME_DIR`, which is unique per harness env.
+///
+/// Enumeration is in-process (no `ps`/`lsof` subprocess, which sandboxed
+/// agent hosts deny). Every pid is classified from positive evidence, never
+/// from a failed read: a numeric owner uid that the kernel reports for every
+/// process, then a full `sysprims_proc` read for same-user `chanvoy`
+/// processes only. A pid that is gone or owned by another uid is skipped
+/// (the harness spawns every daemon as itself). A live same-user process
+/// whose owner cannot be read, or a live same-user `chanvoy` whose command
+/// line or environment stays unreadable, panics, so an unreadable process
+/// can never make a survivor count look like zero. Panic text names pids
+/// only.
 fn count_daemon_serve_processes(env: &TestEnv) -> usize {
-    let out = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=,command="])
-        .output()
-        .expect("ps -ax");
     let runtime = env.chanvoy_runtime_dir();
-    let socket = env.socket_path();
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let mut parts = line.splitn(2, char::is_whitespace);
-            let pid: u32 = parts.next()?.trim().parse().ok()?;
-            let cmd = parts.next().unwrap_or("");
-            if !(cmd.contains("chanvoy")
-                && cmd.contains("daemon")
-                && cmd.contains("serve")
-                && cmd.contains(&env.profile_name))
-            {
-                return None;
-            }
-            // Belong to this harness invocation: open file under our runtime
-            // or our socket path. Foreign seats with the same slug fail this.
-            if process_holds_path(pid, &socket) || process_holds_path(pid, &runtime) {
-                Some(pid)
-            } else {
-                None
-            }
+    let runtime = runtime.to_str().expect("runtime dir is UTF-8");
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    all_pids()
+        .into_iter()
+        .filter(|&pid| identity_or_panic(pid, me) == Identity::Candidate)
+        .filter(|&pid| {
+            same_user_daemon_runtime(pid, me, &env.profile_name).as_deref() == Some(runtime)
         })
         .count()
 }
 
-/// Whether process `pid` has `path` open (socket, cwd, or any FD under a dir).
-fn process_holds_path(pid: u32, path: &std::path::Path) -> bool {
-    let Some(path_str) = path.to_str() else {
-        return false;
-    };
-    let out = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "--", path_str])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => !o.stdout.is_empty(),
-        _ => false,
+/// For a same-user pid, the `CHANVOY_RUNTIME_DIR` of a matching
+/// `chanvoy --profile <profile> daemon serve` process, or `None` when the
+/// pid is gone, a zombie, or not such a daemon. Incomplete reads are retried
+/// against the process's start time so a reused pid cannot stand in for the
+/// original; a live process that stays unreadable panics.
+fn same_user_daemon_runtime(pid: u32, me: u32, profile: &str) -> Option<String> {
+    let with_env = sysprims_proc::ProcessOptions::default().with_env();
+    let mut first_start = None;
+    for _ in 0..PROCESS_READ_ATTEMPTS {
+        let p = match sysprims_proc::get_process_with_options(pid, with_env) {
+            Ok(p) => p,
+            // sysprims reports several unrelated errnos as NotFound, so no
+            // error is taken as exit until the owner read confirms it.
+            Err(_) => {
+                if identity_or_panic(pid, me) != Identity::Candidate {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+        if p.state == sysprims_proc::ProcessState::Zombie {
+            return None;
+        }
+        match (first_start, p.start_time_unix_ms) {
+            (None, start) => first_start = Some(start),
+            (Some(start), now) if start != now => return None,
+            _ => {}
+        }
+        // The kernel short name already identified chanvoy; argv decides
+        // the profile and verb.
+        if !p.cmdline.is_empty() {
+            if !is_daemon_serve_for(&p.cmdline, profile) {
+                return None;
+            }
+            if let Some(env_vars) = p.env {
+                return env_vars.get("CHANVOY_RUNTIME_DIR").cloned();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
+    panic!(
+        "command line or environment of live chanvoy pid {pid} is unreadable; \
+         survivor count cannot be proven"
+    )
+}
+
+const PROCESS_READ_ATTEMPTS: usize = 5;
+
+/// `struct proc_bsdshortinfo` from `<sys/proc_info.h>` (`PROC_PIDT_SHORTBSDINFO`).
+/// Not in the pinned `libc`. Unlike `PROC_PIDTBSDINFO`, the kernel answers
+/// this flavor for every process, including other users'.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    status: u32,
+    comm: [libc::c_char; 16],
+    flags: u32,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    ruid: libc::uid_t,
+    rgid: libc::gid_t,
+    svuid: libc::uid_t,
+    svgid: libc::gid_t,
+    rfu: u32,
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
+
+#[cfg(target_os = "macos")]
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Identity {
+    /// The kernel reports the pid gone.
+    Gone,
+    /// Another uid, or a same-uid process whose kernel short name is not
+    /// `chanvoy`.
+    Other,
+    /// A live same-uid process whose kernel short name is `chanvoy`.
+    Candidate,
+}
+
+/// The kernel short name is truncated (16 bytes on macOS, 15 on Linux);
+/// `chanvoy` fits either way and is compared as raw bytes.
+const CHANVOY_COMM: &[u8] = b"chanvoy";
+
+fn identity_or_panic(pid: u32, me: u32) -> Identity {
+    process_identity(pid, me).unwrap_or_else(|e| {
+        panic!("owner of pid {pid} is unreadable ({e}); survivor count cannot be proven")
+    })
+}
+
+/// Classify `pid` from reads that do not depend on argv/environment access.
+#[cfg(target_os = "macos")]
+fn process_identity(pid: u32, me: u32) -> std::io::Result<Identity> {
+    // SAFETY: `info` is a plain C struct the kernel fills; the size passed is
+    // its exact size and the call writes nothing beyond it.
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdShortInfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdShortInfo).cast(),
+            size,
+        )
+    };
+    if n == size {
+        if info.uid != me {
+            return Ok(Identity::Other);
+        }
+        // Bounded: the name ends at the first NUL or at the array end.
+        let comm: Vec<u8> = info
+            .comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        return Ok(if comm == CHANVOY_COMM {
+            Identity::Candidate
+        } else {
+            Identity::Other
+        });
+    }
+    let err = std::io::Error::last_os_error();
+    if n <= 0 && err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(Identity::Gone);
+    }
+    Err(if n > 0 {
+        std::io::Error::other(format!("short read {n} of {size} bytes"))
+    } else {
+        err
+    })
+}
+
+/// Classify `pid` from reads that do not depend on argv/environment access.
+/// `/proc/<pid>` is owned by the process's effective uid regardless of
+/// `hidepid`, which only hides other users' entries; `comm` is read only
+/// for same-uid pids.
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32, me: u32) -> std::io::Result<Identity> {
+    use std::os::unix::fs::MetadataExt;
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(meta) if meta.uid() != me => return Ok(Identity::Other),
+        Ok(_) => {}
+        Err(e) if gone(&e) => return Ok(Identity::Gone),
+        Err(e) => return Err(e),
+    }
+    match std::fs::read(format!("/proc/{pid}/comm")) {
+        Ok(comm) if comm.strip_suffix(b"\n").unwrap_or(&comm) == CHANVOY_COMM => {
+            Ok(Identity::Candidate)
+        }
+        Ok(_) => Ok(Identity::Other),
+        Err(e) if gone(&e) => Ok(Identity::Gone),
+        Err(e) => Err(e),
+    }
+}
+
+/// Every pid on the host. Not a snapshot: callers must see unreadable pids.
+#[cfg(target_os = "macos")]
+fn all_pids() -> Vec<u32> {
+    // SAFETY: a null buffer asks for the current count; the second call
+    // writes at most `buf.len()` pids into memory we own.
+    let hint = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    assert!(hint > 0, "proc_listallpids count failed");
+    let mut buf = vec![0 as libc::c_int; hint as usize + 256];
+    let bytes = (buf.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+    let n = unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes) };
+    assert!(n > 0, "proc_listallpids failed");
+    assert!(
+        (n as usize) < buf.len(),
+        "process table grew past the listing buffer"
+    );
+    buf.truncate(n as usize);
+    buf.into_iter()
+        .filter(|&p| p > 0)
+        .map(|p| p as u32)
+        .collect()
+}
+
+/// Every pid on the host. Not a snapshot: callers must see unreadable pids.
+#[cfg(target_os = "linux")]
+fn all_pids() -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .expect("read /proc")
+        .map(|entry| entry.expect("read /proc entry").file_name())
+        .filter_map(|name| name.to_str().and_then(|n| n.parse().ok()))
+        .collect()
+}
+
+fn argv0_is_chanvoy(cmdline: &[String]) -> bool {
+    cmdline.first().is_some_and(|exe| {
+        std::path::Path::new(exe)
+            .file_name()
+            .is_some_and(|name| name == "chanvoy")
+    })
+}
+
+/// Whether `cmdline` is `chanvoy ... --profile <profile> ... daemon serve`.
+fn is_daemon_serve_for(cmdline: &[String], profile: &str) -> bool {
+    argv0_is_chanvoy(cmdline)
+        && cmdline
+            .windows(2)
+            .any(|w| w[0] == "--profile" && w[1] == profile)
+        && cmdline
+            .windows(2)
+            .any(|w| w[0] == "daemon" && w[1] == "serve")
 }
 
 /// Legacy attention repair is provider-backed maintenance, not local daemon
