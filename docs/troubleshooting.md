@@ -78,7 +78,7 @@ daemon spawned under. This happens when:
 
 2. Confirm the daemon is alive at the resolved pid. `<pid-path>` is the
    runtime directory when one is set; otherwise it is
-   `<config root>/run/` (see
+   `<config root>/run/<key>/` (see
    [architecture.md §Storage layout](./architecture.md#storage-layout)):
 
    ```bash

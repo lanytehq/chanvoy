@@ -2140,11 +2140,14 @@ fn platform_runtime_dir() -> Option<PathBuf> {
 /// temp dir (macOS, or Linux without `XDG_RUNTIME_DIR`), the pid file lives
 /// under the config dir instead: the OS ages temp files out from under a
 /// long-running daemon, and a lost pid file leaves only socket-peer evidence.
+/// That durable directory is keyed by the socket directory, so daemons for
+/// one profile under different temp roots never share a pid record.
 pub fn default_pid_dir() -> PathBuf {
     pid_dir_from(
         env::var_os("CHANVOY_RUNTIME_DIR").map(PathBuf::from),
         platform_runtime_dir(),
         default_chanvoy_config_dir,
+        &env::temp_dir().join("chanvoy"),
     )
 }
 
@@ -2152,10 +2155,67 @@ fn pid_dir_from(
     runtime_override: Option<PathBuf>,
     platform_runtime: Option<PathBuf>,
     config_dir: impl FnOnce() -> PathBuf,
+    socket_dir: &Path,
 ) -> PathBuf {
-    runtime_override
-        .or(platform_runtime)
-        .unwrap_or_else(|| config_dir().join("run"))
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    runtime_override.or(platform_runtime).unwrap_or_else(|| {
+        let digest = Sha256::digest(socket_dir.as_os_str().as_bytes());
+        let key: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        config_dir().join("run").join(key)
+    })
+}
+
+/// Prepare the durable `<config root>/run/<key>` pid directory. The config
+/// root must belong to this user and not be writable by group or others;
+/// `run` and `<key>` are created `0700` and, if present, must be real
+/// directories with the same ownership. Links there are refused, so a
+/// planted entry cannot redirect the pid write.
+pub fn prepare_pid_dir(dir: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let refuse = |what: &str| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what);
+    // SAFETY: geteuid has no arguments or preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let private = |meta: &fs::Metadata| meta.uid() == euid && meta.mode() & 0o022 == 0;
+    let run = dir
+        .parent()
+        .ok_or_else(|| refuse("pid directory has no parent"))?;
+    let root = run
+        .parent()
+        .ok_or_else(|| refuse("pid directory has no config root"))?;
+    if !private(&fs::metadata(root)?) {
+        return Err(refuse(
+            "config root is shared or foreign; pid record not written",
+        ));
+    }
+    for component in [run, dir] {
+        match fs::symlink_metadata(component) {
+            Ok(meta) if meta.file_type().is_dir() && private(&meta) => {}
+            Ok(_) => return Err(refuse("pid directory is not a private directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::DirBuilder::new().mode(0o700).create(component)?;
+                if !private(&fs::symlink_metadata(component)?) {
+                    return Err(refuse("pid directory is not a private directory"));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Write this process's pid without following a planted link.
+pub fn write_pid_file(path: &Path) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(std::process::id().to_string().as_bytes())
 }
 
 pub fn socket_path_for_profile(profile: &str) -> PathBuf {
@@ -6671,20 +6731,61 @@ mod tests {
     static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn durable_pid_dir_and_file_refuse_planted_links() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = root.path().join("run").join("key");
+        prepare_pid_dir(&dir).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        let pid = dir.join("p.pid");
+        write_pid_file(&pid).unwrap();
+        assert_eq!(
+            fs::read_to_string(&pid).unwrap(),
+            std::process::id().to_string()
+        );
+        assert_eq!(fs::metadata(&pid).unwrap().mode() & 0o777, 0o600);
+
+        let victim = root.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let link = dir.join("q.pid");
+        symlink(&victim, &link).unwrap();
+        assert!(write_pid_file(&link).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+
+        let planted = tempfile::tempdir().unwrap();
+        fs::set_permissions(planted.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(root.path(), planted.path().join("run")).unwrap();
+        assert!(prepare_pid_dir(&planted.path().join("run").join("key")).is_err());
+
+        let shared = tempfile::tempdir().unwrap();
+        fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_pid_dir(&shared.path().join("run").join("key")).is_err());
+        assert!(!shared.path().join("run").exists());
+    }
+
+    #[test]
     fn pid_dir_leaves_os_temp_only_when_no_runtime_dir_is_configured() {
         let config = || PathBuf::from("/synthetic/config");
+        let socket = Path::new("/synthetic/tmp-a/chanvoy");
         assert_eq!(
-            pid_dir_from(Some("/synthetic/override".into()), None, config),
+            pid_dir_from(Some("/synthetic/override".into()), None, config, socket),
             PathBuf::from("/synthetic/override"),
             "an explicit runtime override keeps socket and pid together"
         );
         assert_eq!(
-            pid_dir_from(None, Some("/synthetic/xdg/chanvoy".into()), config),
+            pid_dir_from(None, Some("/synthetic/xdg/chanvoy".into()), config, socket),
             PathBuf::from("/synthetic/xdg/chanvoy"),
         );
-        let durable = pid_dir_from(None, None, config);
-        assert_eq!(durable, PathBuf::from("/synthetic/config/run"));
+        let durable = pid_dir_from(None, None, config, socket);
+        assert!(durable.starts_with("/synthetic/config/run"));
         assert!(!durable.starts_with(env::temp_dir()));
+        assert_eq!(durable, pid_dir_from(None, None, config, socket));
+        assert_ne!(
+            durable,
+            pid_dir_from(None, None, config, Path::new("/synthetic/tmp-b/chanvoy")),
+            "separate socket roots never share a durable pid record"
+        );
     }
 
     // ------------------------------------------------------------------

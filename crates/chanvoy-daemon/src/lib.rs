@@ -392,11 +392,15 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             })
         }
     }
-    for path in [&socket_path, &pid_path] {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    if let Some(parent) = pid_path
+        .parent()
+        .filter(|dir| Some(*dir) != socket_path.parent())
+    {
+        chanvoy_core::prepare_pid_dir(parent)?;
     }
     // Inspect without consumption before a reduction-enabled startup can
     // contact its family provider. The resolver revalidates/consumes later.
@@ -484,8 +488,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     };
     let listener = UnixListener::bind(&socket_path)?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-    fs::write(&pid_path, std::process::id().to_string())?;
-    fs::set_permissions(&pid_path, fs::Permissions::from_mode(0o600))?;
+    chanvoy_core::write_pid_file(&pid_path)?;
     info!(profile = profile_name, "chanvoy daemon local socket bound");
 
     let ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>> = Arc::new(Mutex::new(None));
@@ -3402,7 +3405,12 @@ fn cleanup_runtime_files(socket_path: &Path, pid_path: &Path) -> Result<(), io::
     if socket_path.exists() {
         fs::remove_file(socket_path)?;
     }
-    if pid_path.exists() {
+    // Remove only this daemon's own record; another daemon may have written
+    // the path since, and its record is not ours to remove.
+    let own = fs::symlink_metadata(pid_path).is_ok_and(|meta| meta.is_file())
+        && fs::read_to_string(pid_path)
+            .is_ok_and(|body| body.trim() == std::process::id().to_string());
+    if own {
         fs::remove_file(pid_path)?;
     }
     Ok(())

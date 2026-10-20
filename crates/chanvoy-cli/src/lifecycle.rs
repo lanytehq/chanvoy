@@ -83,10 +83,12 @@ struct NativeControl {
     captured_birth: Option<u64>,
     exit_watch: Option<ExitWatch>,
     death_seen: Mutex<Option<Instant>>,
-    /// The pid file was written before the current boot, so its process is
-    /// gone whatever now holds the pid. Nothing is signalled; cleanup still
-    /// needs positive socket absence.
+    /// The pid file was written before the current boot. Its pid is released
+    /// only when the current holder is provably not this profile's daemon.
     pre_boot_record: bool,
+    /// A pre-boot record whose pid is now held under another account; that
+    /// holder is never inspected or signalled.
+    foreign_holder: bool,
 }
 
 /// Read-only binding for a daemon observation. This carries no signaling or
@@ -517,6 +519,18 @@ fn stamp_ms(stamp: &FileStamp) -> i128 {
     (stamp.modified_secs as i128) * 1000 + (stamp.modified_nanos as i128) / 1_000_000
 }
 
+/// The kernel refuses a same-account signal probe only for a process under
+/// another account. The daemon runs as the invoking user and never changes
+/// account, so such a holder cannot be the recorded daemon.
+fn held_by_other_user(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence and permission check.
+    let probe = unsafe { libc::kill(pid as i32, 0) };
+    probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn written_before_boot(stamp: &FileStamp) -> bool {
     boot_time_ms().is_some_and(|boot| stamp_ms(stamp) + STALE_RECORD_SLACK_MS < boot)
 }
@@ -643,7 +657,8 @@ impl NativeControl {
         {
             return Err("runtime socket path is not a socket; state retained".into());
         }
-        if pid_stamp.as_ref().is_some_and(written_before_boot) {
+        let pre_boot_record = pid_stamp.as_ref().is_some_and(written_before_boot);
+        if pre_boot_record && held_by_other_user(pid) {
             let control = Self {
                 profile: profile.into(),
                 pid,
@@ -656,6 +671,7 @@ impl NativeControl {
                 exit_watch: None,
                 death_seen: Mutex::new(None),
                 pre_boot_record: true,
+                foreign_holder: true,
             };
             if !control.runtime_matches(false) {
                 return Err("runtime changed during capture; state retained".into());
@@ -688,7 +704,8 @@ impl NativeControl {
             captured_birth,
             exit_watch,
             death_seen: Mutex::new(None),
-            pre_boot_record: false,
+            pre_boot_record,
+            foreign_holder: false,
         };
         if !control.runtime_matches(false) {
             return Err("runtime changed around exit monitor; state retained".into());
@@ -702,7 +719,16 @@ impl NativeControl {
         let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) else {
             return false;
         };
-        let expected_exe = exe.to_string_lossy();
+        let Some(record) = self.pid_stamp.as_ref().or(self.socket_stamp.as_ref()) else {
+            return false;
+        };
+        identity.executable == exe.to_string_lossy()
+            && self.serves_profile(identity)
+            && stamp_ms(record) >= i128::from(identity.start_ms)
+    }
+
+    /// Arguments of a `daemon serve` for this profile, from any executable.
+    fn serves_profile(&self, identity: &ProcessIdentity) -> bool {
         let explicit_profile = identity
             .args
             .windows(2)
@@ -715,21 +741,19 @@ impl NativeControl {
             .args
             .windows(2)
             .any(|a| a[0] == "daemon" && a[1] == "serve");
-        let Some(record) = self.pid_stamp.as_ref().or(self.socket_stamp.as_ref()) else {
-            return false;
-        };
-        identity.executable == expected_exe
-            && explicit_profile
-            && serve
-            && stamp_ms(record) >= i128::from(identity.start_ms)
+        explicit_profile && serve
     }
 
-    /// A pid file written before this process started names an earlier
-    /// process that has since exited and whose pid was reused.
-    fn record_predates(&self, identity: &ProcessIdentity) -> bool {
-        self.pid_stamp.as_ref().is_some_and(|record| {
-            i128::from(identity.start_ms) > stamp_ms(record) + STALE_RECORD_SLACK_MS
-        })
+    /// A pid record is stale only when timing says it predates the current
+    /// holder AND the holder is not serving this profile. Timing alone is not
+    /// death proof: clocks step and mtimes can be restored, so a holder with
+    /// daemon arguments falls through to the ownership refusal instead.
+    fn record_released(&self, identity: &ProcessIdentity) -> bool {
+        let Some(record) = self.pid_stamp.as_ref() else {
+            return false;
+        };
+        let predates = i128::from(identity.start_ms) > stamp_ms(record) + STALE_RECORD_SLACK_MS;
+        (predates || self.pre_boot_record) && !self.serves_profile(identity)
     }
 }
 
@@ -1092,8 +1116,15 @@ async fn peer_owner(socket: &Path, budget: Duration) -> SocketOwner {
 
 impl NativeControl {
     fn observe_process(&self) -> ProcessObservation {
-        if self.pre_boot_record {
-            return ProcessObservation::Dead;
+        if self.foreign_holder {
+            // Recheck the account boundary on every observation.
+            return if held_by_other_user(self.pid)
+                || death_or_unknown(self.pid) == ProcessObservation::Dead
+            {
+                ProcessObservation::Dead
+            } else {
+                ProcessObservation::Unknown
+            };
         }
         if native_birth(self.pid).is_some_and(|birth| Some(birth) != self.captured_birth) {
             return ProcessObservation::Unknown;
@@ -1140,7 +1171,7 @@ impl NativeControl {
             }
         }
         if let ProcessObservation::Alive(identity) = &current {
-            if self.record_predates(identity) {
+            if self.record_released(identity) {
                 tracing::debug!(
                     stage = "process-liveness",
                     pid = self.pid,
@@ -1987,6 +2018,57 @@ mod tests {
             matches!(observe_pid(child.0.id()), ProcessObservation::Alive(_)),
             "the process now holding the pid is never signalled"
         );
+    }
+
+    #[tokio::test]
+    async fn old_record_held_by_a_daemon_shaped_process_is_not_released() {
+        // Timing is not death proof: a holder with this profile's serve
+        // arguments keeps its record and reaches the ownership refusal.
+        let _ = child();
+        let holder = OwnedChild(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "sleep 30; :",
+                    "sh",
+                    "--profile",
+                    "test",
+                    "daemon",
+                    "serve",
+                ])
+                .spawn()
+                .unwrap(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        std::fs::write(&pid, holder.0.id().to_string()).unwrap();
+        let (_, identity) = capture_live(&pid, &socket).await;
+        assert!(
+            identity.args.iter().any(|a| a == "serve"),
+            "{:?}",
+            identity.args
+        );
+        for at in [
+            std::time::UNIX_EPOCH + Duration::from_secs(1_000),
+            std::time::UNIX_EPOCH + Duration::from_millis(identity.start_ms)
+                - Duration::from_secs(30),
+        ] {
+            set_mtime(&pid, at);
+            let control = NativeControl::capture("test", pid.clone(), socket.clone())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(control.observe(), ProcessObservation::Alive(_)));
+            let refusal = stop_at("test", pid.clone(), socket.clone())
+                .await
+                .unwrap_err();
+            assert!(refusal.contains("ownership unconfirmed"), "{refusal}");
+            assert!(pid.exists());
+        }
+        assert!(matches!(
+            observe_pid(holder.0.id()),
+            ProcessObservation::Alive(_)
+        ));
     }
 
     #[tokio::test]

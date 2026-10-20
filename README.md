@@ -160,7 +160,7 @@ namespace):
 Runtime sockets and pid files live separately, under
 `$XDG_RUNTIME_DIR/chanvoy/` when available. Without a runtime dir
 (macOS, or Linux without `XDG_RUNTIME_DIR`), sockets use the OS temp
-dir and pid files use `<config root>/run/`, which the OS does not age
+dir and pid files use `<config root>/run/<key>/`, which the OS does not age
 out from under a long-running daemon.
 
 Two env overrides for non-default deployments (sandboxed agents,

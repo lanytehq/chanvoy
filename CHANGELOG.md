@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - When no runtime directory is configured (macOS, or Linux without
   `XDG_RUNTIME_DIR`), the daemon writes its pid file under
-  `<config root>/run/` instead of the OS temp dir, so temp cleanup can no
+  `<config root>/run/<key>/` instead of the OS temp dir, so temp cleanup can no
   longer remove it from a running daemon. The socket location is unchanged,
   and `CHANVOY_RUNTIME_DIR` still places both.
 - `daemon stop`, `auto-setup` and profile refresh can stop a live daemon whose
@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signal. A socket without a live listener and without a pid file is still
   retained.
 - A pid file written before the current boot, or before the process now
-  holding its PID started, is treated as describing an exited daemon. That
-  process is never signalled; the record is removed only once the socket has
-  no live owner.
+  holding its PID started, is released when that process is not this
+  profile's `daemon serve`. That process is never signalled; the record is
+  removed only once the socket has no live owner.
+- The daemon writes its pid file without following links and removes it at
+  exit only while it still names that daemon.
 
 ### Daemon status
 

@@ -34,7 +34,7 @@ Examples:
 Runtime files are separate from config:
 
 - Socket: `XDG_RUNTIME_DIR/chanvoy/<profile>.sock` when available, otherwise the OS temp dir
-- Pid: same directory as the socket when a runtime dir is available; otherwise `<config root>/run/<profile>.pid`, outside the OS temp dir so periodic temp cleanup cannot remove it from a running daemon
+- Pid: same directory as the socket when a runtime dir is available; otherwise `<config root>/run/<key>/<profile>.pid`, outside the OS temp dir so periodic temp cleanup cannot remove it from a running daemon. `<key>` is derived from the socket directory, so daemons under different temp roots keep separate records. The config root must not be writable by group or others, and `run/` entries must be real directories owned by you; otherwise the daemon refuses to start rather than write through them
 
 Note: the broader `LANYTE_CONFIG_ROOT` override is a cross-app standardization follow-up and is not implemented in `chanvoy` today.
 
@@ -209,9 +209,11 @@ live listener and no readable pid file is still retained.
 
 A pid file can outlive its process, for example across a reboot. A record
 written before the current boot, or more than two seconds before the process
-now holding that PID started, is treated as describing an exited daemon:
-nothing is signalled, and the files are removed only when the socket has no
-live owner.
+now holding that PID started, is released only when that process is not a
+`daemon serve` for this profile (or, for a pre-boot record, runs under another
+account). Nothing is signalled, and the files are removed only when the socket
+has no live owner. Timing alone never releases a record held by a process with
+daemon arguments; that case is refused as unconfirmed ownership.
 
 The exit observer uses macOS kernel process notifications or Linux pidfds
 (kernel 5.3 or newer); unavailable observation fails conservatively. Process

@@ -484,8 +484,10 @@ $RUNTIME_ROOT/                         (default: $XDG_RUNTIME_DIR/chanvoy/
 │                                       runtime dir or override is set)
 └── <profile-name>.bootstrap.json      One-shot bootstrap-state handoff
 
-$CONFIG_ROOT/run/                      Pid files when $RUNTIME_ROOT falls back
-└── <profile-name>.pid                 to the OS temp dir, which ages files out
+$CONFIG_ROOT/run/<key>/                Pid files when $RUNTIME_ROOT falls back
+└── <profile-name>.pid                 to the OS temp dir, which ages files out;
+                                        <key> is 16 hex chars of sha256 over the
+                                        socket directory path
 ```
 
 ### Permission contract
