@@ -210,10 +210,11 @@ live listener and no readable pid file is still retained.
 A pid file can outlive its process, for example across a reboot. A record
 written before the current boot, or more than two seconds before the process
 now holding that PID started, is released only when that process is not a
-`daemon serve` for this profile (or, for a pre-boot record, runs under another
-account). Nothing is signalled, and the files are removed only when the socket
-has no live owner. Timing alone never releases a record held by a process with
-daemon arguments; that case is refused as unconfirmed ownership.
+`daemon serve` of any profile, or, for a pre-boot record, when its owner is
+positively read as another account. Nothing is signalled, and the files are
+removed only when the socket has no live owner. Timing alone never releases a
+record held by a `daemon serve` process; that case is refused as unconfirmed
+ownership.
 
 The exit observer uses macOS kernel process notifications or Linux pidfds
 (kernel 5.3 or newer); unavailable observation fails conservatively. Process

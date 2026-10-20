@@ -519,16 +519,70 @@ fn stamp_ms(stamp: &FileStamp) -> i128 {
     (stamp.modified_secs as i128) * 1000 + (stamp.modified_nanos as i128) / 1_000_000
 }
 
-/// The kernel refuses a same-account signal probe only for a process under
-/// another account. The daemon runs as the invoking user and never changes
-/// account, so such a holder cannot be the recorded daemon.
+/// The daemon runs as the invoking user and never changes account, so a
+/// holder positively read as another account cannot be the recorded daemon.
+/// A denied or unavailable read is not evidence either way.
 fn held_by_other_user(pid: u32) -> bool {
+    // SAFETY: geteuid has no arguments or preconditions.
+    account_of(pid).is_some_and(|uid| uid != unsafe { libc::geteuid() })
+}
+
+/// Darwin `struct proc_bsdshortinfo` from `<sys/proc_info.h>`; the locked
+/// libc release does not declare it.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    status: u32,
+    comm: [libc::c_char; 16],
+    flags: u32,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    ruid: libc::uid_t,
+    rgid: libc::gid_t,
+    svuid: libc::uid_t,
+    svgid: libc::gid_t,
+    reserved: u32,
+}
+
+#[cfg(target_os = "macos")]
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
+
+#[cfg(target_os = "macos")]
+fn account_of(pid: u32) -> Option<u32> {
     if pid == 0 || pid > i32::MAX as u32 {
-        return false;
+        return None;
     }
-    // SAFETY: signal 0 performs only the existence and permission check.
-    let probe = unsafe { libc::kill(pid as i32, 0) };
-    probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // The short BSD flavor is readable across accounts, unlike the full one.
+    // SAFETY: an all-zero bit pattern is valid for this plain C struct.
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    // SAFETY: the buffer pointer and size describe `info` exactly.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            PROC_PIDT_SHORTBSDINFO,
+            1,
+            (&mut info as *mut ProcBsdShortInfo).cast(),
+            size,
+        )
+    };
+    (read == size && info.pid == pid).then_some(info.uid)
+}
+
+#[cfg(target_os = "linux")]
+fn account_of(pid: u32) -> Option<u32> {
+    native_owner(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn account_of(_: u32) -> Option<u32> {
+    None
 }
 
 fn written_before_boot(stamp: &FileStamp) -> bool {
@@ -727,7 +781,7 @@ impl NativeControl {
             && stamp_ms(record) >= i128::from(identity.start_ms)
     }
 
-    /// Arguments of a `daemon serve` for this profile, from any executable.
+    /// Arguments of a `daemon serve` for this profile.
     fn serves_profile(&self, identity: &ProcessIdentity) -> bool {
         let explicit_profile = identity
             .args
@@ -737,24 +791,30 @@ impl NativeControl {
                 .args
                 .iter()
                 .any(|a| a == &format!("--profile={}", self.profile));
-        let serve = identity
-            .args
-            .windows(2)
-            .any(|a| a[0] == "daemon" && a[1] == "serve");
-        explicit_profile && serve
+        explicit_profile && is_daemon_serve(identity)
     }
 
     /// A pid record is stale only when timing says it predates the current
-    /// holder AND the holder is not serving this profile. Timing alone is not
-    /// death proof: clocks step and mtimes can be restored, so a holder with
-    /// daemon arguments falls through to the ownership refusal instead.
+    /// holder AND the holder is not a daemon at all. Timing alone is not death
+    /// proof: clocks step and mtimes can be restored. Any `daemon serve`
+    /// holder may serve this profile through `CHANVOY_PROFILE`, so it falls
+    /// through to the ownership refusal instead.
     fn record_released(&self, identity: &ProcessIdentity) -> bool {
         let Some(record) = self.pid_stamp.as_ref() else {
             return false;
         };
         let predates = i128::from(identity.start_ms) > stamp_ms(record) + STALE_RECORD_SLACK_MS;
-        (predates || self.pre_boot_record) && !self.serves_profile(identity)
+        (predates || self.pre_boot_record) && !is_daemon_serve(identity)
     }
+}
+
+/// A `daemon serve` invocation from any executable, with or without an
+/// explicit profile.
+fn is_daemon_serve(identity: &ProcessIdentity) -> bool {
+    identity
+        .args
+        .windows(2)
+        .any(|a| a[0] == "daemon" && a[1] == "serve")
 }
 
 fn capture_monitor<W>(
@@ -2022,20 +2082,23 @@ mod tests {
 
     #[tokio::test]
     async fn old_record_held_by_a_daemon_shaped_process_is_not_released() {
-        // Timing is not death proof: a holder with this profile's serve
-        // arguments keeps its record and reaches the ownership refusal.
+        // Timing is not death proof: a `daemon serve` holder keeps its record
+        // and reaches the ownership refusal, including one whose profile came
+        // from `CHANVOY_PROFILE` rather than its arguments.
+        for args in [
+            &["--profile", "test", "daemon", "serve"][..],
+            &["daemon", "serve"],
+        ] {
+            old_record_holder_is_refused(args).await;
+        }
+    }
+
+    async fn old_record_holder_is_refused(holder_args: &[&str]) {
         let _ = child();
         let holder = OwnedChild(
             std::process::Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    "sleep 30; :",
-                    "sh",
-                    "--profile",
-                    "test",
-                    "daemon",
-                    "serve",
-                ])
+                .args(["-c", "sleep 30; :", "sh"])
+                .args(holder_args)
                 .spawn()
                 .unwrap(),
         );
@@ -2055,20 +2118,40 @@ mod tests {
                 - Duration::from_secs(30),
         ] {
             set_mtime(&pid, at);
-            let control = NativeControl::capture("test", pid.clone(), socket.clone())
-                .unwrap()
-                .unwrap();
-            assert!(matches!(control.observe(), ProcessObservation::Alive(_)));
-            let refusal = stop_at("test", pid.clone(), socket.clone())
-                .await
-                .unwrap_err();
+            capture_live(&pid, &socket).await;
+            // Retry only transient inspection refusals; any success fails.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let refusal = loop {
+                let refusal = stop_at("test", pid.clone(), socket.clone())
+                    .await
+                    .unwrap_err();
+                if !refusal.contains("unavailable") && !refusal.contains("unknown") {
+                    break refusal;
+                }
+                assert!(std::time::Instant::now() < deadline, "{refusal}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             assert!(refusal.contains("ownership unconfirmed"), "{refusal}");
             assert!(pid.exists());
         }
-        assert!(matches!(
-            observe_pid(holder.0.id()),
-            ProcessObservation::Alive(_)
-        ));
+        // Never signalled: still running, not merely inspectable.
+        let mut holder = holder;
+        assert!(
+            holder.0.try_wait().unwrap().is_none(),
+            "holder was signalled"
+        );
+    }
+
+    #[test]
+    fn other_account_requires_a_positive_uid_read() {
+        assert!(!held_by_other_user(std::process::id()));
+        assert!(!held_by_other_user(0));
+        assert!(!held_by_other_user(u32::MAX));
+        // SAFETY: geteuid has no arguments or preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(account_of(1), Some(0), "init is readable across accounts");
+            assert!(held_by_other_user(1));
+        }
     }
 
     #[tokio::test]
