@@ -1,0 +1,1960 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "inode"
+      ],
+      "properties": {
+        "device": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "inode": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        }
+      }
+    },
+    "birth": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "clock_ticks"
+          ],
+          "properties": {
+            "kind": {
+              "const": "linux"
+            },
+            "clock_ticks": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "seconds",
+            "microseconds"
+          ],
+          "properties": {
+            "kind": {
+              "const": "mac_os"
+            },
+            "seconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "microseconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 999999
+            }
+          }
+        }
+      ]
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "uid",
+        "birth",
+        "executable",
+        "pid_namespace",
+        "mount_namespace"
+      ],
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "executable": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 8192,
+          "pattern": "^(?:[0-9a-f]{2})+$",
+          "description": "Lossless absolute OS path bytes, lowercase hex; native codec also rejects NUL/parent traversal."
+        },
+        "pid_namespace": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/identity"
+            }
+          ]
+        },
+        "mount_namespace": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/identity"
+            }
+          ]
+        }
+      }
+    },
+    "socket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "identity"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 214,
+          "pattern": "^(?:[0-9a-f]{2})+$",
+          "description": "Lossless absolute OS path bytes, lowercase hex; native codec also rejects NUL/parent traversal."
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "commit",
+        "dirty"
+      ],
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-fA-F]{40}|unknown)$"
+        },
+        "dirty": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "uuid": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "namespace": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "path_bytes": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 8192,
+      "pattern": "^(?:[0-9a-f]{2})+$",
+      "description": "Lossless absolute OS path bytes, lowercase hex; native codec also rejects NUL/parent traversal."
+    },
+    "generation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "commit",
+        "dirty"
+      ],
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "commit": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace",
+        "instance_uuid",
+        "record_revision",
+        "process"
+      ],
+      "properties": {
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "instance_uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "record_revision": {
+          "$ref": "#/$defs/u64"
+        },
+        "process": {
+          "$ref": "#/$defs/process"
+        }
+      }
+    },
+    "retirement_params": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "action",
+        "target",
+        "caller_generation"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "retirement_params"
+        },
+        "action": {
+          "enum": [
+            "begin",
+            "continue_same_epoch"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "caller_generation": {
+          "$ref": "#/$defs/generation"
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requests",
+        "streams",
+        "slots",
+        "replacements",
+        "cleanup_obligations"
+      ],
+      "properties": {
+        "requests": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "streams": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slots": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replacements": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cleanup_obligations": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "retirement_facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "memory_retiring",
+        "durable_retiring",
+        "shutdown_started",
+        "responding_at_snapshot",
+        "admission_closed",
+        "durable_revision"
+      ],
+      "properties": {
+        "memory_retiring": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "durable_retiring": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shutdown_started": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "responding_at_snapshot": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "admission_closed": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "durable_revision": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "memory_retiring": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "admission_closed": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "memory_retiring": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "admission_closed": {
+                "const": false
+              },
+              "durable_retiring": {
+                "const": false
+              },
+              "shutdown_started": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "durable_retiring": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "memory_retiring": {
+                "const": true
+              },
+              "admission_closed": {
+                "const": true
+              },
+              "durable_revision": {
+                "$ref": "#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "shutdown_started": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "memory_retiring": {
+                "const": true
+              },
+              "durable_retiring": {
+                "const": true
+              },
+              "admission_closed": {
+                "const": true
+              },
+              "durable_revision": {
+                "$ref": "#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "admission_closed": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "memory_retiring": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "retirement_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "origin",
+        "target",
+        "outcome",
+        "request_committed",
+        "facts",
+        "counts",
+        "reason"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "retirement_result"
+        },
+        "origin": {
+          "enum": [
+            "daemon_response",
+            "cli_no_ack"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "outcome": {
+          "enum": [
+            "busy",
+            "refused",
+            "committed",
+            "continued",
+            "unconfirmed"
+          ]
+        },
+        "request_committed": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "facts": {
+          "$ref": "#/$defs/retirement_facts"
+        },
+        "counts": {
+          "$ref": "#/$defs/counts"
+        },
+        "reason": {
+          "enum": [
+            "active_obligations",
+            "target_mismatch",
+            "generation_refused",
+            "revision_changed",
+            "already_retiring",
+            "durable_retiring",
+            "publication_unconfirmed",
+            "ack_unconfirmed",
+            "native_evidence_unavailable"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "origin": {
+                "const": "daemon_response"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "facts": {
+                "properties": {
+                  "responding_at_snapshot": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "facts": {
+                "properties": {
+                  "memory_retiring": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "counts": {
+                "properties": {
+                  "requests": {
+                    "const": 0
+                  },
+                  "streams": {
+                    "const": 0
+                  },
+                  "slots": {
+                    "const": 0
+                  },
+                  "replacements": {
+                    "const": 0
+                  },
+                  "cleanup_obligations": {
+                    "const": 0
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "oneOf": [
+        {
+          "allOf": [
+            {
+              "properties": {
+                "origin": {
+                  "const": "daemon_response"
+                },
+                "facts": {
+                  "properties": {
+                    "responding_at_snapshot": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "busy"
+                },
+                "request_committed": {
+                  "const": false
+                },
+                "reason": {
+                  "const": "active_obligations"
+                },
+                "facts": {
+                  "properties": {
+                    "memory_retiring": {
+                      "const": false
+                    },
+                    "durable_retiring": {
+                      "const": false
+                    },
+                    "shutdown_started": {
+                      "const": false
+                    },
+                    "admission_closed": {
+                      "const": false
+                    },
+                    "durable_revision": {
+                      "$ref": "#/$defs/u64"
+                    }
+                  }
+                },
+                "counts": {
+                  "properties": {
+                    "requests": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "streams": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "slots": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "replacements": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "cleanup_obligations": {
+                      "$ref": "#/$defs/u64"
+                    }
+                  },
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "requests": {
+                          "minimum": 1
+                        }
+                      }
+                    },
+                    {
+                      "properties": {
+                        "streams": {
+                          "minimum": 1
+                        }
+                      }
+                    },
+                    {
+                      "properties": {
+                        "slots": {
+                          "minimum": 1
+                        }
+                      }
+                    },
+                    {
+                      "properties": {
+                        "replacements": {
+                          "minimum": 1
+                        }
+                      }
+                    },
+                    {
+                      "properties": {
+                        "cleanup_obligations": {
+                          "minimum": 1
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "allOf": [
+                {
+                  "properties": {
+                    "origin": {
+                      "const": "daemon_response"
+                    },
+                    "facts": {
+                      "properties": {
+                        "responding_at_snapshot": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "properties": {
+                    "outcome": {
+                      "const": "refused"
+                    },
+                    "request_committed": {
+                      "const": false
+                    },
+                    "reason": {
+                      "enum": [
+                        "generation_refused",
+                        "revision_changed"
+                      ]
+                    },
+                    "facts": {
+                      "properties": {
+                        "memory_retiring": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                {
+                  "properties": {
+                    "origin": {
+                      "const": "daemon_response"
+                    },
+                    "facts": {
+                      "properties": {
+                        "responding_at_snapshot": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "properties": {
+                    "outcome": {
+                      "const": "refused"
+                    },
+                    "request_committed": {
+                      "const": false
+                    },
+                    "reason": {
+                      "const": "already_retiring"
+                    },
+                    "facts": {
+                      "properties": {
+                        "memory_retiring": {
+                          "const": true
+                        },
+                        "admission_closed": {
+                          "const": true
+                        }
+                      }
+                    },
+                    "counts": {
+                      "properties": {
+                        "requests": {
+                          "const": 0
+                        },
+                        "streams": {
+                          "const": 0
+                        },
+                        "slots": {
+                          "const": 0
+                        },
+                        "replacements": {
+                          "const": 0
+                        },
+                        "cleanup_obligations": {
+                          "const": 0
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                {
+                  "properties": {
+                    "origin": {
+                      "const": "daemon_response"
+                    },
+                    "facts": {
+                      "properties": {
+                        "responding_at_snapshot": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "properties": {
+                    "outcome": {
+                      "const": "refused"
+                    },
+                    "request_committed": {
+                      "const": false
+                    },
+                    "reason": {
+                      "enum": [
+                        "target_mismatch",
+                        "native_evidence_unavailable"
+                      ]
+                    },
+                    "facts": {
+                      "properties": {
+                        "memory_retiring": {
+                          "const": null
+                        },
+                        "durable_retiring": {
+                          "const": null
+                        },
+                        "shutdown_started": {
+                          "const": null
+                        },
+                        "admission_closed": {
+                          "const": null
+                        },
+                        "durable_revision": {
+                          "const": null
+                        }
+                      }
+                    },
+                    "counts": {
+                      "properties": {
+                        "requests": {
+                          "const": null
+                        },
+                        "streams": {
+                          "const": null
+                        },
+                        "slots": {
+                          "const": null
+                        },
+                        "replacements": {
+                          "const": null
+                        },
+                        "cleanup_obligations": {
+                          "const": null
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "origin": {
+                  "const": "daemon_response"
+                },
+                "facts": {
+                  "properties": {
+                    "responding_at_snapshot": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "committed"
+                },
+                "request_committed": {
+                  "const": true
+                },
+                "reason": {
+                  "const": "durable_retiring"
+                },
+                "facts": {
+                  "properties": {
+                    "memory_retiring": {
+                      "const": true
+                    },
+                    "durable_retiring": {
+                      "const": true
+                    },
+                    "responding_at_snapshot": {
+                      "const": true
+                    },
+                    "admission_closed": {
+                      "const": true
+                    },
+                    "durable_revision": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "shutdown_started": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "counts": {
+                  "properties": {
+                    "requests": {
+                      "const": 0
+                    },
+                    "streams": {
+                      "const": 0
+                    },
+                    "slots": {
+                      "const": 0
+                    },
+                    "replacements": {
+                      "const": 0
+                    },
+                    "cleanup_obligations": {
+                      "const": 0
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "origin": {
+                  "const": "daemon_response"
+                },
+                "facts": {
+                  "properties": {
+                    "responding_at_snapshot": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "continued"
+                },
+                "request_committed": {
+                  "const": false
+                },
+                "reason": {
+                  "const": "already_retiring"
+                },
+                "facts": {
+                  "properties": {
+                    "memory_retiring": {
+                      "const": true
+                    },
+                    "durable_retiring": {
+                      "const": true
+                    },
+                    "responding_at_snapshot": {
+                      "const": true
+                    },
+                    "admission_closed": {
+                      "const": true
+                    },
+                    "durable_revision": {
+                      "$ref": "#/$defs/u64"
+                    },
+                    "shutdown_started": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "counts": {
+                  "properties": {
+                    "requests": {
+                      "const": 0
+                    },
+                    "streams": {
+                      "const": 0
+                    },
+                    "slots": {
+                      "const": 0
+                    },
+                    "replacements": {
+                      "const": 0
+                    },
+                    "cleanup_obligations": {
+                      "const": 0
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "properties": {
+                "origin": {
+                  "const": "daemon_response"
+                },
+                "facts": {
+                  "properties": {
+                    "responding_at_snapshot": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "properties": {
+                "outcome": {
+                  "const": "unconfirmed"
+                },
+                "request_committed": {
+                  "type": "boolean"
+                },
+                "reason": {
+                  "const": "publication_unconfirmed"
+                },
+                "facts": {
+                  "properties": {
+                    "memory_retiring": {
+                      "const": true
+                    },
+                    "durable_retiring": {
+                      "enum": [
+                        false,
+                        null
+                      ]
+                    },
+                    "shutdown_started": {
+                      "const": false
+                    },
+                    "responding_at_snapshot": {
+                      "const": true
+                    },
+                    "admission_closed": {
+                      "const": true
+                    }
+                  }
+                },
+                "counts": {
+                  "properties": {
+                    "requests": {
+                      "const": 0
+                    },
+                    "streams": {
+                      "const": 0
+                    },
+                    "slots": {
+                      "const": 0
+                    },
+                    "replacements": {
+                      "const": 0
+                    },
+                    "cleanup_obligations": {
+                      "const": 0
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "origin": {
+              "const": "cli_no_ack"
+            },
+            "outcome": {
+              "const": "unconfirmed"
+            },
+            "request_committed": {
+              "const": null
+            },
+            "reason": {
+              "const": "ack_unconfirmed"
+            },
+            "facts": {
+              "properties": {
+                "memory_retiring": {
+                  "const": null
+                },
+                "durable_retiring": {
+                  "const": null
+                },
+                "shutdown_started": {
+                  "const": null
+                },
+                "responding_at_snapshot": {
+                  "const": null
+                },
+                "admission_closed": {
+                  "const": null
+                },
+                "durable_revision": {
+                  "const": null
+                }
+              }
+            },
+            "counts": {
+              "properties": {
+                "requests": {
+                  "const": null
+                },
+                "streams": {
+                  "const": null
+                },
+                "slots": {
+                  "const": null
+                },
+                "replacements": {
+                  "const": null
+                },
+                "cleanup_obligations": {
+                  "const": null
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "epoch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace",
+        "instance_uuid",
+        "revision"
+      ],
+      "properties": {
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "instance_uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "lifecycle_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "source",
+        "epoch",
+        "phase",
+        "admission_closed",
+        "counts",
+        "native_process",
+        "native_identity_proved",
+        "whole_process_dead",
+        "lease",
+        "listener_present",
+        "generation",
+        "health",
+        "unavailable_reason",
+        "observation_id",
+        "observed_at_unix_millis",
+        "human_procedure"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "lifecycle_observation"
+        },
+        "source": {
+          "enum": [
+            "daemon_application",
+            "cli_native_reconciled",
+            "cli_partial"
+          ]
+        },
+        "epoch": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/epoch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "oneOf": [
+            {
+              "enum": [
+                "starting",
+                "running",
+                "retiring",
+                "exited"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "admission_closed": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "counts": {
+          "$ref": "#/$defs/counts"
+        },
+        "native_process": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/process"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "native_identity_proved": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "whole_process_dead": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lease": {
+          "oneOf": [
+            {
+              "enum": [
+                "free",
+                "contended"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "listener_present": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generation": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/build"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "health": {
+          "oneOf": [
+            {
+              "enum": [
+                "healthy",
+                "degraded_remote",
+                "identity_refused",
+                "unresponsive_local"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "enum": [
+                "legacy",
+                "unreachable",
+                "inventory_unknown",
+                "record_invalid",
+                "native_identity_unknown",
+                "inspection_unavailable"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "observed_at_unix_millis": {
+          "$ref": "#/$defs/u64"
+        },
+        "human_procedure": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^https://github\\.com/lanytehq/chanvoy/blob/main/docs/guides/runtime-recovery\\.md$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "daemon_application"
+              }
+            },
+            "required": [
+              "source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "native_identity_proved": {
+                "const": null
+              },
+              "whole_process_dead": {
+                "const": null
+              },
+              "lease": {
+                "const": null
+              },
+              "listener_present": {
+                "const": null
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "unavailable_reason": {
+                "enum": [
+                  "legacy",
+                  "unreachable",
+                  "inventory_unknown",
+                  "record_invalid",
+                  "inspection_unavailable"
+                ]
+              }
+            },
+            "required": [
+              "unavailable_reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "counts": {
+                "properties": {
+                  "requests": {
+                    "const": null
+                  },
+                  "streams": {
+                    "const": null
+                  },
+                  "slots": {
+                    "const": null
+                  },
+                  "replacements": {
+                    "const": null
+                  },
+                  "cleanup_obligations": {
+                    "const": null
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "native_identity_proved": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "const": "cli_native_reconciled"
+              },
+              "native_process": {
+                "$ref": "#/$defs/process"
+              },
+              "epoch": {
+                "$ref": "#/$defs/epoch"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "whole_process_dead": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source": {
+                "const": "cli_native_reconciled"
+              },
+              "native_identity_proved": {
+                "const": true
+              },
+              "native_process": {
+                "$ref": "#/$defs/process"
+              },
+              "epoch": {
+                "$ref": "#/$defs/epoch"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "observation_params": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "namespace",
+        "expected_instance_uuid"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "observation_params"
+        },
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "expected_instance_uuid": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "runtime_bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "namespace",
+        "instance_uuid",
+        "launcher_revision",
+        "uid",
+        "config_root",
+        "profile",
+        "socket_root",
+        "lease_descriptor",
+        "lease_identity",
+        "validated_username",
+        "validated_user_id",
+        "profile_fingerprint",
+        "issued_at",
+        "launcher_process",
+        "bootstrap_nonce"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "runtime_bootstrap"
+        },
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "instance_uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "launcher_revision": {
+          "const": 0
+        },
+        "uid": {
+          "$ref": "#/$defs/u32"
+        },
+        "config_root": {
+          "$ref": "#/$defs/path_bytes"
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "socket_root": {
+          "$ref": "#/$defs/path_bytes",
+          "maxLength": 182
+        },
+        "lease_descriptor": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 2147483647
+        },
+        "lease_identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "validated_username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "validated_user_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "profile_fingerprint": {
+          "type": "string",
+          "minLength": 71,
+          "maxLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/u64"
+        },
+        "launcher_process": {
+          "$ref": "#/$defs/process"
+        },
+        "bootstrap_nonce": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "launcher_process": {
+                "properties": {
+                  "birth": {
+                    "properties": {
+                      "kind": {
+                        "const": "mac_os"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "socket_root": {
+                "maxLength": 174
+              }
+            }
+          }
+        }
+      ]
+    },
+    "runtime_readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "namespace",
+        "instance_uuid",
+        "revision",
+        "process",
+        "socket",
+        "build",
+        "handoff_validated",
+        "listener_bound",
+        "publication_confirmed",
+        "ready"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "runtime_readiness"
+        },
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "instance_uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 18446744073709551615
+        },
+        "process": {
+          "$ref": "#/$defs/process"
+        },
+        "socket": {
+          "$ref": "#/$defs/socket"
+        },
+        "build": {
+          "$ref": "#/$defs/generation"
+        },
+        "handoff_validated": {
+          "const": true
+        },
+        "listener_bound": {
+          "const": true
+        },
+        "publication_confirmed": {
+          "const": true
+        },
+        "ready": {
+          "const": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "process": {
+                "properties": {
+                  "birth": {
+                    "properties": {
+                      "kind": {
+                        "const": "mac_os"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "socket": {
+                "properties": {
+                  "path": {
+                    "maxLength": 206
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "retire_rpc_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "method": {
+          "const": "runtime_retire_v1"
+        },
+        "params": {
+          "$ref": "#/$defs/retirement_params"
+        }
+      }
+    },
+    "retire_rpc_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "result": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/retirement_result"
+            },
+            {
+              "properties": {
+                "origin": {
+                  "const": "daemon_response"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "observation_rpc_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "method": {
+          "const": "runtime_observation_v1"
+        },
+        "params": {
+          "$ref": "#/$defs/observation_params"
+        }
+      }
+    },
+    "observation_rpc_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "result": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/lifecycle_observation"
+            },
+            {
+              "properties": {
+                "source": {
+                  "const": "daemon_application"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "retirement_no_ack_report": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/retirement_result"
+        },
+        {
+          "properties": {
+            "origin": {
+              "const": "cli_no_ack"
+            }
+          }
+        }
+      ]
+    },
+    "rpc_protocol_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "data"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            -32600,
+            -32601,
+            -32602,
+            -32000
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "data": {
+          "const": null
+        }
+      }
+    },
+    "runtime_rpc_error_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jsonrpc",
+        "id",
+        "error"
+      ],
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "$ref": "#/$defs/rpc_protocol_error"
+        }
+      }
+    },
+    "cli_lifecycle_report": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/lifecycle_observation"
+        },
+        {
+          "properties": {
+            "source": {
+              "enum": [
+                "cli_native_reconciled",
+                "cli_partial"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$ref": "#/$defs/runtime_rpc_error_response"
+}

@@ -1,0 +1,480 @@
+{
+  "source_repository": "https://github.com/lanytehq/crucible",
+  "source_commit": "71f77894b7ac5d6065f20ecbbbaaa936409128f6",
+  "source_tag": "v0.2.0",
+  "license_expression": "CC0-1.0",
+  "files": {
+    "chanvoy-runtime-control-v1.md": {
+      "source_path": "schemas/ipc/local/chanvoy-runtime-control-v1.md",
+      "sha256": "9517f4c70d016b7410c3914613f2b625d79e3b96a989154002a9d50331d9aead"
+    },
+    "chanvoy-runtime-control-v1.roots.json": {
+      "source_path": "schemas/ipc/local/chanvoy-runtime-control-v1.roots.json",
+      "sha256": "80d8a77d47726784ae5f735e74c98915265e86717a582ded25c305280d08c887"
+    },
+    "chanvoy-runtime-control-v1.schema.json": {
+      "source_path": "schemas/ipc/local/chanvoy-runtime-control-v1.schema.json",
+      "sha256": "020258a9cb7d4a7cb6263bae91add7d8457f83adeaa9ca35476259923ade7784",
+      "id": "https://schemas.lanyte.dev/ipc/local/chanvoy-runtime-control-v1.schema.json",
+      "selected_root": null
+    },
+    "cli_lifecycle_report.selected.schema.json": {
+      "source_path": "schemas/ipc/local/cli_lifecycle_report.selected.schema.json",
+      "sha256": "610a6d78beaa2af3e46c2045f6d7378d8d1e7ed0d634a8b3fd8c0e34af922ed0",
+      "id": null,
+      "selected_root": "#/$defs/cli_lifecycle_report"
+    },
+    "fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-missing-required.json",
+      "sha256": "c72104b7235cb661d927c650d3a20fca503c613e01c547111e4d3105c13cdab5"
+    },
+    "fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-positive.json",
+      "sha256": "185c14e608dd820522a2d0cca4f37d54da72869965c76ce903aae9cacdbf284c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-unknown-nested-field.json",
+      "sha256": "d49df24dd83d03dfa935c437514f5b9c4adbf1fd226d9b09aefeca1c9ca94094"
+    },
+    "fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-unknown-root-field.json",
+      "sha256": "3d2d9cdd3267808aecfe07e04fd71fac801778978c9aa8bd4a2bda87dba0ac58"
+    },
+    "fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-wrong-version.json",
+      "sha256": "f8d46955e1d12eba762c3e5dfb15056603a26a30cfed24483d3d9dbaf6e6e6f4"
+    },
+    "fixtures/chanvoy-runtime-control-v1/manifest.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/manifest.json",
+      "sha256": "de1d453eb5e78c4da5eec508bf2cc9af1d54bea09435a5e915d1a587e2bdcd31"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_request-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-missing-required.json",
+      "sha256": "5a89ab47f81a64e5528cceed969b06ed16210f4b6632e95e06853e13f69c624c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_request-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-positive.json",
+      "sha256": "877e561bdb4031e22aea8b4008cab9a4bfe6cf4f5902a1bc015bba650347b4f8"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_request-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-unknown-nested-field.json",
+      "sha256": "70f52ffa788a756af5b4486aae374a7ae27ea018d4aa81cd3a72229236162b2a"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_request-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-unknown-root-field.json",
+      "sha256": "04aee3880bfc6acd3354ab4b4e60187c8093071c9c6ba5cac91168932d36ea17"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_request-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-wrong-version.json",
+      "sha256": "6de057f05261b9c2b645f6e588b178fb1a58322b1af879bd191505c039c4728a"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_response-daemon-claim-not-native-death.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-daemon-claim-not-native-death.json",
+      "sha256": "096cf1610fb59d458b506300aaaabdc0119cecf62220a578d3874b10905143de"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_response-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-missing-required.json",
+      "sha256": "cb60028f5fee097a518578835361baa0ce5df159f8ab971d43e54b177241757c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_response-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-positive.json",
+      "sha256": "7fed159041fc7ce6c1bafad32056de6f450f85b03363c159454577d4270ce3ce"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_response-received-body-cannot-promote-source.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-received-body-cannot-promote-source.json",
+      "sha256": "b1fccd4f84b5a2676e832cc19266e91a57d4b992b8d8b2d27a522cea2641484f"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_response-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-unknown-nested-field.json",
+      "sha256": "ad16ea14432fbe75ef28454879257dfa2235003a731ac7af971547da66540da3"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_response-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-unknown-root-field.json",
+      "sha256": "7eca218c069c838696a49e773878f8ae1fd19a0caf7b88c94691ed8bab988202"
+    },
+    "fixtures/chanvoy-runtime-control-v1/observation_rpc_response-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-wrong-version.json",
+      "sha256": "0d70634ed0beff700fb2e607e726711522f8635c5717a1542cd183078cfd3f7c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_request-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-missing-required.json",
+      "sha256": "7e434265fe12731768b878050d8a4822edc3eaa2442db9727afc8d070f93b47c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_request-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-positive.json",
+      "sha256": "4b85399abdbddcec7b0cba60f28a7e3cc084faac6f1c4dbec98d5f2400af02d5"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_request-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-unknown-nested-field.json",
+      "sha256": "5e1c1939fa8dfe40ef2e6d6f68079004fe5331e940da07836c225e4c7d87b0c0"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_request-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-unknown-root-field.json",
+      "sha256": "55798a68603c195454311ea3ddebd06acb9c4135876cca232089f165f3b90cca"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_request-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-wrong-version.json",
+      "sha256": "3117c40eacfdf35667de768bce0a8858552f78a98ab7c0fc288c51904b4b09cf"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-begin-already-retiring-retains-state-cannot-open-admission.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-begin-already-retiring-retains-state-cannot-open-admission.json",
+      "sha256": "122365b6e0ac061ee2651c068544d259cd2de6555fbc43c565fd2ac6f251ede0"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-begin-already-retiring-retains-state.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-begin-already-retiring-retains-state.json",
+      "sha256": "a8d0b43b90491e10335bc679870f7179accdf8c09bc39509862051d00240f708"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-busy-cannot-commit.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-busy-cannot-commit.json",
+      "sha256": "18286ab9774c7a9e75bc1b97cdf25384126d2556de14ee62f8c797f93b8550bc"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-busy-no-commit.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-busy-no-commit.json",
+      "sha256": "ac6f358cb2fbd668d7d01fb4c8088f30310970e09831148c9263c18116d46540"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-already_retiring-running.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-already_retiring-running.json",
+      "sha256": "bbfabc84e803508fcfe0d39b015758c64070a3a3c3f3c44b77d9e1cc5e6268fa"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-generation_refused-running.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-generation_refused-running.json",
+      "sha256": "f6e7ad083efbb6744171a835dd76cc56b14bce12926fee0dfb027c6b5f54b703"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-already_retiring.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-already_retiring.json",
+      "sha256": "a8d0b43b90491e10335bc679870f7179accdf8c09bc39509862051d00240f708"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-generation_refused.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-generation_refused.json",
+      "sha256": "8053f73a165364693faa2c02adc44b240dbc395570f11c0196a0bc42fb5a7f22"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-revision_changed.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-revision_changed.json",
+      "sha256": "d89d0044b135a5afff1d58d592ffbd1d7cf157934e625760948db7053a8d2d90"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-already_retiring-responding-false.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-already_retiring-responding-false.json",
+      "sha256": "a7b135dd1adc5188198358a1a62544d97e9c94159a0768995f5892341aa72613"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-already_retiring-responding-null.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-already_retiring-responding-null.json",
+      "sha256": "2c2263928bbae54c9f2441f5ac82ba46d67bb7de7fcbf59dd373d1634f70202b"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-generation_refused-responding-false.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-generation_refused-responding-false.json",
+      "sha256": "96825f9f05713d59270764945620dc29b7faae5109d37deb956ae4f4b4bed606"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-generation_refused-responding-null.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-generation_refused-responding-null.json",
+      "sha256": "f9d1efe0357287c40224a3db335d27dab19d9839928fae3c8dd7e1040a631e43"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-revision_changed-responding-false.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-revision_changed-responding-false.json",
+      "sha256": "4e414611fa0a7a0984a6839b55e5b063f2f11547408ef773feb6c82bce447571"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-revision_changed-responding-null.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-revision_changed-responding-null.json",
+      "sha256": "54762899da2daa22358473f7d3310ab7807381d216c4c6d8d590563688c6d432"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-unknown-native_evidence_unavailable-not-responding.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-unknown-native_evidence_unavailable-not-responding.json",
+      "sha256": "c3e27150d19435d772b4e6f500a4082c0583c56218ea47cd79880c1809bbf79c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-unknown-target_mismatch-not-responding.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-unknown-target_mismatch-not-responding.json",
+      "sha256": "099dc57ad689e43d019a56a3b056b498b6d1d8496e5f3015369633d8086193a1"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-cleanup_obligations.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-cleanup_obligations.json",
+      "sha256": "9ea39bd5af66c9e583f69036e7751f14bda94b4df880b4eb4c257bbdf2e1c15a"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-replacements.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-replacements.json",
+      "sha256": "a423c6132c8853ef9ab800b25e76b0fd75dd72d2a1e1a704b476989c3ebe28b7"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-requests.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-requests.json",
+      "sha256": "9da9606ee33e87c24a48857b4e55a9bccbeaa2634a33d2f0c8f7a406bda249f2"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-slots.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-slots.json",
+      "sha256": "495e372450630b5c5dcd19fc3dd062f7458e87562d9157337ba320b1da4cc935"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-streams.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-streams.json",
+      "sha256": "fefb04fc4aebce87448ee49f7e9811bdcacc2e2f25692a004071e228b58e9f37"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-cleanup_obligations.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-cleanup_obligations.json",
+      "sha256": "0009a02a3bf922dcbc24954b64862b358dd5b844c0fe37535849982721516f9f"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-replacements.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-replacements.json",
+      "sha256": "f46fbbb3de57fa5da060c92d0590482623cff1fbc18ce5cecc4c99c276dc5d4e"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-requests.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-requests.json",
+      "sha256": "f94bbd64b44fa02a2c5b0444527e24040e8dad7accdd6b7fa13d710441df14e3"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-slots.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-slots.json",
+      "sha256": "1006757e16b3ade9ca1461cf581e03356c0ce4e71270a75c8a25efab5cf56e2b"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-streams.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-streams.json",
+      "sha256": "70db3ee55ce4c8c6a4a2399200e7fad3b6ed355941228b401436e79c9cf47de9"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-cleanup_obligations.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-cleanup_obligations.json",
+      "sha256": "082e6b4ab095640b1d5904961480f86007088197048669d585c0a968c3b9d65e"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-replacements.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-replacements.json",
+      "sha256": "2faec0fbd8425131476085c478cfd2d3790827ec8913c24a4832c45bc03c6fbc"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-requests.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-requests.json",
+      "sha256": "c96330a6e05ea140741d36e337f1162a02edb029bf58ecda75b61fe4450c4f7c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-slots.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-slots.json",
+      "sha256": "7228b24d06a6647345f0ac17408513c4b985c59b49fe4c3df5048888acde763c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-streams.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-streams.json",
+      "sha256": "1b5607fe268be4d1748bc0991694d4a50e30f28088c79b7ddf13e77bb354d8c6"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-revision_changed-running.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-revision_changed-running.json",
+      "sha256": "d126939f98eee69f04e2bd2b6445d4dc782be5becbc55a8ddc3e322fea9f0b81"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-nonempty-cleanup.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-nonempty-cleanup.json",
+      "sha256": "1b3abe696e3841805344635099aa0448e3c92717ccba16a24348466724b91afb"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-null-revision.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-null-revision.json",
+      "sha256": "f351ae3928cd84837e07258f5f2e040bb8c30eaebd8ff0e5f73137d1de0fedb8"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-wrong-reason.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-wrong-reason.json",
+      "sha256": "3eca3f57d201fe3a9a04617febe147240e5b4626082f36a5aee5a73c30b12d5d"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continuation-no-new-commit.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continuation-no-new-commit.json",
+      "sha256": "463ed099c45643a554e3ccedebf958311e3799ef0dc3dafea2a6d89fba6e2c9f"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-nonempty-stream.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-nonempty-stream.json",
+      "sha256": "a1fcb31915bb6fe75805b9580bc695d8c2bb6447684d19d2733ce77666497a3c"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-null-revision.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-null-revision.json",
+      "sha256": "2382e5b983096dd01f826a3421472a92fee0ca1d71508c4721013fec493d1945"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-wrong-reason.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-wrong-reason.json",
+      "sha256": "d82d10f2bee7c0b701ef8e299fd44a5721ebb20d7ad588d8743963a15d895aba"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-failed-publication-no-shutdown.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-failed-publication-no-shutdown.json",
+      "sha256": "3568491ebe7469eb72f122f73c1580360cb025c296dd9a087e4eb18e4b066583"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-missing-required.json",
+      "sha256": "c76773baabe471f3a4bc76d30f37dae3a36c69b8a73f69ba9bf3f725b1571947"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-native_evidence_unavailable-cannot-invent-target-false.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-native_evidence_unavailable-cannot-invent-target-false.json",
+      "sha256": "e290a689a189a13d0c4be76ac02a28c8262e077c8db82db59a32c4ea1f48d8e9"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-native_evidence_unavailable-unknown-target.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-native_evidence_unavailable-unknown-target.json",
+      "sha256": "5ced8e36dcdf8fb5e95de98ee4c2f6f66219d4979968ad250f027dd6154085ed"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-no-ack-is-not-received-reply.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-no-ack-is-not-received-reply.json",
+      "sha256": "ded7935e8d1737290fc3c7038344b0da959a31589c9d469c7fe94248d8bac6da"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-positive.json",
+      "sha256": "b6db320aa7a7fc5e71ea7292a7329525c7616d7da371747957de32f58c695cd8"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-retiring-alive-publication-failed.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-retiring-alive-publication-failed.json",
+      "sha256": "2055a97609b3e3125fed0410ff606d4b7e311ae8e530d1159759656fee3a4c95"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-same-target-stale-continuation-retains-state-cannot-open-admission.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-same-target-stale-continuation-retains-state-cannot-open-admission.json",
+      "sha256": "fda12fe315584ee8490b249c87849b4c3a5b879c68fd039dbc37eecfe468bba2"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-same-target-stale-continuation-retains-state.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-same-target-stale-continuation-retains-state.json",
+      "sha256": "d89d0044b135a5afff1d58d592ffbd1d7cf157934e625760948db7053a8d2d90"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-target_mismatch-cannot-invent-target-false.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-target_mismatch-cannot-invent-target-false.json",
+      "sha256": "310a3634ab5e0ed3d63ca67775255f4b5874abce678f75a0f8e246f4c7e8c840"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-target_mismatch-unknown-target.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-target_mismatch-unknown-target.json",
+      "sha256": "4137a0c47328ecd43faac76a3e55232befd7136117c447eb5e281460fb1e0ca0"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unconfirmed-contradictory-facts.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unconfirmed-contradictory-facts.json",
+      "sha256": "e983383a1c47aebf650c12c9585719e33b8eb81ee5f697e23a9b30d47c746878"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unknown-nested-field.json",
+      "sha256": "63ed6a5d9559266f4e1951944ed44b5cbc4fefd4210ed13230c92e3751667a11"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unknown-root-field.json",
+      "sha256": "4772f543565a4dc5ce598efc435bff9b995fb72feb6dc44fb2d105135fc60fe4"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retire_rpc_response-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-wrong-version.json",
+      "sha256": "609f1b707216aad60d50fa32371c671cbc9878faf030a1079001abd81c502752"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-lost-ack-cannot-prove-alive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-lost-ack-cannot-prove-alive.json",
+      "sha256": "27c4d7b4c1499ae7d0ca0f53006294625ab5d1d463a25738f19588f2d1445aaa"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-missing-required.json",
+      "sha256": "06bc6fb71c98bb0e87e0497cc39d6fc96550cf865080b263982db429225448b4"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-positive.json",
+      "sha256": "e377f0087472e5ff08cc191d537e84531311de37c16c184edcce3d91a6d34fdb"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-unknown-nested-field.json",
+      "sha256": "6507a6961795dde7958cc759911d2ccd20974e8cde328e133d9dd8a6733f7cdc"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-unknown-root-field.json",
+      "sha256": "e7155fc4a0022e8c1f4a251db967b77d5861638d350d221c0c94c5ca0afa8d05"
+    },
+    "fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-wrong-version.json",
+      "sha256": "5be7d65e64f326a47705ace37ec84d10175d129048d7e93d2e1dee0b80511a02"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-missing-required.json",
+      "sha256": "0284f0e6fae28471025578dd8355ba738e095a8568af58f6046fc1df459c0ea5"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-positive.json",
+      "sha256": "e5895695dc3424c272c51213ba54ba9f1cc5a1a7cc6a4f627479ae2c0780388b"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-stdio-not-inherited-lease.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-stdio-not-inherited-lease.json",
+      "sha256": "9ae4e781c07ad1f7aee584f4287e8cb4bad01999fd0e32ee847b73c29ecd161f"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-unknown-nested-field.json",
+      "sha256": "3e2fc7baf61509e76c6b0d7da90d95c56f7975391ef57bf1fed70f2f68a54c54"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-unknown-root-field.json",
+      "sha256": "c2d898aa668edf1da12feef85b52a9ff14b2544507532550d80c1a42a4d2a31f"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-wrong-version.json",
+      "sha256": "779b669a57660f5974d6ba51a7393c8bd0a3703eaf9b000ec67efc850da24fb1"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_readiness-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-missing-required.json",
+      "sha256": "70841ead85a4e25c7937ae4ad71e50a7e5b1dbf1ae7c17a6215631422c86492d"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_readiness-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-positive.json",
+      "sha256": "c4575dab2378acfef560432ce22e548bc801de52ff0aa09f9dc6d587ee41d067"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_readiness-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-unknown-nested-field.json",
+      "sha256": "3f8b48b4c12981a627c2d5c10812ccf9be0e95a8f3f370e88f77872a3cb5fade"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_readiness-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-unknown-root-field.json",
+      "sha256": "f50aec33667b03f59cecd6d7831ba00a1634f3c3b82ec453e068e7c6e0091e2f"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_readiness-unpublished-not-ready.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-unpublished-not-ready.json",
+      "sha256": "34721f5a94092e01ca15eac1c3c3d8ac59a7eb98348adae97069fc3f5cd94e5d"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_readiness-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-wrong-version.json",
+      "sha256": "628b091d88117002e526119347f17e39ecf58921ca96dc2d9d5a45f3df0eac98"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-missing-required.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-missing-required.json",
+      "sha256": "6a7452e7e5f6ee89e5bffd06aa91bf64b53bc4909d700ab5134f13dcf57a8193"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-positive.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-positive.json",
+      "sha256": "72af797a2012712d24a555f2abf1155b745ee6a9d1bb5a391527349348b74ece"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-unknown-nested-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-unknown-nested-field.json",
+      "sha256": "2ceb607f25d313c43faeaab4aee32eeef92b156d4ad403d9f9239a26dd492f61"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-unknown-root-field.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-unknown-root-field.json",
+      "sha256": "971bdd5e7d28dbaacb3ee3d47a2770305b0beba56ab5f389ec63545633d7096f"
+    },
+    "fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-wrong-version.json": {
+      "source_path": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-wrong-version.json",
+      "sha256": "d0ecf3c91f96785dec0f26572b81ead7bc1c172be71bcdef85a0bc764845269c"
+    },
+    "observation_rpc_request.selected.schema.json": {
+      "source_path": "schemas/ipc/local/observation_rpc_request.selected.schema.json",
+      "sha256": "505a42583252e524a7c3b32666e556bf257020f1b9662437bc916a0cb6991f3e",
+      "id": null,
+      "selected_root": "#/$defs/observation_rpc_request"
+    },
+    "observation_rpc_response.selected.schema.json": {
+      "source_path": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+      "sha256": "fb3f20eb3714d113f067907b416e7cf4d8527b092ae1d8116645b178c474a20a",
+      "id": null,
+      "selected_root": "#/$defs/observation_rpc_response"
+    },
+    "retire_rpc_request.selected.schema.json": {
+      "source_path": "schemas/ipc/local/retire_rpc_request.selected.schema.json",
+      "sha256": "3f5d109a7c3d32825d879470aec4ebf00ddaff278ad8b61916459a1bcd5ee99c",
+      "id": null,
+      "selected_root": "#/$defs/retire_rpc_request"
+    },
+    "retire_rpc_response.selected.schema.json": {
+      "source_path": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+      "sha256": "7eb8767cd2ea10e610c4cf024f7eb802b25ea0f245455e54cd1d718406b8d96a",
+      "id": null,
+      "selected_root": "#/$defs/retire_rpc_response"
+    },
+    "retirement_no_ack_report.selected.schema.json": {
+      "source_path": "schemas/ipc/local/retirement_no_ack_report.selected.schema.json",
+      "sha256": "aec7ef641ff3c573dc1807ffb9285268eb17e737ac7c3c34aa0c8c0b8fac59bf",
+      "id": null,
+      "selected_root": "#/$defs/retirement_no_ack_report"
+    },
+    "runtime_bootstrap.selected.schema.json": {
+      "source_path": "schemas/ipc/local/runtime_bootstrap.selected.schema.json",
+      "sha256": "f035ded6b4eafc6e8db1e03019348e82678718998bbcdc0bc3305f6254b5a66a",
+      "id": null,
+      "selected_root": "#/$defs/runtime_bootstrap"
+    },
+    "runtime_readiness.selected.schema.json": {
+      "source_path": "schemas/ipc/local/runtime_readiness.selected.schema.json",
+      "sha256": "a23eb130e7cea3f3356442ed1a5e169425afe941126a12993d3e29552a6bb809",
+      "id": null,
+      "selected_root": "#/$defs/runtime_readiness"
+    },
+    "runtime_rpc_error_response.selected.schema.json": {
+      "source_path": "schemas/ipc/local/runtime_rpc_error_response.selected.schema.json",
+      "sha256": "2913d4d5961523d2b19b4b6484a1f6cf9990de5845651f33be10426b310346c2",
+      "id": null,
+      "selected_root": "#/$defs/runtime_rpc_error_response"
+    }
+  }
+}

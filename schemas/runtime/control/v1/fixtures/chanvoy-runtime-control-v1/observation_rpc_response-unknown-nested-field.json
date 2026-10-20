@@ -1,0 +1,50 @@
+{
+  "jsonrpc": "2.0",
+  "id": "87654321-4321-4321-8321-cba987654321",
+  "result": {
+    "schema_version": 1,
+    "kind": "lifecycle_observation",
+    "source": "daemon_application",
+    "epoch": {
+      "namespace": "f691215e0d009bcb711257dd344ca628c882a411938ad516b9cc999981ee4acd",
+      "instance_uuid": "12345678-1234-4234-8234-123456789abc",
+      "revision": 3
+    },
+    "phase": "retiring",
+    "admission_closed": true,
+    "counts": {
+      "requests": 0,
+      "streams": 0,
+      "slots": 0,
+      "replacements": 0,
+      "cleanup_obligations": 0
+    },
+    "native_process": {
+      "pid": 123,
+      "uid": 501,
+      "birth": {
+        "kind": "mac_os",
+        "seconds": 1,
+        "microseconds": 2
+      },
+      "executable": "2f6f776e65642f6368616e766f79",
+      "pid_namespace": null,
+      "mount_namespace": null
+    },
+    "native_identity_proved": null,
+    "whole_process_dead": null,
+    "lease": null,
+    "listener_present": null,
+    "generation": {
+      "version": "0.3.3",
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "dirty": false
+    },
+    "health": "healthy",
+    "unavailable_reason": null,
+    "human_procedure": "https://github.com/lanytehq/chanvoy/blob/main/docs/guides/runtime-recovery.md",
+    "observation_id": "87654321-4321-4321-8321-cba987654321",
+    "observed_at_unix_millis": 100000,
+    "unknown": true
+  }
+}

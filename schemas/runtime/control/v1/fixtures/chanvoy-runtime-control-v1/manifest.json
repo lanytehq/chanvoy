@@ -1,0 +1,702 @@
+[
+  {
+    "root": "runtime_rpc_error_response",
+    "case": "positive",
+    "schema": "schemas/ipc/local/runtime_rpc_error_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "runtime_rpc_error_response",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/runtime_rpc_error_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_rpc_error_response",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/runtime_rpc_error_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_rpc_error_response",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/runtime_rpc_error_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_rpc_error_response",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/runtime_rpc_error_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_rpc_error_response-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retirement_no_ack_report",
+    "case": "positive",
+    "schema": "schemas/ipc/local/retirement_no_ack_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retirement_no_ack_report",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/retirement_no_ack_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retirement_no_ack_report",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/retirement_no_ack_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retirement_no_ack_report",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/retirement_no_ack_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retirement_no_ack_report",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/retirement_no_ack_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_request",
+    "case": "positive",
+    "schema": "schemas/ipc/local/retire_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_request",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/retire_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_request",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/retire_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_request",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/retire_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_request",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/retire_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_request-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "positive",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_request",
+    "case": "positive",
+    "schema": "schemas/ipc/local/observation_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "observation_rpc_request",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/observation_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_request",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/observation_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_request",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/observation_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_request",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/observation_rpc_request.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_request-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_response",
+    "case": "positive",
+    "schema": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "observation_rpc_response",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_response",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_response",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_response",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_bootstrap",
+    "case": "positive",
+    "schema": "schemas/ipc/local/runtime_bootstrap.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "runtime_bootstrap",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/runtime_bootstrap.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_bootstrap",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/runtime_bootstrap.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_bootstrap",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/runtime_bootstrap.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_bootstrap",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/runtime_bootstrap.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_readiness",
+    "case": "positive",
+    "schema": "schemas/ipc/local/runtime_readiness.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "runtime_readiness",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/runtime_readiness.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_readiness",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/runtime_readiness.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_readiness",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/runtime_readiness.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_readiness",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/runtime_readiness.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "cli_lifecycle_report",
+    "case": "positive",
+    "schema": "schemas/ipc/local/cli_lifecycle_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-positive.json",
+    "expected_valid": true
+  },
+  {
+    "root": "cli_lifecycle_report",
+    "case": "unknown-root-field",
+    "schema": "schemas/ipc/local/cli_lifecycle_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-unknown-root-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "cli_lifecycle_report",
+    "case": "unknown-nested-field",
+    "schema": "schemas/ipc/local/cli_lifecycle_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-unknown-nested-field.json",
+    "expected_valid": false
+  },
+  {
+    "root": "cli_lifecycle_report",
+    "case": "missing-required",
+    "schema": "schemas/ipc/local/cli_lifecycle_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-missing-required.json",
+    "expected_valid": false
+  },
+  {
+    "root": "cli_lifecycle_report",
+    "case": "wrong-version",
+    "schema": "schemas/ipc/local/cli_lifecycle_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/cli_lifecycle_report-wrong-version.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retirement_no_ack_report",
+    "case": "lost-ack-cannot-prove-alive",
+    "schema": "schemas/ipc/local/retirement_no_ack_report.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retirement_no_ack_report-lost-ack-cannot-prove-alive.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "no-ack-is-not-received-reply",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-no-ack-is-not-received-reply.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "busy-no-commit",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-busy-no-commit.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "busy-cannot-commit",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-busy-cannot-commit.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "retiring-alive-publication-failed",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-retiring-alive-publication-failed.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "failed-publication-no-shutdown",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-failed-publication-no-shutdown.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_response",
+    "case": "daemon-claim-not-native-death",
+    "schema": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-daemon-claim-not-native-death.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_bootstrap",
+    "case": "stdio-not-inherited-lease",
+    "schema": "schemas/ipc/local/runtime_bootstrap.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_bootstrap-stdio-not-inherited-lease.json",
+    "expected_valid": false
+  },
+  {
+    "root": "runtime_readiness",
+    "case": "unpublished-not-ready",
+    "schema": "schemas/ipc/local/runtime_readiness.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/runtime_readiness-unpublished-not-ready.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "same-target-stale-continuation-retains-state",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-same-target-stale-continuation-retains-state.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "same-target-stale-continuation-retains-state-cannot-open-admission",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-same-target-stale-continuation-retains-state-cannot-open-admission.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "begin-already-retiring-retains-state",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-begin-already-retiring-retains-state.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "begin-already-retiring-retains-state-cannot-open-admission",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-begin-already-retiring-retains-state-cannot-open-admission.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "target_mismatch-unknown-target",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-target_mismatch-unknown-target.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "target_mismatch-cannot-invent-target-false",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-target_mismatch-cannot-invent-target-false.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "native_evidence_unavailable-unknown-target",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-native_evidence_unavailable-unknown-target.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "native_evidence_unavailable-cannot-invent-target-false",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-native_evidence_unavailable-cannot-invent-target-false.json",
+    "expected_valid": false
+  },
+  {
+    "root": "observation_rpc_response",
+    "case": "received-body-cannot-promote-source",
+    "schema": "schemas/ipc/local/observation_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/observation_rpc_response-received-body-cannot-promote-source.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "committed-nonempty-cleanup",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-nonempty-cleanup.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "committed-null-revision",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-null-revision.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "committed-wrong-reason",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-committed-wrong-reason.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "unconfirmed-contradictory-facts",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-unconfirmed-contradictory-facts.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "continuation-no-new-commit",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continuation-no-new-commit.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "continued-nonempty-stream",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-nonempty-stream.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "continued-null-revision",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-null-revision.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "continued-wrong-reason",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-continued-wrong-reason.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-known-retiring-already_retiring",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-already_retiring.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-already_retiring-nonempty-requests",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-requests.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-already_retiring-nonempty-streams",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-streams.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-already_retiring-nonempty-slots",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-slots.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-already_retiring-nonempty-replacements",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-replacements.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-already_retiring-nonempty-cleanup_obligations",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-already_retiring-nonempty-cleanup_obligations.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-already_retiring-responding-false",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-already_retiring-responding-false.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-already_retiring-responding-null",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-already_retiring-responding-null.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-already_retiring-running",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-already_retiring-running.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-known-retiring-generation_refused",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-generation_refused.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-generation_refused-nonempty-requests",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-requests.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-generation_refused-nonempty-streams",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-streams.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-generation_refused-nonempty-slots",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-slots.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-generation_refused-nonempty-replacements",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-replacements.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-generation_refused-nonempty-cleanup_obligations",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-generation_refused-nonempty-cleanup_obligations.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-generation_refused-responding-false",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-generation_refused-responding-false.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-generation_refused-responding-null",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-generation_refused-responding-null.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-generation_refused-running",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-generation_refused-running.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-known-retiring-revision_changed",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-known-retiring-revision_changed.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-revision_changed-nonempty-requests",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-requests.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-revision_changed-nonempty-streams",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-streams.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-revision_changed-nonempty-slots",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-slots.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-revision_changed-nonempty-replacements",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-replacements.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-retiring-revision_changed-nonempty-cleanup_obligations",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-retiring-revision_changed-nonempty-cleanup_obligations.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-revision_changed-responding-false",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-revision_changed-responding-false.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-revision_changed-responding-null",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-revision_changed-responding-null.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-revision_changed-running",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-revision_changed-running.json",
+    "expected_valid": true
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-unknown-target_mismatch-not-responding",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-unknown-target_mismatch-not-responding.json",
+    "expected_valid": false
+  },
+  {
+    "root": "retire_rpc_response",
+    "case": "c1-received-unknown-native_evidence_unavailable-not-responding",
+    "schema": "schemas/ipc/local/retire_rpc_response.selected.schema.json",
+    "data": "schemas/ipc/local/fixtures/chanvoy-runtime-control-v1/retire_rpc_response-c1-received-unknown-native_evidence_unavailable-not-responding.json",
+    "expected_valid": false
+  }
+]

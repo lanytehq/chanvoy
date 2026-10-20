@@ -1,0 +1,19 @@
+{
+  "roots": [
+    "runtime_rpc_error_response",
+    "retirement_no_ack_report",
+    "retire_rpc_request",
+    "retire_rpc_response",
+    "observation_rpc_request",
+    "observation_rpc_response",
+    "runtime_bootstrap",
+    "runtime_readiness",
+    "cli_lifecycle_report"
+  ],
+  "budgets": {
+    "rpc_frame_utf8_bytes_excluding_newline": 16384,
+    "bootstrap_utf8_bytes": 32768,
+    "readiness_utf8_bytes": 16384
+  },
+  "parse_policy": "bounded UTF8 before parse; duplicate keys at every depth refused; unknown field/version refused; one JSON object only; roots validated explicitly, no numbered registry recursion"
+}
