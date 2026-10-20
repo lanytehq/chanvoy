@@ -1372,55 +1372,61 @@ async fn daemon_start_classifies_child_startup_failure() {
 /// Process-table match on profile slug alone is **not** safe under concurrent
 /// multi-seat `make pr-final` on a shared host — seats use the same fixed test
 /// slugs with isolated `CHANVOY_RUNTIME_DIR` trees, so a foreign daemon with the
-/// same `--profile` would false-count as a survivor. Scope candidates to
-/// processes that hold open our runtime dir (or socket) via `lsof`.
+/// same `--profile` would false-count as a survivor. Ownership is proven by the
+/// candidate's inherited `CHANVOY_RUNTIME_DIR`, which is unique per harness env.
+///
+/// Enumeration is in-process via `sysprims_proc` (no `ps`/`lsof` subprocess,
+/// which sandboxed agent hosts deny). A candidate whose environment cannot be
+/// read panics instead of being skipped, so an unreadable process table can
+/// never make a survivor count look like zero.
 fn count_daemon_serve_processes(env: &TestEnv) -> usize {
-    let out = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=,command="])
-        .output()
-        .expect("ps -ax");
     let runtime = env.chanvoy_runtime_dir();
-    let socket = env.socket_path();
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            let mut parts = line.splitn(2, char::is_whitespace);
-            let pid: u32 = parts.next()?.trim().parse().ok()?;
-            let cmd = parts.next().unwrap_or("");
-            if !(cmd.contains("chanvoy")
-                && cmd.contains("daemon")
-                && cmd.contains("serve")
-                && cmd.contains(&env.profile_name))
-            {
-                return None;
-            }
-            // Belong to this harness invocation: open file under our runtime
-            // or our socket path. Foreign seats with the same slug fail this.
-            if process_holds_path(pid, &socket) || process_holds_path(pid, &runtime) {
-                Some(pid)
-            } else {
-                None
-            }
+    let runtime = runtime.to_str().expect("runtime dir is UTF-8");
+    let snapshot =
+        sysprims_proc::snapshot_with_options(sysprims_proc::ProcessOptions::default().with_env())
+            .expect("process snapshot");
+    snapshot
+        .processes
+        .iter()
+        .filter(|p| p.state != sysprims_proc::ProcessState::Zombie)
+        .filter(|p| {
+            // cmdline and env share one kernel read; the name does not. A
+            // live chanvoy with no readable cmdline must not drop out here.
+            assert!(
+                !(p.name == "chanvoy" && p.cmdline.is_empty()),
+                "command line of chanvoy pid {} is unreadable; \
+                 survivor count cannot be proven",
+                p.pid
+            );
+            is_daemon_serve_for(&p.cmdline, &env.profile_name)
+        })
+        .filter(|p| {
+            let env_vars = p.env.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "environment of daemon candidate pid {} is unreadable; \
+                     ownership cannot be proven",
+                    p.pid
+                )
+            });
+            env_vars.get("CHANVOY_RUNTIME_DIR").map(String::as_str) == Some(runtime)
         })
         .count()
 }
 
-/// Whether process `pid` has `path` open (socket, cwd, or any FD under a dir).
-fn process_holds_path(pid: u32, path: &std::path::Path) -> bool {
-    let Some(path_str) = path.to_str() else {
-        return false;
-    };
-    let out = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "--", path_str])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => !o.stdout.is_empty(),
-        _ => false,
-    }
+/// Whether `cmdline` is `chanvoy ... --profile <profile> ... daemon serve`.
+fn is_daemon_serve_for(cmdline: &[String], profile: &str) -> bool {
+    let is_chanvoy = cmdline.first().is_some_and(|exe| {
+        std::path::Path::new(exe)
+            .file_name()
+            .is_some_and(|name| name == "chanvoy")
+    });
+    is_chanvoy
+        && cmdline
+            .windows(2)
+            .any(|w| w[0] == "--profile" && w[1] == profile)
+        && cmdline
+            .windows(2)
+            .any(|w| w[0] == "daemon" && w[1] == "serve")
 }
 
 /// Legacy attention repair is provider-backed maintenance, not local daemon
