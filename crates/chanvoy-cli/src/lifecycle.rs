@@ -1924,16 +1924,24 @@ mod tests {
         child.0.wait().unwrap();
     }
 
-    /// A just-spawned child can still be exec-ing when it is first inspected,
-    /// which production treats as unknown. Fixtures wait, within a bound, for
-    /// a stable identity rather than racing that window.
+    /// A just-spawned child can still be exec-ing when it is first inspected:
+    /// between fork and exec it shows this test binary's identity, and
+    /// production treats the transition as unknown or changed. Fixtures wait,
+    /// within a bound, for the post-exec identity rather than racing that window.
     async fn capture_live(pid: &Path, socket: &Path) -> (NativeControl, ProcessIdentity) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let this_binary = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         loop {
             let last = match NativeControl::capture("test", pid.to_path_buf(), socket.to_path_buf())
             {
                 Ok(Some(control)) => match control.observe() {
-                    ProcessObservation::Alive(identity) => return (control, identity),
+                    ProcessObservation::Alive(identity) if identity.executable != this_binary => {
+                        return (control, identity)
+                    }
                     other => format!("{other:?}"),
                 },
                 other => format!("{:?}", other.map(|c| c.map(|c| c.pid))),
@@ -2070,11 +2078,20 @@ mod tests {
             "child too close to boot"
         );
         set_mtime(&pid, earlier);
-        let control = NativeControl::capture("test", pid.clone(), socket.clone())
-            .unwrap()
-            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let control = loop {
+            match NativeControl::capture("test", pid.clone(), socket.clone()) {
+                Ok(Some(control)) if control.observe() == ProcessObservation::Dead => {
+                    break control
+                }
+                other => {
+                    let last = format!("{:?}", other.map(|c| c.map(|c| c.observe())));
+                    assert!(std::time::Instant::now() < deadline, "{last}");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         assert!(!control.pre_boot_record);
-        assert_eq!(control.observe(), ProcessObservation::Dead);
         stop_at("test", pid.clone(), socket).await.unwrap();
         assert!(!pid.exists(), "stale record released");
         assert!(
