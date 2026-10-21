@@ -233,6 +233,9 @@ else:
         shutil.copy(ROOT / "Makefile", self.source / "Makefile")
         (self.source / "scripts").mkdir()
         shutil.copy(DRIVER, self.source / "scripts/build-campaign.py")
+        # `make check` also runs the process-tool guard, which records no step.
+        for guard in ("process-tool-guard.py", "process-tool-guard.test.py"):
+            shutil.copy(ROOT / "scripts" / guard, self.source / "scripts" / guard)
         (self.source / "Cargo.toml").write_text('rust-version = "1.89.0"\n')
         args = f"--cache-root {self.cache} --min-free-gib 0"
         result = subprocess.run(["make", "check", f"BUILD_CAMPAIGN_ARGS={args}"],
