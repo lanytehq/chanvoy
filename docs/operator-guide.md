@@ -207,6 +207,17 @@ use this path, so a live daemon whose pid file was removed by OS temp cleanup
 is stopped normally; errors name the PID as `(socket peer)`. A socket with no
 live listener and no readable pid file is still retained.
 
+The shutdown request is sent on the same connection whose kernel peer was
+checked, so a listener that takes the socket path afterwards never receives
+it. A daemon that survives the shutdown grace window is force signalled after
+its identity is revalidated. On Linux the signal goes through a pidfd opened
+at capture, so it cannot reach a later holder of the same PID. On macOS, which
+has no process-bound signal, `daemon stop` checks the kernel exit event
+registered at capture immediately before a numeric kill; a daemon that has
+been seen to exit is never signalled. A residual window remains on macOS:
+if the daemon exits and is reaped between that check and the kill, and another
+process is given the same PID in that moment, the signal reaches that process.
+
 A pid file can outlive its process, for example across a reboot. A record
 written before the current boot, or more than two seconds before the process
 now holding that PID started, is released only when that process is not a
