@@ -373,9 +373,26 @@ run_probes() {
 	fi
 	emit_kv "computed_runtime_dir" "$RUNTIME_DIR"
 
+	# Mirrors default_pid_dir(): without a runtime dir, pid files live under
+	# the config root, keyed by the socket directory.
+	if [[ -n "${CHANVOY_RUNTIME_DIR:-}" || -n "${XDG_RUNTIME_DIR:-}" ]]; then
+		PID_DIR="$RUNTIME_DIR"
+	else
+		if [[ -n "${CHANVOY_CONFIG_DIR:-}" ]]; then
+			config_root="$CHANVOY_CONFIG_DIR"
+		elif [[ "$(uname -s)" == "Darwin" ]]; then
+			config_root="$HOME/Library/Application Support/lanytehq/chanvoy"
+		else
+			config_root="${XDG_CONFIG_HOME:-$HOME/.config}/lanytehq/chanvoy"
+		fi
+		pid_key="$(printf '%s' "$RUNTIME_DIR" | shasum -a 256 | cut -c1-16)"
+		PID_DIR="${config_root}/run/${pid_key}"
+	fi
+	emit_kv "computed_pid_dir" "$PID_DIR"
+
 	if [[ -n "$RESOLVED_PROFILE" ]]; then
 		SOCK_PATH="${RUNTIME_DIR}/${RESOLVED_PROFILE}.sock"
-		PID_PATH="${RUNTIME_DIR}/${RESOLVED_PROFILE}.pid"
+		PID_PATH="${PID_DIR}/${RESOLVED_PROFILE}.pid"
 	else
 		SOCK_PATH=""
 		PID_PATH=""

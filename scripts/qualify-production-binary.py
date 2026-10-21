@@ -69,6 +69,7 @@ SUITES = {
         "daemon_start_requires_explicit_profile_selection",
         "daemon_start_sweeps_residue_when_child_exits_after_binding",
         "daemon_start_timeout_leaves_no_live_child_and_retry_yields_one_daemon",
+        "daemon_stop_recovers_a_live_daemon_without_its_pid_file",
         "harness_smoke_daemon_spawns_and_stops_cleanly",
         "notifications_cursor_survives_clean_restart",
         "post_cursor_survives_clean_restart",

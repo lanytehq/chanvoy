@@ -75,12 +75,20 @@ struct NativeControl {
     pid: u32,
     pid_path: PathBuf,
     socket_path: PathBuf,
-    pid_stamp: FileStamp,
+    /// None when the pid came from the socket peer because no pid file
+    /// exists; the pid path must then stay absent until cleanup.
+    pid_stamp: Option<FileStamp>,
     socket_stamp: Option<FileStamp>,
     captured: ProcessObservation,
     captured_birth: Option<u64>,
     exit_watch: Option<ExitWatch>,
     death_seen: Mutex<Option<Instant>>,
+    /// The pid file was written before the current boot. Its pid is released
+    /// only when the current holder is provably not this profile's daemon.
+    pre_boot_record: bool,
+    /// A pre-boot record whose pid is now held under another account; that
+    /// holder is never inspected or signalled.
+    foreign_holder: bool,
 }
 
 /// Read-only binding for a daemon observation. This carries no signaling or
@@ -500,6 +508,126 @@ impl ExitWatch {
     }
 }
 
+const PIDLESS_SOCKET: &str = "socket exists without a regular readable pid file; state retained";
+
+/// A pid file whose mtime precedes the observed process start by more than
+/// this cannot describe that process: a daemon writes its pid file after it
+/// starts. The slack absorbs start-time rounding across platforms.
+const STALE_RECORD_SLACK_MS: i128 = 2_000;
+
+fn stamp_ms(stamp: &FileStamp) -> i128 {
+    (stamp.modified_secs as i128) * 1000 + (stamp.modified_nanos as i128) / 1_000_000
+}
+
+/// The daemon runs as the invoking user and never changes account, so a
+/// holder positively read as another account cannot be the recorded daemon.
+/// A denied or unavailable read is not evidence either way.
+fn held_by_other_user(pid: u32) -> bool {
+    // SAFETY: geteuid has no arguments or preconditions.
+    account_of(pid).is_some_and(|uid| uid != unsafe { libc::geteuid() })
+}
+
+/// Darwin `struct proc_bsdshortinfo` from `<sys/proc_info.h>`; the locked
+/// libc release does not declare it.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    status: u32,
+    comm: [libc::c_char; 16],
+    flags: u32,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    ruid: libc::uid_t,
+    rgid: libc::gid_t,
+    svuid: libc::uid_t,
+    svgid: libc::gid_t,
+    reserved: u32,
+}
+
+#[cfg(target_os = "macos")]
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<ProcBsdShortInfo>() == 64);
+
+#[cfg(target_os = "macos")]
+fn account_of(pid: u32) -> Option<u32> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    // The short BSD flavor is readable across accounts, unlike the full one.
+    // SAFETY: an all-zero bit pattern is valid for this plain C struct.
+    let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    // SAFETY: the buffer pointer and size describe `info` exactly.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            PROC_PIDT_SHORTBSDINFO,
+            1,
+            (&mut info as *mut ProcBsdShortInfo).cast(),
+            size,
+        )
+    };
+    (read == size && info.pid == pid).then_some(info.uid)
+}
+
+#[cfg(target_os = "linux")]
+fn account_of(pid: u32) -> Option<u32> {
+    native_owner(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn account_of(_: u32) -> Option<u32> {
+    None
+}
+
+fn written_before_boot(stamp: &FileStamp) -> bool {
+    boot_time_ms().is_some_and(|boot| stamp_ms(stamp) + STALE_RECORD_SLACK_MS < boot)
+}
+
+#[cfg(target_os = "macos")]
+fn boot_time_ms() -> Option<i128> {
+    let mut boot: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of_val(&boot);
+    // SAFETY: the output buffer and its length describe `boot` exactly; no
+    // new value is written.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&mut boot as *mut libc::timeval).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size != std::mem::size_of_val(&boot) || boot.tv_sec <= 0 {
+        return None;
+    }
+    Some(i128::from(boot.tv_sec) * 1000 + i128::from(boot.tv_usec) / 1000)
+}
+
+#[cfg(target_os = "linux")]
+fn boot_time_ms() -> Option<i128> {
+    std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse::<i128>()
+        .ok()
+        .filter(|secs| *secs > 0)
+        .map(|secs| secs * 1000)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn boot_time_ms() -> Option<i128> {
+    None
+}
+
 impl NativeControl {
     fn capture(
         profile: &str,
@@ -510,10 +638,70 @@ impl NativeControl {
             return if stamp(&socket_path)?.is_none() {
                 Ok(None)
             } else {
-                Err("socket exists without a regular readable pid file; state retained".into())
+                Err(PIDLESS_SOCKET.into())
             };
         };
         let pid_stamp = stamp(&pid_path)?.ok_or("pid file changed")?;
+        Self::capture_pid(profile, pid, pid_path, socket_path, Some(pid_stamp)).map(Some)
+    }
+
+    /// Pid-file capture, falling back to the socket peer when the pid file is
+    /// absent but the socket exists. The peer pid is neither birth nor
+    /// liveness proof, so the fallback requires a live same-user process,
+    /// re-reads the peer after the identity read, and leaves ownership to
+    /// `owned_identity` with the socket inode standing in for the pid file.
+    async fn capture_with_peer(
+        profile: &str,
+        pid_path: PathBuf,
+        socket_path: PathBuf,
+    ) -> Result<Option<Self>, String> {
+        if read_pid(&pid_path)?.is_some() {
+            return Self::capture(profile, pid_path, socket_path);
+        }
+        let Some(socket_stamp) = stamp(&socket_path)? else {
+            return Ok(None);
+        };
+        if !std::fs::symlink_metadata(&socket_path)
+            .map_err(|_| "socket metadata unreadable")?
+            .file_type()
+            .is_socket()
+        {
+            return Err("runtime socket path is not a socket; state retained".into());
+        }
+        let SocketOwner::Live(pid) = peer_owner(&socket_path, Duration::from_millis(750)).await
+        else {
+            return Err(PIDLESS_SOCKET.into());
+        };
+        let control = Self::capture_pid(profile, pid, pid_path, socket_path, None)?;
+        if control.socket_stamp.as_ref() != Some(&socket_stamp)
+            || !matches!(control.captured, ProcessObservation::Alive(_))
+        {
+            return Err(
+                "socket peer identity unconfirmed without a pid file; state retained".into(),
+            );
+        }
+        let owner = peer_owner(&control.socket_path, Duration::from_millis(750)).await;
+        if !control.peer_unchanged(owner) {
+            return Err("socket peer changed during identity capture; state retained".into());
+        }
+        Ok(Some(control))
+    }
+
+    /// The listener still belongs to the same process after its identity was
+    /// read, so a reused pid cannot inherit the earlier observation.
+    fn peer_unchanged(&self, owner: SocketOwner) -> bool {
+        owner == SocketOwner::Live(self.pid)
+            && native_birth(self.pid) == self.captured_birth
+            && self.runtime_matches(false)
+    }
+
+    fn capture_pid(
+        profile: &str,
+        pid: u32,
+        pid_path: PathBuf,
+        socket_path: PathBuf,
+        pid_stamp: Option<FileStamp>,
+    ) -> Result<Self, String> {
         let socket_stamp = stamp(&socket_path)?;
         if socket_stamp.is_some()
             && !std::fs::symlink_metadata(&socket_path)
@@ -522,6 +710,27 @@ impl NativeControl {
                 .is_socket()
         {
             return Err("runtime socket path is not a socket; state retained".into());
+        }
+        let pre_boot_record = pid_stamp.as_ref().is_some_and(written_before_boot);
+        if pre_boot_record && held_by_other_user(pid) {
+            let control = Self {
+                profile: profile.into(),
+                pid,
+                pid_path,
+                socket_path,
+                pid_stamp,
+                socket_stamp,
+                captured: ProcessObservation::Dead,
+                captured_birth: None,
+                exit_watch: None,
+                death_seen: Mutex::new(None),
+                pre_boot_record: true,
+                foreign_holder: true,
+            };
+            if !control.runtime_matches(false) {
+                return Err("runtime changed during capture; state retained".into());
+            }
+            return Ok(control);
         }
         let captured_birth = native_birth(pid);
         let (captured, exit_watch) = capture_monitor(|| observe_pid(pid), || ExitWatch::new(pid))?;
@@ -549,18 +758,31 @@ impl NativeControl {
             captured_birth,
             exit_watch,
             death_seen: Mutex::new(None),
+            pre_boot_record,
+            foreign_holder: false,
         };
         if !control.runtime_matches(false) {
             return Err("runtime changed around exit monitor; state retained".into());
         }
-        Ok(Some(control))
+        Ok(control)
     }
 
+    /// The process must have started no later than its runtime record was
+    /// written: the pid file, or the socket inode when no pid file exists.
     fn owned_identity(&self, identity: &ProcessIdentity) -> bool {
         let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) else {
             return false;
         };
-        let expected_exe = exe.to_string_lossy();
+        let Some(record) = self.pid_stamp.as_ref().or(self.socket_stamp.as_ref()) else {
+            return false;
+        };
+        identity.executable == exe.to_string_lossy()
+            && self.serves_profile(identity)
+            && stamp_ms(record) >= i128::from(identity.start_ms)
+    }
+
+    /// Arguments of a `daemon serve` for this profile.
+    fn serves_profile(&self, identity: &ProcessIdentity) -> bool {
         let explicit_profile = identity
             .args
             .windows(2)
@@ -573,13 +795,29 @@ impl NativeControl {
             .args
             .windows(2)
             .any(|a| a[0] == "daemon" && a[1] == "serve");
-        let modified_ms = (self.pid_stamp.modified_secs as i128) * 1000
-            + (self.pid_stamp.modified_nanos as i128) / 1_000_000;
-        identity.executable == expected_exe
-            && explicit_profile
-            && serve
-            && modified_ms >= i128::from(identity.start_ms)
+        explicit_profile && serve
     }
+
+    /// A pid record is stale only when timing says it predates the current
+    /// holder AND the holder is not a daemon at all. Timing alone is not death
+    /// proof: clocks step and mtimes can be restored. Any `daemon serve`
+    /// holder may serve this profile through `CHANVOY_PROFILE`, so it falls
+    /// through to the ownership refusal instead.
+    fn record_released(&self, identity: &ProcessIdentity) -> bool {
+        let Some(record) = self.pid_stamp.as_ref() else {
+            return false;
+        };
+        let predates = i128::from(identity.start_ms) > stamp_ms(record) + STALE_RECORD_SLACK_MS;
+        (predates || self.pre_boot_record) && !maybe_daemon_serve(identity)
+    }
+}
+
+/// Whether a process could be a `daemon serve` of any profile. Global options
+/// may sit between the two words, so any argument order counts. This only
+/// blocks releasing a record; signalling still requires `owned_identity`.
+fn maybe_daemon_serve(identity: &ProcessIdentity) -> bool {
+    let has = |word: &str| identity.args.iter().skip(1).any(|a| a == word);
+    has("daemon") && has("serve")
 }
 
 fn capture_monitor<W>(
@@ -941,6 +1179,16 @@ async fn peer_owner(socket: &Path, budget: Duration) -> SocketOwner {
 
 impl NativeControl {
     fn observe_process(&self) -> ProcessObservation {
+        if self.foreign_holder {
+            // Recheck the account boundary on every observation.
+            return if held_by_other_user(self.pid)
+                || death_or_unknown(self.pid) == ProcessObservation::Dead
+            {
+                ProcessObservation::Dead
+            } else {
+                ProcessObservation::Unknown
+            };
+        }
         if native_birth(self.pid).is_some_and(|birth| Some(birth) != self.captured_birth) {
             return ProcessObservation::Unknown;
         }
@@ -985,6 +1233,16 @@ impl NativeControl {
                 Ok(false) => {}
             }
         }
+        if let ProcessObservation::Alive(identity) = &current {
+            if self.record_released(identity) {
+                tracing::debug!(
+                    stage = "process-liveness",
+                    pid = self.pid,
+                    outcome = "pid-record-predates-process"
+                );
+                return ProcessObservation::Dead;
+            }
+        }
         current
     }
 }
@@ -1005,11 +1263,11 @@ impl ProcessControl for NativeControl {
             Ok(actual) => actual.as_ref() == expected || (allow_absent && actual.is_none()),
             Err(_) => false,
         };
-        matches(&self.pid_path, Some(&self.pid_stamp))
+        matches(&self.pid_path, self.pid_stamp.as_ref())
             && matches(&self.socket_path, self.socket_stamp.as_ref())
             && match read_pid(&self.pid_path) {
                 Ok(Some(pid)) => pid == self.pid,
-                Ok(None) => allow_absent,
+                Ok(None) => allow_absent || self.pid_stamp.is_none(),
                 // The predecessor may unlink its own PID file between these
                 // reads during graceful exit. Only freshly confirmed absence
                 // is benign; unreadable or changed existing files still refuse.
@@ -1075,11 +1333,16 @@ impl ProcessControl for NativeControl {
 }
 
 pub(super) async fn stop(profile: &str) -> Result<(), String> {
-    let Some(control) = NativeControl::capture(
+    stop_at(
         profile,
         chanvoy_core::pid_path_for_profile(profile),
         chanvoy_core::socket_path_for_profile(profile),
-    )?
+    )
+    .await
+}
+
+async fn stop_at(profile: &str, pid_path: PathBuf, socket_path: PathBuf) -> Result<(), String> {
+    let Some(control) = NativeControl::capture_with_peer(profile, pid_path, socket_path).await?
     else {
         return Ok(());
     };
@@ -1106,8 +1369,13 @@ pub(super) async fn stop(profile: &str) -> Result<(), String> {
     };
     result.map_err(|e| {
         format!(
-            "pid {}: {e}; attempted bounded shutdown/confirmed-stop assessment",
-            control.pid
+            "pid {}{}: {e}; attempted bounded shutdown/confirmed-stop assessment",
+            control.pid,
+            if control.pid_stamp.is_none() {
+                " (socket peer)"
+            } else {
+                ""
+            }
         )
     })
 }
@@ -1656,6 +1924,36 @@ mod tests {
         child.0.wait().unwrap();
     }
 
+    /// A just-spawned child can still be exec-ing when it is first inspected:
+    /// between fork and exec it shows this test binary's identity, and
+    /// production treats the transition as unknown or changed. Fixtures wait,
+    /// within a bound, for the post-exec identity rather than racing that window.
+    async fn capture_live(pid: &Path, socket: &Path) -> (NativeControl, ProcessIdentity) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let this_binary = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        loop {
+            let last = match NativeControl::capture("test", pid.to_path_buf(), socket.to_path_buf())
+            {
+                Ok(Some(control)) => match control.observe() {
+                    ProcessObservation::Alive(identity) if identity.executable != this_binary => {
+                        return (control, identity)
+                    }
+                    other => format!("{other:?}"),
+                },
+                other => format!("{:?}", other.map(|c| c.map(|c| c.pid))),
+            };
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned-child native process inspection blocked or incomplete: {last}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn socket_absent_with_live_owned_pid_is_not_stop_success() {
         let child = child();
@@ -1663,14 +1961,7 @@ mod tests {
         let pid = root.path().join("test.pid");
         let socket = root.path().join("test.sock");
         std::fs::write(&pid, child.0.id().to_string()).unwrap();
-        let control = NativeControl::capture("test", pid.clone(), socket)
-            .unwrap()
-            .unwrap();
-        let ProcessObservation::Alive(identity) = control.observe() else {
-            panic!(
-                "owned-child native process inspection blocked or incomplete; host proof required"
-            );
-        };
+        let (control, identity) = capture_live(&pid, &socket).await;
         assert!(stop_confirmed(&control, &identity, budget()).await.is_err());
         assert!(pid.exists());
         assert!(matches!(control.observe(), ProcessObservation::Alive(_)));
@@ -1758,6 +2049,240 @@ mod tests {
         let cleanup = cleanup_dead(&control).await;
         assert!(cleanup.is_ok(), "post-drop cleanup refused: {cleanup:?}");
         assert!(!pid.exists() && !socket.exists());
+    }
+
+    fn set_mtime(path: &Path, at: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pid_record_older_than_its_process_is_released_without_a_signal() {
+        let child = child();
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        std::fs::write(&pid, child.0.id().to_string()).unwrap();
+        let (_, identity) = capture_live(&pid, &socket).await;
+        // Written well before this process started, but after boot.
+        let start = std::time::UNIX_EPOCH + Duration::from_millis(identity.start_ms);
+        let boot = boot_time_ms().expect("boot time") as u64;
+        let earlier = (start - Duration::from_secs(60))
+            .max(std::time::UNIX_EPOCH + Duration::from_millis(boot + 10_000));
+        assert!(
+            earlier + Duration::from_secs(3) < start,
+            "child too close to boot"
+        );
+        set_mtime(&pid, earlier);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let control = loop {
+            match NativeControl::capture("test", pid.clone(), socket.clone()) {
+                Ok(Some(control)) if control.observe() == ProcessObservation::Dead => {
+                    break control
+                }
+                other => {
+                    let last = format!("{:?}", other.map(|c| c.map(|c| c.observe())));
+                    assert!(std::time::Instant::now() < deadline, "{last}");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(!control.pre_boot_record);
+        stop_at("test", pid.clone(), socket).await.unwrap();
+        assert!(!pid.exists(), "stale record released");
+        assert!(
+            matches!(observe_pid(child.0.id()), ProcessObservation::Alive(_)),
+            "the process now holding the pid is never signalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_record_held_by_a_daemon_shaped_process_is_not_released() {
+        // Timing is not death proof: a `daemon serve` holder keeps its record
+        // and reaches the ownership refusal, including one whose profile came
+        // from `CHANVOY_PROFILE` rather than its arguments.
+        for args in [
+            &["--profile", "test", "daemon", "serve"][..],
+            &["daemon", "serve"],
+            &["daemon", "--profile", "test", "serve"],
+            &["daemon", "--profile=test", "serve"],
+            &["--profile", "test", "daemon", "--json", "serve"],
+        ] {
+            old_record_holder_is_refused(args).await;
+        }
+    }
+
+    async fn old_record_holder_is_refused(holder_args: &[&str]) {
+        let _ = child();
+        let holder = OwnedChild(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 30; :", "sh"])
+                .args(holder_args)
+                .spawn()
+                .unwrap(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        std::fs::write(&pid, holder.0.id().to_string()).unwrap();
+        let (_, identity) = capture_live(&pid, &socket).await;
+        assert!(
+            identity.args.iter().any(|a| a == "serve"),
+            "{:?}",
+            identity.args
+        );
+        for at in [
+            std::time::UNIX_EPOCH + Duration::from_secs(1_000),
+            std::time::UNIX_EPOCH + Duration::from_millis(identity.start_ms)
+                - Duration::from_secs(30),
+        ] {
+            set_mtime(&pid, at);
+            capture_live(&pid, &socket).await;
+            // Retry only transient inspection refusals; any success fails.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let refusal = loop {
+                let refusal = stop_at("test", pid.clone(), socket.clone())
+                    .await
+                    .unwrap_err();
+                if !refusal.contains("unavailable") && !refusal.contains("unknown") {
+                    break refusal;
+                }
+                assert!(std::time::Instant::now() < deadline, "{refusal}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert!(refusal.contains("ownership unconfirmed"), "{refusal}");
+            assert!(pid.exists());
+        }
+        // Never signalled: still running, not merely inspectable.
+        let mut holder = holder;
+        assert!(
+            holder.0.try_wait().unwrap().is_none(),
+            "holder was signalled"
+        );
+    }
+
+    #[test]
+    fn other_account_requires_a_positive_uid_read() {
+        assert!(!held_by_other_user(std::process::id()));
+        assert!(!held_by_other_user(0));
+        assert!(!held_by_other_user(u32::MAX));
+        // SAFETY: geteuid has no arguments or preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(account_of(1), Some(0), "init is readable across accounts");
+            assert!(held_by_other_user(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn pid_record_from_before_boot_is_released_only_with_socket_absence() {
+        if socket_fixture_in_child(
+            "lifecycle::tests::pid_record_from_before_boot_is_released_only_with_socket_absence",
+        )
+        .await
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        // A pid that is live now but cannot be the recorded daemon: this
+        // process, which may have no daemon arguments at all.
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        set_mtime(&pid, std::time::UNIX_EPOCH + Duration::from_secs(1_000));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let control = NativeControl::capture("test", pid.clone(), socket.clone())
+            .unwrap()
+            .unwrap();
+        assert!(control.pre_boot_record);
+        assert_eq!(control.observe(), ProcessObservation::Dead);
+        let refusal = stop_at("test", pid.clone(), socket.clone())
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("state retained"), "{refusal}");
+        assert!(
+            pid.exists() && socket.exists(),
+            "a live listener keeps both"
+        );
+        drop(listener);
+        stop_at("test", pid.clone(), socket.clone()).await.unwrap();
+        assert!(!pid.exists() && !socket.exists());
+    }
+
+    #[tokio::test]
+    async fn pidless_socket_owned_by_another_program_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let before = std::fs::symlink_metadata(&socket).unwrap().ino();
+        let control = NativeControl::capture_with_peer("test", pid.clone(), socket.clone())
+            .await
+            .unwrap()
+            .expect("peer fallback capture");
+        assert_eq!(control.pid, std::process::id());
+        assert!(control.pid_stamp.is_none());
+        let ProcessObservation::Alive(identity) = control.observe() else {
+            panic!("own process inspection blocked; host proof required");
+        };
+        assert!(
+            !control.owned_identity(&identity),
+            "this test binary is not `daemon serve --profile test`"
+        );
+        let refusal = stop_at("test", pid.clone(), socket.clone())
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("(socket peer)"), "{refusal}");
+        assert!(refusal.contains("ownership unconfirmed"), "{refusal}");
+        assert_eq!(std::fs::symlink_metadata(&socket).unwrap().ino(), before);
+        assert!(!pid.exists());
+    }
+
+    #[tokio::test]
+    async fn pidless_capture_refuses_a_pid_file_that_appears_later() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let control = NativeControl::capture_with_peer("test", pid.clone(), socket.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(control.runtime_matches(false));
+        assert!(control.peer_unchanged(SocketOwner::Live(control.pid)));
+        for changed in [
+            SocketOwner::Live(control.pid + 1),
+            SocketOwner::Absent,
+            SocketOwner::Unknown(SocketUnknown::ConnectTimeout),
+        ] {
+            assert!(!control.peer_unchanged(changed), "{changed:?}");
+        }
+        std::fs::write(&pid, std::process::id().to_string()).unwrap();
+        assert!(!control.runtime_matches(false));
+        assert!(!control.runtime_matches(true));
+    }
+
+    #[tokio::test]
+    async fn dead_listener_without_pid_file_is_still_refused() {
+        if socket_fixture_in_child(
+            "lifecycle::tests::dead_listener_without_pid_file_is_still_refused",
+        )
+        .await
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let refusal = stop_at("test", pid.clone(), socket.clone())
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("without a regular readable pid file"));
+        assert!(socket.exists() && !pid.exists());
     }
 
     #[test]
