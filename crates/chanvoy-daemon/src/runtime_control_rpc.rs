@@ -31,22 +31,75 @@ pub(crate) fn root_for(method: &str) -> Option<ControlRoot> {
     }
 }
 
-/// The control root a frame selects, if any. Selection is deliberately
-/// broader than decoding: any frame whose bytes name a control method, in any
-/// position or ASCII `\\u` escape spelling, is routed to the strict decoder and
-/// refused there unless it is exactly its root. Such a frame never reaches
-/// legacy parsing, whatever its shape (trailing data, BOM, array form,
-/// duplicate keys or malformed content).
+/// The control root a frame selects, if any. Only method position counts, so
+/// ordinary payload text that mentions a control method (a chat message, a
+/// search query) keeps its legacy handler:
+///
+/// - a JSON object selects a root when any top-level `method` member (a
+///   duplicate key included) names a control method;
+/// - a JSON array selects one when any top-level element does, because a
+///   lenient decoder can read an array positionally as a request;
+/// - a frame that is not one JSON value (trailing data, BOM, malformed
+///   content) selects one when its bytes name a control method in any ASCII
+///   escape spelling. Legacy parsing would refuse such a frame anyway.
+///
+/// A selected frame is decoded only by the strict root and never reaches
+/// legacy parsing.
 pub(crate) fn frame_root(frame: &[u8]) -> Option<ControlRoot> {
-    let unescaped = unescape_ascii(frame);
-    let named = |method: &str| contains(&unescaped, method.as_bytes());
-    if named(RETIRE_METHOD) {
-        Some(ControlRoot::RetireRequest)
-    } else if named(OBSERVATION_METHOD) {
-        Some(ControlRoot::ObservationRequest)
-    } else {
-        None
+    let names = match serde_json::from_slice::<Value>(frame) {
+        Ok(Value::Object(_)) => top_level_methods(frame),
+        Ok(Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect(),
+        Ok(_) => Vec::new(),
+        Err(_) => {
+            let unescaped = unescape_ascii(frame);
+            [RETIRE_METHOD, OBSERVATION_METHOD]
+                .into_iter()
+                .filter(|method| contains(&unescaped, method.as_bytes()))
+                .map(str::to_owned)
+                .collect()
+        }
+    };
+    names.iter().find_map(|name| root_for(name))
+}
+
+/// Every top-level `method` value of an object, including duplicate keys
+/// that `serde_json::Value` would collapse.
+fn top_level_methods(frame: &[u8]) -> Vec<String> {
+    struct Methods(Vec<String>);
+    impl<'de> serde::Deserialize<'de> for Methods {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Visit;
+            impl<'de> serde::de::Visitor<'de> for Visit {
+                type Value = Methods;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Methods, A::Error> {
+                    let mut methods = Vec::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        if key == "method" {
+                            if let Value::String(name) = map.next_value::<Value>()? {
+                                methods.push(name);
+                            }
+                        } else {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                    Ok(Methods(methods))
+                }
+            }
+            d.deserialize_map(Visit)
+        }
     }
+    serde_json::from_slice::<Methods>(frame)
+        .map(|Methods(methods)| methods)
+        .unwrap_or_default()
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

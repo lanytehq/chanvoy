@@ -514,3 +514,56 @@ async fn an_unread_control_client_does_not_hold_up_shutdown() {
         .unwrap();
     writer.abort();
 }
+
+#[test]
+fn only_method_position_selects_a_control_root() {
+    let legacy = |params: Value| {
+        serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": ID, "method": "post_message", "params": params,
+        }))
+        .unwrap()
+    };
+    // Payload text that mentions a control method keeps its legacy handler.
+    for params in [
+        json!({"channel": "x", "message": "Review runtime_retire_v1 today"}),
+        json!({"query": "runtime_observation_v1"}),
+        json!({"contains": "runtime_retire_v10", "method": "runtime_retire_v1"}),
+        json!({"text": "runtime_\\u0072etire_v1"}),
+    ] {
+        assert_eq!(frame_root(&legacy(params.clone())), None, "{params}");
+    }
+    // Method position selects, whatever the spelling or shape.
+    assert_eq!(
+        frame_root(br#"{"\u006dethod":"runtime_\u0072etire_v1","id":"x"}"#),
+        Some(ControlRoot::RetireRequest)
+    );
+    // Every duplicate counts, not just the one a lenient map keeps.
+    for frame in [
+        br#"{"method":"shutdown","method":"runtime_observation_v1"}"#.as_slice(),
+        br#"{"method":"runtime_observation_v1","method":"shutdown"}"#.as_slice(),
+    ] {
+        assert_eq!(frame_root(frame), Some(ControlRoot::ObservationRequest));
+    }
+    assert_eq!(
+        frame_root(br#"["2.0","x","runtime_retire_v1",{}]"#),
+        Some(ControlRoot::RetireRequest)
+    );
+    // Not one JSON value: any mention routes to strict refusal.
+    assert_eq!(
+        frame_root(b"{\"method\":\"runtime_retire_v1\"} trailing"),
+        Some(ControlRoot::RetireRequest)
+    );
+    assert_eq!(frame_root(br#"{"method":"profile_status"}"#), None);
+}
+
+#[tokio::test]
+async fn chat_text_naming_a_control_method_reaches_its_legacy_handler() {
+    let request = chanvoy_core::rpc_request(
+        "profile_status",
+        json!({"note": "about runtime_retire_v1 and runtime_observation_v1"}),
+    );
+    let (replies, _, _, outcome) = exchange(&[serde_json::to_vec(&request).unwrap()]).await;
+    outcome.unwrap();
+    assert_eq!(replies[0]["id"], json!(request.id));
+    assert!(replies[0].get("result").is_some(), "{}", replies[0]);
+}
