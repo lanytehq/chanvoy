@@ -12,6 +12,7 @@ mod ipc_ownership;
 mod ipc_supervision;
 mod request_frontier;
 mod retirement_control;
+mod runtime_control_rpc;
 mod startup_work;
 mod subscription_owner;
 mod wait;
@@ -892,6 +893,32 @@ where
                 if stop.is_cancelled() { break; }
                 if bytes_read == 0 {
                     break;
+                }
+                // Versioned runtime control is a provider-free control exception:
+                // strict selected-root decode, no operational permit, no legacy
+                // fallback for invalid input.
+                if let Some(root) = runtime_control_rpc::frame_root(line.trim_end()) {
+                    let frame = line.strip_suffix('\n').unwrap_or(&line);
+                    let reply = runtime_control_rpc::answer(
+                        frame.as_bytes(),
+                        root,
+                        &state.wait_owners,
+                        || async {
+                            match shutdown_tx.lock().await.take() {
+                                Some(sender) => sender.send(()).is_ok(),
+                                None => false,
+                            }
+                        },
+                    )
+                    .await;
+                    writer.write_all(&reply.bytes).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                    if reply.close {
+                        break;
+                    }
+                    line.clear();
+                    continue;
                 }
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
                 // Admission precedes every legacy handler and provider preflight.

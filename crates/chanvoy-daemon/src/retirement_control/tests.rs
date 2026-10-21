@@ -10,11 +10,11 @@ use std::{
 };
 
 #[derive(Clone)]
-struct FakePublication {
-    state: Arc<Mutex<PublicationView>>,
+pub(crate) struct FakePublication {
+    pub(crate) state: Arc<Mutex<PublicationView>>,
     writes: Arc<AtomicUsize>,
-    failure: Arc<AtomicUsize>,
-    registry: Arc<WaitOwnerRegistry>,
+    pub(crate) failure: Arc<AtomicUsize>,
+    pub(crate) registry: Arc<WaitOwnerRegistry>,
 }
 impl Publication for FakePublication {
     fn inspect(&self) -> Result<PublicationView, RuntimeError> {
@@ -67,7 +67,7 @@ impl Publication for FakePublication {
         Ok(())
     }
 }
-fn setup() -> (RetirementControl<FakePublication>, FakePublication) {
+pub(crate) fn setup() -> (RetirementControl<FakePublication>, FakePublication) {
     let instance = InstanceId::new();
     let registry = Arc::new(WaitOwnerRegistry::for_instance(instance));
     let config_root = PathBytes::from_path(Path::new("/owned/config")).unwrap();
@@ -120,7 +120,7 @@ fn setup() -> (RetirementControl<FakePublication>, FakePublication) {
         publisher,
     )
 }
-fn request(
+pub(crate) fn request(
     p: &FakePublication,
     action: &str,
     change: impl FnOnce(&mut serde_json::Value),

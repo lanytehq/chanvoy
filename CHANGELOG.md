@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Runtime control RPC routing
+
+- The daemon answers `runtime_retire_v1` and `runtime_observation_v1` through
+  their strict runtime-control v1 roots (16 KiB frame cap, duplicate keys
+  refused, exact schema). Invalid input gets a closed protocol error and never
+  reaches a legacy handler. These methods take no operational request permit.
+- No retirement coordinator is bound yet, so retirement is always refused with
+  `native_evidence_unavailable` and never starts shutdown. Observation reports
+  application admission phase and counts only. Existing methods are unchanged.
+
 ### Daemon pid file and pid-less stop
 
 - When no runtime directory is configured (macOS, or Linux without

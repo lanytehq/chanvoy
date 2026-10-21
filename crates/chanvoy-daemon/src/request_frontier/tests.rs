@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::{oneshot, Mutex, Notify};
 use wiremock::MockServer;
 
-fn state(server_url: &str) -> Arc<AppState> {
+pub(crate) fn state(server_url: &str) -> Arc<AppState> {
     let profile = Profile {
         name: "request-frontier-fixture".into(),
         role: "test".into(),

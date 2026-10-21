@@ -1,0 +1,364 @@
+use super::*;
+use crate::retirement_control::tests::{request, setup};
+use crate::retirement_control::Outcome;
+use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{oneshot, Mutex};
+
+const ID: &str = "87654321-4321-4321-8321-cba987654321";
+
+fn result(document: &ControlDocument) -> &Value {
+    &document.value()["result"]
+}
+
+async fn project(
+    facts: &ResultFacts,
+    request: &ControlDocument,
+    started: bool,
+) -> (Result<ControlDocument, ControlError>, usize) {
+    let calls = AtomicUsize::new(0);
+    let projected = retire(request, facts, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async move { started }
+    })
+    .await;
+    (projected, calls.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn every_coordinator_outcome_projects_to_its_contract_branch() {
+    // Busy, then Committed, AlreadyRetiring and Continued from the real
+    // coordinator against the shared arena.
+    let (c, p) = setup();
+    let permit = p.registry.request_permit().unwrap();
+    let begin = request(&p, "begin", |_| {});
+    let busy = c.attempt(&begin, |_| Ok(())).unwrap();
+    assert_eq!(busy.outcome, Outcome::Busy);
+    let (doc, calls) = project(&busy, &begin, true).await;
+    let doc = doc.unwrap();
+    assert_eq!(calls, 0, "Busy never starts shutdown");
+    assert_eq!(result(&doc)["outcome"], "busy");
+    assert_eq!(result(&doc)["counts"]["requests"], 1);
+    assert_eq!(result(&doc)["facts"]["shutdown_started"], false);
+    permit.confirm_done().unwrap();
+
+    let begin = request(&p, "begin", |_| {});
+    let committed = c.attempt(&begin, |_| Ok(())).unwrap();
+    assert_eq!(committed.outcome, Outcome::Committed);
+    let (doc, calls) = project(&committed, &begin, true).await;
+    let doc = doc.unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(result(&doc)["outcome"], "committed");
+    assert_eq!(result(&doc)["request_committed"], true);
+    assert_eq!(result(&doc)["facts"]["durable_revision"], 3);
+    assert_eq!(result(&doc)["facts"]["shutdown_started"], true);
+    // A shutdown that could not start is reported, not assumed.
+    let (doc, _) = project(&committed, &begin, false).await;
+    assert_eq!(result(&doc.unwrap())["facts"]["shutdown_started"], false);
+
+    let again = request(&p, "begin", |_| {});
+    let already = c.attempt(&again, |_| Ok(())).unwrap();
+    assert_eq!(already.outcome, Outcome::AlreadyRetiring);
+    let (doc, calls) = project(&already, &again, true).await;
+    let doc = doc.unwrap();
+    assert_eq!(calls, 0);
+    assert_eq!(
+        (
+            result(&doc)["outcome"].as_str(),
+            result(&doc)["reason"].as_str()
+        ),
+        (Some("refused"), Some("already_retiring"))
+    );
+    assert_eq!(result(&doc)["facts"]["memory_retiring"], true);
+
+    let cont = request(&p, "continue_same_epoch", |_| {});
+    let continued = c.attempt(&cont, |_| Ok(())).unwrap();
+    assert_eq!(continued.outcome, Outcome::Continued);
+    let (doc, calls) = project(&continued, &cont, true).await;
+    let doc = doc.unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(result(&doc)["outcome"], "continued");
+    assert_eq!(result(&doc)["request_committed"], false);
+}
+
+#[tokio::test]
+async fn refusals_keep_known_facts_and_unknown_targets_stay_null() {
+    let (c, p) = setup();
+    let stale = request(&p, "begin", |v| {
+        v["params"]["target"]["record_revision"] = json!(1)
+    });
+    let facts = c.attempt(&stale, |_| Ok(())).unwrap();
+    assert_eq!(facts.outcome, Outcome::RevisionChanged);
+    let doc = project(&facts, &stale, true).await.0.unwrap();
+    assert_eq!(result(&doc)["reason"], "revision_changed");
+    assert_eq!(result(&doc)["facts"]["memory_retiring"], false);
+    assert_eq!(result(&doc)["facts"]["durable_revision"], 2);
+
+    let generation = request(&p, "begin", |v| {
+        v["params"]["caller_generation"]["commit"] = json!("b".repeat(40))
+    });
+    let facts = c.attempt(&generation, |_| Ok(())).unwrap();
+    assert_eq!(facts.outcome, Outcome::GenerationRefused);
+    let doc = project(&facts, &generation, true).await.0.unwrap();
+    assert_eq!(result(&doc)["reason"], "generation_refused");
+
+    let not_retiring = request(&p, "continue_same_epoch", |_| {});
+    let facts = c.attempt(&not_retiring, |_| Ok(())).unwrap();
+    assert_eq!(facts.outcome, Outcome::NotRetiring);
+    let doc = project(&facts, &not_retiring, true).await.0.unwrap();
+    assert_eq!(result(&doc)["reason"], "revision_changed");
+    assert_eq!(result(&doc)["facts"]["memory_retiring"], false);
+
+    let native = request(&p, "begin", |_| {});
+    let facts = c
+        .attempt(&native, |_| Err(RuntimeError::Unavailable("synthetic")))
+        .unwrap();
+    assert_eq!(facts.outcome, Outcome::NativeUnavailable);
+    let (doc, calls) = project(&facts, &native, true).await;
+    let doc = doc.unwrap();
+    assert_eq!(calls, 0);
+    assert_eq!(result(&doc)["reason"], "native_evidence_unavailable");
+    for fact in ["memory_retiring", "durable_retiring", "shutdown_started"] {
+        assert!(result(&doc)["facts"][fact].is_null(), "{fact}");
+    }
+    assert!(result(&doc)["counts"]["requests"].is_null());
+
+    let mismatch = request(&p, "begin", |v| {
+        v["params"]["target"]["instance_uuid"] = json!(ID)
+    });
+    let facts = c.attempt(&mismatch, |_| Ok(())).unwrap();
+    assert_eq!(facts.outcome, Outcome::TargetMismatch);
+    let doc = project(&facts, &mismatch, true).await.0.unwrap();
+    assert_eq!(result(&doc)["reason"], "target_mismatch");
+}
+
+use chanvoy_core::runtime::RuntimeError;
+
+#[tokio::test]
+async fn publication_failure_is_unconfirmed_without_shutdown() {
+    for mode in 1..=3 {
+        let (c, p) = setup();
+        p.failure.store(mode, Ordering::SeqCst);
+        let begin = request(&p, "begin", |_| {});
+        let facts = c.attempt(&begin, |_| Ok(())).unwrap();
+        assert_eq!(facts.outcome, Outcome::PublicationUnconfirmed, "{mode}");
+        let (doc, calls) = project(&facts, &begin, true).await;
+        let doc = doc.unwrap();
+        assert_eq!(calls, 0, "{mode}");
+        assert_eq!(result(&doc)["outcome"], "unconfirmed");
+        assert_eq!(result(&doc)["request_committed"], true);
+        assert_eq!(result(&doc)["facts"]["memory_retiring"], true);
+        assert_eq!(result(&doc)["facts"]["shutdown_started"], false);
+        assert_ne!(result(&doc)["facts"]["durable_retiring"], true);
+
+        // Forward retry on the same epoch commits nothing new.
+        let cont = request(&p, "continue_same_epoch", |_| {});
+        let retried = c.attempt(&cont, |_| Ok(())).unwrap();
+        assert_eq!(retried.outcome, Outcome::PublicationUnconfirmed);
+        let doc = project(&retried, &cont, true).await.0.unwrap();
+        assert_eq!(result(&doc)["request_committed"], false);
+    }
+}
+
+#[tokio::test]
+async fn unrepresentable_facts_are_refused_before_shutdown() {
+    let (_, p) = setup();
+    let begin = request(&p, "begin", |_| {});
+    // Committed without arena facts cannot be reported truthfully.
+    let facts = ResultFacts {
+        outcome: Outcome::Committed,
+        arena: None,
+        publication: None,
+    };
+    let (projected, calls) = project(&facts, &begin, true).await;
+    assert!(projected.is_err());
+    assert_eq!(calls, 0);
+}
+
+// --- the daemon socket loop -------------------------------------------------
+
+async fn exchange(
+    frames: &[Vec<u8>],
+) -> (
+    Vec<Value>,
+    Arc<crate::AppState>,
+    oneshot::Receiver<()>,
+    Result<(), crate::DaemonError>,
+) {
+    let state = crate::request_frontier::tests::state("http://127.0.0.1:9");
+    let (reader, mut client) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(reader);
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(crate::handle_client_io(
+        BufReader::new(server_read),
+        server_write,
+        Arc::clone(&state),
+        Arc::new(Mutex::new(Some(shutdown))),
+    ));
+    for frame in frames {
+        client.write_all(frame).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+    }
+    let (read, _write) = tokio::io::split(client);
+    let mut lines = BufReader::new(read).lines();
+    let mut replies = Vec::new();
+    while replies.len() < frames.len() {
+        match tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await {
+            Ok(Ok(Some(line))) => replies.push(serde_json::from_str(&line).unwrap()),
+            _ => break,
+        }
+    }
+    drop(lines);
+    drop(_write);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("client loop exits")
+        .unwrap();
+    (replies, state, shutdown_rx, outcome)
+}
+
+fn fixture(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../schemas/runtime/control/v1/fixtures/chanvoy-runtime-control-v1/{name}.json"
+    ));
+    serde_json::to_vec(&serde_json::from_slice::<Value>(&std::fs::read(path).unwrap()).unwrap())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn routed_methods_answer_strict_roots_without_an_operational_permit() {
+    let state_probe = crate::request_frontier::tests::state("http://127.0.0.1:9");
+    // An operational request in flight must not make control Busy-refused.
+    let permit = state_probe.wait_owners.request_permit().unwrap();
+    drop(permit);
+
+    let (replies, state, mut shutdown_rx, outcome) = exchange(&[
+        fixture("retire_rpc_request-positive"),
+        fixture("observation_rpc_request-positive"),
+    ])
+    .await;
+    outcome.unwrap();
+    assert_eq!(replies.len(), 2);
+    let retire = ControlDocument::decode(
+        ControlRoot::RetireResponse,
+        &serde_json::to_vec(&replies[0]).unwrap(),
+    )
+    .expect("retire reply matches its root");
+    assert_eq!(retire.value()["id"], ID);
+    assert_eq!(result(&retire)["outcome"], "refused");
+    assert_eq!(result(&retire)["reason"], "native_evidence_unavailable");
+    let observation = ControlDocument::decode(
+        ControlRoot::ObservationResponse,
+        &serde_json::to_vec(&replies[1]).unwrap(),
+    )
+    .expect("observation reply matches its root");
+    assert_eq!(result(&observation)["source"], "daemon_application");
+    assert_eq!(result(&observation)["phase"], "running");
+    assert_eq!(result(&observation)["counts"]["requests"], 0);
+    assert_eq!(
+        result(&observation)["unavailable_reason"],
+        "native_identity_unknown"
+    );
+    // Control took no permit and left nothing owned; nothing shut down.
+    let snapshot = state.wait_owners.admission_snapshot();
+    assert_eq!((snapshot.requests, snapshot.streams), (0, 0));
+    assert!(shutdown_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn control_is_answered_while_operational_work_is_in_flight() {
+    let state = crate::request_frontier::tests::state("http://127.0.0.1:9");
+    let held = state.wait_owners.request_permit().unwrap();
+    let (reader, mut client) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(reader);
+    let (shutdown, _rx) = oneshot::channel();
+    let task = tokio::spawn(crate::handle_client_io(
+        BufReader::new(server_read),
+        server_write,
+        Arc::clone(&state),
+        Arc::new(Mutex::new(Some(shutdown))),
+    ));
+    client
+        .write_all(&[fixture("observation_rpc_request-positive"), b"\n".to_vec()].concat())
+        .await
+        .unwrap();
+    let (read, write) = tokio::io::split(client);
+    let line = tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(read).lines().next_line(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["result"]["counts"]["requests"], 1);
+    drop(write);
+    held.confirm_done().unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn invalid_and_oversized_control_frames_never_reach_legacy_handlers() {
+    // Contract-invalid but well-formed: refused, connection stays usable.
+    let (replies, _, mut shutdown_rx, outcome) = exchange(&[
+        fixture("retire_rpc_request-unknown-root-field"),
+        fixture("observation_rpc_request-positive"),
+    ])
+    .await;
+    outcome.unwrap();
+    assert_eq!(replies.len(), 2);
+    ControlDocument::decode(
+        ControlRoot::RpcErrorResponse,
+        &serde_json::to_vec(&replies[0]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(replies[0]["error"]["code"], -32602);
+    assert!(replies[0]["id"].is_null());
+    assert_eq!(replies[1]["result"]["kind"], "lifecycle_observation");
+    assert!(shutdown_rx.try_recv().is_err());
+
+    // Duplicate keys are refused even though serde would accept them.
+    let duplicate = br#"{"jsonrpc":"2.0","id":"87654321-4321-4321-8321-cba987654321","method":"runtime_observation_v1","method":"runtime_observation_v1","params":{"schema_version":1,"kind":"observation_params","namespace":"f691215e0d009bcb711257dd344ca628c882a411938ad516b9cc999981ee4acd","expected_instance_uuid":null}}"#;
+    let (replies, _, _, outcome) = exchange(&[duplicate.to_vec()]).await;
+    outcome.unwrap();
+    assert_eq!(replies[0]["error"]["code"], -32600);
+    // A legacy method shadowed by a control method is still strict-routed and
+    // refused; it never reaches the legacy shutdown handler.
+    let shadowed = br#"{"jsonrpc":"2.0","id":"87654321-4321-4321-8321-cba987654321","method":"shutdown","method":"runtime_retire_v1","params":{}}"#;
+    let (replies, _, mut shutdown_rx, outcome) = exchange(&[shadowed.to_vec()]).await;
+    outcome.unwrap();
+    assert_eq!(replies[0]["error"]["code"], -32600);
+    assert!(
+        shutdown_rx.try_recv().is_err(),
+        "legacy shutdown was not taken"
+    );
+
+    // Over the frame cap: refused and the exchange closes.
+    let mut big: Value = serde_json::from_slice(&fixture("retire_rpc_request-positive")).unwrap();
+    big["params"]["target"]["process"]["executable"] = json!("61".repeat(9_000));
+    let big = serde_json::to_vec(&big).unwrap();
+    assert!(big.len() > chanvoy_core::runtime::control::RPC_MAX_BYTES);
+    let (replies, _, mut shutdown_rx, outcome) =
+        exchange(&[big, fixture("observation_rpc_request-positive")]).await;
+    outcome.unwrap();
+    assert_eq!(
+        replies.len(),
+        1,
+        "connection closes after a framing refusal"
+    );
+    assert_eq!(replies[0]["error"]["code"], -32600);
+    assert!(shutdown_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn legacy_methods_keep_their_existing_path() {
+    let request = chanvoy_core::rpc_request("profile_status", json!({}));
+    let (replies, _, _, outcome) = exchange(&[serde_json::to_vec(&request).unwrap()]).await;
+    outcome.unwrap();
+    assert_eq!(replies[0]["id"], json!(request.id));
+    assert!(replies[0].get("result").is_some(), "{}", replies[0]);
+}

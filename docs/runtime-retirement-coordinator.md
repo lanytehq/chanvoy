@@ -1,8 +1,8 @@
 # Runtime retirement coordinator
 
 The daemon's internal retirement coordinator composes the shared ownership arena
-with the child-owned record publisher. It is not registered as an RPC and does
-not initiate shutdown, cancellation, cleanup, signaling, or a successor.
+with the child-owned record publisher. It does not initiate cancellation,
+cleanup, signaling, or a successor.
 
 Construction consumes a child publisher with confirmed Running publication and
 requires the same instance in the Running admission arena. The coordinator owns
@@ -37,6 +37,30 @@ death, free lease, absent listener, or permission to create a successor.
 The deterministic tests use the actual shared arena and a controlled publication
 adapter. They establish application ordering and failure behavior, not native
 filesystem/process qualification. Publisher state tests separately cover exact
-observation and pending-state preservation. Response projection, production
-routing, native binding and shutdown/flush frontiers require further integration
-and review before lifecycle activation.
+observation and pending-state preservation.
+
+## RPC routing
+
+The daemon routes `runtime_retire_v1` and `runtime_observation_v1` before the
+ordinary request path. A frame that names either method in any top-level
+`method` member is decoded only through its strict selected root: the 16 KiB
+frame cap, strict UTF-8, one JSON object, duplicate keys refused, and the exact
+schema. Invalid input is answered with a closed protocol error and never falls
+back to a legacy handler; a framing or size failure closes the connection.
+These are provider-free control exceptions and take no operational request
+permit, so active work never makes them refuse themselves. Every other method
+keeps its existing path.
+
+Coordinator facts are projected onto `retire_rpc_response` and checked against
+that root before they are sent; a combination the contract cannot represent is
+a protocol error, not an invented fact. Memory and admission facts come from
+the arena snapshot. Graceful shutdown starts only for a committed or continued
+retirement, after the projection is known to be representable, and
+`shutdown_started` reports whether it actually started.
+
+No coordinator is bound in a production daemon until native lifecycle binding
+exists. Until then every retirement is refused with
+`native_evidence_unavailable` and unknown target facts, and shutdown never
+starts. Observation reports `daemon_application` with the arena phase and
+counts and `native_identity_unknown`; epoch, generation and native fields are
+null.
