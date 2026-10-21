@@ -2,7 +2,6 @@ use super::*;
 use crate::retirement_control::tests::{request, setup};
 use crate::retirement_control::Outcome;
 use serde_json::json;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,18 +13,47 @@ fn result(document: &ControlDocument) -> &Value {
     &document.value()["result"]
 }
 
+/// A daemon's shutdown signal for projection tests: whether the receiver is
+/// alive decides whether a send can succeed, and the latch is shared.
+struct Signal {
+    sender: Mutex<Option<oneshot::Sender<()>>>,
+    started: std::sync::atomic::AtomicBool,
+    receiver: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+}
+impl Signal {
+    fn new(deliverable: bool) -> Self {
+        let (tx, rx) = oneshot::channel();
+        Self {
+            sender: Mutex::new(Some(tx)),
+            started: std::sync::atomic::AtomicBool::new(false),
+            receiver: std::sync::Mutex::new(deliverable.then_some(rx)),
+        }
+    }
+    fn starter(&self) -> ShutdownStarter<'_> {
+        ShutdownStarter {
+            sender: &self.sender,
+            started: &self.started,
+        }
+    }
+    fn sent(&self) -> bool {
+        self.receiver
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|rx| rx.try_recv().is_ok())
+    }
+}
+
+/// Project with a fresh signal; returns the document and whether a shutdown
+/// signal was actually sent.
 async fn project(
     facts: &ResultFacts,
     request: &ControlDocument,
-    started: bool,
+    deliverable: bool,
 ) -> (Result<ControlDocument, ControlError>, usize) {
-    let calls = AtomicUsize::new(0);
-    let projected = retire(request, facts, || {
-        calls.fetch_add(1, Ordering::SeqCst);
-        async move { started }
-    })
-    .await;
-    (projected, calls.load(Ordering::SeqCst))
+    let signal = Signal::new(deliverable);
+    let projected = retire(request, facts, &signal.starter()).await;
+    (projected, usize::from(signal.sent()))
 }
 
 #[tokio::test]
@@ -59,12 +87,22 @@ async fn every_coordinator_outcome_projects_to_its_contract_branch() {
     let (doc, _) = project(&committed, &begin, false).await;
     assert_eq!(result(&doc.unwrap())["facts"]["shutdown_started"], false);
 
+    // shutdown_started describes the target: after one request starts it,
+    // later refusals and continuations on the same daemon report it.
+    let shared = Signal::new(true);
+    let doc = retire(&begin, &committed, &shared.starter()).await.unwrap();
+    assert_eq!(result(&doc)["facts"]["shutdown_started"], true);
+    assert!(shared.sent());
+
     let again = request(&p, "begin", |_| {});
     let already = c.attempt(&again, |_| Ok(())).unwrap();
     assert_eq!(already.outcome, Outcome::AlreadyRetiring);
+    let doc = retire(&again, &already, &shared.starter()).await.unwrap();
+    assert_eq!(result(&doc)["facts"]["shutdown_started"], true);
     let (doc, calls) = project(&already, &again, true).await;
     let doc = doc.unwrap();
     assert_eq!(calls, 0);
+    assert_eq!(result(&doc)["facts"]["shutdown_started"], false);
     assert_eq!(
         (
             result(&doc)["outcome"].as_str(),
@@ -82,6 +120,10 @@ async fn every_coordinator_outcome_projects_to_its_contract_branch() {
     assert_eq!(calls, 1);
     assert_eq!(result(&doc)["outcome"], "continued");
     assert_eq!(result(&doc)["request_committed"], false);
+    // A repeated continuation after the signal was already sent still
+    // reports the target's started shutdown, without sending again.
+    let doc = retire(&cont, &continued, &shared.starter()).await.unwrap();
+    assert_eq!(result(&doc)["facts"]["shutdown_started"], true);
 }
 
 #[tokio::test]
@@ -361,4 +403,114 @@ async fn legacy_methods_keep_their_existing_path() {
     outcome.unwrap();
     assert_eq!(replies[0]["id"], json!(request.id));
     assert!(replies[0].get("result").is_some(), "{}", replies[0]);
+}
+
+#[tokio::test]
+async fn any_frame_naming_a_control_method_is_strict_refused_never_legacy() {
+    let positive = fixture("observation_rpc_request-positive");
+    let mut trailing = positive.clone();
+    trailing.extend_from_slice(b" {}");
+    let mut bom = b"\xef\xbb\xbf".to_vec();
+    bom.extend_from_slice(&positive);
+    let array =
+        br#"["2.0","87654321-4321-4321-8321-cba987654321","runtime_retire_v1",{}]"#.to_vec();
+    let escaped = String::from_utf8(positive.clone())
+        .unwrap()
+        .replace("runtime_observation_v1", "runtime_\\u006fbservation_v1")
+        .into_bytes();
+    let shutdown_array =
+        br#"["2.0","87654321-4321-4321-8321-cba987654321","shutdown",{},"runtime_retire_v1"]"#
+            .to_vec();
+    for (name, frame) in [
+        ("trailing", trailing),
+        ("bom", bom),
+        ("array", array),
+        ("shutdown-array", shutdown_array),
+    ] {
+        let (replies, state, mut shutdown_rx, outcome) = exchange(&[frame]).await;
+        outcome.unwrap();
+        assert_eq!(replies.len(), 1, "{name}: one strict refusal");
+        ControlDocument::decode(
+            ControlRoot::RpcErrorResponse,
+            &serde_json::to_vec(&replies[0]).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e:?} {}", replies[0]));
+        assert!(shutdown_rx.try_recv().is_err(), "{name}: no shutdown");
+        let snapshot = state.wait_owners.admission_snapshot();
+        assert_eq!(snapshot.requests, 0, "{name}: no operational permit");
+    }
+    // An escaped method name is the same JSON string: it is strict-routed and,
+    // being exactly the selected root, answered by the control handler.
+    let (replies, _, _, outcome) = exchange(&[escaped]).await;
+    outcome.unwrap();
+    assert_eq!(replies[0]["result"]["kind"], "lifecycle_observation");
+}
+
+#[tokio::test]
+async fn a_control_frame_without_its_delimiter_is_truncated() {
+    let state = crate::request_frontier::tests::state("http://127.0.0.1:9");
+    let (reader, client) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(reader);
+    let (shutdown, _rx) = oneshot::channel();
+    let task = tokio::spawn(crate::handle_client_io(
+        BufReader::new(server_read),
+        server_write,
+        Arc::clone(&state),
+        Arc::new(Mutex::new(Some(shutdown))),
+    ));
+    let (read, mut write) = tokio::io::split(client);
+    write
+        .write_all(&fixture("observation_rpc_request-positive"))
+        .await
+        .unwrap();
+    write.shutdown().await.unwrap();
+    let line = tokio::time::timeout(
+        Duration::from_secs(5),
+        BufReader::new(read).lines().next_line(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("a protocol error, not silence");
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["error"]["code"], -32600, "{reply}");
+    drop(write);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn an_unread_control_client_does_not_hold_up_shutdown() {
+    let state = crate::request_frontier::tests::state("http://127.0.0.1:9");
+    // A tiny transport buffer so replies back up when the client never reads.
+    let (reader, client) = tokio::io::duplex(256);
+    let (server_read, server_write) = tokio::io::split(reader);
+    let (shutdown, _rx) = oneshot::channel();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(crate::handle_client_io_with_shutdown(
+        BufReader::new(server_read),
+        server_write,
+        Arc::clone(&state),
+        Arc::new(Mutex::new(Some(shutdown))),
+        stop.clone(),
+    ));
+    let (_read, mut write) = tokio::io::split(client);
+    let mut frame = fixture("observation_rpc_request-positive");
+    frame.push(b'\n');
+    // Queue requests without reading any reply.
+    let writer = tokio::spawn(async move {
+        for _ in 0..64 {
+            if write.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        write
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("client loop exits on stop while a control reply is blocked")
+        .unwrap()
+        .unwrap();
+    writer.abort();
 }

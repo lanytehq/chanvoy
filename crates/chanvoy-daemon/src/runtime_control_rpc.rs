@@ -12,9 +12,12 @@ use crate::wait_owner::{AdmissionPhase, AdmissionSnapshot, WaitOwnerRegistry};
 use chanvoy_core::runtime::control::{ControlDocument, ControlError, ControlRoot};
 use chanvoy_core::runtime::RuntimePhase;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const RETIRE_METHOD: &str = "runtime_retire_v1";
 pub(crate) const OBSERVATION_METHOD: &str = "runtime_observation_v1";
+/// Bound on writing one control reply before the client is dropped.
+pub(crate) const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 const HUMAN_PROCEDURE: &str =
     "https://github.com/lanytehq/chanvoy/blob/main/docs/guides/runtime-recovery.md";
 
@@ -28,42 +31,50 @@ pub(crate) fn root_for(method: &str) -> Option<ControlRoot> {
     }
 }
 
-/// The control root a frame selects, if any. Every top-level `method` member
-/// is considered, so a frame that names a control method anywhere (including
-/// a duplicate key a lenient parser would accept) is routed to the strict
-/// decoder and refused there, never to a legacy handler.
-pub(crate) fn frame_root(frame: &str) -> Option<ControlRoot> {
-    struct Methods(Vec<String>);
-    impl<'de> serde::Deserialize<'de> for Methods {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            struct Visit;
-            impl<'de> serde::de::Visitor<'de> for Visit {
-                type Value = Methods;
-                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    f.write_str("a JSON-RPC object")
-                }
-                fn visit_map<A: serde::de::MapAccess<'de>>(
-                    self,
-                    mut map: A,
-                ) -> Result<Methods, A::Error> {
-                    let mut methods = Vec::new();
-                    while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                        if key == "method" {
-                            if let Ok(name) = map.next_value::<String>() {
-                                methods.push(name);
-                            }
-                        } else {
-                            map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                    Ok(Methods(methods))
-                }
-            }
-            d.deserialize_map(Visit)
-        }
+/// The control root a frame selects, if any. Selection is deliberately
+/// broader than decoding: any frame whose bytes name a control method, in any
+/// position or ASCII `\\u` escape spelling, is routed to the strict decoder and
+/// refused there unless it is exactly its root. Such a frame never reaches
+/// legacy parsing, whatever its shape (trailing data, BOM, array form,
+/// duplicate keys or malformed content).
+pub(crate) fn frame_root(frame: &[u8]) -> Option<ControlRoot> {
+    let unescaped = unescape_ascii(frame);
+    let named = |method: &str| contains(&unescaped, method.as_bytes());
+    if named(RETIRE_METHOD) {
+        Some(ControlRoot::RetireRequest)
+    } else if named(OBSERVATION_METHOD) {
+        Some(ControlRoot::ObservationRequest)
+    } else {
+        None
     }
-    let Methods(methods) = serde_json::from_str(frame).ok()?;
-    methods.iter().find_map(|method| root_for(method))
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Decode `\\u00XX` escapes so an escaped method name is still recognized.
+/// Every other byte is copied unchanged.
+fn unescape_ascii(frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(frame.len());
+    let mut i = 0;
+    while i < frame.len() {
+        if frame[i..].starts_with(b"\\u00") && i + 6 <= frame.len() {
+            if let Some(byte) = std::str::from_utf8(&frame[i + 4..i + 6])
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                out.push(byte);
+                i += 6;
+                continue;
+            }
+        }
+        out.push(frame[i]);
+        i += 1;
+    }
+    out
 }
 
 /// The encoded reply and whether the connection must close after it.
@@ -72,19 +83,17 @@ pub(crate) struct Reply {
     pub close: bool,
 }
 
-/// Answer one control frame (without its newline delimiter). `start_shutdown`
-/// is called only for a committed or continued retirement, before the reply
-/// is projected, and returns whether graceful shutdown is now under way.
-pub(crate) async fn answer<F, Fut>(
-    frame: &[u8],
+/// Answer one control line as read from the transport, including its LF
+/// delimiter; a line that ends without one (EOF first) is a truncated frame.
+pub(crate) async fn answer(
+    line: &[u8],
     root: ControlRoot,
     arena: &WaitOwnerRegistry,
-    start_shutdown: F,
-) -> Reply
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
+    shutdown: &ShutdownStarter<'_>,
+) -> Reply {
+    let Some(frame) = line.strip_suffix(b"\n") else {
+        return protocol_error(None, ControlError::TruncatedFrame);
+    };
     let request = match ControlDocument::decode(root, frame) {
         Ok(request) => request,
         Err(error) => return protocol_error(None, error),
@@ -93,7 +102,7 @@ where
     let projected = match root {
         // No coordinator is bound to this daemon yet: nothing can prove the
         // target, so this is a refusal with unknown target facts.
-        ControlRoot::RetireRequest => retire(&request, &unbound(), start_shutdown).await,
+        ControlRoot::RetireRequest => retire(&request, &unbound(), shutdown).await,
         ControlRoot::ObservationRequest => observation_response(&request, arena),
         _ => Err(ControlError::WrongTransport),
     };
@@ -106,26 +115,45 @@ where
     }
 }
 
+/// The daemon's graceful-shutdown signal and its latched "started" state.
+/// `shutdown_started` describes the target, so once the signal is sent by any
+/// path, every later response reports it.
+pub(crate) struct ShutdownStarter<'a> {
+    pub sender: &'a tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub started: &'a AtomicBool,
+}
+
+impl ShutdownStarter<'_> {
+    pub(crate) fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+    /// Send the signal unless it was already taken; report the latched state.
+    async fn start(&self) -> bool {
+        if let Some(sender) = self.sender.lock().await.take() {
+            if sender.send(()).is_ok() {
+                self.started.store(true, Ordering::Release);
+            }
+        }
+        self.started()
+    }
+}
+
 /// Start shutdown only for an outcome that leaves the target durably
-/// Retiring with an empty arena, then project the facts including whether
-/// shutdown actually started.
-pub(crate) async fn retire<F, Fut>(
+/// Retiring with an empty arena, then project the facts with the target's
+/// shutdown state.
+pub(crate) async fn retire(
     request: &ControlDocument,
     facts: &ResultFacts,
-    start_shutdown: F,
-) -> Result<ControlDocument, ControlError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
+    shutdown: &ShutdownStarter<'_>,
+) -> Result<ControlDocument, ControlError> {
     let shutdown_started = match facts.outcome {
         Outcome::Committed | Outcome::Continued => {
             // Check the projection first: shutdown never starts on facts the
             // contract cannot report.
-            retire_response(request, facts, false)?;
-            start_shutdown().await
+            retire_response(request, facts, shutdown.started())?;
+            shutdown.start().await
         }
-        _ => false,
+        _ => shutdown.started(),
     };
     retire_response(request, facts, shutdown_started)
 }
@@ -229,19 +257,19 @@ fn retire_response(
             "refused",
             Some(false),
             "already_retiring",
-            known(false, arena),
+            known(shutdown_started, arena),
         ),
         (Outcome::RevisionChanged | Outcome::NotRetiring, Some(arena)) => (
             "refused",
             Some(false),
             "revision_changed",
-            known(false, arena),
+            known(shutdown_started, arena),
         ),
         (Outcome::GenerationRefused, Some(arena)) => (
             "refused",
             Some(false),
             "generation_refused",
-            known(false, arena),
+            known(shutdown_started, arena),
         ),
         (Outcome::PublicationUnconfirmed, Some(arena))
             if arena.phase == AdmissionPhase::Retiring =>

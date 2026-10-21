@@ -156,6 +156,8 @@ struct AppState {
     /// target fails startup (never a silent bare-identity fallback).
     reduce_writer: Option<ReduceWriter>,
     wait_owners: Arc<wait_owner::WaitOwnerRegistry>,
+    /// Latched once the shared graceful-shutdown signal is actually sent.
+    shutdown_started: Arc<AtomicBool>,
     poll_cursors: waitprims_poll::PollCursorStore,
     fanin_replay: waitprims_fanin::FanInReplayStore,
     inbox_armed: Arc<AtomicU64>,
@@ -568,6 +570,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
             reduce_writer,
             wait_owners,
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             poll_cursors,
             fanin_replay: waitprims_fanin::FanInReplayStore::new(),
             inbox_armed: inbox_armed.clone(),
@@ -897,30 +900,42 @@ where
                 // Versioned runtime control is a provider-free control exception:
                 // strict selected-root decode, no operational permit, no legacy
                 // fallback for invalid input.
-                if let Some(root) = runtime_control_rpc::frame_root(line.trim_end()) {
-                    let frame = line.strip_suffix('\n').unwrap_or(&line);
+                if let Some(root) = runtime_control_rpc::frame_root(line.as_bytes()) {
                     let reply = runtime_control_rpc::answer(
-                        frame.as_bytes(),
+                        line.as_bytes(),
                         root,
                         &state.wait_owners,
-                        || async {
-                            match shutdown_tx.lock().await.take() {
-                                Some(sender) => sender.send(()).is_ok(),
-                                None => false,
-                            }
+                        &runtime_control_rpc::ShutdownStarter {
+                            sender: &shutdown_tx,
+                            started: &state.shutdown_started,
                         },
                     )
                     .await;
-                    writer.write_all(&reply.bytes).await?;
-                    writer.write_all(b"\n").await?;
-                    writer.flush().await?;
-                    if reply.close {
+                    // Control holds no operational permit, so its reply must
+                    // not hold up daemon shutdown: an unread client is dropped.
+                    let delivered = tokio::select! {
+                        _ = stop.cancelled() => false,
+                        written = tokio::time::timeout(
+                            runtime_control_rpc::REPLY_DEADLINE,
+                            async {
+                                writer.write_all(&reply.bytes).await?;
+                                writer.write_all(b"\n").await?;
+                                writer.flush().await
+                            },
+                        ) => matches!(written, Ok(Ok(()))),
+                    };
+                    if !delivered || reply.close {
                         break;
                     }
                     line.clear();
                     continue;
                 }
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
+                // A decoded control method that escaped byte selection is still
+                // never served by a legacy handler.
+                if runtime_control_rpc::root_for(&request.method).is_some() {
+                    break;
+                }
                 // Admission precedes every legacy handler and provider preflight.
                 let request_permit = state.wait_owners.request_permit()
                     .map_err(request_frontier::admission_error)?;
@@ -2187,7 +2202,9 @@ async fn dispatch_request(
         }
         "shutdown" => {
             if let Some(sender) = shutdown_tx.lock().await.take() {
-                let _ = sender.send(());
+                if sender.send(()).is_ok() {
+                    state.shutdown_started.store(true, Ordering::Release);
+                }
             }
             Ok(to_value(ShutdownResult { stopping: true }))
         }
