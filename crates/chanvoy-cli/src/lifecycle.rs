@@ -510,11 +510,13 @@ impl ExitWatch {
         Ok(exited)
     }
 
-    /// SIGKILL the process this watch was registered on, never a later holder
-    /// of its pid. Nothing is sent once the registered exit is observed.
-    /// Linux signals through the pidfd. macOS has no process handle; an
-    /// unexited process keeps its pid, leaving just the gap between the exit
-    /// check and the kill call.
+    /// SIGKILL the process this watch was registered on. Nothing is sent once
+    /// the registered exit is observed. Linux signals through the pidfd, so a
+    /// later holder of the pid can never receive it. macOS has no
+    /// process-bound signal: an unexited process keeps its pid, but if it
+    /// exits and is reaped between the exit check and `kill`, a reused pid
+    /// can receive the signal. That residual is accepted on macOS so a daemon
+    /// that ignores shutdown can still be stopped.
     fn force_kill(&self) -> Result<(), String> {
         if self.exited()? {
             return Err("process exited before force signal".into());

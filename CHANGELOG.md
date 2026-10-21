@@ -26,10 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The daemon writes its pid file without following links and removes it at
   exit only while it still names that daemon.
 - `daemon stop` sends the shutdown request on the connection whose socket
-  peer it validated instead of reconnecting by path, and the force signal is
-  bound to the captured process: a pidfd on Linux, the registered exit event
-  on macOS. A process that already exited is never signalled, even if its
-  PID was reused.
+  peer it validated instead of reconnecting by path. On Linux the force
+  signal goes through a pidfd bound to the captured process. On macOS it is
+  sent only after the exit event registered at capture is checked and still
+  pending; a daemon seen to exit is never signalled, and a narrow
+  exit-reap-reuse window before the kill remains (see the operator guide).
 
 ### Daemon status
 
