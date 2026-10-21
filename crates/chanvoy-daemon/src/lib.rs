@@ -4395,28 +4395,48 @@ impl DaemonClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, DaemonError> {
-        let mut stream = self.connect_bound().await?;
-        let request = chanvoy_core::rpc_request(method, params);
-        stream
-            .write_all(serde_json::to_string(&request)?.as_bytes())
-            .await?;
-        stream.write_all(b"\n").await?;
-
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        let response: JsonRpcResponse = serde_json::from_str(line.trim_end())?;
+        let stream = self.connect_bound().await?;
+        let response = exchange(stream, method, params).await?;
         self.binding.verify()?;
-        if let Some(error) = response.error {
-            return Err(DaemonError::Rpc {
-                code: error.code,
-                message: error.message,
-                data: error.data,
-            });
-        }
-        let result = response.result.unwrap_or(serde_json::Value::Null);
-        Ok(serde_json::from_value(result)?)
+        decode_response(response)
     }
+}
+
+async fn exchange(
+    mut stream: UnixStream,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<JsonRpcResponse, DaemonError> {
+    let request = chanvoy_core::rpc_request(method, params);
+    stream
+        .write_all(serde_json::to_string(&request)?.as_bytes())
+        .await?;
+    stream.write_all(b"\n").await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    Ok(serde_json::from_str(line.trim_end())?)
+}
+
+fn decode_response<T: DeserializeOwned>(response: JsonRpcResponse) -> Result<T, DaemonError> {
+    if let Some(error) = response.error {
+        return Err(DaemonError::Rpc {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        });
+    }
+    let result = response.result.unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::from_value(result)?)
+}
+
+/// Request shutdown over a connection whose peer the caller has already
+/// validated. The request reaches that listener only; nothing reconnects by
+/// path, so a listener bound at the same path afterwards never receives it.
+pub async fn stop_over(stream: UnixStream) -> Result<(), DaemonError> {
+    decode_response::<ShutdownResult>(exchange(stream, "shutdown", serde_json::json!({})).await?)?;
+    Ok(())
 }
 
 pub fn daemon_client(profile_name: &str) -> DaemonClient {

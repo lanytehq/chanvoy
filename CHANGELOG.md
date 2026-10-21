@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed only once the socket has no live owner.
 - The daemon writes its pid file without following links and removes it at
   exit only while it still names that daemon.
+- `daemon stop` sends the shutdown request on the connection whose socket
+  peer it validated instead of reconnecting by path, and the force signal is
+  bound to the captured process: a pidfd on Linux, the registered exit event
+  on macOS. A process that already exited is never signalled, even if its
+  PID was reused.
 
 ### Daemon status
 

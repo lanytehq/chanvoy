@@ -380,6 +380,7 @@ impl FailedChildRuntime {
 /// the separately revalidated process and socket identity.
 struct ExitWatch {
     fd: OwnedFd,
+    pid: u32,
     exited: AtomicBool,
 }
 
@@ -438,6 +439,7 @@ impl ExitWatch {
             }
             Ok(Some(Self {
                 fd,
+                pid,
                 exited: AtomicBool::new(false),
             }))
         }
@@ -451,6 +453,7 @@ impl ExitWatch {
             }
             Ok(Some(Self {
                 fd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+                pid,
                 exited: AtomicBool::new(false),
             }))
         }
@@ -505,6 +508,44 @@ impl ExitWatch {
             self.exited.store(true, Ordering::Release);
         }
         Ok(exited)
+    }
+
+    /// SIGKILL the process this watch was registered on, never a later holder
+    /// of its pid. Nothing is sent once the registered exit is observed.
+    /// Linux signals through the pidfd. macOS has no process handle; an
+    /// unexited process keeps its pid, leaving just the gap between the exit
+    /// check and the kill call.
+    fn force_kill(&self) -> Result<(), String> {
+        if self.exited()? {
+            return Err("process exited before force signal".into());
+        }
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let result: i32 = {
+            return Err("bound force signal unsupported".into());
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            tracing::debug!(stage = "bound-force-signal", pid = self.pid, outcome = ?error.kind());
+            return Err(format!("bound force signal failed: {:?}", error.kind()));
+        }
+        tracing::debug!(
+            stage = "bound-force-signal",
+            pid = self.pid,
+            outcome = "sent"
+        );
+        Ok(())
     }
 }
 
@@ -1101,6 +1142,16 @@ impl SocketOwner {
 }
 
 async fn peer_owner(socket: &Path, budget: Duration) -> SocketOwner {
+    peer_stream(socket, budget).await.0
+}
+
+/// Connect once and read that connection's kernel peer credentials. The
+/// stream is returned only with a `Live` owner, so a caller can keep talking
+/// to exactly the listener it checked.
+async fn peer_stream(
+    socket: &Path,
+    budget: Duration,
+) -> (SocketOwner, Option<tokio::net::UnixStream>) {
     let stream = match tokio::time::timeout(budget, tokio::net::UnixStream::connect(socket)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error))
@@ -1110,15 +1161,18 @@ async fn peer_owner(socket: &Path, budget: Duration) -> SocketOwner {
             ) =>
         {
             tracing::debug!(stage = "socket-connect", outcome = ?error.kind());
-            return SocketOwner::Absent;
+            return (SocketOwner::Absent, None);
         }
         Ok(Err(error)) => {
             tracing::debug!(stage = "socket-connect", outcome = ?error.kind());
-            return SocketOwner::Unknown(SocketUnknown::Connect(error.kind()));
+            return (
+                SocketOwner::Unknown(SocketUnknown::Connect(error.kind())),
+                None,
+            );
         }
         Err(_) => {
             tracing::debug!(stage = "socket-connect", outcome = "connect-timeout");
-            return SocketOwner::Unknown(SocketUnknown::ConnectTimeout);
+            return (SocketOwner::Unknown(SocketUnknown::ConnectTimeout), None);
         }
     };
     #[cfg(target_os = "macos")]
@@ -1174,7 +1228,10 @@ async fn peer_owner(socket: &Path, budget: Duration) -> SocketOwner {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let owner = SocketOwner::Unknown(SocketUnknown::Unsupported);
     tracing::debug!(stage = "socket-credential-query", outcome = %owner.receipt());
-    owner
+    match owner {
+        SocketOwner::Live(_) => (owner, Some(stream)),
+        _ => (owner, None),
+    }
 }
 
 impl NativeControl {
@@ -1248,6 +1305,7 @@ impl NativeControl {
 }
 
 impl ProcessControl for NativeControl {
+    type Peer = tokio::net::UnixStream;
     fn observe(&self) -> ProcessObservation {
         let observation = self.observe_process();
         if observation == ProcessObservation::Dead {
@@ -1278,6 +1336,12 @@ impl ProcessControl for NativeControl {
         peer_owner(&self.socket_path, Duration::from_millis(750)).await
             == SocketOwner::Live(self.pid)
     }
+    async fn bind_peer(&self) -> Option<Self::Peer> {
+        match peer_stream(&self.socket_path, Duration::from_millis(750)).await {
+            (SocketOwner::Live(pid), stream) if pid == self.pid => stream,
+            _ => None,
+        }
+    }
     async fn socket_owner(&self, budget: Duration) -> SocketOwner {
         peer_owner(&self.socket_path, budget).await
     }
@@ -1307,13 +1371,16 @@ impl ProcessControl for NativeControl {
             None
         }
     }
-    async fn shutdown(&self) -> Result<(), String> {
-        chanvoy_daemon::stop(&self.profile)
+    async fn shutdown(&self, peer: Self::Peer) -> Result<(), String> {
+        chanvoy_daemon::stop_over(peer)
             .await
             .map_err(|e| e.to_string())
     }
     fn force_signal(&self) -> Result<(), String> {
-        sysprims_signal::force_kill(self.pid).map_err(|e| e.to_string())
+        match &self.exit_watch {
+            Some(watch) => watch.force_kill(),
+            None => Err("no kernel handle for the captured process; force signal withheld".into()),
+        }
     }
     fn cleanup(&self) -> Result<(), String> {
         for path in [&self.socket_path, &self.pid_path] {
@@ -1417,12 +1484,15 @@ enum ProcessObservation {
 }
 
 trait ProcessControl {
+    /// A connection whose kernel peer is the captured process.
+    type Peer;
     fn observe(&self) -> ProcessObservation;
     fn runtime_matches(&self, allow_absent: bool) -> bool;
     async fn peer_matches(&self) -> bool;
+    async fn bind_peer(&self) -> Option<Self::Peer>;
     async fn socket_owner(&self, budget: Duration) -> SocketOwner;
     fn leftover_deadline(&self, pid: u32, window: Duration) -> Option<Instant>;
-    async fn shutdown(&self) -> Result<(), String>;
+    async fn shutdown(&self, peer: Self::Peer) -> Result<(), String>;
     fn force_signal(&self) -> Result<(), String>;
     fn cleanup(&self) -> Result<(), String>;
 }
@@ -1561,10 +1631,16 @@ async fn stop_confirmed(
     if !revalidate(control, expected, false)? {
         return cleanup_dead(control).await;
     }
-    if !control.peer_matches().await || !revalidate(control, expected, false)? {
-        return Err("socket process ownership unconfirmed before shutdown; state retained".into());
-    }
-    let _ = tokio::time::timeout(budget.rpc, control.shutdown()).await;
+    // The shutdown request travels on the connection whose peer was checked.
+    let peer = match control.bind_peer().await {
+        Some(peer) if revalidate(control, expected, false)? => peer,
+        _ => {
+            return Err(
+                "socket process ownership unconfirmed before shutdown; state retained".into(),
+            )
+        }
+    };
+    let _ = tokio::time::timeout(budget.rpc, control.shutdown(peer)).await;
     if death_within(control, expected, budget).await? {
         return cleanup_dead(control).await;
     }
@@ -2329,6 +2405,7 @@ mod tests {
         change_on_peer: bool,
         alive_on_peer: bool,
         pending_peer: bool,
+        peer_unbound: bool,
     }
     fn identity() -> ProcessIdentity {
         ProcessIdentity {
@@ -2640,6 +2717,7 @@ mod tests {
             change_on_peer: false,
             alive_on_peer: false,
             pending_peer: false,
+            peer_unbound: false,
         }
     }
     fn budget() -> StopBudget {
@@ -2650,6 +2728,7 @@ mod tests {
         }
     }
     impl ProcessControl for Fake {
+        type Peer = ();
         fn observe(&self) -> ProcessObservation {
             if let Some(next) = self.observations.borrow_mut().pop_front() {
                 *self.last.borrow_mut() = next;
@@ -2661,6 +2740,9 @@ mod tests {
         }
         async fn peer_matches(&self) -> bool {
             true
+        }
+        async fn bind_peer(&self) -> Option<()> {
+            (!self.peer_unbound).then_some(())
         }
         async fn socket_owner(&self, _: Duration) -> SocketOwner {
             self.owner_calls.set(self.owner_calls.get() + 1);
@@ -2682,7 +2764,7 @@ mod tests {
             (pid == identity().pid && self.leftover_birth == Some(identity().birth))
                 .then_some(self.leftover_until)
         }
-        async fn shutdown(&self) -> Result<(), String> {
+        async fn shutdown(&self, _: ()) -> Result<(), String> {
             self.shutdowns.set(self.shutdowns.get() + 1);
             if self.change_on_shutdown {
                 self.runtime.set(false);
@@ -2703,6 +2785,109 @@ mod tests {
             self.cleanups.set(self.cleanups.get() + 1);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn unbound_peer_never_requests_shutdown_or_signals() {
+        let mut f = fake(vec![]);
+        f.peer_unbound = true;
+        let refusal = stop_confirmed(&f, &identity(), budget()).await.unwrap_err();
+        assert!(refusal.contains("before shutdown"), "{refusal}");
+        assert_eq!(
+            (f.shutdowns.get(), f.signals.get(), f.cleanups.get()),
+            (0, 0, 0)
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn bound_force_signal_reaches_only_the_registered_process() {
+        let mut live = child();
+        let watch = ExitWatch::new(live.0.id()).unwrap().expect("live child");
+        watch.force_kill().unwrap();
+        let status = live.0.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+
+        // An exited process is never signalled. Unreaped, it still holds its
+        // pid and a numeric kill would succeed; once reaped the pid is free
+        // for reuse and a numeric kill could reach a later holder.
+        let mut gone = child();
+        let watch = ExitWatch::new(gone.0.id()).unwrap().expect("live child");
+        gone.0.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !watch.exited().unwrap() {
+            assert!(std::time::Instant::now() < deadline, "exit observation");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            watch.force_kill().unwrap_err(),
+            "process exited before force signal"
+        );
+        gone.0.wait().unwrap();
+        assert!(watch.force_kill().is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_the_checked_listener_not_a_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("test.pid");
+        let socket = root.path().join("test.sock");
+        let checked = tokio::net::UnixListener::bind(&socket).unwrap();
+        let control = NativeControl::capture_with_peer("test", pid, socket.clone())
+            .await
+            .unwrap()
+            .expect("peer fallback capture");
+        let peer = control.bind_peer().await.expect("peer is this process");
+        let mut other =
+            NativeControl::capture_with_peer("test", root.path().join("test.pid"), socket.clone())
+                .await
+                .unwrap()
+                .unwrap();
+        other.pid += 1;
+        assert!(
+            other.bind_peer().await.is_none(),
+            "a peer that is not the captured pid is never bound"
+        );
+
+        // A different listener takes the path after the peer check.
+        std::fs::remove_file(&socket).unwrap();
+        let replacement = tokio::net::UnixListener::bind(&socket).unwrap();
+
+        let serve = async {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            // Earlier credential probes are queued first and close unread.
+            let (mut accepted, line) = loop {
+                let (mut accepted, _) = checked.accept().await.unwrap();
+                let mut line = String::new();
+                tokio::io::BufReader::new(&mut accepted)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                if !line.is_empty() {
+                    break (accepted, line);
+                }
+            };
+            assert!(line.contains("\"shutdown\""), "{line}");
+            accepted
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"00000000-0000-0000-0000-000000000000\",\"result\":{\"stopping\":true}}\n")
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(control.shutdown(peer), serve)
+        })
+        .await
+        .expect("shutdown must reach the checked listener");
+        result.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), replacement.accept())
+                .await
+                .is_err(),
+            "the replacement listener must not be contacted"
+        );
     }
 
     #[tokio::test]
