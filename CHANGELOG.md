@@ -18,9 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - At most 16 KiB plus one byte of a frame is read before it is classified. A
   longer frame that names a control method within that window is refused
   without reading further; other long frames are legacy requests as before.
-- No retirement coordinator is bound yet, so retirement is always refused with
-  `native_evidence_unavailable` and never starts shutdown. Observation reports
-  application admission phase and counts only. Existing methods are unchanged.
+  Oversized legacy requests are still supported unless their first 16 KiB + 1
+  bytes contain `runtime_retire_v1` or `runtime_observation_v1`; those frames
+  are refused, including when the name occurs in payload text.
+- Routing and application-only observation are enabled; native retirement
+  remains inactive and always refuses with `native_evidence_unavailable`,
+  never starting shutdown. Observation reports application admission phase
+  and counts only.
 
 ### Daemon pid file and pid-less stop
 

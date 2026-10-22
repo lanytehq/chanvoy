@@ -1,7 +1,7 @@
 # Release Notes — vX.Y.Z
 
 **Release Date**: YYYY-MM-DD
-**Status**: <one-line summary>
+**Status**: <one-line summary of what ships; true after publication, not a pre-release state>
 
 ## Summary
 
