@@ -240,11 +240,17 @@ async fn exchange(
         Arc::clone(&state),
         Arc::new(Mutex::new(Some(shutdown))),
     ));
-    for frame in frames {
-        client.write_all(frame).await.unwrap();
-        client.write_all(b"\n").await.unwrap();
-    }
-    let (read, _write) = tokio::io::split(client);
+    let (read, mut write) = tokio::io::split(client);
+    // Write concurrently with reading so a server that stops reading cannot
+    // block the client; a stalled write simply ends with the exchange.
+    let input: Vec<u8> = frames
+        .iter()
+        .flat_map(|frame| frame.iter().copied().chain(std::iter::once(b'\n')))
+        .collect();
+    let writer = tokio::spawn(async move {
+        let _ = write.write_all(&input).await;
+        write
+    });
     let mut lines = BufReader::new(read).lines();
     let mut replies = Vec::new();
     while replies.len() < frames.len() {
@@ -254,7 +260,8 @@ async fn exchange(
         }
     }
     drop(lines);
-    drop(_write);
+    writer.abort();
+    let _ = writer.await;
     let outcome = tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .expect("client loop exits")
@@ -566,4 +573,150 @@ async fn chat_text_naming_a_control_method_reaches_its_legacy_handler() {
     outcome.unwrap();
     assert_eq!(replies[0]["id"], json!(request.id));
     assert!(replies[0].get("result").is_some(), "{}", replies[0]);
+}
+
+// --- bounded ingress ----------------------------------------------------------
+
+/// A reader over fixed bytes that records how much the frame reader consumed.
+struct Counted {
+    data: Vec<u8>,
+    pos: usize,
+    /// Never serve more than this per fill, so the cap logic sees partial reads.
+    chunk: usize,
+    /// Yield between chunks like a socket, so a reader that keeps reading
+    /// lets the test deadline fire instead of spinning.
+    yielded: bool,
+}
+impl Counted {
+    fn new(data: Vec<u8>, chunk: usize) -> Self {
+        Self {
+            data,
+            pos: 0,
+            chunk,
+            yielded: false,
+        }
+    }
+}
+impl tokio::io::AsyncRead for Counted {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !std::mem::replace(&mut self.yielded, true) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        self.yielded = false;
+        let end = (self.pos + self.chunk)
+            .min(self.data.len())
+            .min(self.pos + buf.remaining());
+        buf.put_slice(&self.data[self.pos..end]);
+        self.pos = end;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+fn padded_observation(total_body: usize) -> Vec<u8> {
+    let body = fixture("observation_rpc_request-positive");
+    let mut frame = body[..body.len() - 1].to_vec();
+    frame.resize(total_body - 1, b' ');
+    frame.push(b'}');
+    assert_eq!(frame.len(), total_body);
+    frame
+}
+
+const CAP: usize = chanvoy_core::runtime::control::RPC_MAX_BYTES;
+
+/// A reader that stops waiting fails the test instead of hanging it.
+async fn bounded_read<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Frame {
+    tokio::time::timeout(Duration::from_secs(5), read_frame(reader))
+        .await
+        .expect("frame reader returned without waiting for more input")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_control_frame_of_exactly_the_cap_is_answered() {
+    let mut frame = padded_observation(CAP);
+    frame.push(b'\n');
+    let (replies, _, _, outcome) = exchange(&[frame[..frame.len() - 1].to_vec()]).await;
+    outcome.unwrap();
+    assert_eq!(
+        replies[0]["result"]["kind"], "lifecycle_observation",
+        "{}",
+        replies[0]
+    );
+}
+
+#[tokio::test]
+async fn an_over_cap_control_frame_stops_at_cap_plus_one_bytes() {
+    // Body over the cap, no LF, more data behind it: the reader must stop.
+    let mut data = padded_observation(CAP + 4096);
+    data.extend_from_slice(b"\n");
+    data.extend_from_slice(&fixture("observation_rpc_request-positive"));
+    data.extend_from_slice(b"\n");
+    for chunk in [1, 7, 4096, 1 << 20] {
+        let mut reader = BufReader::with_capacity(64, Counted::new(data.clone(), chunk));
+        let frame = bounded_read(&mut reader).await;
+        assert!(matches!(frame, Frame::ControlTooLarge), "chunk {chunk}");
+        let consumed = reader.get_ref().pos - reader.buffer().len();
+        assert_eq!(consumed, CAP + 1, "chunk {chunk}: consumed {consumed}");
+    }
+}
+
+#[tokio::test]
+async fn a_late_control_method_within_the_cap_window_is_refused() {
+    // The method comes after ~16 KiB of other members, still inside cap + 1.
+    let filler = "x".repeat(CAP - 200);
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","pad":"{filler}","method":"runtime_retire_v1","params":{{}},"more":"{}"}}"#,
+        "y".repeat(8192)
+    );
+    assert!(body.len() > CAP);
+    let mut reader = BufReader::new(Counted::new(body.into_bytes(), 1024));
+    assert!(matches!(
+        bounded_read(&mut reader).await,
+        Frame::ControlTooLarge
+    ));
+}
+
+#[tokio::test]
+async fn an_over_cap_legacy_frame_is_still_read_to_its_delimiter() {
+    let request = chanvoy_core::rpc_request("profile_status", json!({"note": "z".repeat(3 * CAP)}));
+    let mut data = serde_json::to_vec(&request).unwrap();
+    data.push(b'\n');
+    let expected = data.clone();
+    let mut reader = BufReader::new(Counted::new(data, 4096));
+    match bounded_read(&mut reader).await {
+        Frame::Line(bytes) => assert_eq!(bytes, expected),
+        _ => panic!("legacy frame refused"),
+    }
+    // And the daemon still serves it.
+    let (replies, _, _, outcome) = exchange(&[serde_json::to_vec(&request).unwrap()]).await;
+    outcome.unwrap();
+    assert!(replies[0].get("result").is_some(), "{}", replies[0]);
+}
+
+#[tokio::test]
+async fn a_framing_refusal_never_reinterprets_the_buffered_suffix() {
+    let mut data = padded_observation(CAP + 100);
+    data.push(b'\n');
+    data.extend_from_slice(&fixture("observation_rpc_request-positive"));
+    data.push(b'\n');
+    // Send both in one write; only one reply (the refusal) may come back.
+    let (replies, _, _, outcome) = exchange(&[data[..data.len() - 1].to_vec()]).await;
+    outcome.unwrap();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(replies[0]["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn invalid_utf8_in_a_control_frame_gets_a_protocol_error() {
+    let mut frame = fixture("observation_rpc_request-positive");
+    let at = frame.len() - 2;
+    frame.insert(at, 0xff);
+    let (replies, _, _, outcome) = exchange(&[frame]).await;
+    outcome.unwrap();
+    assert_eq!(replies[0]["error"]["code"], -32600, "{replies:?}");
 }

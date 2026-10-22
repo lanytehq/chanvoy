@@ -889,28 +889,38 @@ where
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
-            read_result = reader.read_line(&mut line) => {
+            read_result = runtime_control_rpc::read_frame(&mut reader) => {
                 // Check again when both input and stop are ready. Once a
                 // branch starts admitted work, it runs to its existing finish.
-                let bytes_read = read_result?;
+                let frame = read_result?;
                 if stop.is_cancelled() { break; }
-                if bytes_read == 0 {
-                    break;
-                }
                 // Versioned runtime control is a provider-free control exception:
-                // strict selected-root decode, no operational permit, no legacy
-                // fallback for invalid input.
-                if let Some(root) = runtime_control_rpc::frame_root(line.as_bytes()) {
-                    let reply = runtime_control_rpc::answer(
-                        line.as_bytes(),
-                        root,
-                        &state.wait_owners,
-                        &runtime_control_rpc::ShutdownStarter {
-                            sender: &shutdown_tx,
-                            started: &state.shutdown_started,
-                        },
-                    )
-                    .await;
+                // bounded ingress, strict selected-root decode, no operational
+                // permit, no legacy fallback for invalid input.
+                let control = match &frame {
+                    runtime_control_rpc::Frame::Eof => break,
+                    runtime_control_rpc::Frame::ControlTooLarge => {
+                        Some(runtime_control_rpc::too_large())
+                    }
+                    runtime_control_rpc::Frame::Line(bytes) => {
+                        match runtime_control_rpc::frame_root(bytes) {
+                            Some(root) => Some(
+                                runtime_control_rpc::answer(
+                                    bytes,
+                                    root,
+                                    &state.wait_owners,
+                                    &runtime_control_rpc::ShutdownStarter {
+                                        sender: &shutdown_tx,
+                                        started: &state.shutdown_started,
+                                    },
+                                )
+                                .await,
+                            ),
+                            None => None,
+                        }
+                    }
+                };
+                if let Some(reply) = control {
                     // Control holds no operational permit, so its reply must
                     // not hold up daemon shutdown: an unread client is dropped.
                     let delivered = tokio::select! {
@@ -927,9 +937,14 @@ where
                     if !delivered || reply.close {
                         break;
                     }
-                    line.clear();
                     continue;
                 }
+                let runtime_control_rpc::Frame::Line(bytes) = frame else { break };
+                // Legacy frames keep their existing UTF-8 line semantics.
+                line.clear();
+                line.push_str(std::str::from_utf8(&bytes).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "stream did not contain valid UTF-8")
+                })?);
                 let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
                 // A decoded control method that escaped byte selection is still
                 // never served by a legacy handler.

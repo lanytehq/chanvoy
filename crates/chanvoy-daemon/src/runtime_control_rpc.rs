@@ -130,6 +130,76 @@ fn unescape_ascii(frame: &[u8]) -> Vec<u8> {
     out
 }
 
+/// How one transport frame was read.
+pub(crate) enum Frame {
+    /// A complete line (LF included, unless EOF came first) of at most the
+    /// control cap, or any length when no control method was seen in its
+    /// first cap + 1 bytes.
+    Line(Vec<u8>),
+    /// More than the control cap without LF, and its first cap + 1 bytes name
+    /// a control method. Nothing past those bytes was consumed.
+    ControlTooLarge,
+    /// The peer closed before sending anything.
+    Eof,
+}
+
+/// Read one LF-terminated frame. Runtime-control frames are bounded before
+/// any parse: once a frame passes the control cap without LF, the bytes read
+/// so far decide. If they name a control method (any ASCII `\\u00XX`
+/// spelling), reading stops there and the frame is refused. Otherwise the
+/// frame is a legacy request and is read to LF without a bound, as legacy
+/// messages up to several MiB are valid.
+pub(crate) async fn read_frame<R>(reader: &mut R) -> std::io::Result<Frame>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let cap = chanvoy_core::runtime::control::RPC_MAX_BYTES;
+    let mut frame = Vec::new();
+    let mut checked = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if frame.is_empty() {
+                Frame::Eof
+            } else {
+                Frame::Line(frame)
+            });
+        }
+        // Until classified, never take more than cap + 1 bytes.
+        let window = if checked {
+            available
+        } else {
+            &available[..available.len().min(cap + 1 - frame.len())]
+        };
+        let newline = window.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(window.len(), |index| index + 1);
+        frame.extend_from_slice(&window[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(Frame::Line(frame));
+        }
+        if !checked && frame.len() > cap {
+            if names_control_method(&frame) {
+                return Ok(Frame::ControlTooLarge);
+            }
+            checked = true;
+        }
+    }
+}
+
+fn names_control_method(bytes: &[u8]) -> bool {
+    let unescaped = unescape_ascii(bytes);
+    [RETIRE_METHOD, OBSERVATION_METHOD]
+        .into_iter()
+        .any(|method| contains(&unescaped, method.as_bytes()))
+}
+
+/// The refusal for a control frame that exceeded the cap; the exchange closes.
+pub(crate) fn too_large() -> Reply {
+    protocol_error(None, ControlError::TooLarge)
+}
+
 /// The encoded reply and whether the connection must close after it.
 pub(crate) struct Reply {
     pub bytes: Vec<u8>,
