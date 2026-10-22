@@ -143,51 +143,69 @@ pub(crate) enum Frame {
     Eof,
 }
 
-/// Read one LF-terminated frame. Runtime-control frames are bounded before
-/// any parse: once a frame passes the control cap without LF, the bytes read
-/// so far decide. If they name a control method (any ASCII `\\u00XX`
-/// spelling), reading stops there and the frame is refused. Otherwise the
-/// frame is a legacy request and is read to LF without a bound, as legacy
-/// messages up to several MiB are valid.
-pub(crate) async fn read_frame<R>(reader: &mut R) -> std::io::Result<Frame>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-{
-    use tokio::io::AsyncBufReadExt;
-    let cap = chanvoy_core::runtime::control::RPC_MAX_BYTES;
-    let mut frame = Vec::new();
-    let mut checked = false;
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(if frame.is_empty() {
-                Frame::Eof
-            } else {
-                Frame::Line(frame)
-            });
-        }
-        // Until classified, never take more than cap + 1 bytes. Classification
-        // always happens once the frame passes the cap, so an unclassified
-        // window is never empty.
-        let window = if checked {
-            available
-        } else {
-            &available[..available
-                .len()
-                .min((cap + 1).saturating_sub(frame.len()).max(1))]
-        };
-        let newline = window.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(window.len(), |index| index + 1);
-        frame.extend_from_slice(&window[..take]);
-        reader.consume(take);
-        if newline.is_some() {
-            return Ok(Frame::Line(frame));
-        }
-        if !checked && frame.len() > cap {
-            if names_control_method(&frame) {
-                return Ok(Frame::ControlTooLarge);
+/// Reads LF-terminated frames from one connection. Runtime-control frames are
+/// bounded before any parse: once a frame passes the control cap without LF,
+/// the bytes read so far decide. If they name a control method (any ASCII
+/// `\\u00XX` spelling), reading stops there and the frame is refused.
+/// Otherwise the frame is a legacy request and is read to LF without a bound,
+/// as legacy messages up to several MiB are valid.
+///
+/// The partial frame and its classification live here, not in the read
+/// future, so a `read` future dropped by a `select!` (for example when a
+/// subscription event wins) loses no consumed bytes: the next `read`
+/// continues the same frame.
+#[derive(Default)]
+pub(crate) struct FrameReader {
+    partial: Vec<u8>,
+    checked: bool,
+}
+
+impl FrameReader {
+    /// Cancel safe: the only await point is `fill_buf`, which consumes
+    /// nothing, and consumed bytes are appended to `partial` before the next.
+    pub(crate) async fn read<R>(&mut self, reader: &mut R) -> std::io::Result<Frame>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt;
+        let cap = chanvoy_core::runtime::control::RPC_MAX_BYTES;
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                let frame = std::mem::take(&mut self.partial);
+                self.checked = false;
+                return Ok(if frame.is_empty() {
+                    Frame::Eof
+                } else {
+                    Frame::Line(frame)
+                });
             }
-            checked = true;
+            // Until classified, never take more than cap + 1 bytes.
+            // Classification always happens once the frame passes the cap, so
+            // an unclassified window is never empty.
+            let window = if self.checked {
+                available
+            } else {
+                &available[..available
+                    .len()
+                    .min((cap + 1).saturating_sub(self.partial.len()).max(1))]
+            };
+            let newline = window.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(window.len(), |index| index + 1);
+            self.partial.extend_from_slice(&window[..take]);
+            reader.consume(take);
+            if newline.is_some() {
+                self.checked = false;
+                return Ok(Frame::Line(std::mem::take(&mut self.partial)));
+            }
+            if !self.checked && self.partial.len() > cap {
+                if names_control_method(&self.partial) {
+                    // The connection closes; nothing more is read.
+                    self.partial.clear();
+                    return Ok(Frame::ControlTooLarge);
+                }
+                self.checked = true;
+            }
         }
     }
 }

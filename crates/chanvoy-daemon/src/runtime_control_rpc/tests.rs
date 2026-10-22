@@ -630,7 +630,7 @@ const CAP: usize = chanvoy_core::runtime::control::RPC_MAX_BYTES;
 
 /// A reader that stops waiting fails the test instead of hanging it.
 async fn bounded_read<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Frame {
-    tokio::time::timeout(Duration::from_secs(5), read_frame(reader))
+    tokio::time::timeout(Duration::from_secs(5), FrameReader::default().read(reader))
         .await
         .expect("frame reader returned without waiting for more input")
         .unwrap()
@@ -704,9 +704,33 @@ async fn a_framing_refusal_never_reinterprets_the_buffered_suffix() {
     data.push(b'\n');
     data.extend_from_slice(&fixture("observation_rpc_request-positive"));
     data.push(b'\n');
-    // Send both in one write; only one reply (the refusal) may come back.
-    let (replies, _, _, outcome) = exchange(&[data[..data.len() - 1].to_vec()]).await;
-    outcome.unwrap();
+    // Both frames in one write; read every reply until the server closes.
+    let state = crate::request_frontier::tests::state("http://127.0.0.1:9");
+    let (reader, client) = tokio::io::duplex(64 * 1024);
+    let (server_read, server_write) = tokio::io::split(reader);
+    let (shutdown, _rx) = oneshot::channel();
+    let task = tokio::spawn(crate::handle_client_io(
+        BufReader::new(server_read),
+        server_write,
+        Arc::clone(&state),
+        Arc::new(Mutex::new(Some(shutdown))),
+    ));
+    let (read, mut write) = tokio::io::split(client);
+    let writer = tokio::spawn(async move {
+        let _ = write.write_all(&data).await;
+        write
+    });
+    let mut replies = Vec::new();
+    let mut lines = BufReader::new(read).lines();
+    while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("server closes after a framing refusal")
+    {
+        replies.push(serde_json::from_str::<Value>(&line).unwrap());
+    }
+    writer.abort();
+    let _ = writer.await;
+    task.await.unwrap().unwrap();
     assert_eq!(replies.len(), 1, "{replies:?}");
     assert_eq!(replies[0]["error"]["code"], -32600);
 }
@@ -719,4 +743,151 @@ async fn invalid_utf8_in_a_control_frame_gets_a_protocol_error() {
     let (replies, _, _, outcome) = exchange(&[frame]).await;
     outcome.unwrap();
     assert_eq!(replies[0]["error"]["code"], -32600, "{replies:?}");
+}
+
+// --- cancellation by other select! arms ---------------------------------------
+
+/// Serves scripted chunks; before each chunk after the first `ready` it parks
+/// until released, and signals `consumed` once it has served everything up to
+/// the park point.
+struct Scripted {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    park_before: usize,
+    served: usize,
+    consumed: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+    acquire: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+}
+impl tokio::io::AsyncRead for Scripted {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.served == self.park_before {
+            if self.acquire.is_none() {
+                self.consumed.notify_one();
+                let release = Arc::clone(&self.release);
+                self.acquire = Some(Box::pin(async move {
+                    release.acquire().await.unwrap().forget();
+                }));
+            }
+            match self.acquire.as_mut().unwrap().as_mut().poll(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(()) => {
+                    self.acquire = None;
+                    self.park_before = usize::MAX;
+                }
+            }
+        }
+        match self.chunks.front_mut() {
+            Some(chunk) => {
+                let n = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..n]);
+                chunk.drain(..n);
+                if chunk.is_empty() {
+                    self.chunks.pop_front();
+                    self.served += 1;
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// A subscribed client sends a control-method prefix without LF; a
+/// subscription event wakes the loop; the client then sends a legacy
+/// `shutdown` and LF. The single wire frame names a control method and must be
+/// strict-refused as a whole. The suffix must never reach legacy dispatch.
+#[tokio::test]
+async fn an_event_wake_never_drops_a_partial_frame() {
+    for (name, prefix) in [
+        ("below-cap", br#"{"method":"runtime_retire_v1"} "#.to_vec()),
+        ("budget-split", {
+            let mut p = br#"{"method":"runtime_observation_v1","pad":""#.to_vec();
+            p.resize(CAP - 64, b'x');
+            p
+        }),
+    ] {
+        let state = crate::request_frontier::tests::state("http://127.0.0.1:9");
+        let subscribe = chanvoy_core::rpc_request("subscribe", json!({"filter": "all_monitored"}));
+        let shutdown_req = chanvoy_core::rpc_request("shutdown", json!({}));
+        let mut first = serde_json::to_vec(&subscribe).unwrap();
+        first.push(b'\n');
+        let mut suffix = br#""}"#.to_vec();
+        if name == "below-cap" {
+            suffix.clear();
+        }
+        suffix.extend_from_slice(&serde_json::to_vec(&shutdown_req).unwrap());
+        // Pad past the cap for the split-budget case so the whole frame is over cap.
+        if name == "budget-split" {
+            let filler = vec![b' '; 256];
+            suffix.splice(0..0, filler);
+        }
+        suffix.push(b'\n');
+        let consumed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let reader = Scripted {
+            chunks: [first, prefix, suffix].into_iter().collect(),
+            park_before: 2,
+            served: 0,
+            consumed: Arc::clone(&consumed),
+            release: Arc::clone(&release),
+            acquire: None,
+        };
+        let (server_write, client) = tokio::io::duplex(64 * 1024);
+        let (shutdown, mut shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(crate::handle_client_io(
+            BufReader::new(reader),
+            server_write,
+            Arc::clone(&state),
+            Arc::new(Mutex::new(Some(shutdown))),
+        ));
+        let mut lines = BufReader::new(client).lines();
+        let ack: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ack["result"]["subscription_id"].is_string(),
+            "{name}: {ack}"
+        );
+        // The prefix is consumed and the reader is parked mid-frame.
+        tokio::time::timeout(Duration::from_secs(5), consumed.notified())
+            .await
+            .expect("prefix consumed");
+        // An event wakes the connection's other select! arm.
+        let _ = state.event_bus.sender().send(Arc::new(
+            crate::request_frontier::tests::subscriptions::event(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.add_permits(1);
+        let mut replies = Vec::new();
+        while let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(2), lines.next_line()).await
+        {
+            replies.push(serde_json::from_str::<Value>(&line).unwrap());
+        }
+        task.abort();
+        let refusals: Vec<_> = replies
+            .iter()
+            .filter(|r| r.get("error").is_some())
+            .collect();
+        assert_eq!(refusals.len(), 1, "{name}: {replies:?}");
+        assert!(
+            replies.iter().all(|r| r
+                .get("result")
+                .is_none_or(|res| res.get("stopping").is_none())),
+            "{name}: legacy shutdown was dispatched: {replies:?}"
+        );
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "{name}: shutdown signalled"
+        );
+    }
 }

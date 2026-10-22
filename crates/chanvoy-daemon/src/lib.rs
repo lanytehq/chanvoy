@@ -883,13 +883,15 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut line = String::new();
+    // Owns partial-frame state across select! cancellation by other arms.
+    let mut frames = runtime_control_rpc::FrameReader::default();
     let mut event_rx: Option<tokio::sync::broadcast::Receiver<Arc<DaemonEvent>>> = None;
     let mut client_sub_ids: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
-            read_result = runtime_control_rpc::read_frame(&mut reader) => {
+            read_result = frames.read(&mut reader) => {
                 // Check again when both input and stop are ready. Once a
                 // branch starts admitted work, it runs to its existing finish.
                 let frame = read_result?;
