@@ -231,7 +231,7 @@ async fn exchange(
     Result<(), crate::DaemonError>,
 ) {
     let state = crate::request_frontier::tests::state("http://127.0.0.1:9");
-    let (reader, mut client) = tokio::io::duplex(64 * 1024);
+    let (reader, client) = tokio::io::duplex(64 * 1024);
     let (server_read, server_write) = tokio::io::split(reader);
     let (shutdown, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(crate::handle_client_io(

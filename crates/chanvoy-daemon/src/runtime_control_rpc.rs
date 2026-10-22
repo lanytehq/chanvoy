@@ -166,11 +166,15 @@ where
                 Frame::Line(frame)
             });
         }
-        // Until classified, never take more than cap + 1 bytes.
+        // Until classified, never take more than cap + 1 bytes. Classification
+        // always happens once the frame passes the cap, so an unclassified
+        // window is never empty.
         let window = if checked {
             available
         } else {
-            &available[..available.len().min(cap + 1 - frame.len())]
+            &available[..available
+                .len()
+                .min((cap + 1).saturating_sub(frame.len()).max(1))]
         };
         let newline = window.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(window.len(), |index| index + 1);
