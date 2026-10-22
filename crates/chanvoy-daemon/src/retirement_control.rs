@@ -236,4 +236,4 @@ fn same_identity(a: &RuntimeRecord, b: &RuntimeRecord) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

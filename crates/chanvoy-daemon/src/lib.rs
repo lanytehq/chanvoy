@@ -12,6 +12,7 @@ mod ipc_ownership;
 mod ipc_supervision;
 mod request_frontier;
 mod retirement_control;
+mod runtime_control_rpc;
 mod startup_work;
 mod subscription_owner;
 mod wait;
@@ -155,6 +156,8 @@ struct AppState {
     /// target fails startup (never a silent bare-identity fallback).
     reduce_writer: Option<ReduceWriter>,
     wait_owners: Arc<wait_owner::WaitOwnerRegistry>,
+    /// Latched once the shared graceful-shutdown signal is actually sent.
+    shutdown_started: Arc<AtomicBool>,
     poll_cursors: waitprims_poll::PollCursorStore,
     fanin_replay: waitprims_fanin::FanInReplayStore,
     inbox_armed: Arc<AtomicU64>,
@@ -567,6 +570,7 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
             reduce_writer,
             wait_owners,
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             poll_cursors,
             fanin_replay: waitprims_fanin::FanInReplayStore::new(),
             inbox_armed: inbox_armed.clone(),
@@ -879,21 +883,76 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut line = String::new();
+    // Owns partial-frame state across select! cancellation by other arms.
+    let mut frames = runtime_control_rpc::FrameReader::default();
     let mut event_rx: Option<tokio::sync::broadcast::Receiver<Arc<DaemonEvent>>> = None;
     let mut client_sub_ids: Vec<String> = Vec::new();
 
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
-            read_result = reader.read_line(&mut line) => {
+            read_result = frames.read(&mut reader) => {
                 // Check again when both input and stop are ready. Once a
                 // branch starts admitted work, it runs to its existing finish.
-                let bytes_read = read_result?;
+                let frame = read_result?;
                 if stop.is_cancelled() { break; }
-                if bytes_read == 0 {
+                // Versioned runtime control is a provider-free control exception:
+                // bounded ingress, strict selected-root decode, no operational
+                // permit, no legacy fallback for invalid input.
+                let control = match &frame {
+                    runtime_control_rpc::Frame::Eof => break,
+                    runtime_control_rpc::Frame::ControlTooLarge => {
+                        Some(runtime_control_rpc::too_large())
+                    }
+                    runtime_control_rpc::Frame::Line(bytes) => {
+                        match runtime_control_rpc::frame_root(bytes) {
+                            Some(root) => Some(
+                                runtime_control_rpc::answer(
+                                    bytes,
+                                    root,
+                                    &state.wait_owners,
+                                    &runtime_control_rpc::ShutdownStarter {
+                                        sender: &shutdown_tx,
+                                        started: &state.shutdown_started,
+                                    },
+                                )
+                                .await,
+                            ),
+                            None => None,
+                        }
+                    }
+                };
+                if let Some(reply) = control {
+                    // Control holds no operational permit, so its reply must
+                    // not hold up daemon shutdown: an unread client is dropped.
+                    let delivered = tokio::select! {
+                        _ = stop.cancelled() => false,
+                        written = tokio::time::timeout(
+                            runtime_control_rpc::REPLY_DEADLINE,
+                            async {
+                                writer.write_all(&reply.bytes).await?;
+                                writer.write_all(b"\n").await?;
+                                writer.flush().await
+                            },
+                        ) => matches!(written, Ok(Ok(()))),
+                    };
+                    if !delivered || reply.close {
+                        break;
+                    }
+                    continue;
+                }
+                let runtime_control_rpc::Frame::Line(bytes) = frame else { break };
+                // Legacy frames keep their existing UTF-8 line semantics.
+                line.clear();
+                line.push_str(std::str::from_utf8(&bytes).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "stream did not contain valid UTF-8")
+                })?);
+                let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
+                // A decoded control method that escaped byte selection is still
+                // never served by a legacy handler.
+                if runtime_control_rpc::root_for(&request.method).is_some() {
                     break;
                 }
-                let request: JsonRpcRequest = serde_json::from_str(line.trim_end())?;
                 // Admission precedes every legacy handler and provider preflight.
                 let request_permit = state.wait_owners.request_permit()
                     .map_err(request_frontier::admission_error)?;
@@ -2160,7 +2219,9 @@ async fn dispatch_request(
         }
         "shutdown" => {
             if let Some(sender) = shutdown_tx.lock().await.take() {
-                let _ = sender.send(());
+                if sender.send(()).is_ok() {
+                    state.shutdown_started.store(true, Ordering::Release);
+                }
             }
             Ok(to_value(ShutdownResult { stopping: true }))
         }

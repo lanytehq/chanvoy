@@ -156,7 +156,7 @@ async fn subscribe(client: &mut tokio::io::DuplexStream, gate: &Gate, state: &Ap
         .to_string()
 }
 
-fn event() -> DaemonEvent {
+pub(crate) fn event() -> DaemonEvent {
     DaemonEvent {
         seq: 0,
         kind: DaemonEventKind::InboundMessage,

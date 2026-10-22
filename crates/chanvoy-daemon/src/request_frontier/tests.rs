@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::{oneshot, Mutex, Notify};
 use wiremock::MockServer;
 
-fn state(server_url: &str) -> Arc<AppState> {
+pub(crate) fn state(server_url: &str) -> Arc<AppState> {
     let profile = Profile {
         name: "request-frontier-fixture".into(),
         role: "test".into(),
@@ -50,6 +50,7 @@ fn state(server_url: &str) -> Arc<AppState> {
         probe_gate: Arc::new(chanvoy_core::recovery::IdentityProbeGate::default()),
         reduce_writer: None,
         wait_owners: Arc::new(wait_owner::WaitOwnerRegistry::new()),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         poll_cursors: crate::waitprims_poll::PollCursorStore::for_test("request-frontier-fixture"),
         fanin_replay: crate::waitprims_fanin::FanInReplayStore::new(),
         inbox_armed: Arc::new(AtomicU64::new(0)),
@@ -453,4 +454,4 @@ async fn actual_wait_disconnect_during_provider_preflight_retains_unconfirmed_re
 
 mod held;
 
-mod subscriptions;
+pub(crate) mod subscriptions;

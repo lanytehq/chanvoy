@@ -94,4 +94,4 @@ pub(super) fn acknowledge(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
