@@ -861,11 +861,24 @@ async fn an_event_wake_never_drops_a_partial_frame() {
         tokio::time::timeout(Duration::from_secs(5), consumed.notified())
             .await
             .expect("prefix consumed");
-        // An event wakes the connection's other select! arm.
+        // An event wakes the connection's other select! arm. Its notification
+        // reaching the client proves that arm ran, cancelling the pending
+        // frame read, before the suffix becomes readable.
         let _ = state.event_bus.sender().send(Arc::new(
             crate::request_frontier::tests::subscriptions::event(),
         ));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let notification: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("event arm ran")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            notification.get("id").is_none() && notification["method"].is_string(),
+            "{name}: expected the subscription notification, got {notification}"
+        );
         release.add_permits(1);
         let mut replies = Vec::new();
         while let Ok(Ok(Some(line))) =
@@ -873,7 +886,13 @@ async fn an_event_wake_never_drops_a_partial_frame() {
         {
             replies.push(serde_json::from_str::<Value>(&line).unwrap());
         }
+        // The scripted reader never reaches EOF, so stop the connection and
+        // collect it: it must end cancelled or cleanly, never with an error.
         task.abort();
+        match task.await {
+            Ok(result) => result.unwrap(),
+            Err(error) => assert!(error.is_cancelled(), "{name}: {error}"),
+        }
         let refusals: Vec<_> = replies
             .iter()
             .filter(|r| r.get("error").is_some())
