@@ -34,7 +34,7 @@ BUILD_CAMPAIGN := python3 -B scripts/build-campaign.py
 BUILD_CAMPAIGN_ARGS ?=
 BUILD_STEP := $(BUILD_CAMPAIGN) step --
 MANAGED_TARGETS := all check quality test test-integration build msrv pr-final precommit prepush
-.PHONY: $(MANAGED_TARGETS) $(addprefix managed-,$(MANAGED_TARGETS)) campaign-check build-storage-test
+.PHONY: $(MANAGED_TARGETS) $(addprefix managed-,$(MANAGED_TARGETS)) campaign-check build-storage-test process-tool-guard
 $(MANAGED_TARGETS):
 	+$(BUILD_CAMPAIGN) run $(BUILD_CAMPAIGN_ARGS) -- $(MAKE) --no-print-directory -j1 managed-$@
 
@@ -44,13 +44,20 @@ campaign-check:
 build-storage-test:
 	@python3 -B scripts/build-campaign.test.py
 
+# Rust sources spawn only allowlisted programs and never run ps/lsof/pgrep/kill
+# and similar tools from a shell string: those are denied in sandboxed seats
+# and differ across platforms.
+process-tool-guard:
+	@python3 -B scripts/process-tool-guard.test.py
+	@python3 -B scripts/process-tool-guard.py
+
 managed-all: managed-check
 
 clean:
 	@echo 'Automatic cache cleanup is disabled. Inspect build-storage documentation and retire explicit paths separately.' >&2
 	@exit 1
 
-managed-check: campaign-check
+managed-check: campaign-check process-tool-guard
 	$(BUILD_STEP) cargo fmt --check
 	$(BUILD_STEP) cargo clippy --workspace --all-targets -- -D warnings
 	$(BUILD_STEP) cargo test --workspace --all-targets
@@ -147,7 +154,7 @@ managed-msrv: campaign-check ensure-msrv
 	$(BUILD_STEP) cargo +$(MSRV) check --workspace --all-targets --locked
 	@echo "[ok] MSRV $(MSRV) verified"
 
-managed-pr-final: campaign-check ensure-msrv version-check workflow-lint release-tooling-test build-storage-test
+managed-pr-final: campaign-check ensure-msrv version-check workflow-lint release-tooling-test build-storage-test process-tool-guard
 	$(BUILD_STEP) cargo fmt --check
 	$(BUILD_STEP) cargo clippy --workspace --all-targets -- -D warnings
 	$(BUILD_STEP) cargo test --workspace --all-targets

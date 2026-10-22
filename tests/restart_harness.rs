@@ -756,15 +756,14 @@ async fn auto_setup_stops_zombie_and_respawns() {
 
     // SIGSTOP daemon1: process alive, socket live, but cannot answer RPCs.
     // sysprims curates to a safe signal subset that excludes SIGSTOP
-    // (reasonable — it's a test-only footgun), so we shell out via `kill`
-    // for the stop/resume simulation.
-    assert!(
-        std::process::Command::new("kill")
-            .args(["-STOP", &pid_before.to_string()])
-            .status()
-            .expect("kill -STOP spawn")
-            .success(),
-        "SIGSTOP daemon1 pid={pid_before}"
+    // (reasonable — it's a test-only footgun), so the stop/resume simulation
+    // signals directly rather than spawning a process tool.
+    // SAFETY: kill has no memory preconditions; the pid is this test's daemon.
+    assert_eq!(
+        unsafe { libc::kill(pid_before as libc::pid_t, libc::SIGSTOP) },
+        0,
+        "SIGSTOP daemon1 pid={pid_before}: {}",
+        std::io::Error::last_os_error()
     );
 
     let refused = auto_setup_command(&env, "lanytehq", "bravo-devlead")
@@ -798,14 +797,10 @@ async fn auto_setup_stops_zombie_and_respawns() {
     .await;
     // Always resume daemon1 so teardown can reap it cleanly. On the happy
     // path the second auto-setup's force-kill fallback has already reaped
-    // daemon1, so this CONT typically hits a nonexistent pid — that's
-    // expected, and both stdout and stderr are silenced so the resulting
-    // `kill: <pid>: No such process` doesn't clutter green test output.
-    let _ = std::process::Command::new("kill")
-        .args(["-CONT", &pid_before.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // daemon1, so this CONT typically hits a nonexistent pid (ESRCH); that
+    // result is expected and ignored.
+    // SAFETY: kill has no memory preconditions.
+    let _ = unsafe { libc::kill(pid_before as libc::pid_t, libc::SIGCONT) };
     let out2 = out2_result
         .expect("auto-setup #2 must complete within 30s")
         .expect("subprocess run");

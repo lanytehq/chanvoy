@@ -5099,18 +5099,15 @@ fn read_daemon_pid_for_force_kill(profile: &str) -> Option<u32> {
     std::fs::read_to_string(pid_path).ok()?.trim().parse().ok()
 }
 
-/// Check whether a pid is live without sending a signal. Uses `kill -0`
-/// (POSIX: "check for existence without signalling") via shell-out to avoid
-/// a libc/nix/sysprims dep for a single predicate. Exit 0 = alive,
-/// non-zero (e.g., ESRCH) = not alive.
+/// Check whether a pid is live without sending a signal (POSIX `kill(pid, 0)`).
+/// EPERM means a live process under another account, which is not ours, so
+/// only success counts. Pids outside the positive range are never live.
 fn is_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs only the existence and permission check.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
 }
 
 /// Per-iteration ping budget on the post-spawn readiness poll. Shorter than
