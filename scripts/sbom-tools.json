@@ -1,8 +1,8 @@
 {
   "goneat": {
-    "archive_sha256": "5bbc963134fa5925ed4250d07692777885d61d55ce3cad8d01d9336bb0c1e205",
-    "archive_url": "https://github.com/fulmenhq/goneat/releases/download/v0.6.1/goneat_v0.6.1_linux_amd64.tar.gz",
-    "version": "0.6.1"
+    "archive_sha256": "4319d262c5bf06a663620b1dc10c5862546cf48228913b56f48ca88328a0f458",
+    "archive_url": "https://github.com/fulmenhq/goneat/releases/download/v0.6.6/goneat_v0.6.6_linux_amd64.tar.gz",
+    "version": "0.6.6"
   },
   "syft": {
     "catalogers": [

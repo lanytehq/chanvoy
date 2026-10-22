@@ -16,6 +16,7 @@ from bounded_evidence import EvidenceError, json_write
 
 
 SCHEMA_ROOT = Path(__file__).resolve().parent.parent / "schemas/cyclonedx-1.6"
+TOOLS_PIN = Path(__file__).resolve().parent / "sbom-tools.json"
 SOURCE_COMMIT = "2aea6eacad7dcb7d93172a427e0d37a2cfcf590d"
 SCHEMAS = {
     "bom-1.6.schema.json": ("cdd5eb70e4359ed9efd67effc91aaf1b28d5c606ce1b81e194755631d7bb17c1",
@@ -207,7 +208,8 @@ def validate(controller, data, goneat, schema_dir=SCHEMA_ROOT):
     version_marker = controller.out / "validator-version-child.json"
     version = json.loads(controller.command("validator-version", argv(version_marker), 10,
                                             expected_images=expected_images()))
-    if not isinstance(version, dict) or version.get("binaryVersion") != "v0.6.1":
+    pinned = "v" + json.loads(regular_bytes(TOOLS_PIN))["goneat"]["version"]
+    if not isinstance(version, dict) or version.get("binaryVersion") != pinned:
         raise EvidenceError("unsupported validator version")
     marker = controller.out / "validator-child.json"
     controller.command("schema-validation", [*argv(marker), "--schema-dir", str(schemas),
