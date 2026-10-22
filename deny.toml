@@ -30,7 +30,14 @@ db-urls = ["https://github.com/RustSec/advisory-db"]
 # via PER-033: reqwest 0.12.15 → 0.13.3 bump dropped the transitive
 # dep entirely. Verified via `cargo tree -i rustls-pemfile` returning
 # no matches.
-ignore = []
+#
+# RUSTSEC-2024-0449 (unsafe-libyaml unmaintained): reached through
+# serde_yaml / serde_yaml_ng in rsfulmen (via sysprims and as a dev
+# dependency). Unmaintained notice only, no known vulnerability. Accepted
+# until the planned replacement with 3leaps/yamlprims.
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained; replacement with 3leaps/yamlprims planned" },
+]
 
 [licenses]
 # Allow these permissive licenses on direct + transitive deps.
