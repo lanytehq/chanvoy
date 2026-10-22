@@ -496,7 +496,8 @@ class SchemaTests(unittest.TestCase):
                 if name == "validator-version":
                     if change == "version-shape":
                         return "[]"
-                    return json.dumps({"binaryVersion": "v0.6.1"})
+                    pinned = json.loads((Path(__file__).resolve().parent / "sbom-tools.json").read_text())
+                    return json.dumps({"binaryVersion": "v" + pinned["goneat"]["version"]})
                 if change == "bom":
                     snapshot = Path(argv[argv.index("--data") + 1])
                     snapshot.chmod(0o644)

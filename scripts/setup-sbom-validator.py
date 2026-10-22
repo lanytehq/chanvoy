@@ -32,7 +32,7 @@ def unpack(archive, output):
     with output.open("xb") as target:
         target.write(data)
     output.chmod(0o555)
-    return {"tool": "goneat", "version": "0.6.1", "platform": "linux-amd64",
+    return {"tool": "goneat", "version": PIN["version"], "platform": "linux-amd64",
             "archive_url": PIN["archive_url"], "archive_sha256": PIN["archive_sha256"],
             "binary_sha256": sha(data), "binary": str(output.resolve())}
 

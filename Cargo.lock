@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chanvoy-cli",
  "chanvoy-core",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chanvoy-core",
  "chanvoy-daemon",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "dirs",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-daemon"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chanvoy-core",
  "chanvoy-ipc",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-ipc"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chanvoy-core",
  "chrono",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "chanvoy-mcp"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chanvoy-core",
  "chanvoy-daemon",

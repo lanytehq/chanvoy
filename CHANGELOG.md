@@ -7,12 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-23
+
 ### Runtime control RPC routing
 
 - The daemon answers `runtime_retire_v1` and `runtime_observation_v1` through
   their strict runtime-control v1 roots (16 KiB frame cap, duplicate keys
   refused, exact schema). Invalid input gets a closed protocol error and never
   reaches a legacy handler. These methods take no operational request permit.
+- At most 16 KiB plus one byte of a frame is read before it is classified. A
+  longer frame that names a control method within that window is refused
+  without reading further; other long frames are legacy requests as before.
 - No retirement coordinator is bound yet, so retirement is always refused with
   `native_evidence_unavailable` and never starts shutdown. Observation reports
   application admission phase and counts only. Existing methods are unchanged.
@@ -120,7 +125,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commits. Release/install refuses redirected targets, and `make clean` requires
   explicit cache review instead of automatically deleting build outputs.
 
+### Process tools
+
+- `make check` and `make pr-final` refuse Rust sources that spawn `ps`,
+  `lsof`, `pgrep`, `kill` or similar tools. Pid liveness uses `kill(pid, 0)`
+  directly instead of spawning `kill -0`.
+
+### Dependencies
+
+- Refresh quinn-proto, rustls, rustls-webpki, webpki-roots and
+  webpki-root-certs for RUSTSEC-2026-0338 through 0342, 0346 through 0349,
+  0381, 0382 and 0383, plus anyhow and rand for RUSTSEC-2026-0190 and 0097.
+  The webpki roots update changes the trusted CA set.
+- Record RUSTSEC-2024-0449 (unsafe-libyaml, unmaintained) as an accepted
+  advisory exception.
+- The offline SBOM route pins goneat 0.6.6.
+
 ### Profile resolution
+
+Shipped in the 0.3.2 binaries; documented here.
 
 - `chanvoy auto-setup` no longer sets or overwrites the host-wide
   `active_profile` marker. Pass `--activate` to opt in. `--no-activate` is
@@ -1255,7 +1278,8 @@ session-survival, hash-chained reconnect-health surface. Pre-this-changelog
 shipping history is captured in git log and the per-task briefs under
 `lanyte-productbook-internal/content/projmgmt/peers/`.
 
-[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/lanytehq/chanvoy/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/lanytehq/chanvoy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/lanytehq/chanvoy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/lanytehq/chanvoy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lanytehq/chanvoy/compare/v0.2.1...v0.3.0
