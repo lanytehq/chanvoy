@@ -94,22 +94,25 @@ fn changelog_has_checkpoint_and_first_public_entries() {
 fn root_release_notes_lead_with_current_and_keep_three() {
     let notes = include_str!("../RELEASE_NOTES.md");
     let current = notes
-        .find("## v0.3.2 - ")
+        .find("## v0.3.3 - ")
         .expect("root notes lead with the current release");
+    let previous = notes
+        .find("## v0.3.2 - 2026-10-10")
+        .expect("root notes include the previous release");
     let first_public = notes
         .find("## v0.3.1 - 2026-08-27")
         .expect("root notes include the first public release");
-    let checkpoint = notes
-        .find("## v0.3.0 - 2026-08-27")
-        .expect("root notes include the dated checkpoint");
-    assert!(current < first_public && first_public < checkpoint);
+    assert!(current < previous && previous < first_public);
+    assert!(notes.contains("docs/releases/v0.3.3.md"));
     assert!(notes.contains("docs/releases/v0.3.2.md"));
     assert!(notes.contains("First public distribution"));
     assert!(notes.contains("docs/releases/v0.3.1.md"));
-    assert!(notes.contains("Signed development checkpoint, not distributed"));
     assert!(notes.contains("default off") || notes.contains("off unless you pass it"));
     assert!(notes.contains("not published"));
-    assert!(!notes.contains("v0.3.0 (unreleased)"));
+    assert!(!notes.contains("## v0.3.0"));
+    // The checkpoint summary that rolled out of the root file is archived.
+    let checkpoint = include_str!("../docs/releases/v0.3.0.md");
+    assert!(checkpoint.contains("Signed development checkpoint, not distributed"));
     assert_eq!(
         notes
             .lines()
