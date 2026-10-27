@@ -344,7 +344,9 @@ enum DaemonCommand {
     Stop,
     /// Report daemon health, including a live Mattermost identity probe.
     Status,
-    /// Exit 0 if this environment can restart the live daemon for a profile.
+    /// Exit 0 if the current credential matches the live daemon's bot identity.
+    ///
+    /// This does not prove native process inspection or stop/restart permission.
     ///
     /// PER-038A / FIX-2: ownership is **daemon-reported**, not env-vs-TOML
     /// string equality. Loads the profile token, runs whoami (start preflight),

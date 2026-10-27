@@ -1274,6 +1274,35 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
   - confirms termination of an independently owned predecessor before reporting success
   - succeeds when both runtime files are absent; uncertain residue or liveness returns nonzero with state retained
   - requires an explicit profile
+- `chanvoy --profile <name> daemon ownable`
+  - compares the current credential's bot identity with the responding daemon
+  - does not prove that native process inspection, shutdown or replacement will succeed
+
+A healthy daemon can be explicitly stopped. `daemon start` preserves a responsive
+daemon, so running it after a failed stop does not perform a restart. There is
+currently no `daemon restart` command.
+
+If stop reports `process identity unavailable`, its diagnostic names the failed
+inspection stage and reason. `permission-denied` means that inspection was
+denied; `unavailable` does not establish why metadata could not be obtained.
+Native birth, account ownership, executable, arguments and start time are
+separate prerequisites from Mattermost authentication. A successful `ownable`
+check does not replace them. Inspect the named prerequisite in an environment
+permitted to inspect the daemon; keep its runtime files intact while ownership
+or termination remains unconfirmed.
+
+For an abandoned inbox wait, use the existing targeted replacement with the
+wait ID reported by `wait_already_active`:
+
+```sh
+chanvoy --profile <name> wait --inbox --after <saved-inbox-cursor> \
+  --replace-wait <existing-wait-id> --timeout 20m --json
+```
+
+Replacement wakes a quiet inbox without needing a new message. It still waits
+for confirmed cleanup of the previous wait; `wait_replace_unconfirmed` is not
+permission to discard its ownership or start a concurrent waiter. Preserve the
+last delivered cursor when retrying.
 
 Observed lifecycle behavior:
 

@@ -375,6 +375,9 @@ async fn run_inbox_armed(
 
         let coalesce_deadline = coalesce.as_ref().and_then(CoalesceBuffer::deadline);
         tokio::select! {
+            _ = session.cancel.cancelled() => {
+                return replaced_outcome(session, stream, coalesce, cursor, proven).await;
+            }
             _ = client_gone.cancelled() => {
                 return canceled_outcome(session, stream, coalesce, cursor, proven).await;
             }
@@ -2384,6 +2387,95 @@ mod tests {
             matches!(err, CoreError::WaitFilterInvalid(ref msg) if msg.contains("512") || msg.contains("exceeds")),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn quiet_inbox_replacement_wakes_without_a_message() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let server = MockServer::start().await;
+        mount_baseline(&server).await;
+        let state = healthy_state(&server).await;
+        let lease = state
+            .wait_owners
+            .acquire_inbox(None, Duration::from_secs(30))
+            .await
+            .unwrap();
+        let old_id = lease.wait_id.clone();
+        let (session, guard) = lease.into_guard();
+        let mut cursor = InboxCursorV1::empty(&state.profile.name, &state.my_user_id);
+        let raw = cursor.encode().unwrap();
+        let original_cursor = raw.clone();
+        let mut proven = Some(raw.clone());
+        let req = WaitInboxRequest {
+            timeout_secs: 30,
+            contains: None,
+            pattern: None,
+            mention: false,
+            after: Some(&raw),
+            replace_wait_id: None,
+            coalesce_ms: None,
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        let predicate = WaitPredicate::compile(
+            &state.my_user_id,
+            "inbox",
+            None,
+            None,
+            false,
+            &state.profile.bot_username,
+        )
+        .unwrap();
+        let mut rx = state.event_bus.subscribe();
+        let mut dms = BTreeMap::new();
+        let mut buffered = VecDeque::new();
+        let mut coalesce = None;
+        let client_gone = CancellationToken::new();
+        let reconnects = current_reconnects(&state).await;
+        let mut first = Box::pin(async {
+            let _guard = guard;
+            run_inbox_armed(
+                &state,
+                &req,
+                None,
+                &mut coalesce,
+                &session,
+                &mut cursor,
+                &mut proven,
+                &predicate,
+                &mut dms,
+                &[],
+                &mut rx,
+                &mut buffered,
+                reconnects,
+                &client_gone,
+            )
+            .await
+        });
+        // With no provider work or buffered events, this poll parks at the
+        // quiet event receive. Cancellation must itself wake that receive.
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let replacement = state
+            .wait_owners
+            .acquire_inbox(Some(&old_id), Duration::from_secs(30));
+        let (old_result, new_lease) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, replacement)
+        })
+        .await
+        .expect("quiet replacement must not need a DM or the original deadman");
+        let new_lease = new_lease.expect("old cleanup confirmed");
+        assert!(
+            matches!(old_result, Err(CoreError::WaitReplaced { wait_id, replaced_by_wait_id })
+            if wait_id == old_id && replaced_by_wait_id == new_lease.wait_id)
+        );
+        assert_eq!(new_lease.replaced_wait_id.as_deref(), Some(old_id.as_str()));
+        assert_eq!(proven.as_deref(), Some(original_cursor.as_str()));
+        assert_eq!(cursor.encode().unwrap(), original_cursor);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
