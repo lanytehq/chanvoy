@@ -66,6 +66,9 @@ impl CompleteGuardHold {
 }
 
 pub struct WaitOwnerRegistry {
+    // Every request/stream/task/collector retaining this arena also retains the
+    // one native lifetime description. This is ownership, not a Busy count.
+    runtime_lifetime: Option<RuntimeLifetime>,
     inner: Mutex<Inner>,
     cleanup_budget: Mutex<Duration>,
     /// Incremented only by the wait engine after a successful acquire.
@@ -151,6 +154,13 @@ impl Default for WaitOwnerRegistry {
     }
 }
 
+struct RuntimeLifetime(Arc<dyn Send + Sync>);
+impl std::fmt::Debug for RuntimeLifetime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RuntimeLifetime(..)")
+    }
+}
+
 impl WaitOwnerRegistry {
     pub fn new() -> Self {
         Self::for_instance(chanvoy_core::runtime::InstanceId::new())
@@ -158,6 +168,7 @@ impl WaitOwnerRegistry {
 
     pub(crate) fn for_instance(instance: chanvoy_core::runtime::InstanceId) -> Self {
         Self {
+            runtime_lifetime: None,
             inner: Mutex::new(Inner {
                 admission: admission::Inventory::new(instance),
                 slots: HashMap::new(),
@@ -169,6 +180,25 @@ impl WaitOwnerRegistry {
             post_ack_hold: Mutex::new(None),
             complete_guard_hold: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn for_runtime(
+        instance: chanvoy_core::runtime::InstanceId,
+        publisher: Arc<chanvoy_core::runtime::RecordPublisher>,
+    ) -> Self {
+        let mut registry = Self::for_instance(instance);
+        registry.runtime_lifetime = Some(RuntimeLifetime(publisher));
+        registry
+    }
+
+    pub(crate) fn retains_publisher(
+        &self,
+        publisher: &Arc<chanvoy_core::runtime::RecordPublisher>,
+    ) -> bool {
+        let expected: Arc<dyn Send + Sync> = publisher.clone();
+        self.runtime_lifetime
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(&held.0, &expected))
     }
 
     #[allow(dead_code)]
@@ -1238,5 +1268,32 @@ mod tests {
         assert_eq!(snap.generation, old_gen);
         assert!(!snap.replacing);
         drop(guard);
+    }
+}
+
+#[cfg(test)]
+mod runtime_lifetime_tests {
+    use super::*;
+    #[test]
+    fn admitted_work_and_cleanup_retain_lifetime_after_serve_owner_drops() {
+        let guard: Arc<dyn Send + Sync> = Arc::new(());
+        let weak = Arc::downgrade(&guard);
+        let mut registry = WaitOwnerRegistry::new();
+        registry.runtime_lifetime = Some(RuntimeLifetime(guard));
+        let registry = Arc::new(registry);
+        let request = registry.request_permit().unwrap();
+        let stream = registry.registration_owner().unwrap();
+        let (task, collector) = registry.task_cleanup_pair().unwrap();
+        drop(registry);
+        assert!(weak.upgrade().is_some());
+        request.confirm_done().unwrap();
+        stream.confirm_done().unwrap();
+        task.confirm_done().unwrap();
+        assert!(
+            weak.upgrade().is_some(),
+            "collector still owns runtime lifetime"
+        );
+        collector.confirm_done().unwrap();
+        assert!(weak.upgrade().is_none());
     }
 }

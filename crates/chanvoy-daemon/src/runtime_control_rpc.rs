@@ -234,6 +234,10 @@ pub(crate) async fn answer(
     line: &[u8],
     root: ControlRoot,
     arena: &WaitOwnerRegistry,
+    native: Option<(
+        &crate::native_runtime::NativeRuntime,
+        Option<&chanvoy_core::runtime::RuntimeProcess>,
+    )>,
     shutdown: &ShutdownStarter<'_>,
 ) -> Reply {
     let Some(frame) = line.strip_suffix(b"\n") else {
@@ -245,9 +249,15 @@ pub(crate) async fn answer(
     };
     let id = request.value()["id"].clone();
     let projected = match root {
-        // No coordinator is bound to this daemon yet: nothing can prove the
-        // target, so this is a refusal with unknown target facts.
-        ControlRoot::RetireRequest => retire(&request, &unbound(), shutdown).await,
+        ControlRoot::RetireRequest => {
+            let facts = match native {
+                Some((runtime, peer)) => runtime
+                    .attempt(&request, peer)
+                    .unwrap_or_else(|_| unbound()),
+                None => unbound(),
+            };
+            retire(&request, &facts, shutdown).await
+        }
         ControlRoot::ObservationRequest => observation_response(&request, arena),
         _ => Err(ControlError::WrongTransport),
     };
@@ -348,6 +358,11 @@ fn retire_response(
     facts: &ResultFacts,
     shutdown_started: bool,
 ) -> Result<ControlDocument, ControlError> {
+    // Managed shutdown can only follow a committed retirement. Never hide
+    // an impossible latch by projecting the schema's required false value.
+    if facts.outcome == Outcome::Busy && shutdown_started {
+        return Err(ControlError::InvalidContract);
+    }
     let target = request.value()["params"]["target"].clone();
     let begin = request.value()["params"]["action"] == "begin";
     let counts = |arena: &AdmissionSnapshot| {

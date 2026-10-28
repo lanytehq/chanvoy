@@ -257,6 +257,26 @@ impl PrivateDirectory {
     /// Synchronous publication: the caller retains mutation ownership through
     /// all writes, replacement and directory sync. Once a namespace mutation
     /// begins, any failure is uncertainty, never a claim of rollback.
+    /// Remove only an exact captured private regular artifact. The owning
+    /// lifecycle operation/publisher must exclude cooperating writers.
+    pub fn remove_file(
+        &self,
+        name: &OsStr,
+        expected: &FileFingerprint,
+    ) -> Result<(), RuntimeError> {
+        self.verify_named()?;
+        self.verify_file_named(name, expected)?;
+        let name =
+            CString::new(name.as_bytes()).map_err(|_| RuntimeError::Invalid("entry name"))?;
+        // SAFETY: validated leaf and retained directory; no recursive removal.
+        if unsafe { libc::unlinkat(self.raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync()
+            .map_err(|_| RuntimeError::PublicationUncertain)?;
+        self.verify_named()
+    }
+
     pub fn publish(
         &self,
         name: &OsStr,
@@ -626,5 +646,33 @@ pub(super) mod tests {
         root.publish(name, None, b"new epoch").unwrap();
         assert!(root.publish(name, Some(&second), b"stale epoch").is_err());
         assert_eq!(std::fs::read(root.path().join(name)).unwrap(), b"new epoch");
+    }
+    #[test]
+    fn captured_removal_refuses_replaced_or_broadened_artifacts() {
+        let fixture = fixture();
+        let dir =
+            PrivateDirectory::open_canonical(fixture.path(), unsafe { libc::geteuid() }).unwrap();
+        let name = OsStr::new("handoff");
+        let captured = dir.publish(name, None, b"original").unwrap();
+        let replacement = dir.publish(name, Some(&captured), b"replacement").unwrap();
+        assert!(dir.remove_file(name, &captured).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(name)).unwrap(),
+            b"replacement"
+        );
+        std::fs::set_permissions(
+            dir.path().join(name),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(dir.remove_file(name, &replacement).is_err());
+        assert!(dir.path().join(name).exists());
+        std::fs::set_permissions(
+            dir.path().join(name),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        dir.remove_file(name, &replacement).unwrap();
+        assert!(!dir.path().join(name).exists());
     }
 }

@@ -378,6 +378,67 @@ impl FailedChildRuntime {
 /// Kernel exit evidence stays usable when an unreaped process no longer exposes
 /// executable metadata. It observes termination; signal ownership still needs
 /// the separately revalidated process and socket identity.
+/// Managed lifecycle exposes only observation, never the legacy signal path.
+#[allow(dead_code)]
+pub(super) struct ManagedExitWatch {
+    process: chanvoy_core::runtime::RuntimeProcess,
+    watch: ExitWatch,
+}
+/// Constructible only after a kernel exit event on the same-birth registered
+/// process. A free lease, missing socket or stale record cannot create this.
+#[allow(dead_code)]
+pub(super) struct WholeProcessExit {
+    process: chanvoy_core::runtime::RuntimeProcess,
+}
+#[allow(dead_code)]
+impl WholeProcessExit {
+    pub(super) fn process(&self) -> &chanvoy_core::runtime::RuntimeProcess {
+        &self.process
+    }
+}
+#[allow(dead_code)]
+impl ManagedExitWatch {
+    pub(super) fn capture(process: &chanvoy_core::runtime::RuntimeProcess) -> Result<Self, String> {
+        process
+            .revalidate()
+            .map_err(|_| "managed process identity unavailable before exit monitor")?;
+        let watch = ExitWatch::new(process.pid.get())?
+            .ok_or("managed process exited before same-birth monitor registration")?;
+        process
+            .revalidate()
+            .map_err(|_| "managed process identity changed during exit monitor registration")?;
+        Ok(Self {
+            process: process.clone(),
+            watch,
+        })
+    }
+    pub(super) async fn observe_exit(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<WholeProcessExit, String> {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("managed whole-process exit unconfirmed; state retained".into());
+            }
+            if self.watch.exited()? {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "managed whole-process exit deadline elapsed; state retained".into(),
+                    );
+                }
+                return Ok(WholeProcessExit {
+                    process: self.process.clone(),
+                });
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                Instant::from_std(deadline),
+                Instant::now() + Duration::from_millis(20),
+            ))
+            .await;
+        }
+    }
+}
+
 struct ExitWatch {
     fd: OwnedFd,
     pid: u32,
@@ -606,7 +667,13 @@ fn account_of(pid: u32) -> Option<u32> {
     let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     // SAFETY: the buffer pointer and size describe `info` exactly.
+    // SAFETY: __error is this thread's errno pointer. Clear it so a failed
+    // or short call without errno cannot inherit an unrelated earlier denial.
+    unsafe { *libc::__error() = 0 };
     let read = unsafe {
+        // libproc may return zero without setting errno. Clear this thread's
+        // slot so a previous denied call cannot mislabel unavailable evidence.
+        *libc::__error() = 0;
         libc::proc_pidinfo(
             pid as i32,
             PROC_PIDT_SHORTBSDINFO,
@@ -897,6 +964,11 @@ fn validate_monitor_identity(
 
 #[cfg(target_os = "macos")]
 fn native_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    native_bsd_info_checked(pid).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn native_bsd_info_checked(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     let read = unsafe {
@@ -910,10 +982,25 @@ fn native_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
             size,
         )
     };
-    if read != size {
-        return None;
+    // Capture errno immediately; positive short reads are unavailable evidence,
+    // not permission denials even if the library left errno nonzero.
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    native_info_read_result(read, size, errno)?;
+    Ok(info)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn native_info_read_result(read: i32, expected: i32, errno: i32) -> std::io::Result<()> {
+    if read == expected {
+        Ok(())
+    } else if read <= 0 && errno > 0 {
+        Err(std::io::Error::from_raw_os_error(errno))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "incomplete native process info",
+        ))
     }
-    Some(info)
 }
 
 #[cfg(target_os = "macos")]
@@ -1041,6 +1128,32 @@ impl std::fmt::Display for InspectionFailure {
     }
 }
 
+fn inspect_native_birth(pid: u32) -> Result<u64, InspectionFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        let info = native_bsd_info_checked(pid).map_err(|error| {
+            InspectionFailure::new("native-birth", io_inspection_reason(&error))
+        })?;
+        info.pbi_start_tvsec
+            .checked_mul(1_000_000)
+            .and_then(|secs| secs.checked_add(info.pbi_start_tvusec))
+            .ok_or(InspectionFailure::new("native-birth", "unavailable"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    native_birth(pid).ok_or(InspectionFailure::new("native-birth", "unavailable"))
+}
+
+fn inspect_native_owner(pid: u32) -> Result<u32, InspectionFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        native_bsd_info_checked(pid)
+            .map(|info| info.pbi_uid)
+            .map_err(|error| InspectionFailure::new("native-owner", io_inspection_reason(&error)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    native_owner(pid).ok_or(InspectionFailure::new("native-owner", "unavailable"))
+}
+
 fn observe_pid(pid: u32) -> ProcessObservation {
     inspect_pid(pid).unwrap_or(ProcessObservation::Unknown)
 }
@@ -1064,12 +1177,11 @@ fn inspect_pid(pid: u32) -> Result<ProcessObservation, InspectionFailure> {
             ))
         };
     }
-    let Some(birth) = native_birth(pid) else {
-        return inspected_death_or_failure(pid, "native-birth", "unavailable");
+    let birth = match inspect_native_birth(pid) {
+        Ok(birth) => birth,
+        Err(failure) => return inspected_death_or_failure(pid, failure.stage, failure.reason),
     };
-    let Some(uid) = native_owner(pid) else {
-        return Err(InspectionFailure::new("native-owner", "unavailable"));
-    };
+    let uid = inspect_native_owner(pid)?;
     if uid != unsafe { libc::geteuid() } {
         return Err(InspectionFailure::new("native-owner", "different-account"));
     }
@@ -2613,6 +2725,23 @@ mod tests {
         assert_eq!((f.signals.get(), f.cleanups.get()), (0, 0));
     }
     #[test]
+    fn native_info_failure_uses_only_failure_errno() {
+        for errno in [libc::EPERM, libc::EACCES] {
+            for read in [0, -1] {
+                let error = native_info_read_result(read, 128, errno).unwrap_err();
+                assert_eq!(io_inspection_reason(&error), "permission-denied");
+            }
+            assert!(native_info_read_result(128, 128, errno).is_ok());
+            let short = native_info_read_result(64, 128, errno).unwrap_err();
+            assert_eq!(io_inspection_reason(&short), "unavailable");
+        }
+        assert_eq!(
+            io_inspection_reason(&native_info_read_result(0, 128, 0).unwrap_err()),
+            "unavailable"
+        );
+    }
+
+    #[test]
     fn inspection_failure_refuses_before_registering_exit_monitor() {
         for failure in [
             InspectionFailure::new("pid-probe", "permission-denied"),
@@ -3159,6 +3288,56 @@ mod tests {
         assert_eq!(
             (f.shutdowns.get(), f.signals.get(), f.cleanups.get()),
             (1, 0, 0)
+        );
+    }
+    #[tokio::test]
+    async fn managed_exit_watch_observes_owned_child_without_signal() {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read -r line"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let captured = chanvoy_core::runtime::RuntimeProcess::observe(
+            chanvoy_core::runtime::ProcessId::new(child.id()).unwrap(),
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|p| ManagedExitWatch::capture(&p));
+        if let Err(error) = &captured {
+            drop(child.stdin.take());
+            let _ = child.wait();
+            panic!("owned child native observer unavailable: {error}");
+        }
+        let watch = captured.unwrap_or_else(|_| unreachable!());
+        assert!(watch.observe_exit(std::time::Instant::now()).await.is_err());
+        // A registered process that remains alive must not turn a timeout into
+        // whole-process death evidence, even when registration itself passed.
+        let alive_timeout = watch
+            .observe_exit(std::time::Instant::now() + Duration::from_millis(30))
+            .await;
+        let still_alive = child.try_wait().unwrap().is_none();
+        let mut wrong_birth = watch.process.clone();
+        match &mut wrong_birth.birth {
+            chanvoy_core::runtime::NativeBirth::Linux { clock_ticks } => *clock_ticks += 1,
+            chanvoy_core::runtime::NativeBirth::MacOs { seconds, .. } => *seconds += 1,
+        }
+        let wrong_birth_refused = ManagedExitWatch::capture(&wrong_birth).is_err();
+        child.stdin.take().unwrap().write_all(b"finish\n").unwrap();
+        let proof = watch
+            .observe_exit(std::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        let status = child.wait().unwrap();
+        assert!(alive_timeout.is_err());
+        assert!(still_alive);
+        assert!(wrong_birth_refused);
+        assert!(status.success());
+        assert_eq!(
+            proof.unwrap_or_else(|e| panic!("{e}")).process().pid.get(),
+            child.id()
         );
     }
 }

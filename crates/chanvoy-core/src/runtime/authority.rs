@@ -28,6 +28,14 @@ pub struct RecordSnapshot {
     pub(super) bytes: Vec<u8>,
 }
 
+/// Ephemeral credential-tier handoff capture. Debug intentionally omits the
+/// bootstrap, nonce and bytes. Persistent runtime records never contain them.
+pub struct BootstrapSnapshot {
+    pub bootstrap: super::RuntimeBootstrap,
+    fingerprint: FileFingerprint,
+    bytes: Vec<u8>,
+}
+
 impl RuntimeAuthority {
     /// Read-only lookup. Missing authority is only filesystem evidence; callers
     /// still reconcile native inventory/lease evidence before claiming absence.
@@ -308,6 +316,114 @@ impl RuntimeAuthority {
         Ok(())
     }
 
+    /// Publish an epoch-specific, no-replace bootstrap under the held operation
+    /// lock. This validates file and record claims, not descriptor inheritance.
+    pub fn write_bootstrap(
+        &self,
+        operation: &OperationLock,
+        lease: &LifetimeLease,
+        starting: &RecordSnapshot,
+        bootstrap: &super::RuntimeBootstrap,
+    ) -> Result<BootstrapSnapshot, RuntimeError> {
+        operation.verify(self)?;
+        lease.verify(self)?;
+        if operation.namespace() != &bootstrap.namespace
+            || lease.namespace() != &bootstrap.namespace
+            || lease.identity() != bootstrap.lease_identity
+            || starting.record.namespace != bootstrap.namespace
+            || starting.record.instance_uuid != bootstrap.instance_uuid
+            || starting.record.config_root != bootstrap.config_root
+            || starting.record.profile != bootstrap.profile
+            || starting.record.uid != bootstrap.uid
+            || starting.record.revision != 0
+            || starting.record.phase != RuntimePhase::Starting
+            || bootstrap.uid != self.uid()
+            || !self.unchanged(starting)?
+        {
+            return Err(RuntimeError::Changed("bootstrap launcher ownership"));
+        }
+        let bytes = bootstrap
+            .encode()
+            .map_err(|_| RuntimeError::Invalid("bootstrap contract"))?;
+        let dir = self
+            .records
+            .as_ref()
+            .ok_or(RuntimeError::Unavailable("record directory"))?;
+        let name = bootstrap_name(&bootstrap.namespace, bootstrap.instance_uuid);
+        let fingerprint = dir.publish(OsStr::new(&name), None, &bytes)?;
+        self.verify()?;
+        Ok(BootstrapSnapshot {
+            bootstrap: bootstrap.clone(),
+            fingerprint,
+            bytes,
+        })
+    }
+
+    /// Credential-tier descriptor-relative read with metadata checked before
+    /// parsing. An inaccessible/changed file is never a legacy startup fallback.
+    pub fn read_bootstrap(
+        &self,
+        namespace: &Namespace,
+        instance: super::InstanceId,
+    ) -> Result<BootstrapSnapshot, RuntimeError> {
+        self.verify()?;
+        let dir = self
+            .records
+            .as_ref()
+            .ok_or(RuntimeError::Unavailable("record directory"))?;
+        let name = bootstrap_name(namespace, instance);
+        let file = dir
+            .open_file(OsStr::new(&name), libc::O_RDONLY)?
+            .ok_or(RuntimeError::Unavailable("bootstrap missing"))?;
+        let fingerprint = FileFingerprint::of(&file.metadata()?);
+        let cap = super::control::BOOTSTRAP_MAX_BYTES;
+        if fingerprint.size > cap as u64 {
+            return Err(RuntimeError::Invalid("bootstrap byte cap"));
+        }
+        let mut bytes = Vec::new();
+        (&file).take(cap as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > cap || FileFingerprint::of(&file.metadata()?) != fingerprint {
+            return Err(RuntimeError::Changed("bootstrap descriptor"));
+        }
+        dir.verify_file_named(OsStr::new(&name), &fingerprint)?;
+        self.verify()?;
+        let bootstrap = super::RuntimeBootstrap::decode(&bytes)
+            .map_err(|_| RuntimeError::Invalid("bootstrap contract"))?;
+        if bootstrap.namespace != *namespace
+            || bootstrap.instance_uuid != instance
+            || bootstrap.uid != self.uid()
+        {
+            return Err(RuntimeError::Changed("bootstrap epoch/account"));
+        }
+        Ok(BootstrapSnapshot {
+            bootstrap,
+            fingerprint,
+            bytes,
+        })
+    }
+
+    /// Consume only the exact handoff that passed child validation. No lease,
+    /// record, listener or process is removed by this operation.
+    pub fn consume_bootstrap(&self, captured: &BootstrapSnapshot) -> Result<(), RuntimeError> {
+        let bootstrap = &captured.bootstrap;
+        let current = self.read_bootstrap(&bootstrap.namespace, bootstrap.instance_uuid)?;
+        if current.fingerprint != captured.fingerprint || current.bytes != captured.bytes {
+            return Err(RuntimeError::Changed("bootstrap consumption identity"));
+        }
+        let dir = self
+            .records
+            .as_ref()
+            .ok_or(RuntimeError::Unavailable("record directory"))?;
+        dir.remove_file(
+            OsStr::new(&bootstrap_name(
+                &bootstrap.namespace,
+                bootstrap.instance_uuid,
+            )),
+            &captured.fingerprint,
+        )?;
+        self.verify()
+    }
+
     fn open_lock(
         &self,
         namespace: &Namespace,
@@ -373,6 +489,10 @@ pub enum LeaseObservation {
     Missing,
     Free,
     Contended,
+}
+
+fn bootstrap_name(namespace: &Namespace, instance: super::InstanceId) -> String {
+    format!("{}.{}.bootstrap.json", namespace.hex(), instance.uuid())
 }
 
 /// Lifetime reference; drop closes only this reference. No explicit unlock or
@@ -685,5 +805,140 @@ mod tests {
                 Err(RuntimeError::Invalid("state-root override unsupported"))
             ));
         }
+    }
+    #[test]
+    fn lifetime_description_survives_exec_and_parent_reference_drop() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::process::CommandExt;
+        let fixture = super::super::filesystem::tests::fixture();
+        let uid = unsafe { libc::geteuid() };
+        let dir = PrivateDirectory::open_canonical(fixture.path(), uid).unwrap();
+        let namespace = Namespace::derive(
+            uid,
+            &PathBytes::from_path(fixture.path()).unwrap(),
+            "exec-lease",
+        )
+        .unwrap();
+        let name = format!("{}.lease", namespace.hex());
+        let file = dir
+            .open_file(
+                OsStr::new(&name),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            )
+            .unwrap()
+            .unwrap();
+        acquire(&file).unwrap();
+        let lease = LifetimeLease {
+            opened: OpenedLock {
+                fingerprint: FileFingerprint::of(&file.metadata().unwrap()),
+                file,
+                name: name.clone(),
+                namespace,
+            },
+        };
+        let child_fd = lease.duplicate_for_child().unwrap();
+        let raw = child_fd.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "runtime::authority::tests::inherited_lease_child_fixture",
+                "--nocapture",
+            ])
+            .env("CHANVOY_TEST_LEASE_FD", raw.to_string())
+            .env(
+                "CHANVOY_TEST_LEASE_DEVICE",
+                lease.identity().device.to_string(),
+            )
+            .env(
+                "CHANVOY_TEST_LEASE_INODE",
+                lease.identity().inode.to_string(),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: post-fork callback uses only descriptor fcntl operations and
+        // scalar state. Parent descriptor flags are never changed.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(raw, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(child_fd);
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child ended before inherited-fd proof"
+            );
+            if line.contains("LEASE_INHERITED_READY") {
+                break;
+            }
+            line.clear();
+        }
+        let observer = dir
+            .open_file(OsStr::new(&name), libc::O_RDWR)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(acquire(&observer), Err(RuntimeError::Locked)));
+        drop(lease);
+        assert!(
+            matches!(acquire(&observer), Err(RuntimeError::Locked)),
+            "child must retain the original locked description"
+        );
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+        acquire(&observer).unwrap();
+    }
+
+    #[test]
+    #[ignore = "exec fixture helper, invoked only by lifetime description test"]
+    fn inherited_lease_child_fixture() {
+        use std::io::{Read, Write};
+        // Fixture-only deadman bounds both parent-output and child-input waits.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            std::process::exit(91);
+        });
+        let fd: i32 = std::env::var("CHANVOY_TEST_LEASE_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(fd >= 3);
+        // SAFETY: test launcher deliberately inherited this sole child-owned fd.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let observed = FileFingerprint::of(&file.metadata().unwrap());
+        assert_eq!(
+            observed.identity.device.to_string(),
+            std::env::var("CHANVOY_TEST_LEASE_DEVICE").unwrap()
+        );
+        assert_eq!(
+            observed.identity.inode.to_string(),
+            std::env::var("CHANVOY_TEST_LEASE_INODE").unwrap()
+        );
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) },
+            0
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        println!("LEASE_INHERITED_READY");
+        std::io::stdout().flush().unwrap();
+        let mut release = [0u8];
+        std::io::stdin().read_exact(&mut release).unwrap();
+        assert_eq!(release, [b'x']);
+        drop(file);
     }
 }

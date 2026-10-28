@@ -1202,6 +1202,8 @@ mod tests {
             reduce_writer: None,
             wait_owners: Arc::new(WaitOwnerRegistry::new()),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_policy: crate::ShutdownPolicy::Legacy,
+            native_runtime: None,
             poll_cursors: crate::waitprims_poll::PollCursorStore::for_test("wait-inbox-engine"),
             fanin_replay: crate::waitprims_fanin::FanInReplayStore::new(),
             inbox_armed: Arc::new(AtomicU64::new(0)),

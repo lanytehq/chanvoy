@@ -15,8 +15,8 @@ pub struct PublicationView {
     pub confirmed: bool,
 }
 
-pub struct RecordPublisher<'a> {
-    authority: &'a RuntimeAuthority,
+pub struct RecordPublisher {
+    authority: RuntimeAuthority,
     lease: LifetimeLease,
     inner: Mutex<PublicationState>,
 }
@@ -81,18 +81,18 @@ impl PublicationState {
         Ok(())
     }
 }
-impl<'a> RecordPublisher<'a> {
+impl RecordPublisher {
     /// Called by the intended child only after the external native bootstrap
     /// has proved the inherited lease/handoff and this process's full identity.
     /// This method enforces local ownership and revision claims, not that proof.
     /// It owns the lifetime reference throughout every synchronous publication.
     pub fn for_current_child(
-        authority: &'a RuntimeAuthority,
+        authority: RuntimeAuthority,
         lease: LifetimeLease,
         starting: RecordSnapshot,
         process: RuntimeProcess,
     ) -> Result<Self, RuntimeError> {
-        lease.verify(authority)?;
+        lease.verify(&authority)?;
         if process.pid.get() != std::process::id()
             || process.uid != authority.uid()
             || starting.record.namespace != *lease.namespace()
@@ -125,7 +125,7 @@ impl<'a> RecordPublisher<'a> {
             .inner
             .lock()
             .map_err(|_| RuntimeError::Unavailable("publisher mutex"))?;
-        self.lease.verify(self.authority)?;
+        self.lease.verify(&self.authority)?;
         let observed = self
             .authority
             .read_record(&inner.durable.record.namespace)?
@@ -185,7 +185,7 @@ impl<'a> RecordPublisher<'a> {
         self.flush(&mut inner)
     }
     fn flush(&self, inner: &mut PublicationState) -> Result<(), RuntimeError> {
-        self.lease.verify(self.authority)?;
+        self.lease.verify(&self.authority)?;
         let Some(next) = inner.pending.clone() else {
             if !self.authority.unchanged(&inner.durable)? {
                 return Err(RuntimeError::Changed(

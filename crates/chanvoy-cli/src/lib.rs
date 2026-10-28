@@ -1,3 +1,8 @@
+mod managed_entry;
+mod managed_environment;
+mod managed_launch;
+mod managed_retire;
+pub use managed_entry::{prepare_process_entry, PreparedInvocation};
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 mod daemon_assessment;
 mod generation;
@@ -339,7 +344,7 @@ enum DaemonCommand {
     /// Diagnostic mode: logs go to your terminal and `Ctrl-C` stops it. It is
     /// not a background start — the difference from `daemon start` is
     /// lifetime and detachment, not just where stdio points.
-    Serve,
+    Serve(ManagedServeArgs),
     /// Stop the daemon for a profile. Requires an explicit profile.
     Stop,
     /// Report daemon health, including a live Mattermost identity probe.
@@ -348,14 +353,22 @@ enum DaemonCommand {
     ///
     /// This does not prove native process inspection or stop/restart permission.
     ///
-    /// PER-038A / FIX-2: ownership is **daemon-reported**, not env-vs-TOML
-    /// string equality. Loads the profile token, runs whoami (start preflight),
-    /// and compares to the live daemon's `status.mattermost_username`. Used by
-    /// `make install-restart-daemons` so org-spanning seats whose ambient
-    /// `LANYTE_MM_BOT_USERNAME` diverges from profile TOML bot naming still
-    /// cycle their own daemon, while foreign seats stay left-running.
+    /// Loads the profile token, runs whoami and compares the result to the
+    /// live daemon's verified bot identity. The installer uses this as an
+    /// identity filter; a selected daemon must still pass independent process
+    /// ownership and termination checks before replacement.
     /// Requires an explicit profile (`--profile` / `CHANVOY_PROFILE` / identity).
     Ownable,
+}
+
+#[derive(Debug, Args)]
+struct ManagedServeArgs {
+    #[arg(long, hide = true, requires_all = ["runtime_instance", "runtime_config_root"])]
+    runtime_namespace: Option<String>,
+    #[arg(long, hide = true, requires_all = ["runtime_namespace", "runtime_config_root"])]
+    runtime_instance: Option<String>,
+    #[arg(long, hide = true, requires_all = ["runtime_namespace", "runtime_instance"])]
+    runtime_config_root: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1191,7 +1204,7 @@ async fn handle_version(
                         println!("     chanvoy daemon stop --profile {profile}");
                         println!("     chanvoy auto-setup");
                         println!(
-                            "     # or: make install-restart-daemons  (ownable profiles only)"
+                            "     # or: make install-restart-daemons  (identity-matched profiles; stop must also succeed)"
                         );
                     }
                     None => println!("Generation: unknown (incomplete pin on one side)"),
@@ -1205,7 +1218,7 @@ async fn handle_version(
                     .unwrap_or("ownership not determined");
                 println!("Generation: not scored ({why})");
                 println!(
-                    "         probed profile `{profile}` is not restart-ownable in this environment"
+                    "         probed profile `{profile}` has no verified bot-identity match in this environment"
                 );
                 println!(
                     "         target your seat: chanvoy --profile <your-profile> version --extended"
@@ -3469,7 +3482,12 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
             };
             print_start_assessment(json, &profile_config, &launched.assessment, "started")
         }
-        DaemonCommand::Serve => {
+        DaemonCommand::Serve(args) => {
+            if args.runtime_namespace.is_some() {
+                return Err(CliError::Bootstrap(
+                    "managed serve requires process-entry handoff".into(),
+                ));
+            }
             let health = start(profile).await?;
             print_json_or_text(
                 json,
