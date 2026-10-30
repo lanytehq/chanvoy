@@ -582,6 +582,32 @@ mod tests {
 
     #[test]
     fn duplicate_keeps_same_flock_description_after_holder_drop_without_unlock_or_relock() {
+        // A sibling test can fork while this test owns the lease. CLOEXEC only
+        // closes that inherited reference at exec, so run the release assertion
+        // in its own process, where unrelated test threads cannot copy its fds.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::authority::tests::duplicate_lease_child_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("LEASE_DUPLICATE_RELEASED"),
+            "isolated lease fixture: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "child helper; invoked by the duplicate lease test in a separate process"]
+    fn duplicate_lease_child_fixture() {
         // Generic persistent-base primitive proof, not real-C/bootstrap proof.
         let fixture = super::super::filesystem::tests::fixture();
         // SAFETY: pure effective UID getter.
@@ -629,6 +655,7 @@ mod tests {
         drop(duplicate);
         acquire(&observer).unwrap();
         assert!(dir.path().join(name).exists());
+        println!("LEASE_DUPLICATE_RELEASED");
     }
 
     /// Run explicitly on the qualified host. This never installs/cycles an
