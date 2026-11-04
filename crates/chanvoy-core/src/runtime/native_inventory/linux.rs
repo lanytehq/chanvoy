@@ -12,13 +12,28 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 #[cfg(target_os = "linux")]
+fn map_proc_io(error: std::io::Error) -> RuntimeError {
+    match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ESRCH) => {
+            RuntimeError::Changed("native inventory process exited")
+        }
+        Some(libc::EPERM | libc::EACCES) => {
+            RuntimeError::Unavailable("native inventory owner permission denied")
+        }
+        _ => RuntimeError::Unavailable("native inventory owner unreadable"),
+    }
+}
+#[cfg(target_os = "linux")]
 fn bounded(path: &std::path::Path, cap: usize) -> Result<Vec<u8>, RuntimeError> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(path)
+        .map_err(map_proc_io)?;
     let mut bytes = Vec::new();
-    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(map_proc_io)?;
     if bytes.len() > cap {
         return Err(RuntimeError::Unavailable("procfs metadata truncated"));
     }
@@ -29,7 +44,8 @@ fn visibility() -> Result<(std::fs::File, Vec<u8>), RuntimeError> {
     let root = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open("/proc")?;
+        .open("/proc")
+        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatfs(root.as_raw_fd(), &mut fs) } != 0
         || fs.f_type != libc::PROC_SUPER_MAGIC
@@ -39,17 +55,45 @@ fn visibility() -> Result<(std::fs::File, Vec<u8>), RuntimeError> {
     let mountinfo = bounded(
         std::path::Path::new("/proc/self/mountinfo"),
         4 * 1024 * 1024,
-    )?;
+    )
+    .map_err(|_| RuntimeError::Unavailable("native inventory mountinfo"))?;
     validate_mount_view(&mountinfo)?;
+    let init_name = std::ffi::CStr::from_bytes_with_nul(b"1\0").unwrap();
+    let mut init_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            init_name.as_ptr(),
+            &mut init_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+        || (init_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+    {
+        return Err(RuntimeError::Unavailable("native inventory init view"));
+    }
+    let self_pid = std::process::id();
+    let self_target = std::fs::read_link("/proc/self")
+        .map_err(|_| RuntimeError::Unavailable("native inventory self link"))?;
+    if self_target != std::path::Path::new(&self_pid.to_string()) {
+        return Err(RuntimeError::Unavailable(
+            "native inventory PID namespace view",
+        ));
+    }
     for kind in ["pid", "mnt"] {
-        let ours = std::fs::metadata(format!("/proc/self/ns/{kind}"))?;
-        let init = std::fs::metadata(format!("/proc/1/ns/{kind}"))?;
-        if (ours.dev(), ours.ino()) != (init.dev(), init.ino()) {
+        let ours = std::fs::metadata(format!("/proc/self/ns/{kind}"))
+            .map_err(|_| RuntimeError::Unavailable("native inventory namespace view"))?;
+        let direct = std::fs::metadata(format!("/proc/{self_pid}/ns/{kind}"))
+            .map_err(|_| RuntimeError::Unavailable("native inventory namespace view"))?;
+        if ours.ino() == 0 || (ours.dev(), ours.ino()) != (direct.dev(), direct.ino()) {
             return Err(RuntimeError::Unavailable("native inventory namespace view"));
         }
     }
-    let current = root.metadata()?;
-    let named = std::fs::symlink_metadata("/proc")?;
+    let current = root
+        .metadata()
+        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
+    let named = std::fs::symlink_metadata("/proc")
+        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
     if (current.dev(), current.ino()) != (named.dev(), named.ino()) {
         return Err(RuntimeError::Changed("native inventory procfs root"));
     }
@@ -113,7 +157,11 @@ pub(super) fn enumerate() -> Result<Vec<ProcessId>, RuntimeError> {
             )
         } != 0
         {
-            return Err(std::io::Error::last_os_error().into());
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) {
+                continue;
+            }
+            return Err(map_proc_io(error));
         }
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(RuntimeError::Unavailable(
@@ -126,8 +174,12 @@ pub(super) fn enumerate() -> Result<Vec<ProcessId>, RuntimeError> {
         }
     }
     let (after_root, after) = visibility()?;
-    let old = root.metadata()?;
-    let new = after_root.metadata()?;
+    let old = root
+        .metadata()
+        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
+    let new = after_root
+        .metadata()
+        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
     if before != after || (old.dev(), old.ino()) != (new.dev(), new.ino()) {
         return Err(RuntimeError::Changed("native inventory procfs mounts"));
     }

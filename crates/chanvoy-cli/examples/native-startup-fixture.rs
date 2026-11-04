@@ -58,7 +58,8 @@ fn main() {
                 && (args[1] == "--run-in-disposable-native-home"
                     || args[1] == "--run-retirement-in-disposable-native-home"
                     || args[1] == "--run-busy-in-disposable-native-home"
-                    || args[1] == "--run-cancel-in-disposable-native-home"),
+                    || args[1] == "--run-cancel-in-disposable-native-home"
+                    || args[1] == "--run-restart-in-disposable-native-home"),
             "requires explicit disposable-home fixture invocation",
         )?;
         require(
@@ -107,6 +108,7 @@ capability_class = "standard"
             args[1] != "--run-in-disposable-native-home",
             args[1] == "--run-busy-in-disposable-native-home",
             args[1] == "--run-cancel-in-disposable-native-home",
+            args[1] == "--run-restart-in-disposable-native-home",
         ))
     })();
     if let Err(error) = result {
@@ -162,7 +164,12 @@ async fn exchange(
     .await?
 }
 
-async fn run_parent(managed_retirement: bool, check_busy: bool, check_cancel: bool) -> Result<()> {
+async fn run_parent(
+    managed_retirement: bool,
+    check_busy: bool,
+    check_cancel: bool,
+    check_restart: bool,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let profile = chanvoy_core::load_profile("fixture-native")?;
     let authority = RuntimeAuthority::initialize()?;
@@ -251,6 +258,7 @@ async fn run_parent(managed_retirement: bool, check_busy: bool, check_cancel: bo
             deadline,
             check_busy,
             check_cancel,
+            check_restart,
         )
         .await;
     }
@@ -366,6 +374,7 @@ async fn run_managed_retirement(
     deadline: Instant,
     busy_checked: bool,
     cancel_at_first_pending: bool,
+    check_restart: bool,
 ) -> Result<()> {
     require(
         authority.observe_lease(&namespace)? == LeaseObservation::Contended,
@@ -474,6 +483,126 @@ async fn run_managed_retirement(
                 .exists(),
         "managed retirement removed or changed evidence",
     )?;
+    if check_restart {
+        let first_socket = running
+            .record
+            .socket
+            .as_ref()
+            .ok_or("running socket missing")?
+            .path
+            .to_path();
+        let socket_root = SocketRoot::initialize()?;
+        let (authority, operation, tombstone) = retirement.reap_exited(&exited, &socket_root)?;
+        require(
+            !first_socket.exists()
+                && tombstone.record.phase == RuntimePhase::Exited
+                && tombstone.record.revision == 4
+                && tombstone.record.socket.is_none()
+                && tombstone.record.process.is_none()
+                && !tombstone.record.ready,
+            "guarded reap did not remove predecessor socket and publish Exited tombstone",
+        )?;
+        require(
+            chanvoy_core::runtime::RuntimeBinding::resolve_profile("fixture-native")?.is_none(),
+            "Exited tombstone did not resolve to None",
+        )?;
+        let profile = chanvoy_core::load_profile("fixture-native")?;
+        let lease = authority.try_lifetime(&operation)?;
+        let starting = authority.create_starting(
+            &operation,
+            &lease,
+            &RuntimeRecord {
+                schema_version: 1,
+                namespace: namespace.clone(),
+                instance_uuid: InstanceId::new(),
+                revision: 0,
+                phase: RuntimePhase::Starting,
+                uid: authority.uid(),
+                config_root: running.record.config_root.clone(),
+                profile: profile.name.clone(),
+                process: None,
+                socket: None,
+                build: None,
+                ready: false,
+            },
+        )?;
+        let mut launch = managed_launch::ManagedLaunch::new(
+            authority,
+            operation,
+            lease,
+            starting.clone(),
+            SocketRoot::initialize()?,
+            deadline,
+        )?;
+        launch.spawn(
+            &profile,
+            &chanvoy_core::Identity {
+                id: "fixture-user".into(),
+                username: profile.bot_username.clone(),
+                is_bot: true,
+                nickname: None,
+                email: None,
+            },
+        )?;
+        let host = chanvoy_core::resolve_host_build_info();
+        let generation = RuntimeBuildPin {
+            version: host.version,
+            commit: host.commit,
+            dirty: host.dirty,
+        };
+        let ready2 = launch.accept(&generation).await?;
+        drop(launch);
+        require(
+            ready2.instance_uuid == starting.record.instance_uuid
+                && ready2.instance_uuid != running.record.instance_uuid,
+            "successor epoch did not establish fresh instance_uuid",
+        )?;
+        let resolved = chanvoy_core::runtime::RuntimeBinding::resolve_profile("fixture-native")?
+            .ok_or("successor binding did not resolve")?;
+        require(
+            resolved
+                .record()
+                .is_some_and(|r| r.record.instance_uuid == ready2.instance_uuid),
+            "resolved binding did not match successor epoch",
+        )?;
+        let running2 = observer
+            .read_record(&namespace)?
+            .ok_or("successor running record missing")?;
+        let operation2 = observer.try_operation(&namespace)?;
+        let mut retirement2 = managed_retire::ManagedRetirement::prepare(
+            observer,
+            operation2,
+            running2.clone(),
+            deadline,
+        )?;
+        match retirement2.request().await? {
+            managed_retire::RetirementReply::Accepted
+            | managed_retire::RetirementReply::NoAcknowledgement => {}
+            managed_retire::RetirementReply::Refused => {
+                return Err("successor retirement refused".into());
+            }
+        }
+        let exited2 = retirement2.observe_exit().await?;
+        let (_authority2, _operation2, tombstone2) =
+            retirement2.reap_exited(&exited2, &SocketRoot::initialize()?)?;
+        require(
+            tombstone2.record.phase == RuntimePhase::Exited
+                && !ready2.socket.path.to_path().exists(),
+            "successor reap did not complete",
+        )?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "fixture": "native-managed-restart",
+                "first_reaped_revision": 4,
+                "successor_ready_revision": 2,
+                "successor_reaped_revision": tombstone2.record.revision,
+                "cycled": true,
+                "qualification": false
+            })
+        );
+        return Ok(());
+    }
     drop(retirement);
     let _operation = observer.try_operation(&namespace)?;
     println!(

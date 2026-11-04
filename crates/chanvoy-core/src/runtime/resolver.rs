@@ -69,6 +69,45 @@ impl RuntimeBinding {
             kind: BindingKind::Legacy(socket),
         }
     }
+    /// Resolve the active runtime binding for `profile` when a v1 authority
+    /// record exists for the current account and config root, or fall back to
+    /// the legacy profile socket only when no v1 record exists for that
+    /// namespace. An `Exited` v1 tombstone returns `Ok(None)` without falling
+    /// back to legacy.
+    pub fn resolve_profile(profile: &str) -> Result<Option<Self>, RuntimeError> {
+        let Some(authority) = RuntimeAuthority::observe()? else {
+            return Ok(Some(Self::legacy(profile)));
+        };
+        let config_dir = crate::default_chanvoy_config_dir();
+        let canonical = match std::fs::canonicalize(&config_dir) {
+            Ok(path) => PathBytes::from_path(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(Self::legacy(profile)));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let namespace = Namespace::derive(authority.uid(), &canonical, profile)?;
+        let Some(snapshot) = authority.read_record(&namespace)? else {
+            return Ok(Some(Self::legacy(profile)));
+        };
+        match choose(
+            Some(snapshot),
+            Some(authority.path()),
+            &DiscoveryInventory {
+                v1_markers: MarkerInventory::Absent,
+                legacy: LegacyInventory::Absent,
+            },
+        )? {
+            RuntimeResolution::Located(binding) => {
+                binding.verify()?;
+                Ok(Some(binding))
+            }
+            RuntimeResolution::AbsentObservation => Ok(None),
+            RuntimeResolution::Uncertain(_) => Err(RuntimeError::Unavailable(
+                "unspawned starting runtime record",
+            )),
+        }
+    }
     pub fn socket_path(&self) -> &Path {
         match &self.kind {
             BindingKind::Legacy(path) => path,
@@ -159,6 +198,28 @@ fn choose(
     inventory: &DiscoveryInventory,
 ) -> Result<RuntimeResolution, RuntimeError> {
     if let Some(snapshot) = record {
+        if snapshot.record.phase == RuntimePhase::Exited {
+            if snapshot.record.socket.is_some()
+                || snapshot.record.process.is_some()
+                || snapshot.record.ready
+            {
+                return Err(RuntimeError::Invalid("exited record retains live claims"));
+            }
+            return Ok(match (&inventory.v1_markers, &inventory.legacy) {
+                (MarkerInventory::Present, _) => {
+                    RuntimeResolution::Uncertain(ResolutionUncertainty::MissingV1Record)
+                }
+                (MarkerInventory::Unknown, _) | (_, LegacyInventory::Unknown) => {
+                    RuntimeResolution::Uncertain(ResolutionUncertainty::InventoryUnknown)
+                }
+                (MarkerInventory::Absent, LegacyInventory::Absent) => {
+                    RuntimeResolution::AbsentObservation
+                }
+                (MarkerInventory::Absent, LegacyInventory::Sole(_) | LegacyInventory::Multiple) => {
+                    RuntimeResolution::Uncertain(ResolutionUncertainty::MultipleLegacy)
+                }
+            });
+        }
         let Some(socket) = snapshot.record.socket.as_ref().map(|s| s.path.to_path()) else {
             return Ok(RuntimeResolution::Uncertain(
                 ResolutionUncertainty::UnspawnedStarting,
@@ -266,5 +327,78 @@ mod tests {
         };
         assert_eq!(binding.socket_path(), Path::new("/observed/old.sock"));
         assert!(binding.record().is_none());
+    }
+
+    #[test]
+    fn exited_tombstone_resolves_absent_only_when_markers_and_legacy_are_absent() {
+        let uid = unsafe { libc::geteuid() };
+        let config_root = PathBytes::from_path(Path::new("/tmp/chanvoy-resolver-test")).unwrap();
+        let namespace = Namespace::derive(uid, &config_root, "seat").unwrap();
+        let record = super::super::RuntimeRecord {
+            schema_version: 1,
+            namespace,
+            instance_uuid: super::super::InstanceId::new(),
+            revision: 3,
+            phase: RuntimePhase::Exited,
+            uid,
+            config_root,
+            profile: "seat".into(),
+            process: None,
+            socket: None,
+            build: None,
+            ready: false,
+        };
+        let bytes = record.encode().unwrap();
+        let snapshot = RecordSnapshot {
+            record,
+            fingerprint: super::super::filesystem::FileFingerprint {
+                identity: InodeIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+                uid,
+                mode: libc::S_IFREG as u32 | 0o600,
+                size: bytes.len() as u64,
+                modified_secs: 1,
+                modified_nanos: 0,
+            },
+            bytes,
+        };
+        assert_eq!(
+            choose(
+                Some(snapshot.clone()),
+                Some(Path::new("/tmp/c")),
+                &DiscoveryInventory {
+                    v1_markers: MarkerInventory::Absent,
+                    legacy: LegacyInventory::Absent,
+                },
+            )
+            .unwrap(),
+            RuntimeResolution::AbsentObservation
+        );
+        assert!(matches!(
+            choose(
+                Some(snapshot.clone()),
+                Some(Path::new("/tmp/c")),
+                &DiscoveryInventory {
+                    v1_markers: MarkerInventory::Present,
+                    legacy: LegacyInventory::Absent,
+                },
+            )
+            .unwrap(),
+            RuntimeResolution::Uncertain(ResolutionUncertainty::MissingV1Record)
+        ));
+        assert!(matches!(
+            choose(
+                Some(snapshot),
+                Some(Path::new("/tmp/c")),
+                &DiscoveryInventory {
+                    v1_markers: MarkerInventory::Absent,
+                    legacy: LegacyInventory::Sole(PathBuf::from("/observed/old.sock")),
+                },
+            )
+            .unwrap(),
+            RuntimeResolution::Uncertain(ResolutionUncertainty::MultipleLegacy)
+        ));
     }
 }

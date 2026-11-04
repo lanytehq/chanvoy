@@ -3660,18 +3660,21 @@ fn cleanup_runtime_files(socket_path: &Path, pid_path: &Path) -> Result<(), io::
 
 #[derive(Clone)]
 pub struct DaemonClient {
+    profile_name: Option<String>,
     socket_path: PathBuf,
-    binding: chanvoy_core::runtime::RuntimeBinding,
+    binding: Option<chanvoy_core::runtime::RuntimeBinding>,
 }
 
 impl DaemonClient {
-    /// Explicit legacy profile locator. Runtime-v1 callers must supply the
-    /// independently resolved record binding through `from_runtime_binding`.
+    /// Profile locator that resolves an active runtime-v1 record binding when
+    /// present in `RuntimeAuthority`, or falls back to the legacy profile
+    /// socket only when no v1 record exists for the namespace.
     pub fn new(profile_name: &str) -> Self {
         let binding = chanvoy_core::runtime::RuntimeBinding::legacy(profile_name);
         Self {
+            profile_name: Some(profile_name.to_string()),
             socket_path: binding.socket_path().to_path_buf(),
-            binding,
+            binding: None,
         }
     }
 
@@ -3682,30 +3685,49 @@ impl DaemonClient {
     ) -> Result<Self, DaemonError> {
         binding.verify()?;
         Ok(Self {
+            profile_name: None,
             socket_path: binding.socket_path().to_path_buf(),
-            binding,
+            binding: Some(binding),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn with_socket_path(socket_path: PathBuf) -> Self {
         Self {
-            binding: chanvoy_core::runtime::RuntimeBinding::legacy_socket(socket_path.clone()),
+            profile_name: None,
+            binding: Some(chanvoy_core::runtime::RuntimeBinding::legacy_socket(
+                socket_path.clone(),
+            )),
             socket_path,
         }
     }
 
-    async fn connect_bound(&self) -> Result<UnixStream, DaemonError> {
-        self.binding.verify()?;
-        if !self.socket_path.exists() {
-            return Err(DaemonError::NotRunning(
-                self.socket_path.display().to_string(),
-            ));
+    async fn connect_bound(
+        &self,
+    ) -> Result<(UnixStream, chanvoy_core::runtime::RuntimeBinding), DaemonError> {
+        let binding = match &self.binding {
+            Some(binding) => binding.clone(),
+            None => {
+                let profile = self.profile_name.as_deref().unwrap_or_default();
+                match chanvoy_core::runtime::RuntimeBinding::resolve_profile(profile)? {
+                    Some(binding) => binding,
+                    None => {
+                        return Err(DaemonError::NotRunning(
+                            self.socket_path.display().to_string(),
+                        ));
+                    }
+                }
+            }
+        };
+        binding.verify()?;
+        let socket_path = binding.socket_path();
+        if !socket_path.exists() {
+            return Err(DaemonError::NotRunning(socket_path.display().to_string()));
         }
-        let stream = UnixStream::connect(&self.socket_path)
+        let stream = UnixStream::connect(socket_path)
             .await
-            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
-        if let Some(snapshot) = self.binding.record() {
+            .map_err(|_| DaemonError::NotRunning(socket_path.display().to_string()))?;
+        if let Some(snapshot) = binding.record() {
             let process = snapshot.record.process.as_ref().ok_or(
                 chanvoy_core::runtime::RuntimeError::Invalid("record peer process"),
             )?;
@@ -3717,8 +3739,8 @@ impl DaemonClient {
                 .into());
             }
         }
-        self.binding.verify()?;
-        Ok(stream)
+        binding.verify()?;
+        Ok((stream, binding))
     }
 
     pub async fn whoami(&self) -> Result<chanvoy_core::Identity, DaemonError> {
@@ -4152,7 +4174,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitFollowEvent) -> Result<(), DaemonError>,
     {
-        let mut stream = self.connect_bound().await?;
+        let (mut stream, binding) = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -4171,7 +4193,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-            self.binding.verify()?;
+            binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_FOLLOW_V1_EVENT_METHOD)
@@ -4259,7 +4281,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitFollowEvent) -> Result<(), DaemonError>,
     {
-        let mut stream = self.connect_bound().await?;
+        let (mut stream, binding) = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_DM_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -4278,7 +4300,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-            self.binding.verify()?;
+            binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_FOLLOW_V1_EVENT_METHOD)
@@ -4366,7 +4388,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitInboxFollowEvent) -> Result<(), DaemonError>,
     {
-        let mut stream = self.connect_bound().await?;
+        let (mut stream, binding) = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_INBOX_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -4385,7 +4407,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-            self.binding.verify()?;
+            binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_INBOX_FOLLOW_V1_EVENT_METHOD)
@@ -4459,7 +4481,7 @@ impl DaemonClient {
         R: DeserializeOwned,
         F: FnMut(E) -> Result<(), DaemonError>,
     {
-        let stream = self.connect_bound().await?;
+        let (stream, binding) = self.connect_bound().await?;
         let request = chanvoy_core::rpc_request(method, params);
         let (reader, mut writer) = stream.into_split();
         writer
@@ -4483,7 +4505,7 @@ impl DaemonClient {
                                 });
                             }
                             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-                self.binding.verify()?;
+                binding.verify()?;
                             line.clear();
                             value
                         }
@@ -4504,7 +4526,7 @@ impl DaemonClient {
                     });
                 }
                 let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-                self.binding.verify()?;
+                binding.verify()?;
                 line.clear();
                 value
             };
@@ -4637,9 +4659,9 @@ impl DaemonClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, DaemonError> {
-        let stream = self.connect_bound().await?;
+        let (stream, binding) = self.connect_bound().await?;
         let response = exchange(stream, method, params).await?;
-        self.binding.verify()?;
+        binding.verify()?;
         decode_response(response)
     }
 }

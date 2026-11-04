@@ -347,6 +347,14 @@ enum DaemonCommand {
     Serve(ManagedServeArgs),
     /// Stop the daemon for a profile. Requires an explicit profile.
     Stop,
+    /// Restart the daemon for a profile.
+    ///
+    /// Retires any running owned daemon for the profile, confirms whole-process
+    /// exit and socket cleanup, and starts a replacement daemon. When the
+    /// current runtime epoch is already retiring, completes that retirement
+    /// without starting a successor (`cycled = false`). Requires an explicit
+    /// profile (`--profile`, `CHANVOY_PROFILE`, or a sourced agent identity).
+    Restart,
     /// Report daemon health, including a live Mattermost identity probe.
     Status,
     /// Exit 0 if the current credential matches the live daemon's bot identity.
@@ -1299,9 +1307,12 @@ async fn execute(cli: Cli) -> Result<(), CliError> {
     // only ever reached with an explicit `--profile`, either from an operator
     // debugging in the foreground or from `spawn_durable_daemon`.
     let policy = match &cli.command {
-        CommandSet::Daemon(DaemonCommand::Stop | DaemonCommand::Start | DaemonCommand::Ownable) => {
-            chanvoy_core::FallbackPolicy::ExplicitOnly
-        }
+        CommandSet::Daemon(
+            DaemonCommand::Stop
+            | DaemonCommand::Start
+            | DaemonCommand::Restart
+            | DaemonCommand::Ownable,
+        ) => chanvoy_core::FallbackPolicy::ExplicitOnly,
         _ => chanvoy_core::FallbackPolicy::AllowReadFallbacks,
     };
     let profile = resolve_profile_name(cli.profile.as_deref(), policy)?;
@@ -3513,6 +3524,7 @@ async fn handle_daemon(profile: &str, json: bool, command: DaemonCommand) -> Res
             }
             Ok(())
         }
+        DaemonCommand::Restart => handle_daemon_restart(profile, json).await,
         DaemonCommand::Status => {
             let mut daemon_status = status(profile).await.map_err(|error| match error {
                 DaemonError::Json(_) => {
@@ -3756,12 +3768,21 @@ async fn handle_auto_setup(
         ProfileAction::Reuse => {
             let existing = existing.expect("Reuse implies existing profile");
             reuse_candidate = lifecycle::ReuseCandidate::capture(&existing.name).await;
-            let binding = reuse_candidate
-                .as_ref()
-                .map(|c| c.binding().clone())
-                .unwrap_or_else(|| chanvoy_core::runtime::RuntimeBinding::legacy(&existing.name));
-            let assessment =
-                daemon_assessment::assess_binding_until(&existing, deadline, binding).await?;
+            let assessment = match match reuse_candidate.as_ref() {
+                Some(candidate) => Some(candidate.binding().clone()),
+                None => chanvoy_core::runtime::RuntimeBinding::resolve_profile(&existing.name)
+                    .map_err(DaemonError::from)?,
+            } {
+                Some(binding) => {
+                    daemon_assessment::assess_binding_until(&existing, deadline, binding).await?
+                }
+                None => daemon_assessment::Assessment {
+                    disposition: DaemonDisposition::UnresponsiveLocal,
+                    status: None,
+                    observation_ready: None,
+                    pin_invalid: false,
+                },
+            };
             if assessment.disposition == DaemonDisposition::DegradedRemote {
                 let generation =
                     require_matching_reuse(json, &existing, &assessment, reuse_candidate.as_ref())
@@ -4052,7 +4073,13 @@ fn generation_from_assessment(assessment: &daemon_assessment::Assessment) -> gen
 }
 
 async fn observe_generation(profile: &str) -> generation::Evidence {
-    observe_generation_bound(chanvoy_core::runtime::RuntimeBinding::legacy(profile)).await
+    let Some(binding) = chanvoy_core::runtime::RuntimeBinding::resolve_profile(profile)
+        .ok()
+        .flatten()
+    else {
+        return generation::Evidence::compare(resolve_host_build_info(), None, false);
+    };
+    observe_generation_bound(binding).await
 }
 async fn observe_generation_bound(
     binding: chanvoy_core::runtime::RuntimeBinding,
@@ -4500,6 +4527,14 @@ struct DaemonLaunch {
     assessment: daemon_assessment::Assessment,
 }
 
+fn resolved_socket_path_for_profile(profile_name: &str) -> PathBuf {
+    chanvoy_core::runtime::RuntimeBinding::resolve_profile(profile_name)
+        .ok()
+        .flatten()
+        .map(|binding| binding.socket_path().to_path_buf())
+        .unwrap_or_else(|| socket_path_for_profile(profile_name))
+}
+
 fn print_start_assessment(
     json: bool,
     profile: &Profile,
@@ -4513,7 +4548,7 @@ fn print_start_assessment(
         provider: profile.provider.clone(),
         bot_username: profile.bot_username.clone(),
         server_url: profile.server_url.clone(),
-        socket_path: socket_path_for_profile(&profile.name),
+        socket_path: resolved_socket_path_for_profile(&profile.name),
     })?;
     receipt["daemon_disposition"] = serde_json::to_value(assessment.disposition)?;
     receipt["observation_ready"] = serde_json::to_value(assessment.observation_ready)?;
@@ -4528,6 +4563,85 @@ fn print_start_assessment(
                 .observation_ready
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "unknown".into())
+        );
+    }
+    Ok(())
+}
+
+fn print_restart_assessment(
+    json: bool,
+    profile: &Profile,
+    assessment: &daemon_assessment::Assessment,
+    predecessor: Option<generation::Evidence>,
+    cycled: bool,
+) -> Result<(), CliError> {
+    let mut generation = generation_from_assessment(assessment);
+    if let Some(prior) = predecessor {
+        let confirmed = cycled && generation.generation_match == Some(true);
+        generation = generation.refreshed(prior, false, false, confirmed);
+    }
+    let mut receipt = serde_json::to_value(ProfileStatus {
+        profile_name: profile.name.clone(),
+        role: profile.role.clone(),
+        scope: profile.scope.clone(),
+        provider: profile.provider.clone(),
+        bot_username: profile.bot_username.clone(),
+        server_url: profile.server_url.clone(),
+        socket_path: resolved_socket_path_for_profile(&profile.name),
+    })?;
+    receipt["daemon_disposition"] = serde_json::to_value(assessment.disposition)?;
+    receipt["observation_ready"] = serde_json::to_value(assessment.observation_ready)?;
+    receipt["restarted"] = serde_json::Value::Bool(cycled);
+    receipt["cycled"] = serde_json::Value::Bool(cycled);
+    receipt["completion_only"] = serde_json::Value::Bool(false);
+    receipt["generation"] = serde_json::to_value(&generation)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        let action = if cycled { "restarted" } else { "started" };
+        println!(
+            "daemon {action} for profile {}: {}; observation_ready={}; cycled={cycled}",
+            profile.name,
+            assessment.disposition.label(),
+            assessment
+                .observation_ready
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+    }
+    Ok(())
+}
+
+fn print_restart_completion_only(
+    json: bool,
+    profile: &Profile,
+    predecessor: Option<generation::Evidence>,
+) -> Result<(), CliError> {
+    let mut generation = generation::Evidence::compare(resolve_host_build_info(), None, false);
+    if let Some(prior) = predecessor {
+        generation = generation.refreshed(prior, false, false, false);
+    }
+    let mut receipt = serde_json::to_value(ProfileStatus {
+        profile_name: profile.name.clone(),
+        role: profile.role.clone(),
+        scope: profile.scope.clone(),
+        provider: profile.provider.clone(),
+        bot_username: profile.bot_username.clone(),
+        server_url: profile.server_url.clone(),
+        socket_path: socket_path_for_profile(&profile.name),
+    })?;
+    receipt["daemon_disposition"] = serde_json::to_value(DaemonDisposition::UnresponsiveLocal)?;
+    receipt["observation_ready"] = serde_json::Value::Bool(false);
+    receipt["restarted"] = serde_json::Value::Bool(false);
+    receipt["cycled"] = serde_json::Value::Bool(false);
+    receipt["completion_only"] = serde_json::Value::Bool(true);
+    receipt["generation"] = serde_json::to_value(&generation)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!(
+            "daemon retirement completed for profile {} without launching a successor (cycled=false)",
+            profile.name
         );
     }
     Ok(())
@@ -4663,6 +4777,31 @@ async fn spawn_durable_daemon(
     identity: &Identity,
     profile_name: &str,
 ) -> Result<ProfileStatus, CliError> {
+    if let Some((authority, config_root, namespace)) =
+        observe_v1_namespace(profile_name).map_err(DaemonError::from)?
+    {
+        if authority
+            .read_record(&namespace)
+            .map_err(DaemonError::from)?
+            .is_some()
+        {
+            let operation = authority
+                .try_operation(&namespace)
+                .map_err(DaemonError::from)?;
+            let deadline = std::time::Instant::now() + SPAWN_READY_DEADLINE;
+            launch_v1_under_operation(
+                authority,
+                operation,
+                config_root,
+                namespace,
+                profile,
+                identity,
+                deadline,
+            )
+            .await?;
+            return ping(profile_name).await.map_err(CliError::from);
+        }
+    }
     spawn_durable_daemon_with(profile, identity, profile_name, |cmd| cmd.spawn()).await
 }
 
@@ -5096,7 +5235,446 @@ fn detach_into_new_session(_cmd: &mut Command) {
 
 /// Stop only a revalidated predecessor and retain state unless death is confirmed.
 async fn stop_daemon_if_present(profile: &str) -> Result<(), CliError> {
+    if let Some((authority, _config_root, namespace)) =
+        observe_v1_namespace(profile).map_err(DaemonError::from)?
+    {
+        if authority
+            .read_record(&namespace)
+            .map_err(DaemonError::from)?
+            .is_some()
+        {
+            let operation = authority
+                .try_operation(&namespace)
+                .map_err(DaemonError::from)?;
+            let Some(snapshot) = authority
+                .read_record(&namespace)
+                .map_err(DaemonError::from)?
+            else {
+                return Err(CliError::Bootstrap(
+                    "runtime record disappeared under operation lock; state retained".into(),
+                ));
+            };
+            let deadline = std::time::Instant::now() + daemon_assessment::OPERATION_BUDGET;
+            match snapshot.record.phase {
+                chanvoy_core::runtime::RuntimePhase::Exited => {
+                    ensure_no_conflicting_v1_candidates(
+                        &authority, &operation, &namespace, deadline,
+                    )?;
+                    return Ok(());
+                }
+                chanvoy_core::runtime::RuntimePhase::Running
+                | chanvoy_core::runtime::RuntimePhase::Retiring => {
+                    let _ = retire_and_reap_v1_under_operation(
+                        authority, operation, snapshot, deadline,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                chanvoy_core::runtime::RuntimePhase::Starting => {
+                    return Err(CliError::Bootstrap(
+                        "starting runtime record requires bootstrap reconciliation; state retained"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
     lifecycle::stop(profile).await.map_err(CliError::Bootstrap)
+}
+
+fn observe_v1_namespace(
+    profile: &str,
+) -> Result<
+    Option<(
+        chanvoy_core::runtime::RuntimeAuthority,
+        chanvoy_core::runtime::PathBytes,
+        chanvoy_core::runtime::Namespace,
+    )>,
+    chanvoy_core::runtime::RuntimeError,
+> {
+    use chanvoy_core::runtime::{Namespace, PathBytes, RuntimeAuthority};
+    let Some(authority) = RuntimeAuthority::observe()? else {
+        return Ok(None);
+    };
+    let config_dir = chanvoy_core::default_chanvoy_config_dir();
+    let canonical = match std::fs::canonicalize(&config_dir) {
+        Ok(path) => PathBytes::from_path(&path)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let namespace = Namespace::derive(authority.uid(), &canonical, profile)?;
+    Ok(Some((authority, canonical, namespace)))
+}
+
+fn ensure_no_conflicting_v1_candidates(
+    authority: &chanvoy_core::runtime::RuntimeAuthority,
+    operation: &chanvoy_core::runtime::OperationLock,
+    namespace: &chanvoy_core::runtime::Namespace,
+    deadline: std::time::Instant,
+) -> Result<(), CliError> {
+    use chanvoy_core::runtime::{NativeCandidateKind, NativeInventory};
+    let inventory = NativeInventory::scan_unreferenced(authority, operation, deadline)
+        .map_err(DaemonError::from)?;
+    for candidate in &inventory.candidates {
+        match &candidate.kind {
+            NativeCandidateKind::Legacy { .. } => {
+                return Err(CliError::Bootstrap(
+                    "legacy daemon candidate requires manual reconciliation; state retained".into(),
+                ));
+            }
+            NativeCandidateKind::Managed(marker) if &marker.namespace == namespace => {
+                return Err(CliError::Bootstrap(
+                    "managed daemon candidate for namespace still present; state retained".into(),
+                ));
+            }
+            NativeCandidateKind::Managed(_) => {}
+        }
+    }
+    Ok(())
+}
+
+async fn retire_and_reap_v1_under_operation(
+    authority: chanvoy_core::runtime::RuntimeAuthority,
+    operation: chanvoy_core::runtime::OperationLock,
+    snapshot: chanvoy_core::runtime::RecordSnapshot,
+    deadline: std::time::Instant,
+) -> Result<
+    (
+        chanvoy_core::runtime::RuntimeAuthority,
+        chanvoy_core::runtime::OperationLock,
+        chanvoy_core::runtime::RecordSnapshot,
+        bool,
+    ),
+    CliError,
+> {
+    use chanvoy_core::runtime::{NativeInventory, RuntimePhase, SocketRoot};
+    let completion_only = snapshot.record.phase == RuntimePhase::Retiring;
+    let process = snapshot
+        .record
+        .process
+        .as_ref()
+        .ok_or_else(|| CliError::Bootstrap("runtime record missing process identity".into()))?
+        .clone();
+    if process.revalidate().is_err() {
+        let inventory = NativeInventory::scan_unreferenced(&authority, &operation, deadline)
+            .map_err(DaemonError::from)?;
+        let exit = lifecycle::WholeProcessExit::confirm_already_exited(
+            &process,
+            &inventory,
+            operation.namespace(),
+        )
+        .map_err(DaemonError::from)?;
+        let _ = exit.process();
+        let socket_root = SocketRoot::initialize().map_err(DaemonError::from)?;
+        let exited = authority
+            .reap_exited(&operation, &snapshot, &socket_root)
+            .map_err(DaemonError::from)?;
+        return Ok((authority, operation, exited, completion_only));
+    }
+    let mut retirement =
+        managed_retire::ManagedRetirement::prepare(authority, operation, snapshot, deadline)
+            .map_err(DaemonError::from)?;
+    match retirement.request().await.map_err(DaemonError::from)? {
+        managed_retire::RetirementReply::Accepted
+        | managed_retire::RetirementReply::NoAcknowledgement => {
+            let observed = retirement.observe_exit().await.map_err(DaemonError::from)?;
+            let socket_root = SocketRoot::initialize().map_err(DaemonError::from)?;
+            let (authority, operation, exited) = retirement
+                .reap_exited(&observed, &socket_root)
+                .map_err(DaemonError::from)?;
+            Ok((authority, operation, exited, completion_only))
+        }
+        managed_retire::RetirementReply::Refused => {
+            let detail = match retirement.last_refusal() {
+                Some(refusal) => format!(
+                    "daemon retirement refused ({}: {}; requests={}, slots={}, streams={}); state retained",
+                    refusal.outcome, refusal.reason, refusal.requests, refusal.slots, refusal.streams
+                ),
+                None => "daemon retirement refused; state retained".into(),
+            };
+            Err(CliError::Bootstrap(detail))
+        }
+    }
+}
+
+async fn launch_v1_under_operation(
+    authority: chanvoy_core::runtime::RuntimeAuthority,
+    operation: chanvoy_core::runtime::OperationLock,
+    config_root: chanvoy_core::runtime::PathBytes,
+    namespace: chanvoy_core::runtime::Namespace,
+    profile: &Profile,
+    identity: &Identity,
+    deadline: std::time::Instant,
+) -> Result<chanvoy_core::runtime::RuntimeReadiness, CliError> {
+    use chanvoy_core::runtime::{
+        InstanceId, RuntimeBuildPin, RuntimePhase, RuntimeRecord, SocketRoot,
+    };
+    ensure_no_conflicting_v1_candidates(&authority, &operation, &namespace, deadline)?;
+    let lease = authority
+        .try_lifetime(&operation)
+        .map_err(DaemonError::from)?;
+    let starting = authority
+        .create_starting(
+            &operation,
+            &lease,
+            &RuntimeRecord {
+                schema_version: 1,
+                namespace,
+                instance_uuid: InstanceId::new(),
+                revision: 0,
+                phase: RuntimePhase::Starting,
+                uid: authority.uid(),
+                config_root,
+                profile: profile.name.clone(),
+                process: None,
+                socket: None,
+                build: None,
+                ready: false,
+            },
+        )
+        .map_err(DaemonError::from)?;
+    let socket_root = SocketRoot::initialize().map_err(DaemonError::from)?;
+    let mut launch = managed_launch::ManagedLaunch::new(
+        authority,
+        operation,
+        lease,
+        starting,
+        socket_root,
+        deadline,
+    )
+    .map_err(DaemonError::from)?;
+    launch.spawn(profile, identity).map_err(DaemonError::from)?;
+    let host = resolve_host_build_info();
+    let generation = RuntimeBuildPin {
+        version: host.version,
+        commit: host.commit,
+        dirty: host.dirty,
+    };
+    let ready = launch
+        .accept(&generation)
+        .await
+        .map_err(DaemonError::from)?;
+    drop(launch);
+    Ok(ready)
+}
+
+async fn handle_daemon_restart(profile: &str, json: bool) -> Result<(), CliError> {
+    let deadline = daemon_assessment::deadline();
+    let std_deadline = std::time::Instant::now() + daemon_assessment::OPERATION_BUDGET;
+    let profile_config = load_profile(profile)?;
+    let predecessor_candidate = lifecycle::ReuseCandidate::capture(&profile_config.name).await;
+    let existing = daemon_assessment::assess_until(&profile_config, deadline).await;
+    if !profile_config.bot_username.is_empty() {
+        if let Some(status) = &existing.status {
+            if daemon_reuse_decision(status, &profile_config.bot_username)
+                == DaemonReuseDecision::RefuseForeign
+            {
+                let error = CliError::DaemonAssessment {
+                    disposition: DaemonDisposition::IdentityRefused,
+                    detail: "daemon's observed identity belongs to another profile; state retained"
+                        .into(),
+                };
+                print_start_failure(
+                    json,
+                    &profile_config,
+                    DaemonDisposition::IdentityRefused,
+                    &error,
+                )?;
+                return Err(error);
+            }
+        }
+    }
+    let had_predecessor = predecessor_candidate.is_some() || existing.status.is_some();
+    let predecessor_generation = if had_predecessor {
+        let mut observed = generation_from_assessment(&existing);
+        if observed.generation_match.is_some()
+            && !candidate_unchanged(predecessor_candidate.as_ref(), &profile_config.name).await
+        {
+            observed = observed.unconfirmed();
+        }
+        Some(observed)
+    } else {
+        None
+    };
+    let identity = match within_health_budget(
+        deadline,
+        validate_persisted_profile_identity(&profile_config),
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            print_start_failure(
+                json,
+                &profile_config,
+                failure_disposition(&error, existing.disposition),
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
+    if let Some(status) = &existing.status {
+        if daemon_reuse_decision(status, &identity.username) == DaemonReuseDecision::RefuseForeign {
+            let error = CliError::DaemonAssessment {
+                disposition: DaemonDisposition::IdentityRefused,
+                detail: "daemon's observed identity belongs to another profile; state retained"
+                    .into(),
+            };
+            print_start_failure(
+                json,
+                &profile_config,
+                DaemonDisposition::IdentityRefused,
+                &error,
+            )?;
+            return Err(error);
+        }
+    }
+    if let Some((authority, config_root, namespace)) =
+        observe_v1_namespace(&profile_config.name).map_err(DaemonError::from)?
+    {
+        if authority
+            .read_record(&namespace)
+            .map_err(DaemonError::from)?
+            .is_some()
+        {
+            let operation = authority
+                .try_operation(&namespace)
+                .map_err(DaemonError::from)?;
+            let snapshot = authority
+                .read_record(&namespace)
+                .map_err(DaemonError::from)?
+                .ok_or_else(|| {
+                    CliError::Bootstrap(
+                        "runtime record disappeared under operation lock; state retained".into(),
+                    )
+                })?;
+            match snapshot.record.phase {
+                chanvoy_core::runtime::RuntimePhase::Retiring => {
+                    let (_authority, _operation, _exited, _) = retire_and_reap_v1_under_operation(
+                        authority,
+                        operation,
+                        snapshot,
+                        std_deadline,
+                    )
+                    .await?;
+                    return print_restart_completion_only(
+                        json,
+                        &profile_config,
+                        predecessor_generation,
+                    );
+                }
+                chanvoy_core::runtime::RuntimePhase::Running => {
+                    let (authority, operation, _exited, _) = retire_and_reap_v1_under_operation(
+                        authority,
+                        operation,
+                        snapshot,
+                        std_deadline,
+                    )
+                    .await?;
+                    launch_v1_under_operation(
+                        authority,
+                        operation,
+                        config_root,
+                        namespace,
+                        &profile_config,
+                        &identity,
+                        std_deadline,
+                    )
+                    .await?;
+                    let assessment =
+                        daemon_assessment::assess_until(&profile_config, deadline).await;
+                    if !assessment.disposition.successful() {
+                        let error = CliError::DaemonAssessment {
+                            disposition: assessment.disposition,
+                            detail: "newly restarted daemon did not establish usable local identity; state retained".into(),
+                        };
+                        print_start_failure(json, &profile_config, assessment.disposition, &error)?;
+                        return Err(error);
+                    }
+                    return print_restart_assessment(
+                        json,
+                        &profile_config,
+                        &assessment,
+                        predecessor_generation,
+                        true,
+                    );
+                }
+                chanvoy_core::runtime::RuntimePhase::Exited => {
+                    launch_v1_under_operation(
+                        authority,
+                        operation,
+                        config_root,
+                        namespace,
+                        &profile_config,
+                        &identity,
+                        std_deadline,
+                    )
+                    .await?;
+                    let assessment =
+                        daemon_assessment::assess_until(&profile_config, deadline).await;
+                    if !assessment.disposition.successful() {
+                        let error = CliError::DaemonAssessment {
+                            disposition: assessment.disposition,
+                            detail: "newly started daemon did not establish usable local identity; state retained".into(),
+                        };
+                        print_start_failure(json, &profile_config, assessment.disposition, &error)?;
+                        return Err(error);
+                    }
+                    return print_restart_assessment(
+                        json,
+                        &profile_config,
+                        &assessment,
+                        None,
+                        false,
+                    );
+                }
+                chanvoy_core::runtime::RuntimePhase::Starting => {
+                    return Err(CliError::Bootstrap(
+                        "starting runtime record requires bootstrap reconciliation; state retained"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
+    if let Err(error) = stop_daemon_if_present(&profile_config.name).await {
+        let err = CliError::DaemonAssessment {
+            disposition: existing.disposition,
+            detail: error.to_string(),
+        };
+        print_start_failure(json, &profile_config, existing.disposition, &err)?;
+        return Err(err);
+    }
+    if let Err(error) = spawn_durable_daemon(&profile_config, &identity, &profile_config.name).await
+    {
+        print_start_failure(
+            json,
+            &profile_config,
+            failure_disposition(&error, DaemonDisposition::UnresponsiveLocal),
+            &error,
+        )?;
+        return Err(error);
+    }
+    let assessment = daemon_assessment::assess_until(&profile_config, deadline).await;
+    if !assessment.disposition.successful() {
+        let error = CliError::DaemonAssessment {
+            disposition: assessment.disposition,
+            detail: "newly started daemon did not establish usable local identity; state retained"
+                .into(),
+        };
+        print_start_failure(json, &profile_config, assessment.disposition, &error)?;
+        return Err(error);
+    }
+    let cycled = predecessor_candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.terminated());
+    print_restart_assessment(
+        json,
+        &profile_config,
+        &assessment,
+        predecessor_generation,
+        cycled,
+    )
 }
 
 /// Read the daemon's pid from the runtime-dir pid file. Returns None on any
@@ -9468,5 +10046,16 @@ mod tests {
             socket_inode
         );
         drop(listener);
+    }
+
+    #[test]
+    fn daemon_restart_subcommand_parses_with_explicit_profile() {
+        let cli = Cli::try_parse_from(["chanvoy", "--profile", "seat-a", "daemon", "restart"])
+            .expect("daemon restart should parse");
+        assert_eq!(cli.profile.as_deref(), Some("seat-a"));
+        assert!(matches!(
+            cli.command,
+            CommandSet::Daemon(DaemonCommand::Restart)
+        ));
     }
 }

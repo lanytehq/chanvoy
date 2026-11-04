@@ -105,10 +105,10 @@ pub(super) struct ReuseCandidate {
 
 impl ReuseCandidate {
     pub(super) async fn capture(profile: &str) -> Option<Self> {
-        Self::capture_binding(chanvoy_core::runtime::RuntimeBinding::legacy(profile))
-            .await
+        let binding = chanvoy_core::runtime::RuntimeBinding::resolve_profile(profile)
             .ok()
-            .flatten()
+            .flatten()?;
+        Self::capture_binding(binding).await.ok().flatten()
     }
 
     #[cfg(test)]
@@ -394,6 +394,44 @@ pub(super) struct WholeProcessExit {
 impl WholeProcessExit {
     pub(super) fn process(&self) -> &chanvoy_core::runtime::RuntimeProcess {
         &self.process
+    }
+
+    pub(super) fn confirm_already_exited(
+        process: &chanvoy_core::runtime::RuntimeProcess,
+        inventory: &chanvoy_core::runtime::NativeInventory,
+        namespace: &chanvoy_core::runtime::Namespace,
+    ) -> Result<Self, chanvoy_core::runtime::RuntimeError> {
+        use chanvoy_core::runtime::{NativeCandidateKind, RuntimeError};
+        for candidate in &inventory.candidates {
+            match &candidate.kind {
+                NativeCandidateKind::Legacy { .. } => {
+                    return Err(RuntimeError::Unavailable(
+                        "legacy candidate requires manual reconciliation",
+                    ));
+                }
+                NativeCandidateKind::Managed(marker) if &marker.namespace == namespace => {
+                    return Err(RuntimeError::Changed(
+                        "managed target still present in native inventory",
+                    ));
+                }
+                NativeCandidateKind::Managed(_) => {}
+            }
+        }
+        let pid = process.pid.get();
+        let Some(expected_birth) = birth_claim(&process.birth) else {
+            return Err(RuntimeError::Invalid("recorded process birth"));
+        };
+        let exited = native_birth(pid).is_some_and(|birth| birth != expected_birth)
+            || native_terminated(pid)
+            || matches!(death_or_unknown(pid), ProcessObservation::Dead);
+        if !exited {
+            return Err(RuntimeError::Unavailable(
+                "managed whole-process exit unconfirmed",
+            ));
+        }
+        Ok(Self {
+            process: process.clone(),
+        })
     }
 }
 #[allow(dead_code)]

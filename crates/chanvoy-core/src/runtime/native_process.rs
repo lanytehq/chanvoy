@@ -101,11 +101,19 @@ fn observe_once(pid: ProcessId) -> Result<RuntimeProcess, RuntimeError> {
     use super::InodeIdentity;
     use std::os::unix::fs::MetadataExt;
     let root = std::path::PathBuf::from(format!("/proc/{}", pid.get()));
+    let map_meta_io = |error: std::io::Error| match error.raw_os_error() {
+        Some(libc::EPERM | libc::EACCES) => {
+            RuntimeError::Unavailable("native process birth/owner permission denied")
+        }
+        _ => RuntimeError::Unavailable("native process birth/owner incomplete"),
+    };
     let read = |name: &str| -> Result<String, RuntimeError> {
         use std::io::Read;
-        let file = std::fs::File::open(root.join(name))?;
+        let file = std::fs::File::open(root.join(name)).map_err(map_meta_io)?;
         let mut bytes = Vec::new();
-        file.take(65_537).read_to_end(&mut bytes)?;
+        file.take(65_537)
+            .read_to_end(&mut bytes)
+            .map_err(map_meta_io)?;
         if bytes.len() > 65_536 {
             return Err(RuntimeError::Invalid("native process metadata size"));
         }
@@ -114,13 +122,25 @@ fn observe_once(pid: ProcessId) -> Result<RuntimeProcess, RuntimeError> {
     };
     let clock_ticks = linux_birth(&read("stat")?, pid)?;
     let uid = linux_effective_uid(&read("status")?)?;
-    let executable = std::fs::read_link(root.join("exe"))?;
+    let executable = std::fs::read_link(root.join("exe")).map_err(|error| {
+        if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+            RuntimeError::Unavailable("native executable path permission denied")
+        } else {
+            RuntimeError::Unavailable("native executable path incomplete")
+        }
+    })?;
     use std::os::unix::ffi::OsStrExt;
     if executable.as_os_str().as_bytes().ends_with(b" (deleted)") {
         return Err(RuntimeError::Unavailable("deleted native executable"));
     }
     let namespace = |name: &str| -> Result<InodeIdentity, RuntimeError> {
-        let meta = std::fs::metadata(root.join("ns").join(name))?;
+        let meta = std::fs::metadata(root.join("ns").join(name)).map_err(|error| {
+            if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+                RuntimeError::Unavailable("native namespace permission denied")
+            } else {
+                RuntimeError::Unavailable("native namespace incomplete")
+            }
+        })?;
         if meta.ino() == 0 {
             return Err(RuntimeError::Invalid("native namespace identity"));
         }
@@ -255,8 +275,8 @@ impl RelevanceIdentity {
         self.pid == full.pid
             && self.uid == full.uid
             && self.birth == full.birth
-            && self.pid_namespace == full.pid_namespace
-            && self.mount_namespace == full.mount_namespace
+            && (self.pid_namespace.is_none() || self.pid_namespace == full.pid_namespace)
+            && (self.mount_namespace.is_none() || self.mount_namespace == full.mount_namespace)
     }
 }
 #[cfg(target_os = "macos")]
@@ -264,6 +284,7 @@ fn relevance_once(pid: ProcessId) -> Result<RelevanceIdentity, RuntimeError> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     let read = unsafe {
+        *libc::__error() = 0;
         libc::proc_pidinfo(
             pid.get() as i32,
             libc::PROC_PIDTBSDINFO,
@@ -272,7 +293,13 @@ fn relevance_once(pid: ProcessId) -> Result<RelevanceIdentity, RuntimeError> {
             size,
         )
     };
+    let errno = std::io::Error::last_os_error().raw_os_error();
     if read != size {
+        if matches!(errno, Some(libc::EPERM | libc::EACCES)) {
+            return Err(RuntimeError::Unavailable(
+                "native relevance birth/owner permission denied",
+            ));
+        }
         return Err(RuntimeError::Unavailable(
             "native relevance birth/owner unreadable",
         ));
@@ -294,28 +321,25 @@ fn relevance_once(pid: ProcessId) -> Result<RelevanceIdentity, RuntimeError> {
 #[cfg(target_os = "linux")]
 fn relevance_once(pid: ProcessId) -> Result<RelevanceIdentity, RuntimeError> {
     use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
     let root = std::path::PathBuf::from(format!("/proc/{}", pid.get()));
+    let map_io = |error: std::io::Error| match error.raw_os_error() {
+        Some(libc::EPERM | libc::EACCES) => {
+            RuntimeError::Unavailable("native relevance birth/owner permission denied")
+        }
+        _ => RuntimeError::Unavailable("native relevance birth/owner unreadable"),
+    };
     let read = |name: &str| -> Result<String, RuntimeError> {
         let mut bytes = Vec::new();
-        std::fs::File::open(root.join(name))?
+        std::fs::File::open(root.join(name))
+            .map_err(map_io)?
             .take(65_537)
-            .read_to_end(&mut bytes)?;
+            .read_to_end(&mut bytes)
+            .map_err(map_io)?;
         if bytes.len() > 65_536 {
             return Err(RuntimeError::Unavailable("native relevance metadata cap"));
         }
         String::from_utf8(bytes)
             .map_err(|_| RuntimeError::Invalid("native relevance metadata encoding"))
-    };
-    let namespace = |name: &str| -> Result<super::InodeIdentity, RuntimeError> {
-        let m = std::fs::metadata(root.join("ns").join(name))?;
-        if m.ino() == 0 {
-            return Err(RuntimeError::Invalid("native relevance namespace"));
-        }
-        Ok(super::InodeIdentity {
-            device: m.dev(),
-            inode: m.ino(),
-        })
     };
     Ok(RelevanceIdentity {
         pid,
@@ -323,8 +347,8 @@ fn relevance_once(pid: ProcessId) -> Result<RelevanceIdentity, RuntimeError> {
         birth: NativeBirth::Linux {
             clock_ticks: linux_birth(&read("stat")?, pid)?,
         },
-        pid_namespace: Some(namespace("pid")?),
-        mount_namespace: Some(namespace("mnt")?),
+        pid_namespace: None,
+        mount_namespace: None,
     })
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

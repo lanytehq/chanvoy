@@ -132,13 +132,18 @@ impl AssessmentProbe for ProfileProbe {
 }
 
 pub(super) async fn assess_until(profile: &Profile, deadline: tokio::time::Instant) -> Assessment {
-    match assess_binding_until(
-        profile,
-        deadline,
-        chanvoy_core::runtime::RuntimeBinding::legacy(&profile.name),
-    )
-    .await
-    {
+    let Some(binding) = chanvoy_core::runtime::RuntimeBinding::resolve_profile(&profile.name)
+        .ok()
+        .flatten()
+    else {
+        return Assessment {
+            disposition: DaemonDisposition::UnresponsiveLocal,
+            status: None,
+            observation_ready: None,
+            pin_invalid: false,
+        };
+    };
+    match assess_binding_until(profile, deadline, binding).await {
         Ok(assessment) => assessment,
         Err(_) => Assessment {
             disposition: DaemonDisposition::UnresponsiveLocal,

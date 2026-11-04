@@ -24,7 +24,16 @@ pub(crate) struct ManagedRetirement {
     exit: super::lifecycle::ManagedExitWatch,
     entered_retiring: bool,
     sent: bool,
+    last_refusal: Option<RetirementRefusal>,
     deadline: Instant,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetirementRefusal {
+    pub(crate) outcome: String,
+    pub(crate) reason: String,
+    pub(crate) requests: u64,
+    pub(crate) slots: u64,
+    pub(crate) streams: u64,
 }
 pub(crate) enum RetirementReply {
     Accepted,
@@ -106,6 +115,7 @@ impl ManagedRetirement {
             exit,
             entered_retiring,
             sent: false,
+            last_refusal: None,
             deadline,
         })
     }
@@ -114,17 +124,22 @@ impl ManagedRetirement {
     pub(crate) fn completion_only(&self) -> bool {
         self.entered_retiring
     }
+    pub(crate) fn last_refusal(&self) -> Option<&RetirementRefusal> {
+        self.last_refusal.as_ref()
+    }
     pub(crate) async fn request(&mut self) -> Result<RetirementReply, RuntimeError> {
         if self.sent {
             return Err(RuntimeError::Invalid("retirement attempt already sent"));
         }
         require_time_remaining(self.deadline)?;
         self.sent = true;
-        tokio::time::timeout_at(self.deadline.into(), self.exchange())
+        let (reply, refusal) = tokio::time::timeout_at(self.deadline.into(), self.exchange())
             .await
-            .map_err(|_| RuntimeError::Unavailable("retirement acknowledgement unconfirmed"))?
+            .map_err(|_| RuntimeError::Unavailable("retirement acknowledgement unconfirmed"))??;
+        self.last_refusal = refusal;
+        Ok(reply)
     }
-    async fn exchange(&self) -> Result<RetirementReply, RuntimeError> {
+    async fn exchange(&self) -> Result<(RetirementReply, Option<RetirementRefusal>), RuntimeError> {
         self.operation.verify(&self.authority)?;
         if !self.authority.unchanged(&self.record)? {
             return Err(RuntimeError::Changed("retirement record before request"));
@@ -145,7 +160,8 @@ impl ManagedRetirement {
         bytes.push(b'\n');
         stream.write_all(&bytes).await?;
         let mut reader = tokio::io::BufReader::new(stream);
-        let reply = read_response(&mut reader, &request, self.entered_retiring).await?;
+        let reply =
+            read_response_with_refusal(&mut reader, &request, self.entered_retiring).await?;
         // No post-response liveness requirement: the independently registered
         // exit observer may already have received the graceful exit event.
         self.operation.verify(&self.authority)?;
@@ -189,6 +205,23 @@ impl ManagedRetirement {
         require_time_remaining(self.deadline)?;
         Ok(ObservedRetirementExit { exit, record })
     }
+    pub(crate) fn reap_exited(
+        self,
+        observed: &ObservedRetirementExit,
+        socket_root: &chanvoy_core::runtime::SocketRoot,
+    ) -> Result<(RuntimeAuthority, OperationLock, RecordSnapshot), RuntimeError> {
+        require_time_remaining(self.deadline)?;
+        if Some(observed.exit.process()) != observed.record.record.process.as_ref()
+            || observed.record.record.namespace != *self.operation.namespace()
+        {
+            return Err(RuntimeError::Changed("retirement reap target"));
+        }
+        let exited = self
+            .authority
+            .reap_exited(&self.operation, &observed.record, socket_root)?;
+        require_time_remaining(self.deadline)?;
+        Ok((self.authority, self.operation, exited))
+    }
 }
 
 async fn read_response<R: AsyncBufRead + Unpin>(
@@ -196,6 +229,16 @@ async fn read_response<R: AsyncBufRead + Unpin>(
     request: &ControlDocument,
     continuing: bool,
 ) -> Result<RetirementReply, RuntimeError> {
+    read_response_with_refusal(reader, request, continuing)
+        .await
+        .map(|(reply, _)| reply)
+}
+
+async fn read_response_with_refusal<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    request: &ControlDocument,
+    continuing: bool,
+) -> Result<(RetirementReply, Option<RetirementRefusal>), RuntimeError> {
     // Peek without consuming: only an empty EOF can become the typed no-ACK
     // result. Once a byte arrives, strict framing/contract/correlation failures
     // must remain errors, including a subsequent EOF before the delimiter.
@@ -205,7 +248,7 @@ async fn read_response<R: AsyncBufRead + Unpin>(
         .map_err(|_| RuntimeError::Unavailable("retirement response read"))?
         .is_empty()
     {
-        return Ok(RetirementReply::NoAcknowledgement);
+        return Ok((RetirementReply::NoAcknowledgement, None));
     }
     let response = control::read_rpc(reader, ControlRoot::RetireResponse)
         .await
@@ -296,7 +339,7 @@ fn interpret_response(
     request: &ControlDocument,
     response: &ControlDocument,
     continuing: bool,
-) -> Result<RetirementReply, RuntimeError> {
+) -> Result<(RetirementReply, Option<RetirementRefusal>), RuntimeError> {
     response
         .correlate(request)
         .map_err(|_| RuntimeError::Invalid("retirement response correlation"))?;
@@ -310,12 +353,20 @@ fn interpret_response(
         result["outcome"] == "committed"
     };
     if !accepted {
-        return Ok(RetirementReply::Refused);
+        let counts = &result["counts"];
+        let refusal = RetirementRefusal {
+            outcome: result["outcome"].as_str().unwrap_or("refused").to_string(),
+            reason: result["reason"].as_str().unwrap_or("unknown").to_string(),
+            requests: counts["requests"].as_u64().unwrap_or(0),
+            slots: counts["slots"].as_u64().unwrap_or(0),
+            streams: counts["streams"].as_u64().unwrap_or(0),
+        };
+        return Ok((RetirementReply::Refused, Some(refusal)));
     }
     if result["facts"]["durable_retiring"] != true || result["facts"]["admission_closed"] != true {
         return Err(RuntimeError::Invalid("retirement admission facts"));
     }
-    Ok(RetirementReply::Accepted)
+    Ok((RetirementReply::Accepted, None))
 }
 #[cfg(test)]
 mod tests {
@@ -491,11 +542,20 @@ mod tests {
         let mut value = response();
         assert!(matches!(
             interpret_response(&request, &doc(&value), false).unwrap(),
-            RetirementReply::Accepted
+            (RetirementReply::Accepted, None)
         ));
         assert!(matches!(
             interpret_response(&request, &doc(&value), true).unwrap(),
-            RetirementReply::Refused
+            (
+                RetirementReply::Refused,
+                Some(RetirementRefusal {
+                    ref outcome,
+                    ref reason,
+                    requests: 0,
+                    slots: 0,
+                    streams: 0,
+                })
+            ) if outcome == "committed" && reason == "durable_retiring"
         ));
         value["result"]["target"]["process"]["pid"] = serde_json::json!(124);
         assert!(interpret_response(&request, &doc(&value), false).is_err());

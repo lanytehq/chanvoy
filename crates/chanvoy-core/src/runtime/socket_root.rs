@@ -21,6 +21,14 @@ impl SocketRoot {
     pub fn observe() -> Result<Option<Self>, RuntimeError> {
         Self::select(false)
     }
+    #[cfg(test)]
+    pub(super) fn from_test_dir(directory: PrivateDirectory, uid: u32) -> Self {
+        Self {
+            directory,
+            platform: NativePlatform::current().unwrap(),
+            uid,
+        }
+    }
     fn select(create: bool) -> Result<Option<Self>, RuntimeError> {
         let account = super::NativeAccount::resolve()?;
         let platform = NativePlatform::current()?;
@@ -78,6 +86,29 @@ impl SocketRoot {
         }
         self.directory.verify_named()?;
         super::locality::validate_native_local_filesystem(self.directory.raw_fd())
+    }
+    pub fn verify_socket(
+        &self,
+        pid: ProcessId,
+        expected: &super::RuntimeSocket,
+    ) -> Result<(), RuntimeError> {
+        self.verify()?;
+        if self.child_path(pid)? != expected.path {
+            return Err(RuntimeError::Changed("socket child path"));
+        }
+        let name = format!("{}.sock", pid.get());
+        self.directory
+            .verify_socket_named(OsStr::new(&name), expected.identity)
+    }
+    pub fn remove_socket(
+        &self,
+        pid: ProcessId,
+        expected: &super::RuntimeSocket,
+    ) -> Result<(), RuntimeError> {
+        self.verify_socket(pid, expected)?;
+        let name = format!("{}.sock", pid.get());
+        self.directory
+            .remove_socket(OsStr::new(&name), expected.identity)
     }
 }
 

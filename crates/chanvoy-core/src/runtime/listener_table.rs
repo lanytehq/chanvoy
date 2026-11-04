@@ -22,51 +22,129 @@ const ADDRESS_OFFSET: usize = 104;
 pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservation, RuntimeError> {
     use std::os::unix::ffi::OsStrExt;
     let name = c"net.local.stream.pcblist64";
-    let mut size = 0usize;
-    if unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(RuntimeError::Unavailable(
-            "kernel Unix socket table size denied/unavailable",
-        ));
+    for attempt in 0..3 {
+        let mut size = 0usize;
+        if unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(RuntimeError::Unavailable(
+                "kernel Unix socket table size denied/unavailable",
+            ));
+        }
+        if !(GENERATION_BYTES..=MAX_TABLE_BYTES).contains(&size) {
+            return Err(RuntimeError::Unavailable(
+                "kernel Unix socket table size budget",
+            ));
+        }
+        let capacity = size.saturating_add(PCB64_BYTES * 16).min(MAX_TABLE_BYTES);
+        let mut bytes = vec![0u8; capacity];
+        let mut actual = capacity;
+        if unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                &mut actual,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            if attempt < 2 {
+                continue;
+            }
+            return Err(RuntimeError::Unavailable(
+                "kernel Unix socket table read denied/truncated",
+            ));
+        }
+        if actual > capacity {
+            if attempt < 2 {
+                continue;
+            }
+            return Err(RuntimeError::Unavailable(
+                "kernel Unix socket table overflow",
+            ));
+        }
+        bytes.truncate(actual);
+        match decode_darwin64(&bytes, path.to_path().as_os_str().as_bytes()) {
+            Ok(observation) => return Ok(observation),
+            Err(RuntimeError::Changed(_)) if attempt < 2 => continue,
+            Err(error) => return Err(error),
+        }
     }
-    if !(GENERATION_BYTES..=MAX_TABLE_BYTES).contains(&size) {
-        return Err(RuntimeError::Unavailable(
-            "kernel Unix socket table size budget",
-        ));
-    }
-    let mut bytes = vec![0u8; size];
-    let capacity = size;
-    if unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            bytes.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(RuntimeError::Unavailable(
-            "kernel Unix socket table read denied/truncated",
-        ));
-    }
-    if size > capacity {
-        return Err(RuntimeError::Unavailable(
-            "kernel Unix socket table overflow",
-        ));
-    }
-    bytes.truncate(size);
-    decode_darwin64(&bytes, path.to_path().as_os_str().as_bytes())
+    unreachable!("bounded Darwin listener table observation")
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservation, RuntimeError> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let read_snapshot = || -> Result<((u64, u64), Vec<u8>), RuntimeError> {
+        let netns_before = std::fs::metadata("/proc/self/ns/net")
+            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket netns unavailable"))?;
+        if netns_before.ino() == 0 {
+            return Err(RuntimeError::Invalid("kernel Unix socket netns inode"));
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open("/proc/self/net/unix")
+            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket table unavailable"))?;
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } != 0
+            || fs.f_type != libc::PROC_SUPER_MAGIC
+        {
+            return Err(RuntimeError::Unavailable(
+                "kernel Unix socket table procfs type",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_TABLE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket table read failed"))?;
+        if bytes.len() > MAX_TABLE_BYTES {
+            return Err(RuntimeError::Unavailable(
+                "kernel Unix socket table size budget",
+            ));
+        }
+        let netns_after = std::fs::metadata("/proc/self/ns/net")
+            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket netns unavailable"))?;
+        if (netns_before.dev(), netns_before.ino()) != (netns_after.dev(), netns_after.ino()) {
+            return Err(RuntimeError::Changed("kernel Unix socket netns"));
+        }
+        Ok(((netns_after.dev(), netns_after.ino()), bytes))
+    };
+
+    let target = path.to_path().as_os_str().as_bytes();
+    for attempt in 0..3 {
+        let (ns_first, first_bytes) = read_snapshot()?;
+        let (first_obs, first_listeners) = decode_linux_unix(&first_bytes, target)?;
+        if first_obs == ListenerTableObservation::Present {
+            return Ok(ListenerTableObservation::Present);
+        }
+        let (ns_second, second_bytes) = read_snapshot()?;
+        let (second_obs, second_listeners) = decode_linux_unix(&second_bytes, target)?;
+        if second_obs == ListenerTableObservation::Present {
+            return Ok(ListenerTableObservation::Present);
+        }
+        if ns_first == ns_second && first_listeners == second_listeners {
+            return Ok(ListenerTableObservation::NotObserved);
+        }
+        if attempt == 2 {
+            return Err(RuntimeError::Changed("socket table generation/envelope"));
+        }
+    }
+    unreachable!("bounded Linux listener table observation")
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn observe_listener_table(_: &PathBytes) -> Result<ListenerTableObservation, RuntimeError> {
     Err(RuntimeError::Unavailable(
         "kernel listener table platform unqualified",
@@ -178,6 +256,130 @@ fn decode_darwin64(bytes: &[u8], target: &[u8]) -> Result<ListenerTableObservati
         at += length;
     }
     Err(RuntimeError::Unavailable("socket table trailer missing"))
+}
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+type LinuxListenerRow = (u64, Vec<u8>);
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn decode_linux_unix(
+    bytes: &[u8],
+    target: &[u8],
+) -> Result<(ListenerTableObservation, Vec<LinuxListenerRow>), RuntimeError> {
+    if bytes.is_empty() || bytes.len() > MAX_TABLE_BYTES || !bytes.ends_with(b"\n") {
+        return Err(RuntimeError::Unavailable(
+            "socket table incomplete envelope",
+        ));
+    }
+    let mut lines = bytes[..bytes.len() - 1].split(|b| *b == b'\n');
+    let header = lines
+        .next()
+        .ok_or(RuntimeError::Unavailable("socket table header ABI"))?;
+    let header_cols: Vec<&[u8]> = header
+        .split(|b| *b == b' ' || *b == b'\t')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if header_cols
+        != [
+            &b"Num"[..],
+            &b"RefCount"[..],
+            &b"Protocol"[..],
+            &b"Flags"[..],
+            &b"Type"[..],
+            &b"St"[..],
+            &b"Inode"[..],
+            &b"Path"[..],
+        ]
+    {
+        return Err(RuntimeError::Unavailable("socket table header ABI"));
+    }
+    let next_token = |line: &[u8], idx: &mut usize| -> Option<usize> {
+        while *idx < line.len() && (line[*idx] == b' ' || line[*idx] == b'\t') {
+            *idx += 1;
+        }
+        if *idx >= line.len() {
+            return None;
+        }
+        let start = *idx;
+        while *idx < line.len() && line[*idx] != b' ' && line[*idx] != b'\t' {
+            *idx += 1;
+        }
+        Some(start)
+    };
+    let parse_hex_u32 = |raw: &[u8], len: usize| -> Result<u32, RuntimeError> {
+        if raw.len() != len {
+            return Err(RuntimeError::Invalid("socket table hex field"));
+        }
+        let s = std::str::from_utf8(raw)
+            .map_err(|_| RuntimeError::Invalid("socket table hex field"))?;
+        u32::from_str_radix(s, 16).map_err(|_| RuntimeError::Invalid("socket table hex field"))
+    };
+    let mut found = false;
+    let mut listeners = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            return Err(RuntimeError::Invalid("socket table empty row"));
+        }
+        let mut idx = 0usize;
+        let num_start =
+            next_token(line, &mut idx).ok_or(RuntimeError::Invalid("socket table row fields"))?;
+        let num_tok = &line[num_start..idx];
+        let Some(ptr_hex) = num_tok.strip_suffix(b":") else {
+            return Err(RuntimeError::Invalid("socket table slot field"));
+        };
+        if ptr_hex.is_empty() || !ptr_hex.iter().all(u8::is_ascii_hexdigit) {
+            return Err(RuntimeError::Invalid("socket table slot field"));
+        }
+        let ref_start =
+            next_token(line, &mut idx).ok_or(RuntimeError::Invalid("socket table row fields"))?;
+        let _refcount = parse_hex_u32(&line[ref_start..idx], 8)?;
+        let proto_start =
+            next_token(line, &mut idx).ok_or(RuntimeError::Invalid("socket table row fields"))?;
+        let protocol = parse_hex_u32(&line[proto_start..idx], 8)?;
+        if protocol != 0 {
+            return Err(RuntimeError::Invalid("socket table protocol"));
+        }
+        let flags_start =
+            next_token(line, &mut idx).ok_or(RuntimeError::Invalid("socket table row fields"))?;
+        let flags = parse_hex_u32(&line[flags_start..idx], 8)?;
+        let type_start =
+            next_token(line, &mut idx).ok_or(RuntimeError::Invalid("socket table row fields"))?;
+        let sock_type = parse_hex_u32(&line[type_start..idx], 4)?;
+        let st_start =
+            next_token(line, &mut idx).ok_or(RuntimeError::Invalid("socket table row fields"))?;
+        let _state = parse_hex_u32(&line[st_start..idx], 2)?;
+        let ino_start =
+            next_token(line, &mut idx).ok_or(RuntimeError::Invalid("socket table row fields"))?;
+        let inode = std::str::from_utf8(&line[ino_start..idx])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(RuntimeError::Invalid("socket table inode field"))?;
+        let rest = &line[idx..];
+        let pathname: &[u8] = if rest.is_empty() {
+            b""
+        } else if rest[0] == b' ' {
+            &rest[1..]
+        } else {
+            return Err(RuntimeError::Invalid("socket table path delimiter"));
+        };
+        let listener = sock_type == 1 && (flags & 0x0001_0000) != 0;
+        if listener {
+            if pathname.is_empty() {
+                return Err(RuntimeError::Unavailable(
+                    "socket table listener address unavailable",
+                ));
+            }
+            found |= pathname == target;
+            listeners.push((inode, pathname.to_vec()));
+        }
+    }
+    listeners.sort();
+    Ok((
+        if found {
+            ListenerTableObservation::Present
+        } else {
+            ListenerTableObservation::NotObserved
+        },
+        listeners,
+    ))
 }
 #[cfg(test)]
 mod tests {
@@ -342,5 +544,36 @@ mod tests {
             decode_darwin64(&table, b"ignored-tail").unwrap(),
             ListenerTableObservation::NotObserved
         );
+    }
+    #[test]
+    fn linux_proc_net_unix_decoder_distinguishes_stream_listeners_and_rejects_malformed_tables() {
+        let header = b"Num       RefCount Protocol Flags    Type St Inode Path\n";
+        let mut table = header.to_vec();
+        table.extend_from_slice(
+            b"0000000000000000: 00000002 00000000 00010000 0001 01   123 /run/user/1001/chanvoy/\xff.sock\n",
+        );
+        table.extend_from_slice(
+            b"0000000000000000: 00000003 00000000 00000000 0001 03   124 /run/user/1001/chanvoy/connected.sock\n",
+        );
+        table.extend_from_slice(b"0000000000000000: 00000002 00000000 00000000 0002 01 12345\n");
+        let (obs, listeners) =
+            decode_linux_unix(&table, b"/run/user/1001/chanvoy/\xff.sock").unwrap();
+        assert_eq!(obs, ListenerTableObservation::Present);
+        assert_eq!(
+            listeners,
+            vec![(123, b"/run/user/1001/chanvoy/\xff.sock".to_vec())]
+        );
+        let (obs_other, _) =
+            decode_linux_unix(&table, b"/run/user/1001/chanvoy/connected.sock").unwrap();
+        assert_eq!(obs_other, ListenerTableObservation::NotObserved);
+        for bad in [
+            &b""[..],
+            &b"Num RefCount Protocol Flags Type St Inode Path"[..],
+            &b"Wrong Header\n"[..],
+            &b"Num       RefCount Protocol Flags    Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0001 01 999\n"[..],
+            &b"Num       RefCount Protocol Flags    Type St Inode Path\n0000000000000000: 00000002 00000000 00010000 0001 01 999"[..],
+        ] {
+            assert!(decode_linux_unix(bad, b"/target").is_err());
+        }
     }
 }

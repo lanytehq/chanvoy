@@ -33,28 +33,36 @@ impl super::native_process::RelevanceIdentity {
 
 #[cfg(target_os = "macos")]
 fn arguments(pid: ProcessId) -> Result<Vec<OsString>, RuntimeError> {
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(vec![0u8; MAX_ARGUMENT_BYTES]);
+    }
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.get() as i32];
-    let mut bytes = vec![0u8; MAX_ARGUMENT_BYTES];
-    let mut size = bytes.len();
-    // SAFETY: MIB and output buffer have the supplied lengths; no input buffer.
-    let result = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            bytes.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if result != 0 {
-        return Err(inspection_failure(std::io::Error::last_os_error()));
-    }
-    if size > bytes.len() {
-        return Err(RuntimeError::Invalid("native arguments byte budget"));
-    }
-    bytes.truncate(size);
-    mac_arguments(&bytes)
+    BUFFER.with(|cell| {
+        let mut bytes = cell.borrow_mut();
+        if bytes.len() < MAX_ARGUMENT_BYTES {
+            bytes.resize(MAX_ARGUMENT_BYTES, 0);
+        }
+        let mut size = MAX_ARGUMENT_BYTES;
+        // SAFETY: MIB and output buffer have the supplied lengths; no input buffer.
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                bytes.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(inspection_failure(std::io::Error::last_os_error()));
+        }
+        if size > MAX_ARGUMENT_BYTES {
+            return Err(RuntimeError::Invalid("native arguments byte budget"));
+        }
+        mac_arguments(&bytes[..size])
+    })
 }
 
 #[cfg(target_os = "linux")]

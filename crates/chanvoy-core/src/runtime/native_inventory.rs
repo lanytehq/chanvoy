@@ -61,6 +61,30 @@ impl NativeInventory {
         check_deadline(deadline)?;
         Ok(result)
     }
+
+    pub fn scan_unreferenced(
+        authority: &RuntimeAuthority,
+        operation: &OperationLock,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeError> {
+        operation.verify(authority)?;
+        let record = authority.read_record(operation.namespace())?;
+        if record
+            .as_ref()
+            .is_some_and(|r| r.record.phase == super::RuntimePhase::Starting)
+        {
+            return Err(RuntimeError::Unavailable(
+                "starting runtime requires bootstrap reconciliation",
+            ));
+        }
+        let result = reconcile_scans(deadline, || scan_native(authority.uid(), &[], deadline))?;
+        operation.verify(authority)?;
+        if authority.read_record(operation.namespace())? != record {
+            return Err(RuntimeError::Changed("runtime record during inventory"));
+        }
+        check_deadline(deadline)?;
+        Ok(result)
+    }
 }
 fn check_deadline(deadline: Instant) -> Result<(), RuntimeError> {
     if Instant::now() >= deadline {
@@ -109,6 +133,11 @@ fn scan_native(
     referenced: &[ProcessId],
     deadline: Instant,
 ) -> Result<NativeInventory, RuntimeError> {
+    #[cfg(target_os = "linux")]
+    let caller_ns = {
+        let current = RuntimeProcess::observe_current()?;
+        (current.pid_namespace, current.mount_namespace)
+    };
     scan_staged(
         if cfg!(target_os = "macos") {
             OwnerScope::Selected(uid)
@@ -126,6 +155,10 @@ fn scan_native(
         },
         |pid| {
             let process = RuntimeProcess::observe(pid)?;
+            #[cfg(target_os = "linux")]
+            if (process.pid_namespace, process.mount_namespace) != caller_ns {
+                return Err(RuntimeError::Unavailable("native inventory namespace view"));
+            }
             let args = process.observe_arguments()?;
             Ok((process, args))
         },
@@ -178,52 +211,97 @@ fn scan_staged(
     let mut candidates = Vec::new();
     let mut observations = Vec::new();
     let mut owners = Vec::new();
+    let mut exited = Vec::new();
     for &pid in &before {
-        check_deadline(deadline)?;
-        let observed_uid = owner(pid)?;
-        owners.push(observed_uid);
-        if observed_uid != uid {
-            if matches!(scope, OwnerScope::Selected(_)) {
-                return Err(RuntimeError::Changed("selected native inventory owner"));
+        inspect_pid(
+            scope,
+            referenced,
+            deadline,
+            pid,
+            &mut owner,
+            &mut relevance,
+            &mut full,
+            &mut owners,
+            &mut observations,
+            &mut candidates,
+            &mut exited,
+        )?;
+    }
+    let after = checked_pids(enumerate()?)?;
+    if exited.iter().any(|pid| after.contains(pid)) {
+        return Err(RuntimeError::Unavailable(
+            "native inventory owner unreadable",
+        ));
+    }
+    for &pid in &before {
+        if !after.contains(&pid) && !exited.contains(&pid) {
+            if referenced.contains(&pid)
+                || candidates.iter().any(|c| c.process.pid == pid)
+                || !matches!(
+                    owner(pid),
+                    Err(RuntimeError::Changed("native inventory process exited"))
+                )
+            {
+                return Err(RuntimeError::Changed("native inventory PID set"));
             }
-            if referenced.contains(&pid) {
-                return Err(RuntimeError::Changed("referenced runtime owner"));
-            }
-            continue;
-        }
-        let (identity, args) = relevance(pid)
-            .map_err(|_| RuntimeError::Unavailable("same-account process relevance unavailable"))?;
-        if identity.pid != pid || identity.uid != uid {
-            return Err(RuntimeError::Changed("inventory relevance owner/PID"));
-        }
-        observations.push((identity.clone(), argument_digest(&args)));
-        if potential_candidate(&args) || referenced.contains(&pid) {
-            let (process, full_args) = full(pid)
-                .map_err(|_| RuntimeError::Unavailable("candidate daemon identity unavailable"))?;
-            if !identity.matches_full(&process) || args != full_args {
-                return Err(RuntimeError::Changed(
-                    "candidate identity across relevance bracket",
-                ));
-            }
-            let kind = classify(&process, &full_args)?
-                .ok_or(RuntimeError::Changed("referenced runtime launch binding"))?;
-            candidates.push(NativeCandidate { process, kind });
+            exited.push(pid);
+            owners.retain(|(p, _)| *p != pid);
+            observations.retain(|(id, _)| id.pid != pid);
         }
     }
-    if before != checked_pids(enumerate()?)? {
-        return Err(RuntimeError::Changed("native inventory PID set"));
+    for &pid in &after {
+        if !before.contains(&pid) {
+            inspect_pid(
+                scope,
+                referenced,
+                deadline,
+                pid,
+                &mut owner,
+                &mut relevance,
+                &mut full,
+                &mut owners,
+                &mut observations,
+                &mut candidates,
+                &mut exited,
+            )?;
+        }
     }
-    for (&pid, previous_uid) in before.iter().zip(owners) {
+    for (pid, previous_uid) in owners {
         check_deadline(deadline)?;
-        if owner(pid)? != previous_uid {
-            return Err(RuntimeError::Changed("native inventory owner"));
+        match owner(pid) {
+            Ok(observed) if observed == previous_uid => {}
+            Ok(_) => return Err(RuntimeError::Changed("native inventory owner")),
+            Err(RuntimeError::Changed("native inventory process exited"))
+                if !referenced.contains(&pid)
+                    && !candidates.iter().any(|c| c.process.pid == pid) =>
+            {
+                exited.push(pid);
+                observations.retain(|(id, _)| id.pid != pid);
+            }
+            Err(error) => return Err(error),
         }
     }
     // Every exclusion is bracketed. Unknowns never become an empty result.
     for (previous, arguments) in observations {
         check_deadline(deadline)?;
-        let (identity, args) = relevance(previous.pid)
-            .map_err(|_| RuntimeError::Unavailable("same-account process relevance unavailable"))?;
+        let (identity, args) = match relevance(previous.pid) {
+            Ok(pair) => pair,
+            Err(_)
+                if !referenced.contains(&previous.pid)
+                    && !candidates.iter().any(|c| c.process.pid == previous.pid)
+                    && matches!(
+                        owner(previous.pid),
+                        Err(RuntimeError::Changed("native inventory process exited"))
+                    ) =>
+            {
+                continue;
+            }
+            Err(_) => {
+                return Err(RuntimeError::Unavailable(
+                    "same-account process relevance unavailable",
+                ));
+            }
+        };
         if identity != previous || argument_digest(&args) != arguments {
             return Err(RuntimeError::Changed(
                 "native account process during inventory",
@@ -261,6 +339,81 @@ fn scan_staged(
     }
     check_deadline(deadline)?;
     Ok(NativeInventory { candidates })
+}
+#[allow(clippy::too_many_arguments)]
+fn inspect_pid(
+    scope: OwnerScope,
+    referenced: &[ProcessId],
+    deadline: Instant,
+    pid: ProcessId,
+    owner: &mut impl FnMut(ProcessId) -> Result<u32, RuntimeError>,
+    relevance: &mut impl FnMut(ProcessId) -> Result<(RelevanceIdentity, Vec<OsString>), RuntimeError>,
+    full: &mut impl FnMut(ProcessId) -> Result<(RuntimeProcess, Vec<OsString>), RuntimeError>,
+    owners: &mut Vec<(ProcessId, u32)>,
+    observations: &mut Vec<(RelevanceIdentity, [u8; 32])>,
+    candidates: &mut Vec<NativeCandidate>,
+    exited: &mut Vec<ProcessId>,
+) -> Result<(), RuntimeError> {
+    let uid = scope.uid();
+    check_deadline(deadline)?;
+    let observed_uid = match owner(pid) {
+        Ok(observed_uid) => observed_uid,
+        Err(RuntimeError::Changed("native inventory process exited"))
+            if !referenced.contains(&pid) =>
+        {
+            exited.push(pid);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if observed_uid != uid {
+        if matches!(scope, OwnerScope::Selected(_)) {
+            return Err(RuntimeError::Changed("selected native inventory owner"));
+        }
+        if referenced.contains(&pid) {
+            return Err(RuntimeError::Changed("referenced runtime owner"));
+        }
+        owners.push((pid, observed_uid));
+        return Ok(());
+    }
+    let (identity, args) = match relevance(pid) {
+        Ok(pair) => pair,
+        Err(_) if !referenced.contains(&pid) => {
+            if matches!(
+                owner(pid),
+                Err(RuntimeError::Changed("native inventory process exited"))
+            ) {
+                exited.push(pid);
+                return Ok(());
+            }
+            return Err(RuntimeError::Unavailable(
+                "same-account process relevance unavailable",
+            ));
+        }
+        Err(_) => {
+            return Err(RuntimeError::Unavailable(
+                "same-account process relevance unavailable",
+            ));
+        }
+    };
+    if identity.pid != pid || identity.uid != uid {
+        return Err(RuntimeError::Changed("inventory relevance owner/PID"));
+    }
+    owners.push((pid, observed_uid));
+    observations.push((identity.clone(), argument_digest(&args)));
+    if potential_candidate(&args) || referenced.contains(&pid) {
+        let (process, full_args) = full(pid)
+            .map_err(|_| RuntimeError::Unavailable("candidate daemon identity unavailable"))?;
+        if !identity.matches_full(&process) || args != full_args {
+            return Err(RuntimeError::Changed(
+                "candidate identity across relevance bracket",
+            ));
+        }
+        let kind = classify(&process, &full_args)?
+            .ok_or(RuntimeError::Changed("referenced runtime launch binding"))?;
+        candidates.push(NativeCandidate { process, kind });
+    }
+    Ok(())
 }
 #[cfg(test)]
 fn scan_with(
@@ -458,6 +611,11 @@ fn owner(pid: ProcessId) -> Result<u32, RuntimeError> {
             return Err(RuntimeError::Unavailable(
                 "native inventory owner permission denied",
             ));
+        }
+        if unsafe { libc::kill(pid.get() as i32, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return Err(RuntimeError::Changed("native inventory process exited"));
         }
         return Err(RuntimeError::Unavailable(
             "native inventory owner unreadable",
