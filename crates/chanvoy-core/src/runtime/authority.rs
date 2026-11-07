@@ -1109,7 +1109,12 @@ mod tests {
         let uid = unsafe { libc::geteuid() };
         let home_fixture = super::super::filesystem::tests::fixture();
         let home_path = std::fs::canonicalize(home_fixture.path()).unwrap();
-        let base = std::fs::canonicalize("/tmp").unwrap();
+        let base = std::fs::canonicalize(if cfg!(target_os = "linux") {
+            "/var/tmp"
+        } else {
+            "/tmp"
+        })
+        .unwrap();
         let sockets_path = base.join(format!("cv-reap-{}", uuid::Uuid::new_v4().simple()));
         std::fs::DirBuilder::new()
             .mode(0o700)

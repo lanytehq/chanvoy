@@ -123,7 +123,8 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
         Ok(((netns_after.dev(), netns_after.ino()), bytes))
     };
 
-    let target = path.to_path().as_os_str().as_bytes();
+    let target_path = path.to_path();
+    let target = target_path.as_os_str().as_bytes();
     for attempt in 0..3 {
         let (ns_first, first_bytes) = read_snapshot()?;
         let (first_obs, first_listeners) = decode_linux_unix(&first_bytes, target)?;
