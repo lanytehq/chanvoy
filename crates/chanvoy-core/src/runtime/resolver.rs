@@ -330,6 +330,8 @@ mod tests {
     }
 
     #[test]
+    // libc mode_t width differs across the supported Unix ABIs.
+    #[allow(clippy::unnecessary_cast)]
     fn exited_tombstone_resolves_absent_only_when_markers_and_legacy_are_absent() {
         let uid = unsafe { libc::geteuid() };
         let config_root = PathBytes::from_path(Path::new("/tmp/chanvoy-resolver-test")).unwrap();

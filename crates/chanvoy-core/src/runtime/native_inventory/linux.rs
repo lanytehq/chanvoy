@@ -58,7 +58,7 @@ fn visibility() -> Result<(std::fs::File, Vec<u8>), RuntimeError> {
     )
     .map_err(|_| RuntimeError::Unavailable("native inventory mountinfo"))?;
     validate_mount_view(&mountinfo)?;
-    let init_name = std::ffi::CStr::from_bytes_with_nul(b"1\0").unwrap();
+    let init_name = c"1";
     let mut init_stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe {
         libc::fstatat(

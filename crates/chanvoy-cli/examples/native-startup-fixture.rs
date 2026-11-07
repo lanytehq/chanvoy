@@ -1,6 +1,9 @@
 //! Explicit component fixture for a disposable native account home.
 //! Never run against an operator home. It is not a host qualification or reaper.
 //! The launcher module is the production implementation, not a test substitute.
+//! Note: `--run-cancel-in-disposable-native-home` intentionally leaves its child
+//! daemon alive to prove cancellation preserves the running daemon; run it last
+//! or in its own disposable OS account.
 #[path = "../src/managed_environment.rs"]
 mod managed_environment;
 #[path = "../src/managed_launch.rs"]

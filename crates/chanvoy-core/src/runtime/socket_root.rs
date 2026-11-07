@@ -29,6 +29,14 @@ impl SocketRoot {
             uid,
         }
     }
+    #[cfg(test)]
+    pub(super) fn test_socket_parent() -> PathBuf {
+        if cfg!(target_os = "linux") {
+            native_parent().unwrap()
+        } else {
+            PathBuf::from("/tmp")
+        }
+    }
     fn select(create: bool) -> Result<Option<Self>, RuntimeError> {
         let account = super::NativeAccount::resolve()?;
         let platform = NativePlatform::current()?;
