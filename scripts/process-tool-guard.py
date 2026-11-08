@@ -44,6 +44,9 @@ ALLOWED_PROGRAMS = {
 ALLOWED_EXPRESSIONS = {
     "crates/chanvoy-cli/src/lib.rs": {"exe"},
     "crates/chanvoy-cli/src/lifecycle.rs": {"executable", "std::env::current_exe().unwrap()"},
+    # Managed launch constructs argv[0] from the revalidated current native
+    # executable through RuntimeLaunchMarker::arguments, not caller input.
+    "crates/chanvoy-cli/src/managed_launch.rs": {"&arguments[0]"},
     "*": {
         "CHANVOY_BIN",
         "common::CHANVOY_BIN",

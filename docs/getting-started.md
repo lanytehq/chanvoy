@@ -112,6 +112,11 @@ For a development loop without installing, replace `chanvoy` with
 `cargo run -p chanvoy --` in any of the commands below — see
 [Working from source](#working-from-source) at the end.
 
+Before running contributor gates, follow the
+[contributor quick start](../CONTRIBUTING.md#quick-start-contributors). It covers
+rustfmt/Clippy for the active toolchain, the Decernor release-test helper and
+other gate tools, shared build storage and protected directory ancestry.
+
 Verify:
 
 ```bash

@@ -13,14 +13,35 @@
 //! The typed messages are the operator contract; the enum shape is an
 //! implementation detail that belongs in tracing, not on stderr.
 
-#[tokio::main]
-async fn main() {
-    if let Err(err) = chanvoy_cli::run().await {
-        // `Display` only, no source-chain walk: every `#[error(...)]` string in
-        // this workspace already interpolates its cause (`"io error: {0}"`,
-        // `"rpc error {code}: {message}"`), so following `source()` would print
-        // the same text twice.
-        eprintln!("Error: {err}");
-        std::process::exit(1);
+fn main() {
+    // SAFETY: this is the unique process entry before the async runtime and
+    // before any other Rust descriptor owner. Errors exit; no legacy fallback.
+    let mut invocation = match unsafe { chanvoy_cli::prepare_process_entry() } {
+        Ok(invocation) => invocation,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let managed = invocation.is_managed();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let result = runtime.block_on(invocation.run());
+    if let Err(error) = &result {
+        eprintln!("Error: {error}");
+    }
+    if managed || result.is_err() {
+        // The managed lifetime anchor remains owned by invocation until the
+        // kernel closes this process's descriptions. Serve already collected
+        // its runtime tasks; an error never continues with a closed lease.
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
 }

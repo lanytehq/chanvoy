@@ -45,6 +45,12 @@ class SpawnAllowlist(unittest.TestCase):
         self.assertTrue(lines(source, "crates/other/src/lib.rs"))
         self.assertTrue(lines(source))
 
+    def test_native_self_launch_allows_only_its_program_argument_in_its_file(self):
+        path = "crates/chanvoy-cli/src/managed_launch.rs"
+        self.assertEqual(lines("Command::new(&arguments[0]);", path), [])
+        self.assertTrue(lines("Command::new(&arguments[1]);", path))
+        self.assertTrue(lines("Command::new(&arguments[0]);", "crates/other/src/lib.rs"))
+
 
 class ShellCommandWords(unittest.TestCase):
     def test_shell_scripts_naming_tools_fail(self):

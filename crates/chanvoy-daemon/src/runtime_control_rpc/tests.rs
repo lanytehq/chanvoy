@@ -910,3 +910,69 @@ async fn an_event_wake_never_drops_a_partial_frame() {
         );
     }
 }
+
+#[tokio::test]
+async fn busy_with_started_shutdown_is_refused_without_fabricating_facts() {
+    let (control, fixture) = setup();
+    let permit = fixture.registry.request_permit().unwrap();
+    let request = request(&fixture, "begin", |_| {});
+    let facts = control.attempt(&request, |_| Ok(())).unwrap();
+    assert_eq!(facts.outcome, Outcome::Busy);
+    let signal = Signal::new(true);
+    signal.started.store(true, Ordering::Release);
+    assert!(matches!(
+        retire(&request, &facts, &signal.starter()).await,
+        Err(ControlError::InvalidContract)
+    ));
+    assert!(signal.sender.lock().await.is_some());
+    assert!(!signal.sent());
+    permit.confirm_done().unwrap();
+}
+
+#[tokio::test]
+async fn managed_legacy_shutdown_preserves_sender_latch_and_active_work() {
+    let mut state = crate::request_frontier::tests::state("http://127.0.0.1:9");
+    Arc::get_mut(&mut state).unwrap().shutdown_policy =
+        crate::ShutdownPolicy::BoundRetirementRequired;
+    let (sender, mut receiver) = oneshot::channel();
+    let sender = Arc::new(Mutex::new(Some(sender)));
+    let request_owner = state.wait_owners.request_permit().unwrap();
+    let stream_owner = state.wait_owners.registration_owner().unwrap();
+    let (task, cleanup) = state.wait_owners.task_cleanup_pair().unwrap();
+    let before = state.wait_owners.admission_snapshot();
+    let refusal = crate::dispatch_request(
+        chanvoy_core::rpc_request("shutdown", json!({})),
+        &state,
+        &sender,
+    )
+    .await;
+    assert_eq!(
+        refusal.response.error.unwrap().message,
+        "managed runtime requires bound retirement"
+    );
+    assert!(sender.lock().await.is_some());
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(!state.shutdown_started.load(Ordering::Acquire));
+    assert_eq!(state.wait_owners.admission_snapshot(), before);
+    request_owner.confirm_done().unwrap();
+    stream_owner.confirm_done().unwrap();
+    task.confirm_done().unwrap();
+    cleanup.confirm_done().unwrap();
+    // Idle is insufficient: the legacy request still has no bound target.
+    let refusal = crate::dispatch_request(
+        chanvoy_core::rpc_request("shutdown", json!({})),
+        &state,
+        &sender,
+    )
+    .await;
+    assert!(refusal.response.error.is_some());
+    assert!(sender.lock().await.is_some());
+    assert!(!state.shutdown_started.load(Ordering::Acquire));
+    assert_eq!(
+        state.wait_owners.admission_snapshot().phase,
+        AdmissionPhase::Running
+    );
+}

@@ -10,6 +10,9 @@ mod client_tasks;
 mod follow_delivery;
 mod ipc_ownership;
 mod ipc_supervision;
+mod native_listener;
+mod native_runtime;
+mod native_startup;
 mod request_frontier;
 mod retirement_control;
 mod runtime_control_rpc;
@@ -127,6 +130,15 @@ fn bootstrap_startup_failure(error: CoreError) -> DaemonError {
     }
 }
 
+/// Chosen once by startup, never inferred from request fields or idle counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShutdownPolicy {
+    Legacy,
+    // Native startup sets this before the managed listener admits clients.
+    #[allow(dead_code)]
+    BoundRetirementRequired,
+}
+
 #[derive(Clone)]
 struct AppState {
     profile: Profile,
@@ -158,6 +170,8 @@ struct AppState {
     wait_owners: Arc<wait_owner::WaitOwnerRegistry>,
     /// Latched once the shared graceful-shutdown signal is actually sent.
     shutdown_started: Arc<AtomicBool>,
+    shutdown_policy: ShutdownPolicy,
+    native_runtime: Option<Arc<native_runtime::NativeRuntime>>,
     poll_cursors: waitprims_poll::PollCursorStore,
     fanin_replay: waitprims_fanin::FanInReplayStore,
     inbox_armed: Arc<AtomicU64>,
@@ -365,51 +379,129 @@ enum NotificationsResponse {
     Unread(UnreadNotifications),
 }
 
+/// A single-thread managed entry, before registration with an async runtime.
+/// Its fields cannot be constructed from received readiness claims.
+pub struct PreparedManagedDaemon {
+    profile: String,
+    bound: native_startup::BoundBeforeRuntime,
+}
+
+/// Retain at process entry through runtime teardown; the managed child releases
+/// its lifetime description only at process exit, never on a failed handshake.
+pub struct ManagedProcessLifetime {
+    _registry: Arc<wait_owner::WaitOwnerRegistry>,
+}
+
+/// # Safety
+/// Must run once in the intended child before runtime/worker threads. Both fds
+/// must be uniquely captured from the qualified launcher's fork/exec path,
+/// originally inherited with CLOEXEC clear and restored by the entry capture.
+/// The lease must be the launcher's locked open description, not a same-inode
+/// replacement. Failure requires process exit, not a legacy fallback.
+pub unsafe fn prepare_managed_process(
+    marker: chanvoy_core::runtime::RuntimeLaunchMarker,
+    nonce: &str,
+    lease: std::os::fd::OwnedFd,
+    readiness: std::os::fd::OwnedFd,
+    deadline: std::time::Instant,
+) -> Result<PreparedManagedDaemon, DaemonError> {
+    // This is the qualified single-thread child boundary, never serving code.
+    // Unix bind starts from 0777; 0177 creates the socket at 0600 without chmod.
+    unsafe { libc::umask(0o177) };
+    let prepared = (|| {
+        let profile = load_profile(&marker.profile)?;
+        let child = unsafe {
+            native_startup::PreparedChild::from_inherited(
+                &marker, nonce, &profile, lease, readiness, deadline,
+            )
+        }?;
+        Ok::<_, DaemonError>(PreparedManagedDaemon {
+            profile: marker.profile,
+            bound: child.bind_before_runtime()?,
+        })
+    })();
+    // Normal private file/directory creation must retain owner execute bits.
+    unsafe { libc::umask(0o077) };
+    prepared
+}
+
+impl PreparedManagedDaemon {
+    pub fn retain_process_lifetime(&self) -> ManagedProcessLifetime {
+        ManagedProcessLifetime {
+            _registry: self.bound.registry(),
+        }
+    }
+    pub async fn serve(self) -> Result<DaemonHealth, DaemonError> {
+        let bound = self.bound.register()?;
+        start_inner(&self.profile, Some(bound)).await
+    }
+}
+
 pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
+    start_inner(profile_name, None).await
+}
+
+async fn start_inner(
+    profile_name: &str,
+    managed: Option<native_startup::BoundChild>,
+) -> Result<DaemonHealth, DaemonError> {
     let profile = load_profile(profile_name)?;
-    let socket_path = socket_path_for_profile(profile_name);
+    if let Some(child) = &managed {
+        child.check_profile(&profile)?;
+    }
+    let socket_path = match &managed {
+        Some(child) => child
+            .listener()
+            .local_addr()?
+            .as_pathname()
+            .ok_or_else(|| io::Error::other("managed listener has no pathname"))?
+            .to_path_buf(),
+        None => socket_path_for_profile(profile_name),
+    };
     let pid_path = pid_path_for_profile(profile_name);
 
-    // Every observed existing socket ends this attempt. Unknown cannot become
-    // permission to unlink a predecessor; the CLI confirmed-stop path owns that.
-    match fs::symlink_metadata(&socket_path) {
-        Ok(_) => {
-            startup::bounded(
-                StartupPhase::ExistingSocket,
-                profile_name,
-                startup::LOCAL_PING_BUDGET,
-                ping(profile_name),
-                |_| StartupOutcome::LocalUnconfirmed,
-            )
-            .await
-            .map_err(startup_failure)?;
-            return Err(DaemonError::AlreadyRunning(
-                socket_path.display().to_string(),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(DaemonError::Startup {
-                stage: StartupPhase::ExistingSocket.name(),
-                outcome: StartupOutcome::LocalUnconfirmed.name(),
-            })
-        }
-    }
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-    if let Some(parent) = pid_path
-        .parent()
-        .filter(|dir| Some(*dir) != socket_path.parent())
-    {
-        chanvoy_core::prepare_pid_dir(parent)?;
-    }
-    // Inspect without consumption before a reduction-enabled startup can
-    // contact its family provider. The resolver revalidates/consumes later.
     let env_nonce = env::var(chanvoy_core::BOOTSTRAP_NONCE_ENV).ok();
-    chanvoy_core::bootstrap::inspect_bootstrap_ownership(profile_name, env_nonce.as_deref())
-        .map_err(bootstrap_startup_failure)?;
+    if managed.is_none() {
+        // Every observed existing socket ends this attempt. Unknown cannot become
+        // permission to unlink a predecessor; the CLI confirmed-stop path owns that.
+        match fs::symlink_metadata(&socket_path) {
+            Ok(_) => {
+                startup::bounded(
+                    StartupPhase::ExistingSocket,
+                    profile_name,
+                    startup::LOCAL_PING_BUDGET,
+                    ping(profile_name),
+                    |_| StartupOutcome::LocalUnconfirmed,
+                )
+                .await
+                .map_err(startup_failure)?;
+                return Err(DaemonError::AlreadyRunning(
+                    socket_path.display().to_string(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(DaemonError::Startup {
+                    stage: StartupPhase::ExistingSocket.name(),
+                    outcome: StartupOutcome::LocalUnconfirmed.name(),
+                })
+            }
+        }
+        if let Some(parent) = socket_path.parent() {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        if let Some(parent) = pid_path
+            .parent()
+            .filter(|dir| Some(*dir) != socket_path.parent())
+        {
+            chanvoy_core::prepare_pid_dir(parent)?;
+        }
+        // Inspect without consumption before a reduction-enabled startup can
+        // contact its family provider. The resolver revalidates/consumes later.
+        chanvoy_core::bootstrap::inspect_bootstrap_ownership(profile_name, env_nonce.as_deref())
+            .map_err(bootstrap_startup_failure)?;
+    }
     // Loaded exactly once and reused for every surface this daemon
     // brings up. Reading it a second time later would let a rotation
     // between the two reads pair a request-response client
@@ -453,45 +545,59 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     //    path. Manual `chanvoy daemon serve`. Fall through to the
     //    original network whoami() — works in unsandboxed shells and
     //    is the right thing for developer-mode invocations.
-    let resolution =
-        chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())
-            .map_err(bootstrap_startup_failure)?;
-    let my_user_id = match resolution {
-        chanvoy_core::BootstrapResolution::Validated { user_id } => {
-            info!(
-                profile = profile_name,
-                "chanvoy daemon trusted pre-validated identity from bootstrap state"
-            );
-            user_id
-        }
-        chanvoy_core::BootstrapResolution::Legacy => {
-            // Manual `chanvoy daemon serve` (not via auto-setup): no
-            // handoff in flight. Network whoami() runs as before.
-            let identity = startup::bounded(
-                StartupPhase::ForegroundIdentity,
-                profile_name,
-                startup::IDENTITY_BUDGET,
-                async {
-                    let identity = client.whoami().await?;
-                    if !profile.bot_username.is_empty() && identity.username != profile.bot_username
-                    {
-                        return Err(CoreError::ProfileIdentityMismatch {
-                            expected: profile.bot_username.clone(),
-                            actual: identity.username,
-                        });
-                    }
-                    Ok(identity)
-                },
-                startup::classify_core_error,
-            )
-            .await
-            .map_err(startup_failure)?;
-            identity.id
+    let my_user_id = if let Some(child) = &managed {
+        child.user_id().to_owned()
+    } else {
+        let resolution =
+            chanvoy_core::resolve_startup_identity(profile_name, &profile, env_nonce.as_deref())
+                .map_err(bootstrap_startup_failure)?;
+        match resolution {
+            chanvoy_core::BootstrapResolution::Validated { user_id } => {
+                info!(
+                    profile = profile_name,
+                    "chanvoy daemon trusted pre-validated identity from bootstrap state"
+                );
+                user_id
+            }
+            chanvoy_core::BootstrapResolution::Legacy => {
+                // Manual `chanvoy daemon serve` (not via auto-setup): no
+                // handoff in flight. Network whoami() runs as before.
+                let identity = startup::bounded(
+                    StartupPhase::ForegroundIdentity,
+                    profile_name,
+                    startup::IDENTITY_BUDGET,
+                    async {
+                        let identity = client.whoami().await?;
+                        if !profile.bot_username.is_empty()
+                            && identity.username != profile.bot_username
+                        {
+                            return Err(CoreError::ProfileIdentityMismatch {
+                                expected: profile.bot_username.clone(),
+                                actual: identity.username,
+                            });
+                        }
+                        Ok(identity)
+                    },
+                    startup::classify_core_error,
+                )
+                .await
+                .map_err(startup_failure)?;
+                identity.id
+            }
         }
     };
-    let listener = UnixListener::bind(&socket_path)?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
-    chanvoy_core::write_pid_file(&pid_path)?;
+    let legacy_listener = if managed.is_none() {
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        chanvoy_core::write_pid_file(&pid_path)?;
+        Some(listener)
+    } else {
+        None
+    };
+    let listener = match &managed {
+        Some(child) => child.listener(),
+        None => legacy_listener.as_ref().expect("legacy listener bound"),
+    };
     info!(profile = profile_name, "chanvoy daemon local socket bound");
 
     let ws_state_holder: Arc<Mutex<Option<Arc<WsState>>>> = Arc::new(Mutex::new(None));
@@ -504,7 +610,38 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     // gate as the local UDS surface.
     let identity_drift = Arc::new(AtomicBool::new(false));
 
-    let wait_owners = Arc::new(wait_owner::WaitOwnerRegistry::new());
+    let wait_owners = match &managed {
+        Some(child) => child.registry(),
+        None => Arc::new(wait_owner::WaitOwnerRegistry::new()),
+    };
+    // Recover local state and establish managed Running before spawning any
+    // provider infrastructure. Startup refusal must not leave unowned work.
+    let mut attention = load_attention_state(&profile.name)?;
+    let poll_cursors =
+        waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
+    poll_cursors
+        .apply_pending_txn(&mut attention)
+        .map_err(DaemonError::from)?;
+    let legacy_attention_records = attention
+        .channels
+        .keys()
+        .filter(|key| !key.contains('/'))
+        .count();
+    info!(
+        profile = profile_name,
+        channel_records = attention.channels.len(),
+        legacy_records = legacy_attention_records,
+        quarantined_records = attention.quarantined.len(),
+        "chanvoy daemon local attention state recovered"
+    );
+
+    let (native_runtime, readiness) = match &managed {
+        Some(child) => {
+            let (runtime, ready) = child.publish_running(&profile).await?;
+            (Some(runtime), Some(ready))
+        }
+        None => (None, None),
+    };
     let (ipc_state, ipc_task) = match &profile.ipc {
         Some(IpcConfig {
             enabled: true,
@@ -535,25 +672,11 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let mut startup_tasks = startup_work::StartupTasks::default();
     let mut websocket_task = websocket_task::WebsocketTask::default();
     let outcome: Result<DaemonHealth, DaemonError> = async {
-        let mut attention = load_attention_state(&profile.name)?;
-        let poll_cursors =
-            waitprims_poll::PollCursorStore::load(&profile.name).map_err(DaemonError::from)?;
-        poll_cursors
-            .apply_pending_txn(&mut attention)
-            .map_err(DaemonError::from)?;
-        let legacy_attention_records = attention
-            .channels
-            .keys()
-            .filter(|key| !key.contains('/'))
-            .count();
-        info!(
-            profile = profile_name,
-            channel_records = attention.channels.len(),
-            legacy_records = legacy_attention_records,
-            quarantined_records = attention.quarantined.len(),
-            "chanvoy daemon local attention state recovered"
-        );
-
+        let shutdown_policy = if native_runtime.is_some() {
+            ShutdownPolicy::BoundRetirementRequired
+        } else {
+            ShutdownPolicy::Legacy
+        };
         let inbox_armed = Arc::new(AtomicU64::new(0));
         let state = Arc::new(AppState {
             profile: profile.clone(),
@@ -571,6 +694,8 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
             reduce_writer,
             wait_owners,
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_policy,
+            native_runtime,
             poll_cursors,
             fanin_replay: waitprims_fanin::FanInReplayStore::new(),
             inbox_armed: inbox_armed.clone(),
@@ -612,6 +737,11 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
         // constructed, and its collector retains ownership through actual join.
         startup_tasks.spawn_probe(Arc::clone(&state))?;
 
+        if let Some(ready) = readiness {
+            let owner = managed.as_ref().expect("managed readiness owner");
+            owner.check_profile(&profile)?;
+            owner.send_readiness(&ready).await?;
+        }
         info!(
             profile = profile_name,
             socket = %socket_path.display(),
@@ -651,7 +781,15 @@ pub async fn start(profile_name: &str) -> Result<DaemonHealth, DaemonError> {
     let outcome = client_tasks.finish(outcome).await;
     let outcome = startup_tasks.finish(outcome).await;
     let outcome = websocket_task.finish(outcome).await;
-    let cleanup = || cleanup_runtime_files(&socket_path, &pid_path).map_err(DaemonError::from);
+    let cleanup = || {
+        if managed.is_some() {
+            // The external reconciler alone removes managed artifacts after
+            // independent whole-process death/listener/lease confirmation.
+            Ok(())
+        } else {
+            cleanup_runtime_files(&socket_path, &pid_path).map_err(DaemonError::from)
+        }
+    };
     match ipc_task {
         Some(task) => task.finish(outcome, cleanup).await,
         None => {
@@ -846,8 +984,24 @@ async fn handle_client_with_shutdown(
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     stop: tokio_util::sync::CancellationToken,
 ) -> Result<(), DaemonError> {
+    let peer = if state.native_runtime.is_some() {
+        use std::os::fd::AsFd;
+        chanvoy_core::runtime::native_peer_pid(stream.as_fd())
+            .and_then(chanvoy_core::runtime::RuntimeProcess::observe)
+            .ok()
+    } else {
+        None
+    };
     let (reader, writer) = stream.into_split();
-    handle_client_io_with_shutdown(BufReader::new(reader), writer, state, shutdown_tx, stop).await
+    handle_client_io_with_native(
+        BufReader::new(reader),
+        writer,
+        state,
+        shutdown_tx,
+        stop,
+        peer,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -871,12 +1025,28 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn handle_client_io_with_shutdown<R, W>(
+    reader: R,
+    writer: W,
+    state: Arc<AppState>,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Result<(), DaemonError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    handle_client_io_with_native(reader, writer, state, shutdown_tx, stop, None).await
+}
+
+async fn handle_client_io_with_native<R, W>(
     mut reader: R,
     mut writer: W,
     state: Arc<AppState>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     stop: tokio_util::sync::CancellationToken,
+    peer: Option<chanvoy_core::runtime::RuntimeProcess>,
 ) -> Result<(), DaemonError>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -911,6 +1081,7 @@ where
                                     bytes,
                                     root,
                                     &state.wait_owners,
+                                    state.native_runtime.as_deref().map(|runtime| (runtime, peer.as_ref())),
                                     &runtime_control_rpc::ShutdownStarter {
                                         sender: &shutdown_tx,
                                         started: &state.shutdown_started,
@@ -2217,6 +2388,16 @@ async fn dispatch_request(
             .await
             .map(to_value)
         }
+        "shutdown"
+            if state.native_runtime.is_some()
+                || state.shutdown_policy == ShutdownPolicy::BoundRetirementRequired =>
+        {
+            Err(DaemonError::Rpc {
+                code: -32_000,
+                message: "managed runtime requires bound retirement".into(),
+                data: None,
+            })
+        }
         "shutdown" => {
             if let Some(sender) = shutdown_tx.lock().await.take() {
                 if sender.send(()).is_ok() {
@@ -3479,18 +3660,21 @@ fn cleanup_runtime_files(socket_path: &Path, pid_path: &Path) -> Result<(), io::
 
 #[derive(Clone)]
 pub struct DaemonClient {
+    profile_name: Option<String>,
     socket_path: PathBuf,
-    binding: chanvoy_core::runtime::RuntimeBinding,
+    binding: Option<chanvoy_core::runtime::RuntimeBinding>,
 }
 
 impl DaemonClient {
-    /// Explicit legacy profile locator. Runtime-v1 callers must supply the
-    /// independently resolved record binding through `from_runtime_binding`.
+    /// Profile locator that resolves an active runtime-v1 record binding when
+    /// present in `RuntimeAuthority`, or falls back to the legacy profile
+    /// socket only when no v1 record exists for the namespace.
     pub fn new(profile_name: &str) -> Self {
         let binding = chanvoy_core::runtime::RuntimeBinding::legacy(profile_name);
         Self {
+            profile_name: Some(profile_name.to_string()),
             socket_path: binding.socket_path().to_path_buf(),
-            binding,
+            binding: None,
         }
     }
 
@@ -3501,30 +3685,49 @@ impl DaemonClient {
     ) -> Result<Self, DaemonError> {
         binding.verify()?;
         Ok(Self {
+            profile_name: None,
             socket_path: binding.socket_path().to_path_buf(),
-            binding,
+            binding: Some(binding),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn with_socket_path(socket_path: PathBuf) -> Self {
         Self {
-            binding: chanvoy_core::runtime::RuntimeBinding::legacy_socket(socket_path.clone()),
+            profile_name: None,
+            binding: Some(chanvoy_core::runtime::RuntimeBinding::legacy_socket(
+                socket_path.clone(),
+            )),
             socket_path,
         }
     }
 
-    async fn connect_bound(&self) -> Result<UnixStream, DaemonError> {
-        self.binding.verify()?;
-        if !self.socket_path.exists() {
-            return Err(DaemonError::NotRunning(
-                self.socket_path.display().to_string(),
-            ));
+    async fn connect_bound(
+        &self,
+    ) -> Result<(UnixStream, chanvoy_core::runtime::RuntimeBinding), DaemonError> {
+        let binding = match &self.binding {
+            Some(binding) => binding.clone(),
+            None => {
+                let profile = self.profile_name.as_deref().unwrap_or_default();
+                match chanvoy_core::runtime::RuntimeBinding::resolve_profile(profile)? {
+                    Some(binding) => binding,
+                    None => {
+                        return Err(DaemonError::NotRunning(
+                            self.socket_path.display().to_string(),
+                        ));
+                    }
+                }
+            }
+        };
+        binding.verify()?;
+        let socket_path = binding.socket_path();
+        if !socket_path.exists() {
+            return Err(DaemonError::NotRunning(socket_path.display().to_string()));
         }
-        let stream = UnixStream::connect(&self.socket_path)
+        let stream = UnixStream::connect(socket_path)
             .await
-            .map_err(|_| DaemonError::NotRunning(self.socket_path.display().to_string()))?;
-        if let Some(snapshot) = self.binding.record() {
+            .map_err(|_| DaemonError::NotRunning(socket_path.display().to_string()))?;
+        if let Some(snapshot) = binding.record() {
             let process = snapshot.record.process.as_ref().ok_or(
                 chanvoy_core::runtime::RuntimeError::Invalid("record peer process"),
             )?;
@@ -3536,8 +3739,8 @@ impl DaemonClient {
                 .into());
             }
         }
-        self.binding.verify()?;
-        Ok(stream)
+        binding.verify()?;
+        Ok((stream, binding))
     }
 
     pub async fn whoami(&self) -> Result<chanvoy_core::Identity, DaemonError> {
@@ -3971,7 +4174,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitFollowEvent) -> Result<(), DaemonError>,
     {
-        let mut stream = self.connect_bound().await?;
+        let (mut stream, binding) = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -3990,7 +4193,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-            self.binding.verify()?;
+            binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_FOLLOW_V1_EVENT_METHOD)
@@ -4078,7 +4281,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitFollowEvent) -> Result<(), DaemonError>,
     {
-        let mut stream = self.connect_bound().await?;
+        let (mut stream, binding) = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_DM_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -4097,7 +4300,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-            self.binding.verify()?;
+            binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_FOLLOW_V1_EVENT_METHOD)
@@ -4185,7 +4388,7 @@ impl DaemonClient {
     where
         F: FnMut(chanvoy_core::WaitInboxFollowEvent) -> Result<(), DaemonError>,
     {
-        let mut stream = self.connect_bound().await?;
+        let (mut stream, binding) = self.connect_bound().await?;
         let request =
             chanvoy_core::rpc_request(WAIT_INBOX_FOLLOW_V1_METHOD, serde_json::to_value(params)?);
         stream
@@ -4204,7 +4407,7 @@ impl DaemonClient {
                 });
             }
             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-            self.binding.verify()?;
+            binding.verify()?;
             line.clear();
             if value.get("method").and_then(serde_json::Value::as_str)
                 == Some(WAIT_INBOX_FOLLOW_V1_EVENT_METHOD)
@@ -4278,7 +4481,7 @@ impl DaemonClient {
         R: DeserializeOwned,
         F: FnMut(E) -> Result<(), DaemonError>,
     {
-        let stream = self.connect_bound().await?;
+        let (stream, binding) = self.connect_bound().await?;
         let request = chanvoy_core::rpc_request(method, params);
         let (reader, mut writer) = stream.into_split();
         writer
@@ -4302,7 +4505,7 @@ impl DaemonClient {
                                 });
                             }
                             let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-                self.binding.verify()?;
+                binding.verify()?;
                             line.clear();
                             value
                         }
@@ -4323,7 +4526,7 @@ impl DaemonClient {
                     });
                 }
                 let value: serde_json::Value = serde_json::from_str(line.trim_end())?;
-                self.binding.verify()?;
+                binding.verify()?;
                 line.clear();
                 value
             };
@@ -4456,9 +4659,9 @@ impl DaemonClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, DaemonError> {
-        let stream = self.connect_bound().await?;
+        let (stream, binding) = self.connect_bound().await?;
         let response = exchange(stream, method, params).await?;
-        self.binding.verify()?;
+        binding.verify()?;
         decode_response(response)
     }
 }

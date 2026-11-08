@@ -247,6 +247,45 @@ impl PrivateDirectory {
         self.verify_named()
     }
 
+    #[allow(clippy::unnecessary_cast)]
+    pub fn verify_socket_named(
+        &self,
+        name: &OsStr,
+        expected: InodeIdentity,
+    ) -> Result<(), RuntimeError> {
+        validate_leaf(name)?;
+        let name =
+            CString::new(name.as_bytes()).map_err(|_| RuntimeError::Invalid("entry name"))?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: live directory, single terminated component and writable stat.
+        let result = unsafe {
+            libc::fstatat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: successful fstatat initialized the supplied stat structure.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK
+            || stat.st_uid != self.uid
+            || stat.st_mode as u32 & 0o7777 != 0o600
+            || stat.st_nlink != 1
+        {
+            return Err(RuntimeError::Invalid(
+                "named socket is not private single-link socket authority",
+            ));
+        }
+        if stat.st_dev as u64 != expected.device || stat.st_ino as u64 != expected.inode {
+            return Err(RuntimeError::Changed("named socket identity"));
+        }
+        self.verify_named()
+    }
+
     pub fn raw_fd(&self) -> i32 {
         self.file.as_raw_fd()
     }
@@ -257,6 +296,41 @@ impl PrivateDirectory {
     /// Synchronous publication: the caller retains mutation ownership through
     /// all writes, replacement and directory sync. Once a namespace mutation
     /// begins, any failure is uncertainty, never a claim of rollback.
+    /// Remove only an exact captured private regular artifact. The owning
+    /// lifecycle operation/publisher must exclude cooperating writers.
+    pub fn remove_file(
+        &self,
+        name: &OsStr,
+        expected: &FileFingerprint,
+    ) -> Result<(), RuntimeError> {
+        self.verify_named()?;
+        self.verify_file_named(name, expected)?;
+        let name =
+            CString::new(name.as_bytes()).map_err(|_| RuntimeError::Invalid("entry name"))?;
+        // SAFETY: validated leaf and retained directory; no recursive removal.
+        if unsafe { libc::unlinkat(self.raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync()
+            .map_err(|_| RuntimeError::PublicationUncertain)?;
+        self.verify_named()
+    }
+
+    /// Remove only an exact captured private socket entry under this directory.
+    pub fn remove_socket(&self, name: &OsStr, expected: InodeIdentity) -> Result<(), RuntimeError> {
+        self.verify_named()?;
+        self.verify_socket_named(name, expected)?;
+        let name =
+            CString::new(name.as_bytes()).map_err(|_| RuntimeError::Invalid("entry name"))?;
+        // SAFETY: validated leaf and retained directory; no recursive removal.
+        if unsafe { libc::unlinkat(self.raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        self.sync()
+            .map_err(|_| RuntimeError::PublicationUncertain)?;
+        self.verify_named()
+    }
+
     pub fn publish(
         &self,
         name: &OsStr,
@@ -626,5 +700,59 @@ pub(super) mod tests {
         root.publish(name, None, b"new epoch").unwrap();
         assert!(root.publish(name, Some(&second), b"stale epoch").is_err());
         assert_eq!(std::fs::read(root.path().join(name)).unwrap(), b"new epoch");
+    }
+    #[test]
+    fn captured_removal_refuses_replaced_or_broadened_artifacts() {
+        let fixture = fixture();
+        let dir =
+            PrivateDirectory::open_canonical(fixture.path(), unsafe { libc::geteuid() }).unwrap();
+        let name = OsStr::new("handoff");
+        let captured = dir.publish(name, None, b"original").unwrap();
+        let replacement = dir.publish(name, Some(&captured), b"replacement").unwrap();
+        assert!(dir.remove_file(name, &captured).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(name)).unwrap(),
+            b"replacement"
+        );
+        std::fs::set_permissions(
+            dir.path().join(name),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(dir.remove_file(name, &replacement).is_err());
+        assert!(dir.path().join(name).exists());
+        std::fs::set_permissions(
+            dir.path().join(name),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        dir.remove_file(name, &replacement).unwrap();
+        assert!(!dir.path().join(name).exists());
+
+        let short_tmp = tempfile::Builder::new()
+            .prefix("cv-rm-")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap();
+        std::fs::set_permissions(short_tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sock_dir =
+            PrivateDirectory::open_canonical(short_tmp.path(), unsafe { libc::geteuid() }).unwrap();
+        let sock_name = OsStr::new("4242.sock");
+        let sock_path = sock_dir.path().join(sock_name);
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let meta = std::fs::symlink_metadata(&sock_path).unwrap();
+        let identity = InodeIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        };
+        let wrong_identity = InodeIdentity {
+            device: meta.dev(),
+            inode: meta.ino().wrapping_add(1),
+        };
+        assert!(sock_dir.remove_socket(sock_name, wrong_identity).is_err());
+        assert!(sock_path.exists());
+        drop(listener);
+        sock_dir.remove_socket(sock_name, identity).unwrap();
+        assert!(!sock_path.exists());
     }
 }

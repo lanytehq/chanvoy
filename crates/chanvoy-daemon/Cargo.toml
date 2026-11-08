@@ -34,4 +34,9 @@ waitprims-async = { workspace = true }
 waitprims-core = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 wiremock = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+# Native managed-child descriptor adoption and parent identity checks.
+libc = "0.2"

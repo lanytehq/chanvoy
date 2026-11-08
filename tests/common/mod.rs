@@ -68,9 +68,17 @@ impl TestEnv {
     /// same slug; process-table observations must therefore scope to this
     /// env's runtime dir, not the slug alone.
     pub async fn new(profile_name: &str) -> Self {
+        // Request private modes at creation, independent of a group-writable
+        // caller umask. Existing state files require a protected parent.
+        let private_dir = |purpose| {
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .expect(purpose)
+        };
         Self {
-            config_dir: tempfile::tempdir().expect("tempdir config"),
-            runtime_dir: tempfile::tempdir().expect("tempdir runtime"),
+            config_dir: private_dir("tempdir config"),
+            runtime_dir: private_dir("tempdir runtime"),
             mock: MockServer::start().await,
             profile_name: profile_name.to_string(),
             token_env_name: "LANYTE_MM_TOKEN".to_string(),

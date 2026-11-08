@@ -133,7 +133,7 @@ keyring plus GitHub Verified/valid, checks VERSION, and builds natively:
 | ------------- | ------------------------------ | ----------------------- |
 | Linux x86_64  | `chanvoy-vX.Y.Z-linux-x86_64`  | `ubuntu-22.04`          |
 | Linux aarch64 | `chanvoy-vX.Y.Z-linux-aarch64` | `ubuntu-latest-arm64-s` |
-| macOS aarch64 | `chanvoy-vX.Y.Z-macos-aarch64` | `macos-14`              |
+| macOS aarch64 | `chanvoy-vX.Y.Z-macos-aarch64` | `macos-15`              |
 
 Confirm runner availability and hosted success on the actual cut. CI also creates
 a versioned CycloneDX SBOM and stages both licenses in one exact base inventory.

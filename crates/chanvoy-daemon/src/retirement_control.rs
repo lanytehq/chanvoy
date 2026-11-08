@@ -20,7 +20,7 @@ pub(crate) trait Publication: Send {
     fn begin(&self) -> Result<(), RuntimeError>;
     fn retry(&self) -> Result<(), RuntimeError>;
 }
-impl Publication for RecordPublisher<'_> {
+impl Publication for Arc<RecordPublisher> {
     fn inspect(&self) -> Result<PublicationView, RuntimeError> {
         self.inspect_publication()
     }
@@ -82,10 +82,10 @@ pub(crate) struct RetirementControl<P> {
     anchor: RuntimeRecord,
     publisher: Mutex<P>,
 }
-impl<'a> RetirementControl<RecordPublisher<'a>> {
+impl RetirementControl<Arc<RecordPublisher>> {
     pub(crate) fn for_child(
         registry: Arc<WaitOwnerRegistry>,
-        publisher: RecordPublisher<'a>,
+        publisher: Arc<RecordPublisher>,
     ) -> Result<Self, RuntimeError> {
         Self::bind(registry, publisher)
     }

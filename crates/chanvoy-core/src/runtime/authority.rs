@@ -18,6 +18,8 @@ pub struct RuntimeAuthority {
     root: PrivateDirectory,
     records: Option<PrivateDirectory>,
     locks: Option<PrivateDirectory>,
+    #[cfg(test)]
+    test_home: bool,
 }
 
 /// Captured bytes plus descriptor/name fingerprint, for exact capture/recheck.
@@ -26,6 +28,14 @@ pub struct RecordSnapshot {
     pub record: RuntimeRecord,
     pub(super) fingerprint: FileFingerprint,
     pub(super) bytes: Vec<u8>,
+}
+
+/// Ephemeral credential-tier handoff capture. Debug intentionally omits the
+/// bootstrap, nonce and bytes. Persistent runtime records never contain them.
+pub struct BootstrapSnapshot {
+    pub bootstrap: super::RuntimeBootstrap,
+    fingerprint: FileFingerprint,
+    bytes: Vec<u8>,
 }
 
 impl RuntimeAuthority {
@@ -81,7 +91,30 @@ impl RuntimeAuthority {
             root,
             records,
             locks,
+            #[cfg(test)]
+            test_home: false,
         }))
+    }
+
+    #[cfg(test)]
+    fn open_for_test(canonical_home: PathBuf) -> Self {
+        let account = NativeAccount::resolve().unwrap();
+        let uid = account.uid();
+        let home = PrivateDirectory::open_native_home(&canonical_home, uid).unwrap();
+        let base = home.child(OsStr::new(".chanvoy"), true).unwrap().unwrap();
+        let root = base.child(OsStr::new("lifecycle"), true).unwrap().unwrap();
+        let records = root.child(OsStr::new("records"), true).unwrap();
+        let locks = root.child(OsStr::new("locks"), true).unwrap();
+        Self {
+            account,
+            canonical_home,
+            home,
+            base,
+            root,
+            records,
+            locks,
+            test_home: true,
+        }
     }
 
     pub fn uid(&self) -> u32 {
@@ -93,9 +126,14 @@ impl RuntimeAuthority {
 
     pub fn verify(&self) -> Result<(), RuntimeError> {
         let account = NativeAccount::resolve()?;
-        if account.uid() != self.account.uid()
-            || std::fs::canonicalize(account.home())?.as_os_str() != self.canonical_home.as_os_str()
-        {
+        #[cfg(test)]
+        let home_changed = !self.test_home
+            && std::fs::canonicalize(account.home())?.as_os_str()
+                != self.canonical_home.as_os_str();
+        #[cfg(not(test))]
+        let home_changed =
+            std::fs::canonicalize(account.home())?.as_os_str() != self.canonical_home.as_os_str();
+        if account.uid() != self.account.uid() || home_changed {
             return Err(RuntimeError::Changed("native account home"));
         }
         self.home.verify_named()?;
@@ -213,8 +251,9 @@ impl RuntimeAuthority {
         Ok(result)
     }
 
-    /// Launcher revision zero is no-replace and unspawned. Existing records
-    /// require a separately proven death/reaper path, not automatic overwrite.
+    /// Launcher revision zero is unspawned and either creates a new record or
+    /// replaces an already-reaped Exited tombstone with a fresh instance epoch.
+    /// Live or unconfirmed records require a separately proven death/reaper path.
     pub fn create_starting(
         &self,
         operation: &OperationLock,
@@ -237,7 +276,110 @@ impl RuntimeAuthority {
         {
             return Err(RuntimeError::Changed("loaded canonical config root"));
         }
-        self.publish_record(None, record)
+        if let Some(existing) = self.read_record(&record.namespace)? {
+            if existing.record.phase != RuntimePhase::Exited
+                || existing.record.namespace != record.namespace
+                || existing.record.uid != self.uid()
+                || existing.record.config_root != record.config_root
+                || existing.record.profile != record.profile
+                || existing.record.instance_uuid == record.instance_uuid
+            {
+                return Err(RuntimeError::Changed("record already exists"));
+            }
+            if !self.unchanged(&existing)? {
+                return Err(RuntimeError::Changed("record revision/epoch"));
+            }
+            let bytes = record.encode()?;
+            let dir = self
+                .records
+                .as_ref()
+                .ok_or(RuntimeError::Unavailable("record directory"))?;
+            let name = format!("{}.json", record.namespace.hex());
+            let fingerprint =
+                dir.publish(OsStr::new(&name), Some(&existing.fingerprint), &bytes)?;
+            self.verify()
+                .map_err(|_| RuntimeError::PublicationUncertain)?;
+            let published = RecordSnapshot {
+                record: record.clone(),
+                fingerprint,
+                bytes,
+            };
+            self.confirm_publication(&published)?;
+            return Ok(published);
+        }
+        let published = self.publish_record(None, record)?;
+        self.confirm_publication(&published)?;
+        Ok(published)
+    }
+
+    /// Guarded reaper: after independent whole-process death proof, under the
+    /// held operation lock, verify lease freedom, exact socket identity, and
+    /// kernel listener absence before removing the socket and publishing an
+    /// Exited tombstone at `revision + 1`.
+    pub fn reap_exited(
+        &self,
+        operation: &OperationLock,
+        captured: &RecordSnapshot,
+        socket_root: &super::SocketRoot,
+    ) -> Result<RecordSnapshot, RuntimeError> {
+        operation.verify(self)?;
+        if captured.record.namespace != *operation.namespace()
+            || captured.record.uid != self.uid()
+            || !matches!(
+                captured.record.phase,
+                RuntimePhase::Running | RuntimePhase::Retiring
+            )
+        {
+            return Err(RuntimeError::Invalid("reaper record state"));
+        }
+        if !self.unchanged(captured)? {
+            return Err(RuntimeError::Changed("reaper record changed"));
+        }
+        if !matches!(
+            self.observe_lease(&captured.record.namespace)?,
+            LeaseObservation::Free | LeaseObservation::Missing
+        ) {
+            return Err(RuntimeError::Changed("runtime lease still held"));
+        }
+        let process = captured
+            .record
+            .process
+            .as_ref()
+            .ok_or(RuntimeError::Invalid("reaper record missing process"))?;
+        let socket = captured
+            .record
+            .socket
+            .as_ref()
+            .ok_or(RuntimeError::Invalid("reaper record missing socket"))?;
+        socket_root.verify_socket(process.pid, socket)?;
+        if super::observe_listener_table(&socket.path)?
+            != super::ListenerTableObservation::NotObserved
+        {
+            return Err(RuntimeError::Changed("runtime listener still observed"));
+        }
+        operation.verify(self)?;
+        if !self.unchanged(captured)? {
+            return Err(RuntimeError::Changed("reaper record changed"));
+        }
+        let exited = RuntimeRecord {
+            schema_version: captured.record.schema_version,
+            namespace: captured.record.namespace.clone(),
+            instance_uuid: captured.record.instance_uuid,
+            revision: captured.record.next_revision()?,
+            phase: RuntimePhase::Exited,
+            uid: captured.record.uid,
+            config_root: captured.record.config_root.clone(),
+            profile: captured.record.profile.clone(),
+            process: None,
+            socket: None,
+            build: captured.record.build.clone(),
+            ready: false,
+        };
+        exited.validate()?;
+        socket_root.remove_socket(process.pid, socket)?;
+        let published = self.publish_record(Some(captured), &exited)?;
+        self.confirm_publication(&published)?;
+        Ok(published)
     }
 
     pub(super) fn publish_record(
@@ -308,6 +450,114 @@ impl RuntimeAuthority {
         Ok(())
     }
 
+    /// Publish an epoch-specific, no-replace bootstrap under the held operation
+    /// lock. This validates file and record claims, not descriptor inheritance.
+    pub fn write_bootstrap(
+        &self,
+        operation: &OperationLock,
+        lease: &LifetimeLease,
+        starting: &RecordSnapshot,
+        bootstrap: &super::RuntimeBootstrap,
+    ) -> Result<BootstrapSnapshot, RuntimeError> {
+        operation.verify(self)?;
+        lease.verify(self)?;
+        if operation.namespace() != &bootstrap.namespace
+            || lease.namespace() != &bootstrap.namespace
+            || lease.identity() != bootstrap.lease_identity
+            || starting.record.namespace != bootstrap.namespace
+            || starting.record.instance_uuid != bootstrap.instance_uuid
+            || starting.record.config_root != bootstrap.config_root
+            || starting.record.profile != bootstrap.profile
+            || starting.record.uid != bootstrap.uid
+            || starting.record.revision != 0
+            || starting.record.phase != RuntimePhase::Starting
+            || bootstrap.uid != self.uid()
+            || !self.unchanged(starting)?
+        {
+            return Err(RuntimeError::Changed("bootstrap launcher ownership"));
+        }
+        let bytes = bootstrap
+            .encode()
+            .map_err(|_| RuntimeError::Invalid("bootstrap contract"))?;
+        let dir = self
+            .records
+            .as_ref()
+            .ok_or(RuntimeError::Unavailable("record directory"))?;
+        let name = bootstrap_name(&bootstrap.namespace, bootstrap.instance_uuid);
+        let fingerprint = dir.publish(OsStr::new(&name), None, &bytes)?;
+        self.verify()?;
+        Ok(BootstrapSnapshot {
+            bootstrap: bootstrap.clone(),
+            fingerprint,
+            bytes,
+        })
+    }
+
+    /// Credential-tier descriptor-relative read with metadata checked before
+    /// parsing. An inaccessible/changed file is never a legacy startup fallback.
+    pub fn read_bootstrap(
+        &self,
+        namespace: &Namespace,
+        instance: super::InstanceId,
+    ) -> Result<BootstrapSnapshot, RuntimeError> {
+        self.verify()?;
+        let dir = self
+            .records
+            .as_ref()
+            .ok_or(RuntimeError::Unavailable("record directory"))?;
+        let name = bootstrap_name(namespace, instance);
+        let file = dir
+            .open_file(OsStr::new(&name), libc::O_RDONLY)?
+            .ok_or(RuntimeError::Unavailable("bootstrap missing"))?;
+        let fingerprint = FileFingerprint::of(&file.metadata()?);
+        let cap = super::control::BOOTSTRAP_MAX_BYTES;
+        if fingerprint.size > cap as u64 {
+            return Err(RuntimeError::Invalid("bootstrap byte cap"));
+        }
+        let mut bytes = Vec::new();
+        (&file).take(cap as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > cap || FileFingerprint::of(&file.metadata()?) != fingerprint {
+            return Err(RuntimeError::Changed("bootstrap descriptor"));
+        }
+        dir.verify_file_named(OsStr::new(&name), &fingerprint)?;
+        self.verify()?;
+        let bootstrap = super::RuntimeBootstrap::decode(&bytes)
+            .map_err(|_| RuntimeError::Invalid("bootstrap contract"))?;
+        if bootstrap.namespace != *namespace
+            || bootstrap.instance_uuid != instance
+            || bootstrap.uid != self.uid()
+        {
+            return Err(RuntimeError::Changed("bootstrap epoch/account"));
+        }
+        Ok(BootstrapSnapshot {
+            bootstrap,
+            fingerprint,
+            bytes,
+        })
+    }
+
+    /// Consume only the exact handoff that passed child validation. No lease,
+    /// record, listener or process is removed by this operation.
+    pub fn consume_bootstrap(&self, captured: &BootstrapSnapshot) -> Result<(), RuntimeError> {
+        let bootstrap = &captured.bootstrap;
+        let current = self.read_bootstrap(&bootstrap.namespace, bootstrap.instance_uuid)?;
+        if current.fingerprint != captured.fingerprint || current.bytes != captured.bytes {
+            return Err(RuntimeError::Changed("bootstrap consumption identity"));
+        }
+        let dir = self
+            .records
+            .as_ref()
+            .ok_or(RuntimeError::Unavailable("record directory"))?;
+        dir.remove_file(
+            OsStr::new(&bootstrap_name(
+                &bootstrap.namespace,
+                bootstrap.instance_uuid,
+            )),
+            &captured.fingerprint,
+        )?;
+        self.verify()
+    }
+
     fn open_lock(
         &self,
         namespace: &Namespace,
@@ -373,6 +623,10 @@ pub enum LeaseObservation {
     Missing,
     Free,
     Contended,
+}
+
+fn bootstrap_name(namespace: &Namespace, instance: super::InstanceId) -> String {
+    format!("{}.{}.bootstrap.json", namespace.hex(), instance.uuid())
 }
 
 /// Lifetime reference; drop closes only this reference. No explicit unlock or
@@ -462,6 +716,32 @@ mod tests {
 
     #[test]
     fn duplicate_keeps_same_flock_description_after_holder_drop_without_unlock_or_relock() {
+        // A sibling test can fork while this test owns the lease. CLOEXEC only
+        // closes that inherited reference at exec, so run the release assertion
+        // in its own process, where unrelated test threads cannot copy its fds.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::authority::tests::duplicate_lease_child_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("LEASE_DUPLICATE_RELEASED"),
+            "isolated lease fixture: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "child helper; invoked by the duplicate lease test in a separate process"]
+    fn duplicate_lease_child_fixture() {
         // Generic persistent-base primitive proof, not real-C/bootstrap proof.
         let fixture = super::super::filesystem::tests::fixture();
         // SAFETY: pure effective UID getter.
@@ -509,6 +789,7 @@ mod tests {
         drop(duplicate);
         acquire(&observer).unwrap();
         assert!(dir.path().join(name).exists());
+        println!("LEASE_DUPLICATE_RELEASED");
     }
 
     /// Run explicitly on the qualified host. This never installs/cycles an
@@ -685,5 +966,275 @@ mod tests {
                 Err(RuntimeError::Invalid("state-root override unsupported"))
             ));
         }
+    }
+    #[test]
+    fn lifetime_description_survives_exec_and_parent_reference_drop() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::process::CommandExt;
+        let fixture = super::super::filesystem::tests::fixture();
+        let uid = unsafe { libc::geteuid() };
+        let dir = PrivateDirectory::open_canonical(fixture.path(), uid).unwrap();
+        let namespace = Namespace::derive(
+            uid,
+            &PathBytes::from_path(fixture.path()).unwrap(),
+            "exec-lease",
+        )
+        .unwrap();
+        let name = format!("{}.lease", namespace.hex());
+        let file = dir
+            .open_file(
+                OsStr::new(&name),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            )
+            .unwrap()
+            .unwrap();
+        acquire(&file).unwrap();
+        let lease = LifetimeLease {
+            opened: OpenedLock {
+                fingerprint: FileFingerprint::of(&file.metadata().unwrap()),
+                file,
+                name: name.clone(),
+                namespace,
+            },
+        };
+        let child_fd = lease.duplicate_for_child().unwrap();
+        let raw = child_fd.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "runtime::authority::tests::inherited_lease_child_fixture",
+                "--nocapture",
+            ])
+            .env("CHANVOY_TEST_LEASE_FD", raw.to_string())
+            .env(
+                "CHANVOY_TEST_LEASE_DEVICE",
+                lease.identity().device.to_string(),
+            )
+            .env(
+                "CHANVOY_TEST_LEASE_INODE",
+                lease.identity().inode.to_string(),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: post-fork callback uses only descriptor fcntl operations and
+        // scalar state. Parent descriptor flags are never changed.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(raw, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(child_fd);
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child ended before inherited-fd proof"
+            );
+            if line.contains("LEASE_INHERITED_READY") {
+                break;
+            }
+            line.clear();
+        }
+        let observer = dir
+            .open_file(OsStr::new(&name), libc::O_RDWR)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(acquire(&observer), Err(RuntimeError::Locked)));
+        drop(lease);
+        assert!(
+            matches!(acquire(&observer), Err(RuntimeError::Locked)),
+            "child must retain the original locked description"
+        );
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(child.wait().unwrap().success());
+        acquire(&observer).unwrap();
+    }
+
+    #[test]
+    #[ignore = "exec fixture helper, invoked only by lifetime description test"]
+    fn inherited_lease_child_fixture() {
+        use std::io::{Read, Write};
+        // Fixture-only deadman bounds both parent-output and child-input waits.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            std::process::exit(91);
+        });
+        let fd: i32 = std::env::var("CHANVOY_TEST_LEASE_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(fd >= 3);
+        // SAFETY: test launcher deliberately inherited this sole child-owned fd.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let observed = FileFingerprint::of(&file.metadata().unwrap());
+        assert_eq!(
+            observed.identity.device.to_string(),
+            std::env::var("CHANVOY_TEST_LEASE_DEVICE").unwrap()
+        );
+        assert_eq!(
+            observed.identity.inode.to_string(),
+            std::env::var("CHANVOY_TEST_LEASE_INODE").unwrap()
+        );
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) },
+            0
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        println!("LEASE_INHERITED_READY");
+        std::io::stdout().flush().unwrap();
+        let mut release = [0u8];
+        std::io::stdin().read_exact(&mut release).unwrap();
+        assert_eq!(release, [b'x']);
+        drop(file);
+    }
+
+    #[test]
+    fn reap_exited_requires_free_lease_and_no_listener_then_allows_fresh_starting_epoch() {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let uid = unsafe { libc::geteuid() };
+        let home_fixture = super::super::filesystem::tests::fixture();
+        let home_path = std::fs::canonicalize(home_fixture.path()).unwrap();
+        let base = std::fs::canonicalize(super::super::SocketRoot::test_socket_parent()).unwrap();
+        let sockets_path = base.join(format!("cv-reap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&sockets_path)
+            .unwrap();
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(sockets_path.clone());
+        let authority = RuntimeAuthority::open_for_test(home_path.clone());
+        let socket_root = super::super::SocketRoot::from_test_dir(
+            PrivateDirectory::open_canonical(&sockets_path, uid).unwrap(),
+            uid,
+        );
+        let config_root = PathBytes::from_path(&home_path).unwrap();
+        let namespace = Namespace::derive(uid, &config_root, "reap-fixture").unwrap();
+        let operation = authority.try_operation(&namespace).unwrap();
+        let lease = authority.try_lifetime(&operation).unwrap();
+        let instance1 = super::super::InstanceId::new();
+        let starting_record = RuntimeRecord {
+            schema_version: 1,
+            namespace: namespace.clone(),
+            instance_uuid: instance1,
+            revision: 0,
+            phase: RuntimePhase::Starting,
+            uid,
+            config_root: config_root.clone(),
+            profile: "reap-fixture".into(),
+            process: None,
+            socket: None,
+            build: None,
+            ready: false,
+        };
+        let starting = authority
+            .create_starting(&operation, &lease, &starting_record)
+            .unwrap();
+        let process = super::super::RuntimeProcess::observe_current().unwrap();
+        let sock_path = socket_root.child_path(process.pid).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(sock_path.to_path()).unwrap();
+        std::fs::set_permissions(
+            sock_path.to_path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let meta = std::fs::symlink_metadata(sock_path.to_path()).unwrap();
+        let socket = super::super::RuntimeSocket {
+            path: sock_path.clone(),
+            identity: super::super::InodeIdentity {
+                device: meta.dev(),
+                inode: meta.ino(),
+            },
+        };
+        let build = super::super::RuntimeBuildPin {
+            version: "0.3.3".into(),
+            commit: "a".repeat(40),
+            dirty: Some(false),
+        };
+        let mut running_record = starting_record.clone();
+        running_record.revision = 1;
+        running_record.phase = RuntimePhase::Running;
+        running_record.process = Some(process);
+        running_record.socket = Some(socket);
+        running_record.build = Some(build);
+        running_record.ready = true;
+        authority
+            .publish_record(Some(&starting), &running_record)
+            .unwrap();
+        let running = authority.read_record(&namespace).unwrap().unwrap();
+        let mut retiring_record = running_record;
+        retiring_record.revision = 2;
+        retiring_record.phase = RuntimePhase::Retiring;
+        retiring_record.ready = false;
+        authority
+            .publish_record(Some(&running), &retiring_record)
+            .unwrap();
+        let retiring = authority.read_record(&namespace).unwrap().unwrap();
+
+        // Lease still contended -> reap refused.
+        assert!(matches!(
+            authority.reap_exited(&operation, &retiring, &socket_root),
+            Err(RuntimeError::Changed("runtime lease still held"))
+        ));
+        drop(lease);
+
+        // Lease is free, but listener is still open -> reap refused on Linux/macOS when observed.
+        assert!(matches!(
+            authority.reap_exited(&operation, &retiring, &socket_root),
+            Err(RuntimeError::Changed("runtime listener still observed"))
+        ));
+        assert!(sock_path.to_path().exists());
+
+        // Close listener; socket file remains on disk until guarded reap.
+        drop(listener);
+        assert!(sock_path.to_path().exists());
+        let exited = authority
+            .reap_exited(&operation, &retiring, &socket_root)
+            .unwrap();
+        assert!(!sock_path.to_path().exists());
+        assert_eq!(exited.record.phase, RuntimePhase::Exited);
+        assert_eq!(exited.record.revision, 3);
+        assert!(exited.record.socket.is_none());
+        assert!(exited.record.process.is_none());
+        assert!(!exited.record.ready);
+
+        // Same instance_uuid cannot be reused after Exited tombstone.
+        let lease2 = authority.try_lifetime(&operation).unwrap();
+        assert!(matches!(
+            authority.create_starting(&operation, &lease2, &starting_record),
+            Err(RuntimeError::Changed("record already exists"))
+        ));
+
+        // Fresh instance_uuid replaces Exited tombstone with revision-0 Starting.
+        let mut successor_record = starting_record;
+        successor_record.instance_uuid = super::super::InstanceId::new();
+        let successor = authority
+            .create_starting(&operation, &lease2, &successor_record)
+            .unwrap();
+        assert_eq!(successor.record.phase, RuntimePhase::Starting);
+        assert_eq!(successor.record.revision, 0);
+        assert_eq!(
+            successor.record.instance_uuid,
+            successor_record.instance_uuid
+        );
     }
 }

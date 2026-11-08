@@ -8,8 +8,14 @@ pub mod control;
 
 mod authority;
 mod filesystem;
+mod handoff;
 mod identity;
+mod launch_marker;
+mod listener_table;
 mod locality;
+mod native_arguments;
+mod native_inventory;
+mod native_process;
 mod peer;
 mod publisher;
 mod record;
@@ -17,9 +23,14 @@ mod resolver;
 mod socket_root;
 
 pub use authority::{
-    LeaseObservation, LifetimeLease, OperationLock, RecordSnapshot, RuntimeAuthority,
+    BootstrapSnapshot, LeaseObservation, LifetimeLease, OperationLock, RecordSnapshot,
+    RuntimeAuthority,
 };
+pub use handoff::{RuntimeBootstrap, RuntimeReadiness};
 pub use identity::{Namespace, NativeAccount, PathBytes};
+pub use launch_marker::RuntimeLaunchMarker;
+pub use listener_table::{observe_listener_table, ListenerTableObservation};
+pub use native_inventory::{NativeCandidate, NativeCandidateKind, NativeInventory};
 pub use peer::native_peer_pid;
 pub use publisher::{PublicationView, RecordPublisher};
 pub use record::{

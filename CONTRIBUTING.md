@@ -18,10 +18,50 @@ covers the contributor's side.
 
 1. Install Rust and the repo toolchain (MSRV is **1.89.0**):
 
-   - `rustup toolchain install 1.89.0`
-   - `rustup component add rustfmt clippy`
+   - `rustup toolchain install 1.89.0 --profile minimal`
+   - Install `rustfmt` and `clippy` for the toolchain selected by plain `cargo`.
+     For a stable default: `rustup component add rustfmt clippy --toolchain stable`.
 
-2. Use the Makefile so ordinary builds share bounded caches across worktrees:
+   `make pr-final` runs fmt, Clippy and tests with the toolchain selected by plain `cargo`;
+   only its final locked compatibility check selects `+1.89.0`. Its `ensure-msrv`
+   prerequisite installs a minimal MSRV toolchain, without fmt or Clippy.
+
+2. Provision the gate's non-Rust tools: Bash, Python 3, Git, GnuPG (`gpg` and
+   `gpgconf`), Minisign, jq, `shasum`, Decernor >=0.1.8 and actionlint
+   v1.7.12. CI installs these before `make pr-final`; see
+   [the check workflow](.github/workflows/check.yml). A missing actionlint is
+   skipped locally, so that result does not include workflow lint.
+
+   Decernor must be an absolute executable regular file. Set all three helper
+   variables in the gate's shell:
+
+   ```sh
+   export CHANVOY_DECERNOR_BIN=/absolute/path/to/decernor
+   export DECERNOR_BIN="$CHANVOY_DECERNOR_BIN" DECERNOR="$CHANVOY_DECERNOR_BIN"
+   ```
+
+   The Linux amd64 CI artifact and checksum are pinned in
+   [the helper installer](scripts/release-install-decernor.sh) and
+   [its checksum file](config/release/decernor-ci-sha256.txt). The installer
+   expects CI runner paths; a local setup can verify the same archive and keep
+   the binary in its existing tool home. No Decernor source build is required.
+
+3. Check placement and directory permissions before the first gate. Keep the
+   existing Cargo/rustup homes, managed cache and temporary files on a volume
+   with sufficient space; set their paths before installing tools. Place Go
+   tools with an explicit `GOBIN` when the default binary directory is on a
+   smaller volume.
+
+   Runtime filesystem tests walk the checkout's directory ancestry. Those
+   ancestors must not be group/world-writable, except for root-owned sticky
+   directories. Use a protected workspace and umask `022` when creating a new
+   checkout. A later umask change does not repair existing directory modes;
+   inspect the failing ancestry instead of changing the entire checkout.
+   A private `0700` temporary directory is suitable when a shared temporary
+   parent does not meet this ancestry rule. Test config/runtime directories
+   request `0700` themselves; do not loosen production permission checks.
+
+4. Use the Makefile so ordinary builds share bounded caches across worktrees:
 
    - `make pr-final` — CI-exact final gate before pushing a PR branch
    - `make check` — fast loop (fmt + clippy + test)

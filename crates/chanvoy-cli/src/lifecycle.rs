@@ -105,10 +105,10 @@ pub(super) struct ReuseCandidate {
 
 impl ReuseCandidate {
     pub(super) async fn capture(profile: &str) -> Option<Self> {
-        Self::capture_binding(chanvoy_core::runtime::RuntimeBinding::legacy(profile))
-            .await
+        let binding = chanvoy_core::runtime::RuntimeBinding::resolve_profile(profile)
             .ok()
-            .flatten()
+            .flatten()?;
+        Self::capture_binding(binding).await.ok().flatten()
     }
 
     #[cfg(test)]
@@ -378,6 +378,105 @@ impl FailedChildRuntime {
 /// Kernel exit evidence stays usable when an unreaped process no longer exposes
 /// executable metadata. It observes termination; signal ownership still needs
 /// the separately revalidated process and socket identity.
+/// Managed lifecycle exposes only observation, never the legacy signal path.
+#[allow(dead_code)]
+pub(super) struct ManagedExitWatch {
+    process: chanvoy_core::runtime::RuntimeProcess,
+    watch: ExitWatch,
+}
+/// Constructible only after a kernel exit event on the same-birth registered
+/// process. A free lease, missing socket or stale record cannot create this.
+#[allow(dead_code)]
+pub(super) struct WholeProcessExit {
+    process: chanvoy_core::runtime::RuntimeProcess,
+}
+#[allow(dead_code)]
+impl WholeProcessExit {
+    pub(super) fn process(&self) -> &chanvoy_core::runtime::RuntimeProcess {
+        &self.process
+    }
+
+    pub(super) fn confirm_already_exited(
+        process: &chanvoy_core::runtime::RuntimeProcess,
+        inventory: &chanvoy_core::runtime::NativeInventory,
+        namespace: &chanvoy_core::runtime::Namespace,
+    ) -> Result<Self, chanvoy_core::runtime::RuntimeError> {
+        use chanvoy_core::runtime::{NativeCandidateKind, RuntimeError};
+        for candidate in &inventory.candidates {
+            match &candidate.kind {
+                NativeCandidateKind::Legacy { .. } => {
+                    return Err(RuntimeError::Unavailable(
+                        "legacy candidate requires manual reconciliation",
+                    ));
+                }
+                NativeCandidateKind::Managed(marker) if &marker.namespace == namespace => {
+                    return Err(RuntimeError::Changed(
+                        "managed target still present in native inventory",
+                    ));
+                }
+                NativeCandidateKind::Managed(_) => {}
+            }
+        }
+        let pid = process.pid.get();
+        let Some(expected_birth) = birth_claim(&process.birth) else {
+            return Err(RuntimeError::Invalid("recorded process birth"));
+        };
+        let exited = native_birth(pid).is_some_and(|birth| birth != expected_birth)
+            || native_terminated(pid)
+            || matches!(death_or_unknown(pid), ProcessObservation::Dead);
+        if !exited {
+            return Err(RuntimeError::Unavailable(
+                "managed whole-process exit unconfirmed",
+            ));
+        }
+        Ok(Self {
+            process: process.clone(),
+        })
+    }
+}
+#[allow(dead_code)]
+impl ManagedExitWatch {
+    pub(super) fn capture(process: &chanvoy_core::runtime::RuntimeProcess) -> Result<Self, String> {
+        process
+            .revalidate()
+            .map_err(|_| "managed process identity unavailable before exit monitor")?;
+        let watch = ExitWatch::new(process.pid.get())?
+            .ok_or("managed process exited before same-birth monitor registration")?;
+        process
+            .revalidate()
+            .map_err(|_| "managed process identity changed during exit monitor registration")?;
+        Ok(Self {
+            process: process.clone(),
+            watch,
+        })
+    }
+    pub(super) async fn observe_exit(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<WholeProcessExit, String> {
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("managed whole-process exit unconfirmed; state retained".into());
+            }
+            if self.watch.exited()? {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "managed whole-process exit deadline elapsed; state retained".into(),
+                    );
+                }
+                return Ok(WholeProcessExit {
+                    process: self.process.clone(),
+                });
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                Instant::from_std(deadline),
+                Instant::now() + Duration::from_millis(20),
+            ))
+            .await;
+        }
+    }
+}
+
 struct ExitWatch {
     fd: OwnedFd,
     pid: u32,
@@ -606,7 +705,13 @@ fn account_of(pid: u32) -> Option<u32> {
     let mut info: ProcBsdShortInfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     // SAFETY: the buffer pointer and size describe `info` exactly.
+    // SAFETY: __error is this thread's errno pointer. Clear it so a failed
+    // or short call without errno cannot inherit an unrelated earlier denial.
+    unsafe { *libc::__error() = 0 };
     let read = unsafe {
+        // libproc may return zero without setting errno. Clear this thread's
+        // slot so a previous denied call cannot mislabel unavailable evidence.
+        *libc::__error() = 0;
         libc::proc_pidinfo(
             pid as i32,
             PROC_PIDT_SHORTBSDINFO,
@@ -776,7 +881,7 @@ impl NativeControl {
             return Ok(control);
         }
         let captured_birth = native_birth(pid);
-        let (captured, exit_watch) = capture_monitor(|| observe_pid(pid), || ExitWatch::new(pid))?;
+        let (captured, exit_watch) = capture_monitor(|| inspect_pid(pid), || ExitWatch::new(pid))?;
         let after = observe_pid(pid);
         if native_birth(pid).is_some_and(|birth| Some(birth) != captured_birth) {
             return Err("process birth changed around exit monitor; state retained".into());
@@ -864,15 +969,18 @@ fn maybe_daemon_serve(identity: &ProcessIdentity) -> bool {
 }
 
 fn capture_monitor<W>(
-    mut observe: impl FnMut() -> ProcessObservation,
+    mut observe: impl FnMut() -> Result<ProcessObservation, InspectionFailure>,
     register: impl FnOnce() -> Result<W, String>,
 ) -> Result<(ProcessObservation, W), String> {
-    let before = observe();
+    let before = observe().map_err(|failure| failure.before_monitor())?;
     if before == ProcessObservation::Unknown {
         return Err("process identity unavailable before exit monitor; state retained".into());
     }
     let watch = register()?;
-    validate_monitor_identity(&before, &observe())?;
+    let after = observe().map_err(|failure| {
+        format!("process identity unavailable after exit monitor ({failure}); state retained")
+    })?;
+    validate_monitor_identity(&before, &after)?;
     Ok((before, watch))
 }
 
@@ -894,6 +1002,11 @@ fn validate_monitor_identity(
 
 #[cfg(target_os = "macos")]
 fn native_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    native_bsd_info_checked(pid).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn native_bsd_info_checked(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
     let read = unsafe {
@@ -907,10 +1020,25 @@ fn native_bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
             size,
         )
     };
-    if read != size {
-        return None;
+    // Capture errno immediately; positive short reads are unavailable evidence,
+    // not permission denials even if the library left errno nonzero.
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    native_info_read_result(read, size, errno)?;
+    Ok(info)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn native_info_read_result(read: i32, expected: i32, errno: i32) -> std::io::Result<()> {
+    if read == expected {
+        Ok(())
+    } else if read <= 0 && errno > 0 {
+        Err(std::io::Error::from_raw_os_error(errno))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "incomplete native process info",
+        ))
     }
-    Some(info)
 }
 
 #[cfg(target_os = "macos")]
@@ -1011,56 +1139,124 @@ fn native_owner(_: u32) -> Option<u32> {
     None
 }
 
+/// Closed diagnostic vocabulary: never include process argv, executable paths,
+/// environment values or a dependency's free-form error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InspectionFailure {
+    stage: &'static str,
+    reason: &'static str,
+}
+
+impl InspectionFailure {
+    fn new(stage: &'static str, reason: &'static str) -> Self {
+        Self { stage, reason }
+    }
+
+    fn before_monitor(self) -> String {
+        format!(
+            "process identity unavailable before exit monitor ({self}); state retained; \
+             inspect the named prerequisite from an environment permitted to inspect the daemon"
+        )
+    }
+}
+
+impl std::fmt::Display for InspectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.stage, self.reason)
+    }
+}
+
+fn inspect_native_birth(pid: u32) -> Result<u64, InspectionFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        let info = native_bsd_info_checked(pid).map_err(|error| {
+            InspectionFailure::new("native-birth", io_inspection_reason(&error))
+        })?;
+        info.pbi_start_tvsec
+            .checked_mul(1_000_000)
+            .and_then(|secs| secs.checked_add(info.pbi_start_tvusec))
+            .ok_or(InspectionFailure::new("native-birth", "unavailable"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    native_birth(pid).ok_or(InspectionFailure::new("native-birth", "unavailable"))
+}
+
+fn inspect_native_owner(pid: u32) -> Result<u32, InspectionFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        native_bsd_info_checked(pid)
+            .map(|info| info.pbi_uid)
+            .map_err(|error| InspectionFailure::new("native-owner", io_inspection_reason(&error)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    native_owner(pid).ok_or(InspectionFailure::new("native-owner", "unavailable"))
+}
+
 fn observe_pid(pid: u32) -> ProcessObservation {
+    inspect_pid(pid).unwrap_or(ProcessObservation::Unknown)
+}
+
+fn inspect_pid(pid: u32) -> Result<ProcessObservation, InspectionFailure> {
     if pid == 0 || pid > i32::MAX as u32 {
-        return ProcessObservation::Unknown;
+        return Err(InspectionFailure::new(
+            "pid",
+            "outside-positive-process-range",
+        ));
     }
     if unsafe { libc::kill(pid as i32, 0) } != 0 {
         let error = std::io::Error::last_os_error();
         return if error.raw_os_error() == Some(libc::ESRCH) {
             tracing::debug!(stage = "process-liveness", pid, outcome = "pid-absent");
-            ProcessObservation::Dead
+            Ok(ProcessObservation::Dead)
         } else {
-            tracing::debug!(stage = "pid-probe", pid, outcome = ?error.kind());
-            ProcessObservation::Unknown
+            Err(InspectionFailure::new(
+                "pid-probe",
+                io_inspection_reason(&error),
+            ))
         };
     }
-    let Some(birth) = native_birth(pid) else {
-        return death_or_unknown(pid);
+    let birth = match inspect_native_birth(pid) {
+        Ok(birth) => birth,
+        Err(failure) => return inspected_death_or_failure(pid, failure.stage, failure.reason),
     };
-    let Some(uid) = native_owner(pid).filter(|uid| *uid == unsafe { libc::geteuid() }) else {
-        return ProcessObservation::Unknown;
-    };
-    // Termination needs platform-specific proof before executable metadata
-    // disappears: macOS zombie state or Linux whole-process pidfd readiness.
-    if native_terminated(pid) {
-        return ProcessObservation::Dead;
+    let uid = inspect_native_owner(pid)?;
+    if uid != unsafe { libc::geteuid() } {
+        return Err(InspectionFailure::new("native-owner", "different-account"));
     }
-    let Ok(info) = sysprims_proc::get_process(pid) else {
-        return death_or_unknown(pid);
+    if native_terminated(pid) {
+        return Ok(ProcessObservation::Dead);
+    }
+    let info = match sysprims_proc::get_process(pid) {
+        Ok(info) => info,
+        Err(error) => {
+            // sysprims' stable C-ABI error code 4 denotes permission denied.
+            // Do not display the error body, which may contain private metadata.
+            let reason = if error.error_code() == 4 {
+                "permission-denied"
+            } else {
+                "unavailable"
+            };
+            return inspected_death_or_failure(pid, "process-metadata", reason);
+        }
     };
     if native_birth(pid) != Some(birth) || native_owner(pid) != Some(uid) {
-        return death_or_unknown(pid);
+        return inspected_death_or_failure(pid, "native-identity", "changed-or-unavailable");
     }
     if info.state == sysprims_proc::ProcessState::Zombie {
         #[cfg(target_os = "linux")]
-        {
-            tracing::debug!(
-                stage = "process-liveness",
-                pid,
-                outcome = "leader-zombie-unconfirmed"
-            );
-            return ProcessObservation::Unknown;
-        }
+        return Err(InspectionFailure::new(
+            "process-exit",
+            "whole-process-exit-unconfirmed",
+        ));
         #[cfg(not(target_os = "linux"))]
-        return ProcessObservation::Dead;
+        return Ok(ProcessObservation::Dead);
     }
-    if info.cmdline.is_empty() {
-        tracing::debug!(
-            stage = "process-identity-observation",
-            pid,
-            outcome = "arguments-unavailable"
-        );
+    if let Some(failure) = metadata_failure(
+        info.start_time_unix_ms,
+        info.exe_path.as_deref(),
+        &info.cmdline,
+    ) {
+        return inspected_death_or_failure(pid, failure.stage, failure.reason);
     }
     identity_from_metadata(
         pid,
@@ -1071,7 +1267,46 @@ fn observe_pid(pid: u32) -> ProcessObservation {
         info.cmdline,
     )
     .map(ProcessObservation::Alive)
-    .unwrap_or_else(|| death_or_unknown(pid))
+    .ok_or(InspectionFailure::new("process-metadata", "unavailable"))
+}
+
+fn io_inspection_reason(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        "permission-denied"
+    } else {
+        "unavailable"
+    }
+}
+
+fn metadata_failure(
+    start_ms: Option<u64>,
+    executable: Option<&str>,
+    args: &[String],
+) -> Option<InspectionFailure> {
+    let stage = if start_ms.is_none() {
+        "process-start-time"
+    } else if executable.is_none_or(str::is_empty) {
+        "process-executable"
+    } else if executable.is_some_and(|path| path.ends_with(" (deleted)")) {
+        return Some(InspectionFailure::new("process-executable", "deleted"));
+    } else if args.is_empty() {
+        "process-arguments"
+    } else {
+        return None;
+    };
+    Some(InspectionFailure::new(stage, "unavailable"))
+}
+
+fn inspected_death_or_failure(
+    pid: u32,
+    stage: &'static str,
+    reason: &'static str,
+) -> Result<ProcessObservation, InspectionFailure> {
+    // Missing metadata is not death. Keep the existing independent ESRCH proof.
+    match death_or_unknown(pid) {
+        ProcessObservation::Dead => Ok(ProcessObservation::Dead),
+        _ => Err(InspectionFailure::new(stage, reason)),
+    }
 }
 
 /// Best-effort metadata can disappear during exit. An incomplete read cannot
@@ -2528,6 +2763,133 @@ mod tests {
         assert_eq!((f.signals.get(), f.cleanups.get()), (0, 0));
     }
     #[test]
+    fn native_info_failure_uses_only_failure_errno() {
+        for errno in [libc::EPERM, libc::EACCES] {
+            for read in [0, -1] {
+                let error = native_info_read_result(read, 128, errno).unwrap_err();
+                assert_eq!(io_inspection_reason(&error), "permission-denied");
+            }
+            assert!(native_info_read_result(128, 128, errno).is_ok());
+            let short = native_info_read_result(64, 128, errno).unwrap_err();
+            assert_eq!(io_inspection_reason(&short), "unavailable");
+        }
+        assert_eq!(
+            io_inspection_reason(&native_info_read_result(0, 128, 0).unwrap_err()),
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn inspection_failure_refuses_before_registering_exit_monitor() {
+        for failure in [
+            InspectionFailure::new("pid-probe", "permission-denied"),
+            InspectionFailure::new("native-birth", "unavailable"),
+            InspectionFailure::new("process-arguments", "unavailable"),
+        ] {
+            let registered = Cell::new(false);
+            let error = capture_monitor(
+                || Err(failure),
+                || {
+                    registered.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(!registered.get());
+            assert!(error.contains(&failure.to_string()), "{error}");
+            assert!(error.contains("before exit monitor"));
+            assert!(error.contains("state retained"));
+        }
+    }
+
+    #[test]
+    fn inspection_failure_after_registration_does_not_adopt_candidate() {
+        let mut observations = VecDeque::from([
+            Ok(ProcessObservation::Alive(identity())),
+            Err(InspectionFailure::new(
+                "native-identity",
+                "changed-or-unavailable",
+            )),
+        ]);
+        let registered = Cell::new(false);
+        let error = capture_monitor(
+            || observations.pop_front().unwrap(),
+            || {
+                registered.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(registered.get());
+        assert!(error.contains("after exit monitor"));
+        assert!(error.contains("native-identity: changed-or-unavailable"));
+        assert!(error.contains("state retained"));
+    }
+
+    #[test]
+    fn metadata_diagnostics_identify_missing_fields_without_exposing_values() {
+        let args = vec!["synthetic-private-argument".into()];
+        for (start, exe, argv, stage, reason) in [
+            (
+                None,
+                Some("/private/example"),
+                args.clone(),
+                "process-start-time",
+                "unavailable",
+            ),
+            (
+                Some(1),
+                None,
+                args.clone(),
+                "process-executable",
+                "unavailable",
+            ),
+            (
+                Some(1),
+                Some(""),
+                args.clone(),
+                "process-executable",
+                "unavailable",
+            ),
+            (
+                Some(1),
+                Some("/private/example (deleted)"),
+                args.clone(),
+                "process-executable",
+                "deleted",
+            ),
+            (
+                Some(1),
+                Some("/private/example"),
+                vec![],
+                "process-arguments",
+                "unavailable",
+            ),
+        ] {
+            let failure = metadata_failure(start, exe, &argv).unwrap();
+            assert_eq!(failure, InspectionFailure::new(stage, reason));
+            let message = failure.before_monitor();
+            assert!(!message.contains("/private/example"));
+            assert!(!message.contains("synthetic-private-argument"));
+        }
+        assert!(metadata_failure(Some(1), Some("/synthetic/chanvoy"), &args).is_none());
+        assert_eq!(
+            io_inspection_reason(&std::io::Error::from_raw_os_error(libc::EPERM)),
+            "permission-denied"
+        );
+        assert_eq!(
+            io_inspection_reason(&std::io::Error::from_raw_os_error(libc::EACCES)),
+            "permission-denied"
+        );
+        assert_eq!(
+            io_inspection_reason(&std::io::Error::from_raw_os_error(libc::EIO)),
+            "unavailable"
+        );
+        assert!(inspect_pid(0).is_err());
+        assert!(inspect_pid(u32::MAX).is_err());
+    }
+
+    #[test]
     fn monitor_registration_never_adopts_changed_or_unknown_identity() {
         let mut reused = identity();
         reused.birth += 1;
@@ -2536,11 +2898,11 @@ mod tests {
             ProcessObservation::Alive(reused),
         ] {
             let mut observations = VecDeque::from([ProcessObservation::Alive(identity()), after]);
-            assert!(capture_monitor(|| observations.pop_front().unwrap(), || Ok(())).is_err());
+            assert!(capture_monitor(|| Ok(observations.pop_front().unwrap()), || Ok(())).is_err());
         }
         for error in ["registration denied", "unsupported kernel"] {
             assert!(capture_monitor(
-                || ProcessObservation::Alive(identity()),
+                || Ok(ProcessObservation::Alive(identity())),
                 || Err::<(), _>(error.into())
             )
             .is_err());
@@ -2549,7 +2911,7 @@ mod tests {
             ProcessObservation::Dead,
             ProcessObservation::Alive(identity()),
         ]);
-        assert!(capture_monitor(|| observations.pop_front().unwrap(), || Ok(())).is_err());
+        assert!(capture_monitor(|| Ok(observations.pop_front().unwrap()), || Ok(())).is_err());
     }
 
     fn socket_budget() -> SocketPollBudget {
@@ -2964,6 +3326,56 @@ mod tests {
         assert_eq!(
             (f.shutdowns.get(), f.signals.get(), f.cleanups.get()),
             (1, 0, 0)
+        );
+    }
+    #[tokio::test]
+    async fn managed_exit_watch_observes_owned_child_without_signal() {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read -r line"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let captured = chanvoy_core::runtime::RuntimeProcess::observe(
+            chanvoy_core::runtime::ProcessId::new(child.id()).unwrap(),
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|p| ManagedExitWatch::capture(&p));
+        if let Err(error) = &captured {
+            drop(child.stdin.take());
+            let _ = child.wait();
+            panic!("owned child native observer unavailable: {error}");
+        }
+        let watch = captured.unwrap_or_else(|_| unreachable!());
+        assert!(watch.observe_exit(std::time::Instant::now()).await.is_err());
+        // A registered process that remains alive must not turn a timeout into
+        // whole-process death evidence, even when registration itself passed.
+        let alive_timeout = watch
+            .observe_exit(std::time::Instant::now() + Duration::from_millis(30))
+            .await;
+        let still_alive = child.try_wait().unwrap().is_none();
+        let mut wrong_birth = watch.process.clone();
+        match &mut wrong_birth.birth {
+            chanvoy_core::runtime::NativeBirth::Linux { clock_ticks } => *clock_ticks += 1,
+            chanvoy_core::runtime::NativeBirth::MacOs { seconds, .. } => *seconds += 1,
+        }
+        let wrong_birth_refused = ManagedExitWatch::capture(&wrong_birth).is_err();
+        child.stdin.take().unwrap().write_all(b"finish\n").unwrap();
+        let proof = watch
+            .observe_exit(std::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        let status = child.wait().unwrap();
+        assert!(alive_timeout.is_err());
+        assert!(still_alive);
+        assert!(wrong_birth_refused);
+        assert!(status.success());
+        assert_eq!(
+            proof.unwrap_or_else(|e| panic!("{e}")).process().pid.get(),
+            child.id()
         );
     }
 }

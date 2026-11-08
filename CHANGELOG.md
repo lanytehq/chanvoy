@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Inbox wait replacement wakes an idle receiver immediately instead of waiting
+  for a message or its original deadline before noticing cancellation.
+- Daemon stop identifies the unavailable process-inspection prerequisite rather
+  than reporting only an unknown identity. Diagnostics omit process arguments
+  and executable paths. `daemon ownable` help clarifies that bot-identity matching
+  does not establish native stop or restart permission.
+
 ## [0.3.3] - 2026-10-22
 
 ### Runtime control RPC routing

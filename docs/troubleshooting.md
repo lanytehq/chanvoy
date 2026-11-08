@@ -466,7 +466,8 @@ another session.
 chanvoy --profile <your-profile> version --extended
 # or: chanvoy --profile <your-profile> --json version -e
 # CLI pin is always present. generation_match is scored only when this
-# environment can restart the probed daemon (daemon-reported identity).
+# credential matches the probed daemon's verified bot identity.
+# This does not establish native process inspection or stop permission.
 # Bare version without --profile may probe active_profile belonging to
 # another seat — that path deliberately does not print Generation: match.
 ```
