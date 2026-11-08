@@ -22,23 +22,24 @@ use chanvoy_core::{
     check_search_operator_conflicts, classify_wait_dm_username, clock_check_from_observation,
     current_ws_observation_degraded, doctor_exit_code, format_basic as format_host_basic,
     format_extended as format_host_extended, host_generation_match, is_mattermost_post_id,
-    list_profiles, load_active_profile, load_profile, load_token, parse_after_channel_flag,
-    parse_qualified_wait_selector, parse_time_window, pid_path_for_profile, provider_status_class,
-    refuse_inbox_after, resolve_host_build_info, socket_path_for_profile, store_active_profile,
-    store_profile, validate_wait_channels_params, AckResult, AttentionListResult,
-    AttentionShowResult, AttentionSource, CapabilityClass, Channel, ChanvoyScopes, CheckResult,
-    CheckVerdict, ClockCheck, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation,
-    Identity, LegacyChannel, MattermostClient, Message, Notification, PinResult, PostReceipt,
-    Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
-    SeededChannelOutcome, TimeWindowDefaultUnit, UnpinResult, UnreadNotifications, WaitChannelArm,
-    WaitChannelSelector, WaitChannelV3Params, WaitChannelsParams, WaitChannelsResult,
-    WaitDmFollowV2Params, WaitDmV1Params, WaitDmV1Result, WaitFollowEvent, WaitFollowEventKind,
-    WaitFollowMode, WaitFollowV1Params, WaitFollowV2Params, WaitInboxFollowEvent,
-    WaitInboxFollowV2Event, WaitInboxFollowV2Params, WaitInboxV1Params, WaitInboxV1Result,
-    WaitResult, WsConnectionState, NOT_A_WAITABLE_PEER, POST_ID_NOT_INBOX_CURSOR,
-    RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED, RPC_WAIT_REPLACED,
-    RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_MAX_ARMS, WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP,
-    WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_INBOX_HELP,
+    list_profiles, load_active_profile, load_profile, load_token,
+    observe_native_runtime_diagnostics, parse_after_channel_flag, parse_qualified_wait_selector,
+    parse_time_window, pid_path_for_profile, provider_status_class, refuse_inbox_after,
+    resolve_host_build_info, socket_path_for_profile, store_active_profile, store_profile,
+    validate_wait_channels_params, AckResult, AttentionListResult, AttentionShowResult,
+    AttentionSource, CapabilityClass, Channel, ChanvoyScopes, CheckResult, CheckVerdict,
+    ClockCheck, CredentialMode, DaemonHealthState, DaemonStatus, DmConversation, Identity,
+    LegacyChannel, MattermostClient, Message, NativeRuntimeDiagnostics, Notification, PinResult,
+    PostReceipt, Profile, ProfileStatus, Provider, ReactionResult, SearchResult, SeedCursorsResult,
+    SeededChannelOutcome, SocketAccessStatus, TimeWindowDefaultUnit, UnpinResult,
+    UnreadNotifications, WaitChannelArm, WaitChannelSelector, WaitChannelV3Params,
+    WaitChannelsParams, WaitChannelsResult, WaitDmFollowV2Params, WaitDmV1Params, WaitDmV1Result,
+    WaitFollowEvent, WaitFollowEventKind, WaitFollowMode, WaitFollowV1Params, WaitFollowV2Params,
+    WaitInboxFollowEvent, WaitInboxFollowV2Event, WaitInboxFollowV2Params, WaitInboxV1Params,
+    WaitInboxV1Result, WaitResult, WsConnectionState, NOT_A_WAITABLE_PEER,
+    POST_ID_NOT_INBOX_CURSOR, RPC_WAIT_ALREADY_ACTIVE, RPC_WAIT_CONFLICT_CHANGED,
+    RPC_WAIT_REPLACED, RPC_WAIT_REPLACE_UNCONFIRMED, WAIT_CHANNELS_MAX_ARMS,
+    WAIT_CHANNELS_MIN_ARMS, WAIT_DM_HELP, WAIT_FOLLOW_COALESCE_MS_MAX, WAIT_INBOX_HELP,
 };
 use chanvoy_daemon::{daemon_client, ping, start, status, DaemonError};
 use chrono::{TimeZone, Utc};
@@ -6760,10 +6761,22 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
         checks.push(generation_check);
     }
     let exit = doctor_exit_code(&checks, hard_failure);
+    let native_runtime = observe_native_runtime_diagnostics(
+        profile_name,
+        daemon_block.reachable,
+        std::time::Instant::now() + daemon_assessment::LOCAL_BUDGET,
+    );
+    if !daemon_block.reachable
+        && daemon_disposition != DaemonDisposition::IdentityRefused
+        && native_runtime.socket_access.status == SocketAccessStatus::Denied
+    {
+        daemon_block.reason = native_runtime.socket_access.reason.clone();
+    }
     let mut notes = vec![
         "doctor is cursor-neutral: it does not post, ack, advance, or call check".into(),
         "daemon reachability is not a substitute for provider read visibility".into(),
         "a post at/after an emitted --since boundary that is still missing is a request/provider question, not clock".into(),
+        "native_runtime capabilities are read-only observations (qualification=false) and never authorize daemon retirement, artifact reaping, or restart".into(),
     ];
     let handoff_path = chanvoy_core::bootstrap_path_for_profile(profile_name);
     if !matches!(std::fs::symlink_metadata(&handoff_path), Err(error) if error.kind() == ErrorKind::NotFound)
@@ -6788,6 +6801,7 @@ async fn handle_doctor(profile_name: &str, json: bool, args: DoctorArgs) -> Resu
             detail: identity_block,
         },
         clock: clock_block,
+        native_runtime,
         channel: channel_block,
         notes,
     };
@@ -6826,6 +6840,7 @@ struct DoctorReport {
     generation: DoctorGenerationBlock,
     identity: DoctorCheckWrap<DoctorIdentityBlock>,
     clock: ClockCheck,
+    native_runtime: NativeRuntimeDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     channel: Option<DoctorChannelBlock>,
     notes: Vec<String>,
@@ -7087,6 +7102,27 @@ fn render_doctor_human(report: &DoctorReport) -> String {
         lines.push(format!("  reason: {r}"));
     }
     if let Some(g) = &c.guidance {
+        lines.push(format!("  guidance: {g}"));
+    }
+
+    let nr = &report.native_runtime;
+    lines.push(format!(
+        "native_runtime: qualification={} (socket_access={} process_inventory={} listener_table={})",
+        nr.qualification,
+        nr.socket_access.status.label(),
+        nr.process_inventory.status.label(),
+        nr.listener_table.status.label(),
+    ));
+    if let Some(r) = &nr.socket_access.reason {
+        lines.push(format!("  socket_access_reason: {r}"));
+    }
+    if let Some(r) = &nr.process_inventory.reason {
+        lines.push(format!("  process_inventory_reason: {r}"));
+    }
+    if let Some(r) = &nr.listener_table.reason {
+        lines.push(format!("  listener_table_reason: {r}"));
+    }
+    if let Some(g) = &nr.guidance {
         lines.push(format!("  guidance: {g}"));
     }
 

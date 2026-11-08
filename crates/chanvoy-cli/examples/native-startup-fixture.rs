@@ -3,7 +3,9 @@
 //! The launcher module is the production implementation, not a test substitute.
 //! Note: `--run-cancel-in-disposable-native-home` intentionally leaves its child
 //! daemon alive to prove cancellation preserves the running daemon; run it last
-//! or in its own disposable OS account.
+//! or in its own disposable OS account, or use `--run-all-in-disposable-native-home`
+//! to sequence all 5 phases (`startup` -> `retirement` -> `busy` -> `restart` -> `cancel`)
+//! and retire/reap the `cancel` child at the end.
 #[path = "../src/managed_environment.rs"]
 mod managed_environment;
 #[path = "../src/managed_launch.rs"]
@@ -62,7 +64,8 @@ fn main() {
                     || args[1] == "--run-retirement-in-disposable-native-home"
                     || args[1] == "--run-busy-in-disposable-native-home"
                     || args[1] == "--run-cancel-in-disposable-native-home"
-                    || args[1] == "--run-restart-in-disposable-native-home"),
+                    || args[1] == "--run-restart-in-disposable-native-home"
+                    || args[1] == "--run-all-in-disposable-native-home"),
             "requires explicit disposable-home fixture invocation",
         )?;
         require(
@@ -107,12 +110,23 @@ capability_class = "standard"
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(run_parent(
-            args[1] != "--run-in-disposable-native-home",
-            args[1] == "--run-busy-in-disposable-native-home",
-            args[1] == "--run-cancel-in-disposable-native-home",
-            args[1] == "--run-restart-in-disposable-native-home",
-        ))
+        if args[1] == "--run-all-in-disposable-native-home" {
+            runtime.block_on(run_all_phases(&account, &config, &sockets))
+        } else {
+            let mode = match args[1].to_str() {
+                Some("--run-in-disposable-native-home") => FixtureMode::Startup,
+                Some("--run-retirement-in-disposable-native-home") => {
+                    FixtureMode::ManagedRetirement
+                }
+                Some("--run-busy-in-disposable-native-home") => FixtureMode::Busy,
+                Some("--run-restart-in-disposable-native-home") => FixtureMode::Restart,
+                Some("--run-cancel-in-disposable-native-home") => FixtureMode::Cancel {
+                    retire_after: false,
+                },
+                _ => unreachable!("checked above"),
+            };
+            runtime.block_on(run_parent(mode))
+        }
     })();
     if let Err(error) = result {
         eprintln!("fixture failed: {error}");
@@ -167,12 +181,90 @@ async fn exchange(
     .await?
 }
 
-async fn run_parent(
-    managed_retirement: bool,
-    check_busy: bool,
-    check_cancel: bool,
-    check_restart: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureMode {
+    Startup,
+    ManagedRetirement,
+    Busy,
+    Restart,
+    Cancel { retire_after: bool },
+}
+
+async fn run_all_phases(
+    account: &NativeAccount,
+    config: &std::path::Path,
+    sockets: &std::path::Path,
 ) -> Result<()> {
+    let phases = [
+        FixtureMode::Startup,
+        FixtureMode::ManagedRetirement,
+        FixtureMode::Busy,
+        FixtureMode::Restart,
+        FixtureMode::Cancel { retire_after: true },
+    ];
+    for (idx, mode) in phases.into_iter().enumerate() {
+        if idx > 0 {
+            reset_phase_state(account, config, sockets)?;
+        }
+        run_parent(mode).await?;
+    }
+    cleanup_all_fixture_artifacts(account, config, sockets)?;
+    Ok(())
+}
+
+fn reset_phase_state(
+    account: &NativeAccount,
+    config: &std::path::Path,
+    sockets: &std::path::Path,
+) -> Result<()> {
+    if let Some(observer) = RuntimeAuthority::observe()? {
+        let config_root = PathBytes::from_path(&std::fs::canonicalize(config)?)?;
+        let namespace = Namespace::derive(observer.uid(), &config_root, "fixture-native")?;
+        require(
+            observer.observe_lease(&namespace)? == LeaseObservation::Free,
+            "previous phase left live lifetime lease contended",
+        )?;
+    }
+    let chanvoy_dir = account.home().join(".chanvoy");
+    if chanvoy_dir.exists() {
+        std::fs::remove_dir_all(&chanvoy_dir)?;
+    }
+    if sockets.exists() {
+        std::fs::remove_dir_all(sockets)?;
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(sockets)?;
+    Ok(())
+}
+
+fn cleanup_all_fixture_artifacts(
+    account: &NativeAccount,
+    config: &std::path::Path,
+    sockets: &std::path::Path,
+) -> Result<()> {
+    if let Some(observer) = RuntimeAuthority::observe()? {
+        let config_root = PathBytes::from_path(&std::fs::canonicalize(config)?)?;
+        let namespace = Namespace::derive(observer.uid(), &config_root, "fixture-native")?;
+        require(
+            observer.observe_lease(&namespace)? == LeaseObservation::Free,
+            "final phase left live lifetime lease contended",
+        )?;
+    }
+    for path in [
+        account.home().join(".chanvoy"),
+        sockets.to_path_buf(),
+        config.to_path_buf(),
+        account.home().join("fixture-child-error.txt"),
+    ] {
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_parent(mode: FixtureMode) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let profile = chanvoy_core::load_profile("fixture-native")?;
     let authority = RuntimeAuthority::initialize()?;
@@ -246,24 +338,15 @@ async fn run_parent(
         running.record.phase == RuntimePhase::Running && running.record.revision == 2,
         "unexpected startup publication",
     )?;
-    if check_busy {
+    if mode == FixtureMode::Busy {
         check_busy_subscription(&observer, &running, &generation, deadline).await?;
     }
-    if managed_retirement {
+    if mode != FixtureMode::Startup {
         // Acceptance is complete. Release every parent lease reference before
         // a new operation, rather than letting a parent-held fd mask a broken
         // child-lifetime anchor. Tokio Child drop does not signal the child.
         drop(launch);
-        return run_managed_retirement(
-            observer,
-            namespace,
-            running,
-            deadline,
-            check_busy,
-            check_cancel,
-            check_restart,
-        )
-        .await;
+        return run_managed_retirement(observer, namespace, running, deadline, mode).await;
     }
     let request = ControlDocument::decode(
         ControlRoot::RetireRequest,
@@ -375,10 +458,10 @@ async fn run_managed_retirement(
     namespace: Namespace,
     running: chanvoy_core::runtime::RecordSnapshot,
     deadline: Instant,
-    busy_checked: bool,
-    cancel_at_first_pending: bool,
-    check_restart: bool,
+    mode: FixtureMode,
 ) -> Result<()> {
+    let busy_checked = mode == FixtureMode::Busy;
+    let check_restart = mode == FixtureMode::Restart;
     require(
         authority.observe_lease(&namespace)? == LeaseObservation::Contended,
         "child did not retain lease after launcher drop",
@@ -399,7 +482,10 @@ async fn run_managed_retirement(
         !retirement.completion_only(),
         "running attempt unexpectedly completion-only",
     )?;
-    if cancel_at_first_pending {
+    if let FixtureMode::Cancel {
+        retire_after: retire_after_cancel,
+    } = mode
+    {
         {
             let mut request = Box::pin(retirement.request());
             std::future::poll_fn(|cx| match request.as_mut().poll(cx) {
@@ -437,12 +523,44 @@ async fn run_managed_retirement(
             ),
             "cancelled attempt permitted an implicit retry",
         )?;
+        if retire_after_cancel {
+            drop(retirement);
+            let operation2 = observer.try_operation(&namespace)?;
+            let mut retirement2 = managed_retire::ManagedRetirement::prepare(
+                observer,
+                operation2,
+                running.clone(),
+                deadline,
+            )?;
+            match retirement2.request().await? {
+                managed_retire::RetirementReply::Accepted
+                | managed_retire::RetirementReply::NoAcknowledgement => {}
+                managed_retire::RetirementReply::Refused => {
+                    return Err("post-cancel retirement refused".into());
+                }
+            }
+            let exited = retirement2.observe_exit().await?;
+            let (_authority2, _operation2, tombstone) =
+                retirement2.reap_exited(&exited, &SocketRoot::initialize()?)?;
+            require(
+                tombstone.record.phase == RuntimePhase::Exited
+                    && !running
+                        .record
+                        .socket
+                        .as_ref()
+                        .ok_or("running socket missing")?
+                        .path
+                        .to_path()
+                        .exists(),
+                "post-cancel reap did not complete",
+            )?;
+        }
         println!(
             "{}",
             serde_json::json!({"fixture":"native-retirement-cancel-first-pending",
             "operation_retained":true,"running_record_unchanged":true,"child_lease_retained":true,
             "child_still_matches":true,"implicit_retry_refused":true,"qualification":false,
-            "teardown":"disposable container account; no retirement or exit claim"})
+            "teardown":if retire_after_cancel {"retired_and_reaped_after_cancel"} else {"disposable container account; no retirement or exit claim"}})
         );
         return Ok(());
     }

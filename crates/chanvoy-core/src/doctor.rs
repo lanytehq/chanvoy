@@ -268,6 +268,403 @@ pub fn doctor_exit_code(checks: &[CheckVerdict], hard_failure: bool) -> i32 {
     0
 }
 
+/// Socket-access classification for `chanvoy doctor` sandbox diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketAccessStatus {
+    Reachable,
+    Absent,
+    Denied,
+    Unreachable,
+}
+
+impl SocketAccessStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Absent => "absent",
+            Self::Denied => "denied",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// Read-only observation of local daemon socket reachability and sandbox access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketAccessObservation {
+    pub status: SocketAccessStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+}
+
+/// Capability classification for native runtime probes in `chanvoy doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCapabilityStatus {
+    Supported,
+    Denied,
+    IncompleteOrChanging,
+    Unavailable,
+}
+
+impl NativeCapabilityStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Denied => "denied",
+            Self::IncompleteOrChanging => "incomplete_or_changing",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Read-only observation of a single native runtime capability.
+///
+/// `qualification` is always `false`: a passing diagnostic observation never
+/// certifies host deployment qualification or authorizes daemon retirement,
+/// socket reaping, or restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCapabilityObservation {
+    pub status: NativeCapabilityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub qualification: bool,
+}
+
+/// Combined sandbox-context and native runtime capability diagnostics block
+/// for `chanvoy doctor`.
+///
+/// Reported separately from daemon health, credential identity, and restart
+/// ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRuntimeDiagnostics {
+    pub qualification: bool,
+    pub socket_access: SocketAccessObservation,
+    pub process_inventory: NativeCapabilityObservation,
+    pub listener_table: NativeCapabilityObservation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+}
+
+const SANDBOX_SOCKET_GUIDANCE: &str = "run chanvoy with sandbox escalation/non-sandbox execution, grant the sandbox read/write access to the runtime directory, or set CHANVOY_RUNTIME_DIR to a mutually reachable private directory (see docs/getting-started.md#sandboxed-agents)";
+const SANDBOX_CAPABILITY_GUIDANCE: &str = "sandbox restricts native process-inventory or kernel socket-table inspection; ordinary daemon RPCs work when the socket is reachable, while native lifecycle recovery and socket reaping require an unsandboxed or escalated host shell (see docs/getting-started.md#sandboxed-agents)";
+
+#[cfg(unix)]
+fn is_io_permission_denied(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES))
+}
+
+#[cfg(not(unix))]
+fn is_io_permission_denied(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+fn is_incomplete_capability_reason(reason: &str) -> bool {
+    reason.contains("incomplete")
+        || reason.contains("truncated")
+        || reason.contains("overflow")
+        || reason.contains("size/cap uncertainty")
+        || reason.contains("size budget")
+        || reason.contains("trailer missing")
+        || reason.contains("deadline")
+}
+
+/// Map a native runtime capability probe result to a redacted [`NativeCapabilityObservation`].
+#[cfg(unix)]
+pub fn classify_native_capability(
+    result: Result<(), &crate::runtime::RuntimeError>,
+) -> NativeCapabilityObservation {
+    use crate::runtime::RuntimeError;
+    match result {
+        Ok(()) => NativeCapabilityObservation {
+            status: NativeCapabilityStatus::Supported,
+            reason: None,
+            qualification: false,
+        },
+        Err(RuntimeError::Changed(reason)) => NativeCapabilityObservation {
+            status: NativeCapabilityStatus::IncompleteOrChanging,
+            reason: Some((*reason).to_string()),
+            qualification: false,
+        },
+        Err(RuntimeError::Unavailable(reason)) => {
+            let status = if reason.contains("permission denied") {
+                NativeCapabilityStatus::Denied
+            } else if is_incomplete_capability_reason(reason) {
+                NativeCapabilityStatus::IncompleteOrChanging
+            } else {
+                NativeCapabilityStatus::Unavailable
+            };
+            NativeCapabilityObservation {
+                status,
+                reason: Some((*reason).to_string()),
+                qualification: false,
+            }
+        }
+        Err(RuntimeError::Invalid(reason)) => NativeCapabilityObservation {
+            status: NativeCapabilityStatus::Unavailable,
+            reason: Some((*reason).to_string()),
+            qualification: false,
+        },
+        Err(RuntimeError::Locked) => NativeCapabilityObservation {
+            status: NativeCapabilityStatus::Unavailable,
+            reason: Some("runtime namespace is already locked".into()),
+            qualification: false,
+        },
+        Err(RuntimeError::PublicationUncertain) => NativeCapabilityObservation {
+            status: NativeCapabilityStatus::Unavailable,
+            reason: Some("runtime record publication completion is uncertain".into()),
+            qualification: false,
+        },
+        Err(RuntimeError::Io(err)) => {
+            if is_io_permission_denied(err) {
+                NativeCapabilityObservation {
+                    status: NativeCapabilityStatus::Denied,
+                    reason: Some("native runtime I/O permission denied".into()),
+                    qualification: false,
+                }
+            } else {
+                NativeCapabilityObservation {
+                    status: NativeCapabilityStatus::Unavailable,
+                    reason: Some("native runtime I/O failed".into()),
+                    qualification: false,
+                }
+            }
+        }
+    }
+}
+
+fn denied_socket_observation(reason: &str) -> SocketAccessObservation {
+    SocketAccessObservation {
+        status: SocketAccessStatus::Denied,
+        reason: Some(reason.to_string()),
+        guidance: Some(SANDBOX_SOCKET_GUIDANCE.into()),
+    }
+}
+
+#[cfg(unix)]
+fn nonblocking_unix_connect_probe(socket_path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = socket_path.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Unix socket path",
+        ));
+    }
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Unix socket path exceeds sockaddr_un limit",
+        ));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr().cast::<libc::c_char>(),
+            addr.sun_path.as_mut_ptr(),
+            bytes.len(),
+        );
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if fd_flags >= 0 {
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) };
+        }
+        let fl_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if fl_flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, fl_flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let rc = unsafe {
+            libc::connect(
+                fd,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })();
+    unsafe {
+        libc::close(fd);
+    }
+    result
+}
+
+/// Inspect an unreachable socket path without creating or mutating any files.
+pub fn inspect_unreachable_socket_path(socket_path: &std::path::Path) -> SocketAccessObservation {
+    match std::fs::symlink_metadata(socket_path) {
+        Err(err) if is_io_permission_denied(&err) => denied_socket_observation(
+            "permission denied inspecting daemon socket path; sandbox may restrict the runtime directory",
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = socket_path.parent() {
+                if let Err(parent_err) = std::fs::metadata(parent) {
+                    if is_io_permission_denied(&parent_err) {
+                        return denied_socket_observation(
+                            "permission denied inspecting daemon runtime directory; sandbox may restrict the runtime directory",
+                        );
+                    }
+                }
+            }
+            SocketAccessObservation {
+                status: SocketAccessStatus::Absent,
+                reason: Some("no daemon socket present for this profile".into()),
+                guidance: None,
+            }
+        }
+        Err(_) => SocketAccessObservation {
+            status: SocketAccessStatus::Unreachable,
+            reason: Some("daemon socket path metadata could not be inspected".into()),
+            guidance: None,
+        },
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if !meta.file_type().is_socket() {
+                    return SocketAccessObservation {
+                        status: SocketAccessStatus::Unreachable,
+                        reason: Some(
+                            "configured socket path exists but is not a Unix domain socket".into(),
+                        ),
+                        guidance: None,
+                    };
+                }
+                match nonblocking_unix_connect_probe(socket_path) {
+                    Err(err) if is_io_permission_denied(&err) => denied_socket_observation(
+                        "permission denied connecting to daemon socket; sandbox or filesystem permissions blocked Unix domain socket connect",
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        SocketAccessObservation {
+                            status: SocketAccessStatus::Unreachable,
+                            reason: Some(
+                                "daemon socket exists on disk but connection was refused".into(),
+                            ),
+                            guidance: None,
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        SocketAccessObservation {
+                            status: SocketAccessStatus::Absent,
+                            reason: Some("no daemon socket present for this profile".into()),
+                            guidance: None,
+                        }
+                    }
+                    Ok(_) | Err(_) => SocketAccessObservation {
+                        status: SocketAccessStatus::Unreachable,
+                        reason: Some(
+                            "local daemon did not respond within its local budget".into(),
+                        ),
+                        guidance: None,
+                    },
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = meta;
+                SocketAccessObservation {
+                    status: SocketAccessStatus::Unreachable,
+                    reason: Some("local daemon did not respond within its local budget".into()),
+                    guidance: None,
+                }
+            }
+        }
+    }
+}
+
+/// Observe local socket reachability and read-only native runtime capabilities
+/// for `chanvoy doctor`.
+#[cfg(unix)]
+pub fn observe_native_runtime_diagnostics(
+    profile_name: &str,
+    daemon_reachable: bool,
+    inventory_deadline: std::time::Instant,
+) -> NativeRuntimeDiagnostics {
+    let socket_access = if daemon_reachable {
+        SocketAccessObservation {
+            status: SocketAccessStatus::Reachable,
+            reason: None,
+            guidance: None,
+        }
+    } else {
+        match crate::runtime::RuntimeBinding::resolve_profile(profile_name) {
+            Ok(Some(binding)) => inspect_unreachable_socket_path(binding.socket_path()),
+            Ok(None) => SocketAccessObservation {
+                status: SocketAccessStatus::Absent,
+                reason: Some("no active daemon socket; runtime record is exited".into()),
+                guidance: None,
+            },
+            Err(ref err) => {
+                let classified = classify_native_capability(Err(err));
+                let fallback =
+                    inspect_unreachable_socket_path(&crate::socket_path_for_profile(profile_name));
+                if fallback.status == SocketAccessStatus::Denied {
+                    fallback
+                } else if classified.status == NativeCapabilityStatus::Denied {
+                    denied_socket_observation(
+                        "permission denied resolving native runtime authority or socket path; sandbox may restrict the home or runtime directory",
+                    )
+                } else {
+                    SocketAccessObservation {
+                        status: SocketAccessStatus::Unreachable,
+                        reason: Some(
+                            classified
+                                .reason
+                                .unwrap_or_else(|| "native runtime binding unavailable".into()),
+                        ),
+                        guidance: None,
+                    }
+                }
+            }
+        }
+    };
+    let process_inventory =
+        match crate::runtime::NativeInventory::observe_capability(inventory_deadline) {
+            Ok(()) => classify_native_capability(Ok(())),
+            Err(ref err) => classify_native_capability(Err(err)),
+        };
+    let listener_table = {
+        let probe = crate::runtime::PathBytes::from_path(std::path::Path::new(
+            "/chanvoy-doctor-capability-probe",
+        ));
+        match probe.and_then(|p| crate::runtime::observe_listener_table(&p)) {
+            Ok(_) => classify_native_capability(Ok(())),
+            Err(ref err) => classify_native_capability(Err(err)),
+        }
+    };
+    let guidance = if socket_access.status == SocketAccessStatus::Denied {
+        socket_access.guidance.clone()
+    } else if process_inventory.status == NativeCapabilityStatus::Denied
+        || listener_table.status == NativeCapabilityStatus::Denied
+    {
+        Some(SANDBOX_CAPABILITY_GUIDANCE.into())
+    } else {
+        None
+    };
+    NativeRuntimeDiagnostics {
+        qualification: false,
+        socket_access,
+        process_inventory,
+        listener_table,
+        guidance,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +830,69 @@ mod tests {
         assert_eq!(provider_status_class(429), "throttled");
         assert_eq!(provider_status_class(500), "server_error");
         assert_eq!(provider_status_class(418), "provider_error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_capability_classifier_distinguishes_supported_denied_changing_and_unavailable() {
+        use crate::runtime::RuntimeError;
+
+        let supported = classify_native_capability(Ok(()));
+        assert_eq!(supported.status, NativeCapabilityStatus::Supported);
+        assert!(supported.reason.is_none());
+        assert!(!supported.qualification);
+
+        for denied_reason in [
+            "kernel Unix socket table permission denied",
+            "native inventory owner permission denied",
+            "native arguments permission denied",
+            "native process birth/owner permission denied",
+        ] {
+            let obs = classify_native_capability(Err(&RuntimeError::Unavailable(denied_reason)));
+            assert_eq!(
+                obs.status,
+                NativeCapabilityStatus::Denied,
+                "{denied_reason}"
+            );
+            assert_eq!(obs.reason.as_deref(), Some(denied_reason));
+            assert!(!obs.qualification);
+        }
+
+        let io_denied = classify_native_capability(Err(&RuntimeError::Io(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        )));
+        assert_eq!(io_denied.status, NativeCapabilityStatus::Denied);
+        assert!(!io_denied.qualification);
+
+        for changing in [
+            RuntimeError::Changed("socket table generation/envelope"),
+            RuntimeError::Unavailable("socket table incomplete envelope"),
+            RuntimeError::Unavailable("native UID list size/cap uncertainty"),
+            RuntimeError::Unavailable("native inventory truncated"),
+            RuntimeError::Unavailable("native process birth/owner incomplete"),
+        ] {
+            let obs = classify_native_capability(Err(&changing));
+            assert_eq!(
+                obs.status,
+                NativeCapabilityStatus::IncompleteOrChanging,
+                "{changing:?}"
+            );
+            assert!(!obs.qualification);
+        }
+
+        for unavailable in [
+            RuntimeError::Unavailable("native inventory owner unreadable"),
+            RuntimeError::Unavailable("same-account process relevance unavailable"),
+            RuntimeError::Unavailable("socket table header ABI"),
+            RuntimeError::Invalid("socket table row count"),
+        ] {
+            let obs = classify_native_capability(Err(&unavailable));
+            assert_eq!(
+                obs.status,
+                NativeCapabilityStatus::Unavailable,
+                "{unavailable:?}"
+            );
+            assert!(!obs.qualification);
+        }
     }
 }

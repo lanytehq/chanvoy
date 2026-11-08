@@ -25,6 +25,7 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
     for attempt in 0..3 {
         let mut size = 0usize;
         if unsafe {
+            *libc::__error() = 0;
             libc::sysctlbyname(
                 name.as_ptr(),
                 std::ptr::null_mut(),
@@ -34,9 +35,12 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
             )
         } != 0
         {
-            return Err(RuntimeError::Unavailable(
-                "kernel Unix socket table size denied/unavailable",
-            ));
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            return Err(if matches!(errno, Some(libc::EPERM | libc::EACCES)) {
+                RuntimeError::Unavailable("kernel Unix socket table permission denied")
+            } else {
+                RuntimeError::Unavailable("kernel Unix socket table size unavailable")
+            });
         }
         if !(GENERATION_BYTES..=MAX_TABLE_BYTES).contains(&size) {
             return Err(RuntimeError::Unavailable(
@@ -47,6 +51,7 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
         let mut bytes = vec![0u8; capacity];
         let mut actual = capacity;
         if unsafe {
+            *libc::__error() = 0;
             libc::sysctlbyname(
                 name.as_ptr(),
                 bytes.as_mut_ptr().cast(),
@@ -56,12 +61,20 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
             )
         } != 0
         {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if matches!(errno, Some(libc::EPERM | libc::EACCES)) {
+                return Err(RuntimeError::Unavailable(
+                    "kernel Unix socket table permission denied",
+                ));
+            }
             if attempt < 2 {
                 continue;
             }
-            return Err(RuntimeError::Unavailable(
-                "kernel Unix socket table read denied/truncated",
-            ));
+            return Err(if errno == Some(libc::ENOMEM) {
+                RuntimeError::Changed("kernel Unix socket table truncated")
+            } else {
+                RuntimeError::Unavailable("kernel Unix socket table read unavailable")
+            });
         }
         if actual > capacity {
             if attempt < 2 {
@@ -87,9 +100,21 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+    let map_net_io = |error: std::io::Error, denied: &'static str, other: &'static str| {
+        if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+            RuntimeError::Unavailable(denied)
+        } else {
+            RuntimeError::Unavailable(other)
+        }
+    };
     let read_snapshot = || -> Result<((u64, u64), Vec<u8>), RuntimeError> {
-        let netns_before = std::fs::metadata("/proc/self/ns/net")
-            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket netns unavailable"))?;
+        let netns_before = std::fs::metadata("/proc/self/ns/net").map_err(|e| {
+            map_net_io(
+                e,
+                "kernel Unix socket netns permission denied",
+                "kernel Unix socket netns unavailable",
+            )
+        })?;
         if netns_before.ino() == 0 {
             return Err(RuntimeError::Invalid("kernel Unix socket netns inode"));
         }
@@ -97,7 +122,13 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open("/proc/self/net/unix")
-            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket table unavailable"))?;
+            .map_err(|e| {
+                map_net_io(
+                    e,
+                    "kernel Unix socket table permission denied",
+                    "kernel Unix socket table unavailable",
+                )
+            })?;
         let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } != 0
             || fs.f_type != libc::PROC_SUPER_MAGIC
@@ -109,14 +140,25 @@ pub fn observe_listener_table(path: &PathBytes) -> Result<ListenerTableObservati
         let mut bytes = Vec::new();
         file.take(MAX_TABLE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket table read failed"))?;
+            .map_err(|e| {
+                map_net_io(
+                    e,
+                    "kernel Unix socket table permission denied",
+                    "kernel Unix socket table read failed",
+                )
+            })?;
         if bytes.len() > MAX_TABLE_BYTES {
             return Err(RuntimeError::Unavailable(
                 "kernel Unix socket table size budget",
             ));
         }
-        let netns_after = std::fs::metadata("/proc/self/ns/net")
-            .map_err(|_| RuntimeError::Unavailable("kernel Unix socket netns unavailable"))?;
+        let netns_after = std::fs::metadata("/proc/self/ns/net").map_err(|e| {
+            map_net_io(
+                e,
+                "kernel Unix socket netns permission denied",
+                "kernel Unix socket netns unavailable",
+            )
+        })?;
         if (netns_before.dev(), netns_before.ino()) != (netns_after.dev(), netns_after.ino()) {
             return Err(RuntimeError::Changed("kernel Unix socket netns"));
         }

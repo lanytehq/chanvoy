@@ -41,11 +41,24 @@ fn bounded(path: &std::path::Path, cap: usize) -> Result<Vec<u8>, RuntimeError> 
 }
 #[cfg(target_os = "linux")]
 fn visibility() -> Result<(std::fs::File, Vec<u8>), RuntimeError> {
+    let map_vis_io = |error: std::io::Error, denied: &'static str, other: &'static str| {
+        if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+            RuntimeError::Unavailable(denied)
+        } else {
+            RuntimeError::Unavailable(other)
+        }
+    };
     let root = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open("/proc")
-        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
+        .map_err(|e| {
+            map_vis_io(
+                e,
+                "native inventory procfs permission denied",
+                "native inventory procfs root",
+            )
+        })?;
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatfs(root.as_raw_fd(), &mut fs) } != 0
         || fs.f_type != libc::PROC_SUPER_MAGIC
@@ -56,11 +69,17 @@ fn visibility() -> Result<(std::fs::File, Vec<u8>), RuntimeError> {
         std::path::Path::new("/proc/self/mountinfo"),
         4 * 1024 * 1024,
     )
-    .map_err(|_| RuntimeError::Unavailable("native inventory mountinfo"))?;
+    .map_err(|e| match e {
+        RuntimeError::Unavailable(reason) if reason.contains("permission denied") => {
+            RuntimeError::Unavailable("native inventory mountinfo permission denied")
+        }
+        _ => RuntimeError::Unavailable("native inventory mountinfo"),
+    })?;
     validate_mount_view(&mountinfo)?;
     let init_name = c"1";
     let mut init_stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe {
+        *libc::__errno_location() = 0;
         libc::fstatat(
             root.as_raw_fd(),
             init_name.as_ptr(),
@@ -68,32 +87,62 @@ fn visibility() -> Result<(std::fs::File, Vec<u8>), RuntimeError> {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     } != 0
-        || (init_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
     {
+        return Err(map_vis_io(
+            std::io::Error::last_os_error(),
+            "native inventory init view permission denied",
+            "native inventory init view",
+        ));
+    }
+    if (init_stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
         return Err(RuntimeError::Unavailable("native inventory init view"));
     }
     let self_pid = std::process::id();
-    let self_target = std::fs::read_link("/proc/self")
-        .map_err(|_| RuntimeError::Unavailable("native inventory self link"))?;
+    let self_target = std::fs::read_link("/proc/self").map_err(|e| {
+        map_vis_io(
+            e,
+            "native inventory self link permission denied",
+            "native inventory self link",
+        )
+    })?;
     if self_target != std::path::Path::new(&self_pid.to_string()) {
         return Err(RuntimeError::Unavailable(
             "native inventory PID namespace view",
         ));
     }
     for kind in ["pid", "mnt"] {
-        let ours = std::fs::metadata(format!("/proc/self/ns/{kind}"))
-            .map_err(|_| RuntimeError::Unavailable("native inventory namespace view"))?;
-        let direct = std::fs::metadata(format!("/proc/{self_pid}/ns/{kind}"))
-            .map_err(|_| RuntimeError::Unavailable("native inventory namespace view"))?;
+        let ours = std::fs::metadata(format!("/proc/self/ns/{kind}")).map_err(|e| {
+            map_vis_io(
+                e,
+                "native inventory namespace permission denied",
+                "native inventory namespace view",
+            )
+        })?;
+        let direct = std::fs::metadata(format!("/proc/{self_pid}/ns/{kind}")).map_err(|e| {
+            map_vis_io(
+                e,
+                "native inventory namespace permission denied",
+                "native inventory namespace view",
+            )
+        })?;
         if ours.ino() == 0 || (ours.dev(), ours.ino()) != (direct.dev(), direct.ino()) {
             return Err(RuntimeError::Unavailable("native inventory namespace view"));
         }
     }
-    let current = root
-        .metadata()
-        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
-    let named = std::fs::symlink_metadata("/proc")
-        .map_err(|_| RuntimeError::Unavailable("native inventory procfs root"))?;
+    let current = root.metadata().map_err(|e| {
+        map_vis_io(
+            e,
+            "native inventory procfs permission denied",
+            "native inventory procfs root",
+        )
+    })?;
+    let named = std::fs::symlink_metadata("/proc").map_err(|e| {
+        map_vis_io(
+            e,
+            "native inventory procfs permission denied",
+            "native inventory procfs root",
+        )
+    })?;
     if (current.dev(), current.ino()) != (named.dev(), named.ino()) {
         return Err(RuntimeError::Changed("native inventory procfs root"));
     }

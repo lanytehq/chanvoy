@@ -295,7 +295,7 @@ fn relevance_once(pid: ProcessId) -> Result<RelevanceIdentity, RuntimeError> {
     };
     let errno = std::io::Error::last_os_error().raw_os_error();
     if read != size {
-        if matches!(errno, Some(libc::EPERM | libc::EACCES)) {
+        if read <= 0 && matches!(errno, Some(libc::EPERM | libc::EACCES)) {
             return Err(RuntimeError::Unavailable(
                 "native relevance birth/owner permission denied",
             ));
