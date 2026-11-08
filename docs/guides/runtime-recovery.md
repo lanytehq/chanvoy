@@ -9,15 +9,26 @@ None alone proves that stopping or replacing a daemon is safe.
 | Intent | Operation | What success establishes |
 | --- | --- | --- |
 | Inspect the responding daemon | `chanvoy --profile <name> daemon status --json` | A current daemon response and its reported health/build information. |
+| Observe native runtime & sandbox capabilities | `chanvoy --profile <name> doctor --json` | Read-only `native_runtime` (`socket_access`, `process_inventory`, `listener_table`) with `qualification: false`. |
 | Compare credentials with the daemon's bot | `chanvoy --profile <name> daemon ownable --json` | Matching remote bot identity; not native stop authority. |
 | Ensure an existing profile is running | `chanvoy --profile <name> daemon start --json` | A usable daemon, which may be the existing instance. |
 | Stop the selected daemon | `chanvoy --profile <name> daemon stop --json` | Confirmed termination and guarded cleanup, or an explicit refusal. |
+| Restart the selected daemon | `chanvoy --profile <name> daemon restart --json` | For v1-managed daemons: confirmed retirement/exit (`Busy` refusal if active work exists), guarded socket reap, `Exited` tombstone, and fresh successor readiness. For pre-v0.3.4 daemons without a v1 record: verified legacy stop followed by fresh v1 successor start. |
 | Recover an abandoned inbox waiter | `wait --inbox --replace-wait <wait-id>` with the saved cursor | Replacement after the old wait's cleanup is confirmed. |
 
-The current release has no `daemon restart` command. A healthy daemon can still
-be explicitly stopped. Start preserves a responsive daemon, so start after a
-failed stop is not a successful restart. Do not interpret a successful start
-receipt as evidence that the previous process exited.
+Use `daemon restart` when cycling a running daemon to a fresh epoch or updated
+binary. When the predecessor is a v1-managed daemon, `daemon restart` retires it
+over `runtime_retire_v1` (refusing with `Busy` if active wait, stream, or RPC
+obligations exist — v1 retirement never force-kills active waits), confirms
+whole-process exit and remaining-listener absence, reaps the socket under the
+namespace lock, publishes an `Exited` tombstone, and starts a fresh successor
+epoch. When replacing a pre-v0.3.4 daemon that has no v1 runtime record on disk,
+`daemon restart` uses the verified legacy stop fallback, which does not refuse
+with `Busy` and terminates active waits after its shutdown grace window — finish
+or close active waits before running the first restart after upgrading from
+v0.3.3. `daemon start` preserves a responsive daemon, so running `daemon start`
+after a failed stop is not a successful restart. Do not interpret a
+`daemon start` receipt as evidence that the previous process exited.
 
 ## Recover an inbox wait without replacing the daemon
 
@@ -94,11 +105,26 @@ or a version match is not evidence of a completed restart.
 
 ## Runtime-control observations
 
-The current daemon answers the strict runtime-control observation and retirement
-methods, but native retirement is inactive. Retirement refuses with
-`native_evidence_unavailable`; an observation can report application admission
-and counts without proving native process death, lease freedom or listener
-absence. This guide's presence does not activate that lifecycle protocol.
+Native managed lifecycle (`runtime_observation_v1` / `runtime_retire_v1`) binds
+daemon startup, `daemon stop`, and `daemon restart` to the native runtime
+authority (`~/.chanvoy/lifecycle/records/<namespace-hex>.json`), control-socket
+epoch, process birth/owner/executable/argument identity, and kernel Unix domain
+socket listener table. For v1-managed daemons, when active wait, follow-stream,
+or RPC obligations are present, managed retirement refuses with `Busy` and
+retains the running daemon rather than interrupting active waits. When a
+pre-v0.3.4 daemon without a v1 runtime record is targeted, `daemon stop` and
+`daemon restart` fall back to the verified legacy stop path (only when no v1
+runtime record exists on disk); that legacy fallback does not refuse with `Busy`
+and can force-signal the predecessor after its shutdown grace window, so finish
+active waits before migrating a pre-v0.3.4 daemon.
+
+`chanvoy doctor` includes a read-only `native_runtime` diagnostic block
+(`qualification: false`, `socket_access`, `process_inventory`, `listener_table`,
+and optional sandbox `guidance`). Those probes classify `supported`, `denied`,
+`incomplete_or_changing`, or `unavailable` (and `reachable`, `absent`, `denied`,
+or `unreachable` for `socket_access`) so sandboxed agents can distinguish
+filesystem/sysctl permission denials from ordinary daemon absence without
+mutating state or claiming lifecycle qualification.
 
 Native lifecycle operation requires a qualified native-host process and socket
 view, the same account and supported namespaces, and compatible participating

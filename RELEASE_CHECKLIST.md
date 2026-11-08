@@ -10,7 +10,10 @@ and the procedure for a failed check.
 ## Prepare the reviewed cut
 
 Merge the independently reviewed release changes. Finalize the actual date in
-`CHANGELOG.md`, `RELEASE_NOTES.md` and `docs/releases/vX.Y.Z.md` before signing.
+`CHANGELOG.md`, `RELEASE_NOTES.md` (which keeps the rolling three most recent
+releases, with older cuts archived under `docs/releases/vX.Y.Z.md`),
+`docs/releases/vX.Y.Z.md`, and `tests/release_first_public_shape.rs` before
+signing.
 Run fresh `make release-prep`, hosted checks and `make release-smoke`. The live
 smoke creates a disposable Mattermost channel; failed smoke stops the ceremony.
 `make release-preflight` first checks the pinned scanner's effective configuration

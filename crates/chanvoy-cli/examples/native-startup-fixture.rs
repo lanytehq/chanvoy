@@ -77,6 +77,10 @@ fn main() {
             "fixture refuses existing native authority",
         )?;
         let account = NativeAccount::resolve()?;
+        require(
+            !account.home().join(".chanvoy").exists(),
+            "fixture refuses existing ~/.chanvoy directory",
+        )?;
         let config = account.home().join("fixture-config");
         let sockets = account.home().join("fixture-sockets");
         for path in [&config, &config.join("profiles"), &sockets] {

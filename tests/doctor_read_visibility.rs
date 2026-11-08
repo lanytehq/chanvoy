@@ -831,12 +831,19 @@ async fn doctor_reports_socket_access_denied_when_runtime_dir_forbids_traversal(
     let runtime_dir = env.chanvoy_runtime_dir();
     std::fs::create_dir_all(&runtime_dir).unwrap();
     let _listener = UnixListener::bind(env.socket_path()).unwrap();
+    struct RestoreRuntimePerms(std::path::PathBuf);
+    impl Drop for RestoreRuntimePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore_runtime_perms = RestoreRuntimePerms(runtime_dir.clone());
     std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let json_out = run_chanvoy(&env, &["--json", "doctor"]).await;
     let human_out = run_chanvoy(&env, &["doctor"]).await;
 
-    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(_restore_runtime_perms);
 
     let stdout = String::from_utf8_lossy(&json_out.stdout);
     assert_eq!(

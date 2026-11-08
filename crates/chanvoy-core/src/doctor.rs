@@ -565,7 +565,14 @@ pub fn inspect_unreachable_socket_path(socket_path: &std::path::Path) -> SocketA
                             guidance: None,
                         }
                     }
-                    Ok(_) | Err(_) => SocketAccessObservation {
+                    Ok(()) => SocketAccessObservation {
+                        status: SocketAccessStatus::Unreachable,
+                        reason: Some(
+                            "socket accepted a connection, but the local daemon RPC did not respond within its local budget".into(),
+                        ),
+                        guidance: None,
+                    },
+                    Err(_) => SocketAccessObservation {
                         status: SocketAccessStatus::Unreachable,
                         reason: Some(
                             "local daemon did not respond within its local budget".into(),
@@ -843,10 +850,20 @@ mod tests {
         assert!(!supported.qualification);
 
         for denied_reason in [
+            "kernel Unix socket netns permission denied",
             "kernel Unix socket table permission denied",
-            "native inventory owner permission denied",
             "native arguments permission denied",
+            "native executable path permission denied",
+            "native inventory PID list permission denied",
+            "native inventory init view permission denied",
+            "native inventory mountinfo permission denied",
+            "native inventory namespace permission denied",
+            "native inventory owner permission denied",
+            "native inventory procfs permission denied",
+            "native inventory self link permission denied",
+            "native namespace permission denied",
             "native process birth/owner permission denied",
+            "native relevance birth/owner permission denied",
         ] {
             let obs = classify_native_capability(Err(&RuntimeError::Unavailable(denied_reason)));
             assert_eq!(
@@ -866,10 +883,19 @@ mod tests {
 
         for changing in [
             RuntimeError::Changed("socket table generation/envelope"),
-            RuntimeError::Unavailable("socket table incomplete envelope"),
+            RuntimeError::Unavailable("kernel Unix socket table overflow"),
+            RuntimeError::Unavailable("kernel Unix socket table size budget"),
             RuntimeError::Unavailable("native UID list size/cap uncertainty"),
+            RuntimeError::Unavailable("native arguments empty or incomplete"),
+            RuntimeError::Unavailable("native executable path incomplete"),
+            RuntimeError::Unavailable("native inventory deadline"),
             RuntimeError::Unavailable("native inventory truncated"),
+            RuntimeError::Unavailable("native namespace incomplete"),
             RuntimeError::Unavailable("native process birth/owner incomplete"),
+            RuntimeError::Unavailable("procfs metadata truncated"),
+            RuntimeError::Unavailable("socket table incomplete envelope"),
+            RuntimeError::Unavailable("socket table trailer missing"),
+            RuntimeError::Unavailable("socket table truncated row"),
         ] {
             let obs = classify_native_capability(Err(&changing));
             assert_eq!(
@@ -880,19 +906,194 @@ mod tests {
             assert!(!obs.qualification);
         }
 
-        for unavailable in [
-            RuntimeError::Unavailable("native inventory owner unreadable"),
-            RuntimeError::Unavailable("same-account process relevance unavailable"),
-            RuntimeError::Unavailable("socket table header ABI"),
-            RuntimeError::Invalid("socket table row count"),
+        for unavailable_reason in [
+            "authority filesystem locality unconfirmed",
+            "authority initialization",
+            "authority submount provider cannot be reconciled with native home",
+            "bootstrap missing",
+            "candidate daemon identity unavailable",
+            "deleted native executable",
+            "descriptor mount absent from inventory",
+            "descriptor mount id",
+            "duplicate descriptor mount id",
+            "empty mount inventory",
+            "kernel Unix socket netns unavailable",
+            "kernel Unix socket table procfs type",
+            "kernel Unix socket table read failed",
+            "kernel Unix socket table read unavailable",
+            "kernel Unix socket table size unavailable",
+            "kernel Unix socket table unavailable",
+            "kernel inventory byte cap",
+            "kernel listener table platform unqualified",
+            "kernel procfs source",
+            "lock directory",
+            "lock inode",
+            "macOS authority filesystem provider unconfirmed",
+            "mount device",
+            "mount fields",
+            "mount identity",
+            "mount numeric field",
+            "mount numeric range",
+            "mount pathname NUL",
+            "mount pathname escape",
+            "mount pathname shape",
+            "mount separator",
+            "native account lookup",
+            "native arguments empty",
+            "native arguments platform",
+            "native arguments unreadable",
+            "native executable argument prefix",
+            "native executable path",
+            "native home pointer",
+            "native home terminator",
+            "native inventory PID namespace view",
+            "native inventory init view",
+            "native inventory mountinfo",
+            "native inventory namespace view",
+            "native inventory obscured process",
+            "native inventory owner unreadable",
+            "native inventory platform",
+            "native inventory procfs root",
+            "native inventory procfs type",
+            "native inventory self link",
+            "native local socket selector",
+            "native peer PID",
+            "native process platform",
+            "native relevance birth/owner unreadable",
+            "native relevance metadata cap",
+            "native relevance platform",
+            "native socket selector",
+            "non-local authority filesystem",
+            "overlaid procfs process view",
+            "partial procfs root",
+            "procfs mount fields",
+            "procfs mount root ambiguous",
+            "publication requires forward reconciliation",
+            "publisher mutex",
+            "record directory",
+            "record staging inode",
+            "record version",
+            "recorded exited runtime",
+            "referenced runtime PID omitted; reconciliation required",
+            "restricted procfs visibility",
+            "same-account process relevance unavailable",
+            "socket root",
+            "socket table header ABI",
+            "socket table listener address unavailable",
+            "socket table listener pathname unavailable",
+            "socket table record ABI",
+            "socket table socket ABI/type",
+            "starting runtime requires bootstrap reconciliation",
+            "unspawned starting runtime record",
+            "unsupported native filesystem",
+            "unsupported native platform",
         ] {
-            let obs = classify_native_capability(Err(&unavailable));
+            let obs =
+                classify_native_capability(Err(&RuntimeError::Unavailable(unavailable_reason)));
             assert_eq!(
                 obs.status,
                 NativeCapabilityStatus::Unavailable,
-                "{unavailable:?}"
+                "{unavailable_reason}"
+            );
+            assert_eq!(obs.reason.as_deref(), Some(unavailable_reason));
+            assert!(!obs.qualification);
+        }
+
+        for other_unavailable in [
+            RuntimeError::Invalid("socket table row count"),
+            RuntimeError::Locked,
+            RuntimeError::PublicationUncertain,
+            RuntimeError::Io(std::io::Error::other("synthetic I/O failure")),
+        ] {
+            let obs = classify_native_capability(Err(&other_unavailable));
+            assert_eq!(
+                obs.status,
+                NativeCapabilityStatus::Unavailable,
+                "{other_unavailable:?}"
             );
             assert!(!obs.qualification);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_unreachable_socket_path_classifies_absent_non_socket_refused_accepted_and_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        // 1. Missing socket in accessible parent -> Absent
+        let missing = temp.path().join("absent.sock");
+        let obs = inspect_unreachable_socket_path(&missing);
+        assert_eq!(obs.status, SocketAccessStatus::Absent);
+        assert_eq!(
+            obs.reason.as_deref(),
+            Some("no daemon socket present for this profile")
+        );
+        assert!(obs.guidance.is_none());
+
+        // 2. Non-socket regular file -> Unreachable
+        let regular = temp.path().join("not-a-socket.sock");
+        std::fs::write(&regular, b"not a socket").expect("write regular file");
+        let obs = inspect_unreachable_socket_path(&regular);
+        assert_eq!(obs.status, SocketAccessStatus::Unreachable);
+        assert_eq!(
+            obs.reason.as_deref(),
+            Some("configured socket path exists but is not a Unix domain socket")
+        );
+        assert!(obs.guidance.is_none());
+
+        // 3. Stale socket inode on disk (listener bound and dropped without unlink) -> Unreachable (ConnectionRefused)
+        let stale_sock = temp.path().join("stale.sock");
+        {
+            let _listener = UnixListener::bind(&stale_sock).expect("bind stale socket");
+        }
+        let obs = inspect_unreachable_socket_path(&stale_sock);
+        assert_eq!(obs.status, SocketAccessStatus::Unreachable);
+        assert_eq!(
+            obs.reason.as_deref(),
+            Some("daemon socket exists on disk but connection was refused")
+        );
+        assert!(obs.guidance.is_none());
+
+        // 4. Listening socket that accepts connections while RPC timed out -> Unreachable (accepted connection)
+        let live_sock = temp.path().join("live.sock");
+        let _live_listener = UnixListener::bind(&live_sock).expect("bind live socket");
+        let obs = inspect_unreachable_socket_path(&live_sock);
+        assert_eq!(obs.status, SocketAccessStatus::Unreachable);
+        assert_eq!(
+            obs.reason.as_deref(),
+            Some(
+                "socket accepted a connection, but the local daemon RPC did not respond within its local budget"
+            )
+        );
+        assert!(obs.guidance.is_none());
+
+        // 5. Unsearchable (0o000) parent directory -> symlink_metadata(socket_path) returns EACCES -> Denied (non-root only)
+        if unsafe { libc::geteuid() } != 0 {
+            struct RestorePerms(std::path::PathBuf);
+            impl Drop for RestorePerms {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            let denied_dir = temp.path().join("denied-dir");
+            std::fs::create_dir_all(&denied_dir).expect("create denied dir");
+            let blocked_sock = denied_dir.join("blocked.sock");
+            let _guard = RestorePerms(denied_dir.clone());
+            std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+
+            let obs = inspect_unreachable_socket_path(&blocked_sock);
+            assert_eq!(obs.status, SocketAccessStatus::Denied);
+            assert!(obs
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("permission denied"));
+            assert!(obs.guidance.as_deref().unwrap_or("").contains("sandbox"));
         }
     }
 }
