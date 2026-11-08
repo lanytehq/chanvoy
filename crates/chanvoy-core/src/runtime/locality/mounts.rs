@@ -22,7 +22,7 @@ fn number(bytes: &[u8]) -> Result<u64, RuntimeError> {
         .and_then(|s| s.parse().ok())
         .ok_or(RuntimeError::Unavailable("mount numeric range"))
 }
-fn path(bytes: &[u8]) -> Result<PathBuf, RuntimeError> {
+fn decode_field(bytes: &[u8]) -> Result<PathBuf, RuntimeError> {
     let mut out = Vec::new();
     let mut pos = 0;
     while pos < bytes.len() {
@@ -48,11 +48,18 @@ fn path(bytes: &[u8]) -> Result<PathBuf, RuntimeError> {
         return Err(RuntimeError::Unavailable("mount pathname NUL"));
     }
     let path = PathBuf::from(OsString::from_vec(out));
-    if !path.is_absolute()
+    if path.as_os_str().is_empty()
         || path
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
     {
+        return Err(RuntimeError::Unavailable("mount pathname shape"));
+    }
+    Ok(path)
+}
+fn path(bytes: &[u8]) -> Result<PathBuf, RuntimeError> {
+    let path = decode_field(bytes)?;
+    if !path.is_absolute() {
         return Err(RuntimeError::Unavailable("mount pathname shape"));
     }
     Ok(path)
@@ -85,7 +92,7 @@ fn parse(bytes: &[u8]) -> Result<Vec<Mount>, RuntimeError> {
             id,
             major: number(device[0])?,
             minor: number(device[1])?,
-            root: path(fields[3])?,
+            root: decode_field(fields[3])?,
             point: path(fields[4])?,
         });
     }
@@ -105,6 +112,9 @@ fn map<'a>(
         .ok_or(RuntimeError::Unavailable(
             "descriptor mount absent from inventory",
         ))?;
+    if !mount.root.is_absolute() || !mount.point.is_absolute() {
+        return Err(RuntimeError::Unavailable("mount pathname shape"));
+    }
     let relative = path
         .strip_prefix(&mount.point)
         .map_err(|_| RuntimeError::Changed("descriptor mount pathname"))?;
@@ -232,9 +242,14 @@ mod tests {
     }
     #[test]
     fn mount_paths_are_lossless_and_malformed_or_duplicate_sources_are_unknown() {
-        let mounts = parse(b"1 0 8:1 / /owned\\040root rw shared:4 - ext4 /dev/x rw\n").unwrap();
+        let mounts = parse(
+            b"1 0 8:1 / /owned\\040root rw shared:4 - ext4 /dev/x rw\n\
+              2 1 0:4 mnt:[4026532219] /run/snapd/ns/lxd.mnt rw - nsfs nsfs rw\n",
+        )
+        .unwrap();
         assert_eq!(mounts[0].point, Path::new("/owned root"));
         assert_eq!((mounts[0].major, mounts[0].minor), (8, 1));
+        assert!(map(&mounts, 2, Path::new("/run/snapd/ns/lxd.mnt")).is_err());
         for bad in [
             b"1 0 8:1 / / rw\n".as_slice(),
             b"1 0 8:1 / / rw - ext4 /dev/x rw\n1 0 8:1 / / rw - ext4 /dev/x rw\n",
