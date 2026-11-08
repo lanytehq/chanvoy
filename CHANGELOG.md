@@ -5,7 +5,52 @@ All notable changes to chanvoy are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.4] - 2026-11-08
+
+### Native daemon lifecycle, retirement, and restart
+
+- Managed daemon startup, `daemon stop`, `daemon restart`, `daemon status`, and
+  `auto-setup` bind to a descriptor-pinned v1 native runtime authority
+  (`~/.chanvoy/lifecycle/records/<namespace-hex>.json`), namespace operation
+  lock, inherited lifetime lease, and inherited readiness handoff pipe.
+- Two-pass native account process inventory and kernel listener-table
+  observation are implemented for macOS (`net.local.stream.pcblist*`) and Linux
+  (`/proc` self-consistency, two-stage namespace verification, and
+  `/proc/self/net/unix` listening-socket snapshots) without invoking external
+  process tools (exercised end-to-end in the disposable-home native fixture on
+  macOS and covered by unit and protocol tests on Linux).
+- For v1-managed daemons, `runtime_retire_v1` coordinates admission closure and
+  active-work drain, refuses with `Busy` when wait, follow-stream, or RPC
+  obligations are active (v1 retirement never force-kills active waits),
+  verifies whole-process exit and listener absence before unlinking
+  `<pid>.sock`, and publishes an `Exited` tombstone that permits clean successor
+  startup.
+- Added `chanvoy --profile <name> daemon restart` to cycle an explicitly
+  targeted v1-managed daemon through managed retirement, guarded socket reaping,
+  tombstone publication, and fresh successor launch, with verified legacy-stop
+  fallback when replacing a pre-v0.3.4 daemon that has no v1 runtime record on
+  disk (the legacy fallback does not refuse with `Busy` and terminates active
+  waits after its shutdown grace window).
+- Added `--run-all-in-disposable-native-home` to the `native-startup-fixture`
+  example to sequence all five disposable-home lifecycle phases (`startup`,
+  `retirement`, `busy`, `restart`, and `cancel` with post-verification
+  retirement/reap) in a single invocation.
+
+### Doctor native-runtime and sandbox capability diagnostics
+
+- `chanvoy doctor` (JSON and human output) now includes a read-only
+  `native_runtime` diagnostic block (`qualification: false`, `socket_access`,
+  `process_inventory`, `listener_table`, and optional sandbox `guidance`) that
+  never alters `exit_code`, `daemon_disposition`, or `generation.ownership`.
+- When local daemon RPC is unreachable, `doctor` inspects the profile's socket
+  path using non-mutating metadata and a non-blocking Unix socket connect probe
+  to distinguish `absent` from `denied` (with actionable `CHANVOY_RUNTIME_DIR`
+  and sandbox allowlist guidance) and `unreachable` (`ConnectionRefused`,
+  non-socket file, or accepted connection whose local RPC timed out).
+- `doctor` also probes read-only `process_inventory` and `listener_table`
+  capabilities (`supported`, `denied`, `incomplete_or_changing`, or
+  `unavailable`) without mutating lifecycle state or conferring host
+  qualification.
 
 ### Fixed
 

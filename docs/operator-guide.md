@@ -566,13 +566,14 @@ chanvoy --profile <seat> doctor <channel> --json
 or calls `check`. It reports separate checks so the three common empty-read
 states stay distinct:
 
-| Check                | What it answers                                                      |
-| -------------------- | -------------------------------------------------------------------- |
-| `daemon`             | Socket reachable; drift bit; Mattermost probe on the daemon          |
-| `generation`         | CLI/daemon dual pin when this environment owns the daemon (PER-038A) |
-| `identity`           | Token whoami (status class only on failure — no provider body)       |
-| `clock`              | Local wall clock vs HTTP `Date` on `GET /users/me`                   |
-| `channel` (optional) | Pure resolve / membership for a named channel                        |
+| Check                | What it answers                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------- |
+| `daemon`             | Socket reachable; drift bit; Mattermost probe on the daemon                                          |
+| `generation`         | CLI/daemon dual pin when this environment owns the daemon                                            |
+| `identity`           | Token whoami (status class only on failure — no provider body)                                       |
+| `clock`              | Local wall clock vs HTTP `Date` on `GET /users/me`                                                   |
+| `channel` (optional) | Pure resolve / membership for a named channel                                                        |
+| `native_runtime`     | Read-only `socket_access`, `process_inventory`, and `listener_table` diagnostics (`qualification: false`) |
 
 Within one diagnostic, parent credential evidence and daemon credential evidence
 remain separate. An identity-endpoint 401/403 or observed wrong username remains
@@ -603,6 +604,14 @@ Exit codes: **0** all scored checks pass, including uncertainty-only
 scored outside remote degradation, channel throttle warn) · **2** hard
 failure (auth / identity mismatch, channel hard fail, daemon unreachable
 or identity drift).
+
+`native_runtime` is diagnostic-only (`qualification: false`) and never alters
+`exit_code`, `daemon_disposition`, or `generation.ownership`. It reports
+`socket_access` (`reachable` | `absent` | `denied` | `unreachable`),
+`process_inventory` (`supported` | `denied` | `incomplete_or_changing` |
+`unavailable`), `listener_table` (`supported` | `denied` |
+`incomplete_or_changing` | `unavailable`), and actionable sandbox `guidance`
+when a permission denial is observed.
 
 ## Reopening A Cited Post (`show` / `thread`)
 
@@ -1228,7 +1237,7 @@ When `chanvoy` is invoked without `--profile <name>`, the resolver picks a profi
 Two carve-outs:
 
 - **Profile-collection management verbs** (`profile list`, `profile create`, `profile create-from-env`) and the **`auto-setup` bootstrap verb** bypass this resolver entirely. They operate on the profile collection or env-derived synthesis, not on a single existing target — and forcing resolution would brick fresh bootstrap on an empty config.
-- **Side-effecting daemon-lifecycle verbs** (`daemon stop` and `daemon start`) refuse on rules 4 and 5. They require an explicit target — `--profile`, `CHANVOY_PROFILE`, or env-derived `<role>-<scope>` — to avoid acting on another operator's daemon on a shared machine. `daemon start` is in this set because it validates a live credential and then spawns a long-lived process under that identity: resolving its target from the active marker or "whichever daemon happens to be running" could start a daemon under an identity the operator did not name.
+- **Side-effecting daemon-lifecycle verbs** (`daemon stop`, `daemon start`, and `daemon restart`) refuse on rules 4 and 5. They require an explicit target — `--profile`, `CHANVOY_PROFILE`, or env-derived `<role>-<scope>` — to avoid acting on another operator's daemon on a shared machine. `daemon start` is in this set because it validates a live credential and then spawns a long-lived process under that identity: resolving its target from the active marker or "whichever daemon happens to be running" could start a daemon under an identity the operator did not name.
 
 The full resolver contract, including policy semantics and per-rule rationale, lives in [`docs/specs/agent-chat-conventions.md` in Lanyte Crucible](https://github.com/lanytehq/crucible/blob/main/docs/specs/agent-chat-conventions.md) §"Chanvoy Profile Naming".
 
@@ -1274,13 +1283,17 @@ This replaces a fallback in earlier chanvoy versions that synthesized a name fro
   - confirms termination of an independently owned predecessor before reporting success
   - succeeds when both runtime files are absent; uncertain residue or liveness returns nonzero with state retained
   - requires an explicit profile
+- `chanvoy --profile <name> daemon restart`
+  - for a v1-managed daemon, cycles the explicitly targeted daemon through v1 managed retirement (`runtime_retire_v1`), whole-process exit, remaining-listener verification, guarded socket reap, `Exited` tombstone publication, and fresh successor launch, refusing with `Busy` when active wait, stream, or RPC obligations exist (v1 managed retirement never force-kills active waits)
+  - when replacing a pre-v0.3.4 daemon that has no v1 runtime record on disk, falls back to the verified legacy stop path before starting the v1 successor; the legacy fallback does not refuse with `Busy` and terminates active waits after its shutdown grace window, so finish active waits before the first restart from v0.3.3
+  - requires an explicit profile
 - `chanvoy --profile <name> daemon ownable`
   - compares the current credential's bot identity with the responding daemon
   - does not prove that native process inspection, shutdown or replacement will succeed
 
-A healthy daemon can be explicitly stopped. `daemon start` preserves a responsive
-daemon, so running it after a failed stop does not perform a restart. There is
-currently no `daemon restart` command.
+A healthy daemon can be explicitly stopped with `daemon stop` or cycled with
+`daemon restart`. `daemon start` preserves a responsive daemon, so running
+`daemon start` after a failed stop does not perform a restart.
 
 If stop reports `process identity unavailable`, its diagnostic names the failed
 inspection stage and reason. `permission-denied` means that inspection was
@@ -1449,13 +1462,17 @@ dimension from the network-access dimension — in the network case,
    "neither redirect nor escalation can make one path
    mutually-reachable."
 
-**`chanvoy doctor` today** covers identity, dual pin, server-time clock
-skew, and optional channel resolve (see
-[Read-Visibility Diagnostics](#read-visibility-diagnostics-doctor)). A
-dedicated sandbox-context / socket-access Check 6 (promoting "missing or
-refused" to "socket outside sandbox-writable mount; escalate or
-`CHANVOY_RUNTIME_DIR`") is **not** in this cut — use the decision boundary
-above until that surface lands.
+**`chanvoy doctor` diagnostics.** `chanvoy doctor` includes a read-only
+`native_runtime` section (`qualification: false`) alongside identity, dual pin,
+server-time clock skew, and optional channel resolve (see
+[Read-Visibility Diagnostics](#read-visibility-diagnostics-doctor)). When a
+sandbox blocks the runtime directory or Unix domain socket connect,
+`native_runtime.socket_access.status` reports `denied` (distinct from `absent`
+or `unreachable`) and `native_runtime.guidance` points to
+`CHANVOY_RUNTIME_DIR` or sandbox profile allowlist remediation. It also reports
+read-only `process_inventory` and `listener_table` capability status so a
+sandboxed seat can see before attempting `daemon stop` or `daemon restart`
+whether kernel process/socket inspection is `denied` in the current sandbox.
 
 ### Identity drift surface
 

@@ -2,6 +2,32 @@
 
 **Content policy**: This file contains the most recent 3 releases (reverse chronological). Older releases are archived in `docs/releases/vX.Y.Z.md`.
 
+## v0.3.4 - 2026-11-08
+
+**Native v1 daemon lifecycle, `daemon restart`, and `doctor` sandbox capability diagnostics** —
+managed daemon startup, `daemon stop`, `daemon restart`, and `auto-setup` now
+bind to a descriptor-pinned v1 runtime authority, inherited lifetime lease, and
+two-pass native process and kernel listener-table verification (exercised in the
+macOS disposable-home native fixture and covered by Linux protocol/unit suites).
+For v1-managed daemons, `runtime_retire_v1` drains idle daemons cleanly, refuses
+with `Busy` when active wait, follow-stream, or RPC obligations exist (v1
+managed retirement never force-kills active waits), confirms whole-process exit
+and listener absence before guarded socket reaping, and writes an `Exited`
+tombstone before successor startup.
+
+`chanvoy doctor` adds a read-only `native_runtime` block (`qualification: false`,
+`socket_access`, `process_inventory`, `listener_table`, and sandbox `guidance`)
+that separates sandbox permission denials (`denied`) from ordinary daemon
+absence (`absent`) without mutating state or changing `doctor` exit codes.
+Inbox wait replacement (`--replace-wait`) also wakes idle receivers
+immediately. Signed GitHub Release binaries only; not published on crates.io.
+Stop active waits before the first restart from v0.3.3 (the legacy stop fallback
+for pre-v0.3.4 daemons terminates active waits), then cycle profile daemons with
+`daemon restart` (or `daemon stop` then `auto-setup`) after install.
+
+See `docs/releases/v0.3.4.md` for upgrade notes and
+`docs/guides/runtime-recovery.md` / `docs/operator-guide.md`.
+
 ## v0.3.3 - 2026-10-22
 
 **Safer daemon stop and setup** — the daemon pid file no longer lives in the
@@ -41,20 +67,5 @@ Restart the profile daemon after install.
 
 See `docs/releases/v0.3.2.md` for upgrade notes and
 `docs/guides/wait-follow.md` / `docs/guides/wait-dm.md`.
-
-## v0.3.1 - 2026-08-27
-
-**First public distribution** — v0.3.1 carries the cumulative operator and
-integrity improvements proven at the signed v0.3.0 development checkpoint. It
-makes cited posts and their threads directly reachable, restores honest author
-and thread attribution, and adds process-held `wait --follow` observation
-without weakening the single-owner wait contract.
-
-This cut ships signed GitHub Release binaries only; it is not published on
-crates.io. Restart the profile daemon after installing the new binary so the
-CLI and daemon agree on wait, follow, show, and thread capabilities.
-
-See `docs/releases/v0.3.1.md` for full notes, upgrade guidance, follow wake
-capabilities, and the verification pointer.
 
 _(Older releases archived in `docs/releases/`. This file is kept short per project convention.)_

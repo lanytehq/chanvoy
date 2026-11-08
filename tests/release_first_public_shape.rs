@@ -13,10 +13,10 @@ fn dated_field(document: &str, prefix: &str) -> Option<chrono::NaiveDate> {
 }
 
 fn consistent_release_date(changelog: &str, notes: &str, release: &str) -> bool {
-    let Some(date) = dated_field(changelog, "## [0.3.2] - ") else {
+    let Some(date) = dated_field(changelog, "## [0.3.4] - ") else {
         return false;
     };
-    dated_field(notes, "## v0.3.2 - ") == Some(date)
+    dated_field(notes, "## v0.3.4 - ") == Some(date)
         && dated_field(release, "**Release Date**: ") == Some(date)
 }
 
@@ -25,32 +25,32 @@ fn current_release_dates_are_valid_and_consistent() {
     assert!(consistent_release_date(
         include_str!("../CHANGELOG.md"),
         include_str!("../RELEASE_NOTES.md"),
-        include_str!("../docs/releases/v0.3.2.md"),
+        include_str!("../docs/releases/v0.3.4.md"),
     ));
 }
 
 #[test]
 fn release_date_validation_rejects_missing_duplicate_invalid_and_mixed_dates() {
-    for date in ["2026-10-08", "2026-10-10"] {
+    for date in ["2026-11-07", "2026-11-08"] {
         assert!(consistent_release_date(
-            &format!("## [0.3.2] - {date}"),
-            &format!("## v0.3.2 - {date}"),
+            &format!("## [0.3.4] - {date}"),
+            &format!("## v0.3.4 - {date}"),
             &format!("**Release Date**: {date}"),
         ));
     }
     let valid = [
-        "## [0.3.2] - 2026-10-10",
-        "## v0.3.2 - 2026-10-10",
-        "**Release Date**: 2026-10-10",
+        "## [0.3.4] - 2026-11-08",
+        "## v0.3.4 - 2026-11-08",
+        "**Release Date**: 2026-11-08",
     ];
     for index in 0..3 {
         for replacement in [
             String::new(),
             format!("{}\n{}", valid[index], valid[index]),
-            valid[index].replace("2026-10-10", "2026-02-30"),
-            valid[index].replace("2026-10-10", "2026-1-1"),
-            valid[index].replace("2026-10-10", "unreleased"),
-            valid[index].replace("2026-10-10", "2026-10-09"),
+            valid[index].replace("2026-11-08", "2026-02-30"),
+            valid[index].replace("2026-11-08", "2026-1-1"),
+            valid[index].replace("2026-11-08", "unreleased"),
+            valid[index].replace("2026-11-08", "2026-11-07"),
         ] {
             let mut documents = valid.map(str::to_string);
             documents[index] = replacement;
@@ -82,6 +82,8 @@ fn release_notes_are_final_dated_and_distribution_honest() {
 #[test]
 fn changelog_has_checkpoint_and_first_public_entries() {
     let changelog = include_str!("../CHANGELOG.md");
+    assert!(dated_field(changelog, "## [0.3.4] - ").is_some());
+    assert!(dated_field(changelog, "## [0.3.3] - ").is_some());
     assert!(dated_field(changelog, "## [0.3.2] - ").is_some());
     assert!(changelog.contains("## [0.3.1] - 2026-08-27"));
     assert!(changelog.contains("## [0.3.0] - 2026-08-27"));
@@ -94,23 +96,25 @@ fn changelog_has_checkpoint_and_first_public_entries() {
 fn root_release_notes_lead_with_current_and_keep_three() {
     let notes = include_str!("../RELEASE_NOTES.md");
     let current = notes
-        .find("## v0.3.3 - ")
+        .find("## v0.3.4 - ")
         .expect("root notes lead with the current release");
     let previous = notes
-        .find("## v0.3.2 - 2026-10-10")
+        .find("## v0.3.3 - 2026-10-22")
         .expect("root notes include the previous release");
-    let first_public = notes
-        .find("## v0.3.1 - 2026-08-27")
-        .expect("root notes include the first public release");
-    assert!(current < previous && previous < first_public);
+    let two_back = notes
+        .find("## v0.3.2 - 2026-10-10")
+        .expect("root notes include the third most recent release");
+    assert!(current < previous && previous < two_back);
+    assert!(notes.contains("docs/releases/v0.3.4.md"));
     assert!(notes.contains("docs/releases/v0.3.3.md"));
     assert!(notes.contains("docs/releases/v0.3.2.md"));
-    assert!(notes.contains("First public distribution"));
-    assert!(notes.contains("docs/releases/v0.3.1.md"));
     assert!(notes.contains("default off") || notes.contains("off unless you pass it"));
     assert!(notes.contains("not published"));
+    assert!(!notes.contains("## v0.3.1"));
     assert!(!notes.contains("## v0.3.0"));
-    // The checkpoint summary that rolled out of the root file is archived.
+    // Older releases that rolled out of the root file remain archived.
+    let first_public = include_str!("../docs/releases/v0.3.1.md");
+    assert!(first_public.contains("First public GitHub binary release"));
     let checkpoint = include_str!("../docs/releases/v0.3.0.md");
     assert!(checkpoint.contains("Signed development checkpoint, not distributed"));
     assert_eq!(
