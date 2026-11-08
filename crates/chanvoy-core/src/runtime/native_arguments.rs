@@ -46,6 +46,7 @@ fn arguments(pid: ProcessId) -> Result<Vec<OsString>, RuntimeError> {
         let mut size = MAX_ARGUMENT_BYTES;
         // SAFETY: MIB and output buffer have the supplied lengths; no input buffer.
         let result = unsafe {
+            *libc::__error() = 0;
             libc::sysctl(
                 mib.as_mut_ptr(),
                 mib.len() as u32,

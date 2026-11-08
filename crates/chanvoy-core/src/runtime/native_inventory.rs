@@ -85,6 +85,14 @@ impl NativeInventory {
         check_deadline(deadline)?;
         Ok(result)
     }
+
+    /// Read-only capability check for diagnostics (`chanvoy doctor`).
+    /// Never acquires operation/lifetime locks, mutates authority state, or
+    /// authorizes daemon retirement, artifact reaping, or restart.
+    pub fn observe_capability(deadline: Instant) -> Result<(), RuntimeError> {
+        let current = RuntimeProcess::observe_current()?;
+        reconcile_scans(deadline, || scan_native(current.uid, &[], deadline)).map(|_| ())
+    }
 }
 fn check_deadline(deadline: Instant) -> Result<(), RuntimeError> {
     if Instant::now() >= deadline {
@@ -202,8 +210,19 @@ fn scan_staged(
         if owner(pid)? != uid {
             return Err(RuntimeError::Changed("referenced runtime owner"));
         }
-        full(pid)
-            .map_err(|_| RuntimeError::Unavailable("candidate daemon identity unavailable"))?;
+        match full(pid) {
+            Ok(_) => {}
+            Err(error @ RuntimeError::Unavailable(reason))
+                if reason.contains("permission denied") =>
+            {
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(RuntimeError::Unavailable(
+                    "candidate daemon identity unavailable",
+                ));
+            }
+        }
         return Err(RuntimeError::Unavailable(
             "referenced runtime PID omitted; reconciliation required",
         ));
@@ -286,7 +305,7 @@ fn scan_staged(
         check_deadline(deadline)?;
         let (identity, args) = match relevance(previous.pid) {
             Ok(pair) => pair,
-            Err(_)
+            Err(error)
                 if !referenced.contains(&previous.pid)
                     && !candidates.iter().any(|c| c.process.pid == previous.pid)
                     && matches!(
@@ -294,7 +313,13 @@ fn scan_staged(
                         Err(RuntimeError::Changed("native inventory process exited"))
                     ) =>
             {
+                let _ = error;
                 continue;
+            }
+            Err(error @ RuntimeError::Unavailable(reason))
+                if reason.contains("permission denied") =>
+            {
+                return Err(error);
             }
             Err(_) => {
                 return Err(RuntimeError::Unavailable(
@@ -309,8 +334,19 @@ fn scan_staged(
         }
     }
     for candidate in &candidates {
-        let (process, args) = full(candidate.process.pid)
-            .map_err(|_| RuntimeError::Unavailable("candidate daemon identity unavailable"))?;
+        let (process, args) = match full(candidate.process.pid) {
+            Ok(pair) => pair,
+            Err(error @ RuntimeError::Unavailable(reason))
+                if reason.contains("permission denied") =>
+            {
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(RuntimeError::Unavailable(
+                    "candidate daemon identity unavailable",
+                ));
+            }
+        };
         if process != candidate.process || !potential_candidate(&args) {
             return Err(RuntimeError::Changed(
                 "candidate daemon identity during inventory",
@@ -378,7 +414,7 @@ fn inspect_pid(
     }
     let (identity, args) = match relevance(pid) {
         Ok(pair) => pair,
-        Err(_) if !referenced.contains(&pid) => {
+        Err(error) if !referenced.contains(&pid) => {
             if matches!(
                 owner(pid),
                 Err(RuntimeError::Changed("native inventory process exited"))
@@ -386,9 +422,16 @@ fn inspect_pid(
                 exited.push(pid);
                 return Ok(());
             }
+            if matches!(&error, RuntimeError::Unavailable(reason) if reason.contains("permission denied"))
+            {
+                return Err(error);
+            }
             return Err(RuntimeError::Unavailable(
                 "same-account process relevance unavailable",
             ));
+        }
+        Err(error @ RuntimeError::Unavailable(reason)) if reason.contains("permission denied") => {
+            return Err(error);
         }
         Err(_) => {
             return Err(RuntimeError::Unavailable(
@@ -402,8 +445,19 @@ fn inspect_pid(
     owners.push((pid, observed_uid));
     observations.push((identity.clone(), argument_digest(&args)));
     if potential_candidate(&args) || referenced.contains(&pid) {
-        let (process, full_args) = full(pid)
-            .map_err(|_| RuntimeError::Unavailable("candidate daemon identity unavailable"))?;
+        let (process, full_args) = match full(pid) {
+            Ok(pair) => pair,
+            Err(error @ RuntimeError::Unavailable(reason))
+                if reason.contains("permission denied") =>
+            {
+                return Err(error);
+            }
+            Err(_) => {
+                return Err(RuntimeError::Unavailable(
+                    "candidate daemon identity unavailable",
+                ));
+            }
+        };
         if !identity.matches_full(&process) || args != full_args {
             return Err(RuntimeError::Changed(
                 "candidate identity across relevance bracket",
@@ -563,10 +617,22 @@ fn enumerate_for_account(uid: u32) -> Result<Vec<ProcessId>, RuntimeError> {
     // Size hints bracket each list; neither a short result nor equal lists
     // alone certifies the host view. Raw lists are compared before references.
     let mut pids = vec![0i32; MAX_PIDS];
-    let before = unsafe { libc::proc_listpids(4, uid, std::ptr::null_mut(), 0) };
-    let bytes =
-        unsafe { libc::proc_listpids(4, uid, pids.as_mut_ptr().cast(), (pids.len() * 4) as i32) };
-    let after = unsafe { libc::proc_listpids(4, uid, std::ptr::null_mut(), 0) };
+    let call_listpids = |buffer: *mut libc::c_void, buffersize: i32| -> Result<i32, RuntimeError> {
+        let n = unsafe {
+            *libc::__error() = 0;
+            libc::proc_listpids(4, uid, buffer, buffersize)
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if n <= 0 && matches!(errno, Some(libc::EPERM | libc::EACCES)) {
+            return Err(RuntimeError::Unavailable(
+                "native inventory PID list permission denied",
+            ));
+        }
+        Ok(n)
+    };
+    let before = call_listpids(std::ptr::null_mut(), 0)?;
+    let bytes = call_listpids(pids.as_mut_ptr().cast(), (pids.len() * 4) as i32)?;
+    let after = call_listpids(std::ptr::null_mut(), 0)?;
     validate_darwin_list_size(bytes, before, after)?;
     pids.truncate(bytes as usize / 4);
     // A selected account list cannot silently discard zero/negative entries.
@@ -607,7 +673,7 @@ fn owner(pid: ProcessId) -> Result<u32, RuntimeError> {
     };
     let errno = std::io::Error::last_os_error().raw_os_error();
     if read != size {
-        if matches!(errno, Some(libc::EPERM | libc::EACCES)) {
+        if read <= 0 && matches!(errno, Some(libc::EPERM | libc::EACCES)) {
             return Err(RuntimeError::Unavailable(
                 "native inventory owner permission denied",
             ));

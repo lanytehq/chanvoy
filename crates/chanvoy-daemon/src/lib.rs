@@ -954,11 +954,6 @@ pub async fn ping_full(profile_name: &str) -> Result<DaemonStatus, DaemonError> 
     daemon_client(profile_name).daemon_status().await
 }
 
-pub async fn stop(profile_name: &str) -> Result<(), DaemonError> {
-    daemon_client(profile_name).shutdown().await?;
-    Ok(())
-}
-
 pub async fn status(profile_name: &str) -> Result<DaemonStatus, DaemonError> {
     daemon_client(profile_name).daemon_status().await
 }

@@ -27,10 +27,12 @@ pub use bootstrap::{
 };
 
 pub use doctor::{
-    classify_clock_skew, clock_check_from_observation, doctor_exit_code,
+    classify_clock_skew, classify_native_capability, clock_check_from_observation,
+    doctor_exit_code, inspect_unreachable_socket_path, observe_native_runtime_diagnostics,
     observe_server_time_from_date_header, parse_http_date_ms, provider_status_class, CheckVerdict,
-    ClockCheck, ClockVerdict, ServerTimeObservation, ServerTimeSource, CLOCK_HEALTHY_BOUND_MS,
-    CLOCK_SUSPECT_THRESHOLD_MS,
+    ClockCheck, ClockVerdict, NativeCapabilityObservation, NativeCapabilityStatus,
+    NativeRuntimeDiagnostics, ServerTimeObservation, ServerTimeSource, SocketAccessObservation,
+    SocketAccessStatus, CLOCK_HEALTHY_BOUND_MS, CLOCK_SUSPECT_THRESHOLD_MS,
 };
 
 pub use host_build_info::{

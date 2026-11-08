@@ -60,6 +60,14 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
     assert!(v["clock"]["server_ms"].as_i64().is_some());
     assert_eq!(v["channel"]["check"], "pass");
     assert_eq!(v["channel"]["resolved_name"], "ops-updates");
+    assert_eq!(v["native_runtime"]["qualification"], false);
+    assert_eq!(v["native_runtime"]["socket_access"]["status"], "reachable");
+    assert!(v["native_runtime"]["process_inventory"]["status"]
+        .as_str()
+        .is_some());
+    assert!(v["native_runtime"]["listener_table"]["status"]
+        .as_str()
+        .is_some());
     let dumped = stdout.to_lowercase();
     assert!(!dumped.contains("request_id"));
     assert!(!dumped.contains("detailed_error"));
@@ -75,6 +83,10 @@ async fn doctor_reports_ws_degradation_alongside_healthy_clock_and_channel() {
     assert!(human_stdout.contains("ws_last_error:"), "{human_stdout}");
     assert!(
         human_stdout.contains("ws_reconnect_count:"),
+        "{human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("native_runtime: qualification=false"),
         "{human_stdout}"
     );
     assert!(
@@ -797,4 +809,67 @@ async fn doctor_retains_parent_refusal_through_inconclusive_followup() {
         assert_eq!(read_attention_state_bytes(&env), before);
         task.await.unwrap();
     }
+}
+
+/// When the daemon socket directory is blocked by permissions (e.g. sandbox filesystem
+/// policy denying access to the runtime directory), `doctor` must report `socket_access`
+/// as `denied` with actionable sandbox guidance while keeping `qualification: false`.
+#[tokio::test]
+async fn doctor_reports_socket_access_denied_when_runtime_dir_forbids_traversal() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let env = TestEnv::new("doc-sock-denied").await;
+    env.write_default_profile("agent-test", "org-lanytehq");
+    mount_whoami_with_date(&env, "bot-id", "agent-test", 0).await;
+    mount_primary_team(&env).await;
+
+    let runtime_dir = env.chanvoy_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let _listener = UnixListener::bind(env.socket_path()).unwrap();
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let json_out = run_chanvoy(&env, &["--json", "doctor"]).await;
+    let human_out = run_chanvoy(&env, &["doctor"]).await;
+
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let stdout = String::from_utf8_lossy(&json_out.stdout);
+    assert_eq!(
+        json_out.status.code(),
+        Some(2),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(v["exit_code"], 2, "{v}");
+    assert_eq!(v["daemon"]["check"], "fail", "{v}");
+    assert_eq!(v["daemon"]["reachable"], false, "{v}");
+    let daemon_reason = v["daemon"]["reason"].as_str().unwrap_or("");
+    assert!(
+        daemon_reason.contains("permission denied"),
+        "daemon_reason={daemon_reason}"
+    );
+    assert_eq!(v["native_runtime"]["qualification"], false, "{v}");
+    assert_eq!(
+        v["native_runtime"]["socket_access"]["status"], "denied",
+        "{v}"
+    );
+    let guidance = v["native_runtime"]["guidance"].as_str().unwrap_or("");
+    assert!(guidance.contains("sandbox"), "guidance={guidance}");
+
+    let human_stdout = String::from_utf8_lossy(&human_out.stdout);
+    assert_eq!(human_out.status.code(), Some(2), "{human_stdout}");
+    assert!(
+        human_stdout.contains("native_runtime: qualification=false (socket_access=denied"),
+        "{human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("socket_access_reason:"),
+        "{human_stdout}"
+    );
 }
