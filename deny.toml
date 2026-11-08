@@ -40,6 +40,7 @@ ignore = [
 ]
 
 [licenses]
+include-dev = true
 # Allow these permissive licenses on direct + transitive deps.
 # Symmetric with `.goneat/dependencies.yaml::licenses.allowed`.
 allow = [
@@ -101,6 +102,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
   "https://github.com/3leaps/ipcprims",
   "https://github.com/3leaps/sysprims",
+  "https://github.com/3leaps/waitprims",
 ]
 
 [sources.allow-org]
